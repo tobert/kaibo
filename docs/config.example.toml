@@ -23,7 +23,7 @@ oneshot = true
 run_kaish = true
 batch = true                       # batch_submit; requires batch synth
 list_models = true
-generate = true                     # requires image slot + CAS
+generate = true                     # requires image or audio slot + CAS
 # job_* tools follow enabled producers; read_cas/write_cas follow cas.enabled.
 
 [defaults]
@@ -204,7 +204,7 @@ synth = { backend = "gemini", id = "gemini-pro-latest", lane = "batch" }
 explorer = "gemma/Gemma-4-E4B-it-GGUF"
 synth = { backend = "gemma", id = "Big-Local-70B-GGUF", lane = "direct" }
 
-# Image generation needs a media-kind backend and an image slot. Examples:
+# Media generation needs a media-kind backend and an image or audio slot. Examples:
 # [backends.sd]
 # kind = "stability"
 # api_key_env = "STABILITY_API_KEY"
@@ -224,9 +224,15 @@ synth = { backend = "gemma", id = "Big-Local-70B-GGUF", lane = "direct" }
 # [casts.local-artist]
 # image = "sdcpp/sd3.5-large"
 
-# [backends.gemini-images]
-# kind = "gemini-images"
+# [backends.gemini-media]
+# kind = "gemini-media"                # was gemini-images; that name still loads
 # api_key_env = "GEMINI_API_KEY"
+# [casts.studio]
+# image = "gemini-media/gemini-3.1-flash-image"
+# audio = "gemini-media/gemini-3.8-flash-tts"   # speech: generate with media = "audio"
+
+# [casts.foley]
+# audio = "sd/stable-audio-2.5"         # Stability: music and sound effects
 
 # [backends.wan]
 # kind = "dashscope"

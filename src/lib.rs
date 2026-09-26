@@ -32,7 +32,7 @@ pub mod credentials;
 pub mod dashscope;
 pub mod discover;
 pub mod explorer;
-pub mod gemini_images;
+pub mod gemini_media;
 pub mod jobs;
 pub mod kaish_syntax;
 pub mod mcp_log;
@@ -53,6 +53,7 @@ pub mod tls;
 pub mod tool_span;
 pub mod upload;
 pub mod view_image;
+pub mod wav;
 pub mod wire_repair;
 pub mod worktree;
 

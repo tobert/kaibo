@@ -17,7 +17,7 @@
 //! implementations today: Stability's (`src/stability.rs`, multipart form wire, sync
 //! and deferred shapes), OpenAI Images (`src/openai_images.rs`, JSON body for
 //! `generations` and multipart for the two routes that carry files), DashScope
-//! (`src/dashscope.rs`), and Gemini (`src/gemini_images.rs`) — the odd one, whose wire
+//! (`src/dashscope.rs`), and Gemini (`src/gemini_media.rs`) — the odd one, whose wire
 //! is a *completion* endpoint rather than an images API, and the only one that answers
 //! with words as well as bytes.
 //!
@@ -38,9 +38,56 @@ use std::sync::Arc;
 
 use anyhow::{bail, Result};
 use async_trait::async_trait;
+use rmcp::schemars::{self, JsonSchema};
 
 use crate::config::{Backend, ModelSlot};
 use crate::credentials::{MediaKind, ProviderClass};
+
+/// What a media slot produces. One per media role: the `image` slot makes images, the
+/// `audio` slot makes audio. The `generate` tool's `media` parameter picks one, which
+/// picks the slot, which picks the backend; a provider that serves both (Gemini,
+/// Stability) is built for one of them at a time, so it never has to guess.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Default, serde::Deserialize, JsonSchema, clap::ValueEnum,
+)]
+#[serde(rename_all = "lowercase")]
+pub enum MediaOutput {
+    #[default]
+    Image,
+    Audio,
+}
+
+impl MediaOutput {
+    /// The cast slot that produces this output.
+    pub fn role(self) -> crate::config::ModelRole {
+        match self {
+            MediaOutput::Image => crate::config::ModelRole::Image,
+            MediaOutput::Audio => crate::config::ModelRole::Audio,
+        }
+    }
+
+    /// The output a media role produces, or `None` for a reasoning role.
+    pub fn of_role(role: crate::config::ModelRole) -> Option<Self> {
+        match role {
+            crate::config::ModelRole::Image => Some(MediaOutput::Image),
+            crate::config::ModelRole::Audio => Some(MediaOutput::Audio),
+            crate::config::ModelRole::Explorer | crate::config::ModelRole::Synth => None,
+        }
+    }
+
+    /// The name a caller writes (`"image"`, `"audio"`) — the same word as the slot.
+    pub fn key(self) -> &'static str {
+        self.role().key()
+    }
+
+    /// Whether a stored artifact's format belongs to this output's family.
+    pub fn admits(self, ext: crate::cas::Extension) -> bool {
+        match self {
+            MediaOutput::Image => ext.is_image(),
+            MediaOutput::Audio => ext.is_audio(),
+        }
+    }
+}
 
 /// One provider-native field value, carrying the caller's JSON type end to end. The
 /// caller said string, number, or bool at the tool face; guessing the type back out
@@ -199,8 +246,10 @@ impl MediaInput {
 /// something the object is not.
 ///
 /// Every failure is named and nothing is sent: a bad digest, a digest for an object this
-/// store does not hold, or an object that is not an image all refuse before a request is
-/// built.
+/// store does not hold, or an object that is neither an image nor audio all refuse before
+/// a request is built. Audio is admitted because Stability's audio-to-audio and inpaint
+/// routes take an `audio` part; which family a given route wants is the provider's to
+/// judge, the way it judges every other part.
 pub fn resolve_inputs(
     store: &crate::cas::MediaStore,
     asked: &[(String, String)],
@@ -222,13 +271,15 @@ pub fn resolve_inputs(
             .ok_or_else(|| {
                 anyhow::anyhow!(
                     "`inputs.{field}`: this store holds no object at {digest_hex}. Store \
-                     the image with `write_cas` first and pass the digest it returns."
+                     the file with `write_cas` first, or pass a digest an earlier \
+                     `generate` returned."
                 )
             })?;
-        if !extension.is_image() {
+        if !extension.is_image() && !extension.is_audio() {
             bail!(
-                "`inputs.{field}`: the object at {digest_hex} is {}, not an image. An \
-                 input part is an image; pass the digest of one.",
+                "`inputs.{field}`: the object at {digest_hex} is {}, which no media \
+                 operation takes. An input part is an image or audio; pass the digest of \
+                 one.",
                 extension.mime()
             );
         }
@@ -242,15 +293,16 @@ pub fn resolve_inputs(
 /// Same failure being prevented as [`refuse_binary_inputs`]: running the default route
 /// for a caller who named a different one returns a plausible artifact for the wrong
 /// question, stored with a digest and a sidecar that make it look deliberate.
-pub fn refuse_operation(request: &MediaRequest, provider: &str) -> Result<()> {
+pub fn refuse_operation(request: &MediaRequest, provider: &str, output: MediaOutput) -> Result<()> {
     let Some(op) = &request.op else {
         return Ok(());
     };
+    let slot = output.key();
     bail!(
         "this call asks for operation `{op}`, and the {provider} backend has no named \
-         operations — it generates from a prompt and nothing else, so nothing was \
-         generated. Point the cast's `image` slot at a backend with an operation \
-         vocabulary (Stability), or drop `op`."
+         operations for {slot} — it generates from a prompt and nothing else, so nothing \
+         was generated. Drop `op`, or point the cast's `{slot}` slot at a backend with an \
+         operation vocabulary (Stability)."
     )
 }
 
@@ -261,16 +313,21 @@ pub fn refuse_operation(request: &MediaRequest, provider: &str) -> Result<()> {
 /// digest and a provenance sidecar — the caller asked to edit *this* picture and received
 /// an unrelated one that looks like a success. That is silent corruption of the result,
 /// and it is far worse than a refusal naming the two ways forward.
-pub fn refuse_binary_inputs(request: &MediaRequest, provider: &str) -> Result<()> {
+pub fn refuse_binary_inputs(
+    request: &MediaRequest,
+    provider: &str,
+    output: MediaOutput,
+) -> Result<()> {
     if request.inputs.is_empty() {
         return Ok(());
     }
     let named: Vec<&str> = request.inputs.iter().map(|i| i.field.as_str()).collect();
+    let slot = output.key();
     bail!(
-        "this call carries the input image{} `{}`, and the {provider} backend has no \
-         operation that accepts input images — nothing was generated. Point the cast's `image` \
-         slot at a backend whose operations take an input image (Stability), or drop \
-         `inputs` to generate from the prompt alone.",
+        "this call carries the input{} `{}`, and the {provider} backend has no {slot} \
+         operation that takes an input — nothing was generated. Drop `inputs` to generate \
+         from the prompt alone, or point the cast's `{slot}` slot at a backend whose \
+         operations take one (Stability).",
         if named.len() == 1 { "" } else { "s" },
         named.join("`, `"),
     )
@@ -411,6 +468,9 @@ pub struct MediaArm {
     model: Arc<dyn MediaModel>,
     /// The slot's `"backend/model-id"` ref — provenance and error text.
     slot_ref: String,
+    /// What the model was built to produce. The arm's refusals name this slot, so a
+    /// speech call is never told to fix its `image` slot.
+    output: MediaOutput,
 }
 
 impl std::fmt::Debug for MediaArm {
@@ -431,14 +491,42 @@ impl MediaArm {
         Self {
             model,
             slot_ref: slot_ref.into(),
+            output: MediaOutput::Image,
         }
     }
 
+    /// The same arm, recorded as producing `output`. [`from_slot`](Self::from_slot) sets
+    /// it; a test double for an audio slot sets it here.
+    pub fn with_output(mut self, output: MediaOutput) -> Self {
+        self.output = output;
+        self
+    }
+
+    /// What this arm was built to produce.
+    pub fn output(&self) -> MediaOutput {
+        self.output
+    }
+
     /// The single live construction point: resolve a media cast slot into a callable
-    /// arm. Only a [`ProviderClass::Media`] backend can staff one — a completion
-    /// backend is refused here with the same load-guard framing `Arm::from_slot` uses
-    /// for the mirror-image mistake.
-    pub fn from_slot(backend: &Backend, slot: &ModelSlot) -> Result<Self> {
+    /// arm that produces `output`. Only a [`ProviderClass::Media`] backend can staff one
+    /// — a completion backend is refused here with the same load-guard framing
+    /// `Arm::from_slot` uses for the mirror-image mistake — and only a kind that
+    /// [produces](MediaKind::produces) `output`. Config load refuses both mismatches
+    /// first; these refusals are the structural backstop.
+    pub fn from_slot(backend: &Backend, slot: &ModelSlot, output: MediaOutput) -> Result<Self> {
+        if let ProviderClass::Media(media) = backend.kind.class() {
+            if !media.produces(output) {
+                bail!(
+                    "backend {:?} is kind `{}`, which has no route that produces {} — \
+                     point the `{}` slot at a backend of kind {}",
+                    backend.name,
+                    backend.kind.canonical_name(),
+                    output.key(),
+                    output.key(),
+                    crate::credentials::media_kinds_producing(Some(output)),
+                );
+            }
+        }
         match backend.kind.class() {
             ProviderClass::Media(MediaKind::Stability) => {
                 let key = backend.resolve_key()?;
@@ -448,22 +536,24 @@ impl MediaArm {
                     .unwrap_or_else(|| crate::stability::STABILITY_API_BASE.to_string());
                 let client =
                     crate::stability::StabilityClient::new(key, base_url, backend.request_timeout)?;
-                let model = crate::stability::StabilityImageModel::from_parts(&client, &slot.id);
-                Ok(Self::new(Arc::new(model), slot.qualified()))
+                let model =
+                    crate::stability::StabilityImageModel::from_parts(&client, &slot.id, output);
+                Ok(Self::new(Arc::new(model), slot.qualified()).with_output(output))
             }
-            ProviderClass::Media(MediaKind::GeminiImages) => {
+            ProviderClass::Media(MediaKind::GeminiMedia) => {
                 let key = backend.resolve_key()?;
                 let base_url = backend
                     .base_url
                     .clone()
-                    .unwrap_or_else(|| crate::gemini_images::DEFAULT_BASE_URL.to_string());
-                let client = crate::gemini_images::GeminiImagesClient::new(
+                    .unwrap_or_else(|| crate::gemini_media::DEFAULT_BASE_URL.to_string());
+                let client = crate::gemini_media::GeminiMediaClient::new(
                     &key,
                     &base_url,
                     backend.request_timeout,
                 )?;
-                let model = crate::gemini_images::GeminiImagesModel::from_parts(&client, &slot.id);
-                Ok(Self::new(Arc::new(model), slot.qualified()))
+                let model =
+                    crate::gemini_media::GeminiMediaModel::from_parts(&client, &slot.id, output);
+                Ok(Self::new(Arc::new(model), slot.qualified()).with_output(output))
             }
             ProviderClass::Media(MediaKind::OpenAiImages) => {
                 // Key sources are shared with the `openai` completion kind, but the
@@ -483,7 +573,7 @@ impl MediaArm {
                     backend.request_timeout,
                 )?;
                 let model = crate::openai_images::OpenAiImagesModel::from_parts(&client, &slot.id);
-                Ok(Self::new(Arc::new(model), slot.qualified()))
+                Ok(Self::new(Arc::new(model), slot.qualified()).with_output(output))
             }
             ProviderClass::Media(MediaKind::DashScope) => {
                 // Keyed with no keyless target, so a missing credential is a hard
@@ -498,7 +588,7 @@ impl MediaArm {
                 let client =
                     crate::dashscope::DashScopeClient::new(key, base_url, backend.request_timeout)?;
                 let model = crate::dashscope::DashScopeImageModel::from_parts(&client, &slot.id);
-                Ok(Self::new(Arc::new(model), slot.qualified()))
+                Ok(Self::new(Arc::new(model), slot.qualified()).with_output(output))
             }
             ProviderClass::Media(MediaKind::Bfl) => {
                 // Keyed with no keyless target, same as Stability/DashScope.
@@ -509,14 +599,15 @@ impl MediaArm {
                     .unwrap_or_else(|| crate::bfl::DEFAULT_BASE_URL.to_string());
                 let client = crate::bfl::BflClient::new(key, base_url, backend.request_timeout)?;
                 let model = crate::bfl::BflImageModel::from_parts(&client, &slot.id);
-                Ok(Self::new(Arc::new(model), slot.qualified()))
+                Ok(Self::new(Arc::new(model), slot.qualified()).with_output(output))
             }
             ProviderClass::Wire(_) => bail!(
                 "backend {:?} is kind `{}`, a completion wire — it cannot staff a media \
-                 slot. Point the `image` slot at a media backend, and use this backend \
+                 slot. Point the `{}` slot at a media backend, and use this backend \
                  on `explorer`/`synth` instead",
                 backend.name,
-                backend.kind.canonical_name()
+                backend.kind.canonical_name(),
+                output.key(),
             ),
         }
     }
@@ -568,10 +659,10 @@ impl MediaArm {
     /// a caller to the issue tracker over a parameter they could simply drop.
     pub fn refuse_unsupported(&self, request: &MediaRequest) -> Result<()> {
         if !self.model.accepts_inputs() {
-            refuse_binary_inputs(request, &self.slot_ref)?;
+            refuse_binary_inputs(request, &self.slot_ref, self.output)?;
         }
         if !self.model.accepts_ops() {
-            refuse_operation(request, &self.slot_ref)?;
+            refuse_operation(request, &self.slot_ref, self.output)?;
         }
         Ok(())
     }
@@ -589,7 +680,7 @@ impl MediaArm {
 /// [`MediaModel`] so the whole tool lane — CAS writes, job lane, rendering — runs
 /// offline with no network.
 pub trait MediaArmFactory: Send + Sync {
-    fn build(&self, backend: &Backend, slot: &ModelSlot) -> Result<MediaArm>;
+    fn build(&self, backend: &Backend, slot: &ModelSlot, output: MediaOutput) -> Result<MediaArm>;
 }
 
 /// The real construction path: [`MediaArm::from_slot`], the single live point where a
@@ -597,8 +688,8 @@ pub trait MediaArmFactory: Send + Sync {
 pub struct LiveMediaArms;
 
 impl MediaArmFactory for LiveMediaArms {
-    fn build(&self, backend: &Backend, slot: &ModelSlot) -> Result<MediaArm> {
-        MediaArm::from_slot(backend, slot)
+    fn build(&self, backend: &Backend, slot: &ModelSlot, output: MediaOutput) -> Result<MediaArm> {
+        MediaArm::from_slot(backend, slot, output)
     }
 }
 
@@ -691,7 +782,8 @@ mod tests {
         let cfg = crate::config::Config::builtin();
         let backend = cfg.backends.get("anthropic").expect("built-in exists");
         let slot = ModelSlot::bare("anthropic", "claude-sonnet-4-6");
-        let err = MediaArm::from_slot(backend, &slot).expect_err("wire kind must be refused");
+        let err = MediaArm::from_slot(backend, &slot, MediaOutput::Image)
+            .expect_err("wire kind must be refused");
         let msg = format!("{err:#}");
         assert!(
             msg.contains("completion wire") && msg.contains("media backend"),
@@ -717,7 +809,8 @@ mod tests {
         .expect("config parses");
         let backend = cfg.backends.get("sdcpp").expect("backend exists");
         let slot = ModelSlot::bare("sdcpp", "sd3.5-large");
-        let arm = MediaArm::from_slot(backend, &slot).expect("an openai-images backend staffs");
+        let arm = MediaArm::from_slot(backend, &slot, MediaOutput::Image)
+            .expect("an openai-images backend staffs");
         assert_eq!(arm.slot_ref(), "sdcpp/sd3.5-large");
     }
 
@@ -740,18 +833,19 @@ mod tests {
         .expect("config parses");
         let backend = cfg.backends.get("wan").expect("backend exists");
         let slot = ModelSlot::bare("wan", "wan2.6-t2i");
-        let arm = MediaArm::from_slot(backend, &slot).expect("a dashscope backend staffs");
+        let arm = MediaArm::from_slot(backend, &slot, MediaOutput::Image)
+            .expect("a dashscope backend staffs");
         assert_eq!(arm.slot_ref(), "wan/wan2.6-t2i");
     }
 
     /// The Gemini arm staffs an image slot — the construction half of the media kind
     /// whose wire is a completion endpoint.
     #[test]
-    fn from_slot_staffs_a_gemini_images_backend() {
+    fn from_slot_staffs_a_gemini_media_backend() {
         let cfg = crate::config::Config::from_toml_str(
             r#"
             [backends.gimg]
-            kind = "gemini-images"
+            kind = "gemini-media"
             key_optional = true
             api_key_file = "/nonexistent-kaibo-test/gemini"
             "#,
@@ -759,7 +853,8 @@ mod tests {
         .expect("config parses");
         let backend = cfg.backends.get("gimg").expect("backend exists");
         let slot = ModelSlot::bare("gimg", "gemini-3-flash-image");
-        let arm = MediaArm::from_slot(backend, &slot).expect("a gemini-images backend staffs");
+        let arm = MediaArm::from_slot(backend, &slot, MediaOutput::Image)
+            .expect("a gemini-media backend staffs");
         assert_eq!(arm.slot_ref(), "gimg/gemini-3-flash-image");
     }
 
@@ -780,8 +875,68 @@ mod tests {
         .expect("config parses");
         let backend = cfg.backends.get("bfl").expect("backend exists");
         let slot = ModelSlot::bare("bfl", "flux-2-pro");
-        let arm = MediaArm::from_slot(backend, &slot).expect("a bfl backend staffs");
+        let arm =
+            MediaArm::from_slot(backend, &slot, MediaOutput::Image).expect("a bfl backend staffs");
         assert_eq!(arm.slot_ref(), "bfl/flux-2-pro");
+    }
+
+    /// **An audio arm on an image-only kind is refused at construction**, naming the
+    /// kinds that make audio — the backstop for the config-load refusal.
+    #[test]
+    fn from_slot_refuses_audio_on_an_image_only_kind() {
+        let cfg = crate::config::Config::from_toml_str(
+            r#"
+            [backends.bfl]
+            kind = "bfl"
+            key_optional = true
+            api_key_file = "/nonexistent-kaibo-test/bfl"
+            "#,
+        )
+        .expect("config parses");
+        let backend = cfg.backends.get("bfl").expect("backend exists");
+        let slot = ModelSlot::bare("bfl", "flux-2-pro");
+        let err = MediaArm::from_slot(backend, &slot, MediaOutput::Audio)
+            .expect_err("bfl makes no audio");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("audio") && msg.contains("`gemini-media`") && msg.contains("`stability`"),
+            "the error names the output and the kinds that produce it, got: {msg}"
+        );
+    }
+
+    /// A gemini-media backend staffs an audio arm — speech is the same endpoint asked
+    /// for a different modality.
+    #[test]
+    fn from_slot_staffs_a_gemini_media_audio_arm() {
+        let cfg = crate::config::Config::from_toml_str(
+            r#"
+            [backends.gmedia]
+            kind = "gemini-media"
+            key_optional = true
+            api_key_file = "/nonexistent-kaibo-test/gemini"
+            "#,
+        )
+        .expect("config parses");
+        let backend = cfg.backends.get("gmedia").expect("backend exists");
+        let slot = ModelSlot::bare("gmedia", "gemini-2.5-flash-preview-tts");
+        let arm = MediaArm::from_slot(backend, &slot, MediaOutput::Audio)
+            .expect("a gemini-media backend staffs an audio slot");
+        assert_eq!(arm.slot_ref(), "gmedia/gemini-2.5-flash-preview-tts");
+        assert_eq!(arm.output(), MediaOutput::Audio);
+        // The model inside was built for speech too: it refuses an input part, which
+        // the same backend's image model accepts.
+        let with_input = MediaRequest {
+            prompt: "hello".into(),
+            inputs: vec![MediaInput::new(
+                "image",
+                crate::cas::Extension::Png,
+                b"png".to_vec(),
+            )],
+            ..Default::default()
+        };
+        assert!(arm.refuse_unsupported(&with_input).is_err());
+        let image_arm = MediaArm::from_slot(backend, &slot, MediaOutput::Image).unwrap();
+        assert!(image_arm.refuse_unsupported(&with_input).is_ok());
     }
 
     /// The Stability arm still staffs — the sibling-kind regression guard for the
@@ -798,7 +953,8 @@ mod tests {
         .expect("config parses");
         let backend = cfg.backends.get("sd").expect("backend exists");
         let slot = ModelSlot::bare("sd", "core");
-        let arm = MediaArm::from_slot(backend, &slot).expect("a stability backend staffs");
+        let arm = MediaArm::from_slot(backend, &slot, MediaOutput::Image)
+            .expect("a stability backend staffs");
         assert_eq!(arm.slot_ref(), "sd/core");
     }
 }

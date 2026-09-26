@@ -822,14 +822,17 @@ fn synthless_cast_refusal(cast: &Cast, tool: &str) -> String {
         format!("its slots are {}", slots.join(", "))
     };
     // The tools a synth-less cast can still staff, by the slot each one runs.
-    let fits: Vec<&str> = [
+    let mut fits: Vec<&str> = [
         (ModelRole::Explorer, "`explore`"),
         (ModelRole::Image, "`generate`"),
+        (ModelRole::Audio, "`generate`"),
     ]
     .into_iter()
     .filter(|(role, _)| cast.slot(*role).is_some())
     .map(|(_, t)| t)
     .collect();
+    // Both media slots serve the same tool; name it once.
+    fits.dedup();
     let use_it = if fits.is_empty() {
         String::new()
     } else {

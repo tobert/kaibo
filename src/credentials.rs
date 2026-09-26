@@ -84,7 +84,9 @@ pub enum ProviderKind {
     /// `key_optional = true` beside its explicit local `base_url`. Like Stability,
     /// it is not in the built-in backend list and staffs only `image` cast slots.
     OpenAiImages,
-    /// Gemini's image generation — the fourth media kind, via `src/gemini_images.rs`.
+    /// Gemini's image and speech generation — the fourth media kind, via
+    /// `src/gemini_media.rs`. Named `gemini-images` until speech arrived; that name
+    /// still parses as an alias.
     ///
     /// A *separate kind* from [`ProviderKind::Gemini`] for the same reason
     /// [`ProviderKind::OpenAiImages`] is separate from [`ProviderKind::Openai`]: one
@@ -93,8 +95,10 @@ pub enum ProviderKind {
     /// `models/{model}:generateContent`, the same call as text, with
     /// `responseModalities` naming what comes back. So this kind is a media kind whose
     /// wire is a completion wire, which is exactly why it needs its own name: a reasoning
-    /// slot pointed here would resolve a completion model that answers in pictures.
-    GeminiImages,
+    /// slot pointed here would resolve a completion model that answers in pictures. The
+    /// slot it staffs picks the modality: an `image` slot asks for pictures, an `audio`
+    /// slot for speech.
+    GeminiMedia,
     /// Alibaba's DashScope multimodal-generation route — the third media kind, via
     /// `src/dashscope.rs`, covering the `wan` image family. Media-only on purpose:
     /// the same host serves text through an OpenAI-compatible endpoint, so a text
@@ -131,7 +135,7 @@ impl ProviderKind {
         Self::Openai,
         Self::Stability,
         Self::OpenAiImages,
-        Self::GeminiImages,
+        Self::GeminiMedia,
         Self::DashScope,
         Self::Bfl,
     ];
@@ -178,7 +182,7 @@ impl ProviderKind {
             // Reached only when an operator sets `key_optional = true` for a local
             // sd-server: header-bearer shaped, value ignored by such a server.
             | ProviderKind::OpenAiImages
-            | ProviderKind::GeminiImages
+            | ProviderKind::GeminiMedia
             // Never reached: none of Stability, DashScope, or BFL is `key_optional`,
             // so a missing key is a hard error long before a stand-in is wanted. All
             // three are header-bearer wires, so they take the same shape as the
@@ -203,7 +207,7 @@ impl ProviderKind {
             ProviderKind::Openai => "openai",
             ProviderKind::Stability => "stability",
             ProviderKind::OpenAiImages => "openai-images",
-            ProviderKind::GeminiImages => "gemini-images",
+            ProviderKind::GeminiMedia => "gemini-media",
             ProviderKind::DashScope => "dashscope",
             ProviderKind::Bfl => "bfl",
         }
@@ -228,7 +232,7 @@ impl ProviderKind {
         match self {
             ProviderKind::Anthropic => "ANTHROPIC_API_KEY",
             ProviderKind::DeepSeek => "DEEPSEEK_API_KEY",
-            ProviderKind::Gemini | ProviderKind::GeminiImages => "GEMINI_API_KEY",
+            ProviderKind::Gemini | ProviderKind::GeminiMedia => "GEMINI_API_KEY",
             ProviderKind::OpenRouter => "OPENROUTER_API_KEY",
             // The images kind shares the completion kind's key sources on purpose:
             // both talk to the same OpenAI account when hosted, and both cover a
@@ -254,7 +258,7 @@ impl ProviderKind {
         match self {
             ProviderKind::Anthropic => ".anthropic-key.txt",
             ProviderKind::DeepSeek => ".deepseek-key",
-            ProviderKind::Gemini | ProviderKind::GeminiImages => ".gemini-api-key",
+            ProviderKind::Gemini | ProviderKind::GeminiMedia => ".gemini-api-key",
             ProviderKind::OpenRouter => ".openrouter-key",
             // Shared with the images kind — see `env_var`.
             ProviderKind::Openai | ProviderKind::OpenAiImages => ".openai-key",
@@ -287,7 +291,7 @@ impl ProviderKind {
             ProviderKind::Openai => ProviderClass::Wire(WireKind::Openai),
             ProviderKind::Stability => ProviderClass::Media(MediaKind::Stability),
             ProviderKind::OpenAiImages => ProviderClass::Media(MediaKind::OpenAiImages),
-            ProviderKind::GeminiImages => ProviderClass::Media(MediaKind::GeminiImages),
+            ProviderKind::GeminiMedia => ProviderClass::Media(MediaKind::GeminiMedia),
             ProviderKind::DashScope => ProviderClass::Media(MediaKind::DashScope),
             ProviderKind::Bfl => ProviderClass::Media(MediaKind::Bfl),
         }
@@ -338,14 +342,29 @@ pub enum MediaKind {
     /// OpenAI's Images API shape (`/v1/images/generations`), via
     /// `src/openai_images.rs` — hosted OpenAI or a local sd-server.
     OpenAiImages,
-    /// Gemini's `generateContent` asked for image output, via `src/gemini_images.rs`.
-    GeminiImages,
+    /// Gemini's `generateContent` asked for image or audio output, via
+    /// `src/gemini_media.rs`.
+    GeminiMedia,
     /// Alibaba DashScope's multimodal-generation route, via `src/dashscope.rs` —
     /// the `wan` image family, delivered as presigned URLs kaibo fetches.
     DashScope,
     /// Black Forest Labs' FLUX image family, via `src/bfl.rs` — every operation
     /// asynchronous, delivered as a signed URL kaibo fetches.
     Bfl,
+}
+
+impl MediaKind {
+    /// Whether this kind has any route that produces `output`. Every media kind makes
+    /// images; only Gemini (speech) and Stability (Stable Audio) make audio. Config load
+    /// refuses a slot whose kind cannot produce what the slot is for, so this is the one
+    /// place that fact is written down.
+    pub fn produces(self, output: crate::media::MediaOutput) -> bool {
+        use crate::media::MediaOutput;
+        match output {
+            MediaOutput::Image => true,
+            MediaOutput::Audio => matches!(self, MediaKind::GeminiMedia | MediaKind::Stability),
+        }
+    }
 }
 
 /// The two families a [`ProviderKind`] can belong to — see [`ProviderKind::class`].
@@ -361,9 +380,20 @@ pub enum ProviderClass {
 /// stale when a media kind lands. (Text that must live in a `const` still names the
 /// kinds literally; this helper serves every site that formats at runtime.)
 pub fn media_kinds_list() -> String {
+    media_kinds_producing(None)
+}
+
+/// The media kinds that produce `output`, as a display list — the same derivation as
+/// [`media_kinds_list`], narrowed through [`MediaKind::produces`]. `None` lists every
+/// media kind.
+pub fn media_kinds_producing(output: Option<crate::media::MediaOutput>) -> String {
     ProviderKind::ALL
         .iter()
-        .filter(|k| k.is_media())
+        .filter(|k| match (k.class(), output) {
+            (ProviderClass::Media(m), Some(out)) => m.produces(out),
+            (ProviderClass::Media(_), None) => true,
+            (ProviderClass::Wire(_), _) => false,
+        })
         .map(|k| format!("`{}`", k.canonical_name()))
         .collect::<Vec<_>>()
         .join(", ")
@@ -383,7 +413,9 @@ impl std::str::FromStr for ProviderKind {
             "openai" | "local" | "lemonade" | "gemma" | "gemma4" => Ok(ProviderKind::Openai),
             "stability" => Ok(ProviderKind::Stability),
             "openai-images" => Ok(ProviderKind::OpenAiImages),
-            "gemini-images" => Ok(ProviderKind::GeminiImages),
+            // `gemini-images` was this kind's name until speech joined images on the
+            // same endpoint; configs written then keep loading unchanged.
+            "gemini-media" | "gemini-images" => Ok(ProviderKind::GeminiMedia),
             "dashscope" => Ok(ProviderKind::DashScope),
             "bfl" => Ok(ProviderKind::Bfl),
             other => Err(anyhow!(

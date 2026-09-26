@@ -33,7 +33,7 @@ Connection settings only. Models are never declared here.
 
 | key | type | default | notes |
 |---|---|---|---|
-| `kind` | `anthropic` \| `deepseek` \| `gemini` \| `openrouter` \| `openai` \| `stability` \| `openai-images` \| `gemini-images` \| `dashscope` \| `bfl` | required on a new backend | closed enum; selects client + request shape (`stability`, `openai-images`, `gemini-images`, `dashscope`, and `bfl` are the media kinds — image slots only) |
+| `kind` | `anthropic` \| `deepseek` \| `gemini` \| `openrouter` \| `openai` \| `stability` \| `openai-images` \| `gemini-media` \| `dashscope` \| `bfl` | required on a new backend | closed enum; selects client + request shape (`stability`, `openai-images`, `gemini-media`, `dashscope`, and `bfl` are the media kinds — media slots only; `gemini-images` is an alias of `gemini-media`) |
 | `base_url` | string | kind-dependent | required for a new `openai` backend; optional for `anthropic`/`gemini` and the media kinds; load error elsewhere |
 | `wire` | `responses` \| `chat` | inferred | `kind = "openai"` only; load error elsewhere |
 | `api_key_env` | env var *name* | unset — declared by you | env source, checked first |
@@ -52,7 +52,7 @@ kind. No backend declares a key source unless you write one.
 |---|---|---|
 | `openai` | built-in `openai-local`: `http://localhost:13305/api/v1` | required on new backends; include `/v1` |
 | `anthropic` | `https://api.anthropic.com` | host root |
-| `gemini`, `gemini-images` | `https://generativelanguage.googleapis.com` | host root; kaibo adds `/v1beta` |
+| `gemini`, `gemini-media` | `https://generativelanguage.googleapis.com` | host root; kaibo adds `/v1beta` |
 | `stability` | `https://api.stability.ai` | host root |
 | `openai-images` | `https://api.openai.com/v1` | include `/v1`; kaibo adds `/images/generations` |
 | `dashscope` | `https://dashscope-intl.aliyuncs.com` | host root; kaibo adds the multimodal route |
@@ -63,8 +63,10 @@ Separate names allow several connections using the same protocol. `OPENAI_BASE_U
 overrides the built-in local backend when no explicit URL is present. A new `openai`
 backend without a URL is refused, rather than redirected to the local default.
 
-Media kinds staff only `image` slots. `gemini-images` uses `generateContent` with
-image modalities and refuses `op`. `openai-images` accepts `png`, `jpeg`, or `webp`
+Media kinds staff only media slots: every one staffs `image`, and `gemini-media` and
+`stability` also staff `audio`. `gemini-media` uses `generateContent`, asking for
+`TEXT`+`IMAGE` on an image slot and `AUDIO` on an audio slot, and refuses `op`. It was
+named `gemini-images` before speech arrived; that name still loads. `openai-images` accepts `png`, `jpeg`, or `webp`
 output; a keyless local server must explicitly set `key_optional = true`.
 DashScope text models use a separate `openai` backend at `/compatible-mode/v1`.
 DashScope and BFL fetch generated media from signed URLs. BFL also polls the returned
@@ -189,11 +191,16 @@ synth    = "claude/claude-sonnet-4-6"       # the model that answers
 # explorer = { backend = "openai-local", id = "Gemma-4-E4B-it", preamble = "..." }
 ```
 
-**Roles.** `explorer`, `synth`, and `image`. A misspelled role, or a misspelled
-per-slot key, is a load error rather than a silent no-op. The `image` slot is the
-media member: it points at a media-kind backend and staffs the `generate` tool. Its
+**Roles.** `explorer`, `synth`, `image`, and `audio`. A misspelled role, or a
+misspelled per-slot key, is a load error rather than a silent no-op. `image` and
+`audio` are the media members: each points at a media-kind backend that produces its
+output, and staffs the `generate` tool — `media = "image"` (the default) runs the
+`image` slot, `media = "audio"` the `audio` slot. An `audio` slot on a kind with no
+audio route (`openai-images`, `dashscope`, `bfl`) is a load error. A media slot's
 model id means what that kind says it means — for `stability` it picks the route
-(`core`, `ultra`, or an SD3.5 variant); for `gemini-images` it is the model in the request path; for `openai-images` it is the `model` field
+(image: `core`, `ultra`, or an SD3.5 variant; audio: `stable-audio-2.5`,
+`stable-audio-2`, or `stable-audio-3`); for `gemini-media` it is the model in the
+request path (audio: `gemini-3.8-flash-tts`, ...); for `openai-images` it is the `model` field
 (`gpt-image-1` hosted, or whatever a local sd-server loaded); for `dashscope` it is
 the `model` field too (`wan2.6-t2i`); for `bfl` it names one of five operations
 (`flux-2-pro`, ...) and doubles as `generate`'s default `op`. It sends one
@@ -202,7 +209,7 @@ generation request, not a reasoning loop, so the reasoning tunables (`effort`,
 flags them under `inert_tunables`.
 
 A cast may omit a role. The interactive built-ins carry explorer + synth; the batch
-built-ins carry `synth` only; none carries `image`. A user cast that omits a role is
+built-ins carry `synth` only; none carries a media slot. A user cast that omits a role is
 valid config, and the tool needing the missing role fails at call time naming the gap
 (`cast "lite" has no synth slot`). Absent means the capability is absent.
 
@@ -653,11 +660,11 @@ Which cast shape staffs which tool:
 | `explore` | a cast with an `explorer` slot |
 | `batch_submit` | a cast whose synth runs on `lane = "batch"` (or the `batch = true` sugar) |
 | `deliberate` | a cast with an `explorer` **and** an offline synth (`lane = "batch"` or `lane = "direct"`) |
-| `generate` | a cast with an `image` slot (a media backend: kind `stability`, `openai-images`, `gemini-images`, `dashscope`, or `bfl`) — plus `[cas]` on |
+| `generate` | a cast with an `image` slot (kind `stability`, `openai-images`, `gemini-media`, `dashscope`, or `bfl`) or an `audio` slot (kind `gemini-media` or `stability`) — plus `[cas]` on |
 | `job_get`, `job_cancel`, `job_list`, `job_wait` | at least one live handle *producer*; they follow whatever survives above |
 | `run_kaish`, `list_models` | no cast at all; advertised whenever their flag is on |
 
-No built-in cast has an image slot or pairs an explorer with an offline synth, so
+No built-in cast has a media slot or pairs an explorer with an offline synth, so
 `generate` and `deliberate` need a configured cast before they appear.
 
 ### Finding out why a tool is missing
@@ -846,7 +853,7 @@ explicit. Every other open failure stays fatal.
 
 ## Media CAS: `[cas]`
 
-The content-addressed store holds generated images, deliberate dossiers, and optional
+The content-addressed store holds generated images and audio, deliberate dossiers, and optional
 saved consultation text. It is enabled by default and follows persistence:
 
 | mode | condition | durability |
@@ -886,10 +893,10 @@ prevent intentional temporary use.
 
 | operation | input / output |
 |---|---|
-| `generate` | stores provider images and returns digests; needs an image slot |
+| `generate` | stores provider images or audio (`mp3`, `wav`) and returns digests; needs the `image` or `audio` slot `media` names |
 | `deliberate` | stores its dossier; the `dossier` argument reuses it with another synth |
 | `save_artifact` | saves consult text when the operator and caller enable it; see below |
-| `write_cas` | deposits an image from an allowed `path` or base64 `content`; detects format from bytes |
+| `write_cas` | deposits an image or audio file (`png`, `jpeg`, `gif`, `webp`, `mp3`, `wav`) from an allowed `path` or base64 `content`; detects format from bytes |
 | `read_cas` | reads one digest, metadata first, with bounded content |
 | `kaibo cas write FILE` | deposits an operator-readable image; prints its digest; requires disk mode |
 | `kaibo cas read DIGEST` | streams bytes to stdout and metadata to stderr; `--json` combines them |

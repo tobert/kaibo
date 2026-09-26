@@ -2730,10 +2730,10 @@ fn no_otel_environment_leaves_telemetry_off() {
     assert!(!c.telemetry.capture_content);
 }
 
-// --- the gemini-images kind ------------------------------------------------------
+// --- the gemini-media kind -------------------------------------------------------
 
-/// The `gemini-images` kind parses. Declared-only, like every other kind: kaibo
-/// seeds no key source, even though `gemini-images` **shares `gemini`'s conventional
+/// The `gemini-media` kind parses. Declared-only, like every other kind: kaibo
+/// seeds no key source, even though `gemini-media` **shares `gemini`'s conventional
 /// env var and key-file names** (`credentials::ProviderKind::env_var`/
 /// `key_file_name`) — one Google credential per account, not one per use of the
 /// endpoint, so an operator who declares `api_key_env = "GEMINI_API_KEY"` on both
@@ -2744,16 +2744,16 @@ fn no_otel_environment_leaves_telemetry_off() {
 /// is Google's hosted service, so a keyless seed would 401 on the first paid call
 /// instead of failing at load.
 #[test]
-fn gemini_images_backend_parses_without_seeding_key_sources() {
+fn gemini_media_backend_parses_without_seeding_key_sources() {
     let c = Config::from_toml_str(
         r#"
-        [backends.gimg]
-        kind = "gemini-images"
+        [backends.gmedia]
+        kind = "gemini-media"
         "#,
     )
-    .expect("the gemini-images kind must parse");
-    let b = c.backends.get("gimg").expect("backend exists");
-    assert_eq!(b.kind, kaibo::credentials::ProviderKind::GeminiImages);
+    .expect("the gemini-media kind must parse");
+    let b = c.backends.get("gmedia").expect("backend exists");
+    assert_eq!(b.kind, kaibo::credentials::ProviderKind::GeminiMedia);
     // Declared-only: a fresh media stanza declares its own source or fails loudly.
     assert_eq!(b.api_key_env, None);
     assert_eq!(b.api_key_file, None);
@@ -2764,9 +2764,11 @@ fn gemini_images_backend_parses_without_seeding_key_sources() {
     );
 }
 
-/// An `image` slot may point at it — the whole reason the kind exists.
+/// **`gemini-images` still parses**, as an alias of `gemini-media`. It was the kind's
+/// name until speech joined images on the same endpoint, and a config written then
+/// must keep loading unchanged.
 #[test]
-fn an_image_slot_can_point_at_a_gemini_images_backend() {
+fn the_old_gemini_media_kind_name_still_loads_as_gemini_media() {
     let c = Config::from_toml_str(
         r#"
         [backends.gimg]
@@ -2776,31 +2778,137 @@ fn an_image_slot_can_point_at_a_gemini_images_backend() {
         image = "gimg/gemini-3-flash-image"
         "#,
     )
-    .expect("an image slot on a gemini-images backend is the supported pairing");
-    assert!(c.casts.contains_key("painter"));
+    .expect("a config written with the old kind name keeps loading");
+    let b = c.backends.get("gimg").expect("backend exists");
+    assert_eq!(b.kind, kaibo::credentials::ProviderKind::GeminiMedia);
+    assert_eq!(b.kind.canonical_name(), "gemini-media");
 }
 
-/// **A reasoning slot pointed at `gemini-images` is refused at load**, and this is the
-/// pairing most likely to be got wrong: `gemini` and `gemini-images` are the same vendor
-/// on the same endpoint, so an operator who types the wrong one has made a plausible
-/// mistake rather than an obvious one. Text belongs on `kind = "gemini"`.
+/// An `image` slot and an `audio` slot may both point at it — image generation and
+/// speech are the same `generateContent` call asked for a different modality.
 #[test]
-fn a_reasoning_slot_cannot_point_at_a_gemini_images_backend() {
-    for role in ["explorer", "synth"] {
+fn image_and_audio_slots_can_point_at_a_gemini_media_backend() {
+    let c = Config::from_toml_str(
+        r#"
+        [backends.gmedia]
+        kind = "gemini-media"
+
+        [casts.studio]
+        image = "gmedia/gemini-3-flash-image"
+        audio = "gmedia/gemini-2.5-flash-preview-tts"
+        "#,
+    )
+    .expect("image and audio slots on a gemini-media backend are the supported pairing");
+    let cast = c.casts.get("studio").expect("cast exists");
+    assert_eq!(
+        cast.slot(kaibo::config::ModelRole::Audio)
+            .map(|s| s.id.as_str()),
+        Some("gemini-2.5-flash-preview-tts")
+    );
+    assert!(c.cast_can_generate("studio"));
+}
+
+/// A cast with only an `audio` slot can staff `generate` — the audio slot is a media
+/// member in its own right, not an accessory to an image slot.
+#[test]
+fn an_audio_only_cast_can_generate() {
+    let c = Config::from_toml_str(
+        r#"
+        [backends.gmedia]
+        kind = "gemini-media"
+
+        [casts.voice]
+        audio = "gmedia/gemini-2.5-flash-preview-tts"
+        "#,
+    )
+    .expect("an audio-only cast loads");
+    assert!(c.cast_can_generate("voice"));
+    assert!(!c.cast_can_explore("voice"));
+}
+
+/// Stability's audio routes make it an audio backend as well as an image one.
+#[test]
+fn an_audio_slot_can_point_at_a_stability_backend() {
+    Config::from_toml_str(
+        r#"
+        [backends.sd]
+        kind = "stability"
+        key_optional = true
+
+        [casts.foley]
+        audio = "sd/stable-audio-2.5"
+        "#,
+    )
+    .expect("an audio slot on a stability backend is a supported pairing");
+}
+
+/// **An audio slot on a media kind that makes no audio is refused at load**, naming the
+/// kinds that do. Found at request time instead, it would be a provider error the
+/// operator has to decode, or worse, an image stored where speech was asked for.
+#[test]
+fn an_audio_slot_on_an_image_only_media_kind_is_refused_at_load() {
+    for kind in ["openai-images", "dashscope", "bfl"] {
         let toml = format!(
             r#"
-            [backends.gimg]
-            kind = "gemini-images"
+            [backends.m]
+            kind = "{kind}"
+            key_optional = true
 
             [casts.broken]
-            {role} = "gimg/gemini-3-flash"
+            audio = "m/some-model"
             "#
         );
         let err = Config::from_toml_str(&toml)
-            .expect_err("a reasoning slot on a gemini-images backend must be refused at load");
+            .expect_err("an audio slot on an image-only media kind must be refused at load");
         let msg = format!("{err:#}");
         assert!(
-            msg.contains(role) && msg.contains("gemini-images") && msg.contains("media kind"),
+            msg.contains("audio")
+                && msg.contains(kind)
+                && msg.contains("gemini-media")
+                && msg.contains("stability"),
+            "the error names the slot, the kind, and the kinds that make audio, got: {msg}"
+        );
+    }
+}
+
+/// An audio slot on a completion wire is refused the same way an image slot is.
+#[test]
+fn an_audio_slot_on_a_completion_wire_is_refused_at_load() {
+    let err = Config::from_toml_str(
+        r#"
+        [casts.broken]
+        audio = "gemini/gemini-3-flash"
+        "#,
+    )
+    .expect_err("an audio slot on a completion backend must be refused at load");
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("audio") && msg.contains("completion wire"),
+        "the error names the slot and the class, got: {msg}"
+    );
+}
+
+/// **A reasoning slot pointed at `gemini-media` is refused at load**, and this is the
+/// pairing most likely to be got wrong: `gemini` and `gemini-media` are the same vendor
+/// on the same endpoint, so an operator who types the wrong one has made a plausible
+/// mistake rather than an obvious one. Text belongs on `kind = "gemini"`.
+#[test]
+fn a_reasoning_slot_cannot_point_at_a_gemini_media_backend() {
+    for role in ["explorer", "synth"] {
+        let toml = format!(
+            r#"
+            [backends.gmedia]
+            kind = "gemini-media"
+
+            [casts.broken]
+            {role} = "gmedia/gemini-3-flash"
+            "#
+        );
+        let err = Config::from_toml_str(&toml)
+            .expect_err("a reasoning slot on a gemini-media backend must be refused at load");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains(role) && msg.contains("gemini-media") && msg.contains("media kind"),
             "the error names the slot, the kind, and its class, got: {msg}"
         );
     }

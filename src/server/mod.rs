@@ -677,7 +677,7 @@ pub struct GenerateInputRef {
     pub digest: String,
 }
 
-/// Arguments for [`KaiboHandler::write_cas`] — where the image is, and an optional label.
+/// Arguments for [`KaiboHandler::write_cas`] — where the file is, and an optional label.
 ///
 /// Exactly one of `path` and `content`. There is no destination of any kind (the address
 /// is the content hash) and no `mime` (the format is read out of the bytes, so there is
@@ -686,35 +686,43 @@ pub struct GenerateInputRef {
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct WriteCasInput {
-    /// Path to the image file to store. Relative paths resolve against the launch
-    /// directory. Must be a regular file inside the allowed set. This is the route to
-    /// use whenever the image is on disk.
+    /// Path to the image or audio file to store. Relative paths resolve against the
+    /// launch directory. Must be a regular file inside the allowed set. This is the route
+    /// to use whenever the file is on disk.
     #[serde(default)]
     pub path: Option<String>,
 
-    /// The image's raw bytes, base64-encoded — for an image that is not a file (pasted
-    /// into a conversation, or held in memory). Prefer `path`: these bytes are tokens
-    /// you have to write out, so a real screenshot costs far more here than a path does.
+    /// The file's raw bytes, base64-encoded — for an image or audio clip that is not a
+    /// file (pasted into a conversation, or held in memory). Prefer `path`: these bytes
+    /// are tokens you have to write out, so a real screenshot costs far more here than a
+    /// path does.
     #[serde(default)]
     pub content: Option<String>,
 
-    /// One short line describing the image, recorded beside it and shown by `read_cas`.
+    /// One short line describing the file, recorded beside it and shown by `read_cas`.
     /// Optional, capped at 200 bytes, single-line.
     #[serde(default)]
     pub label: Option<String>,
 }
 
-/// Arguments to `generate`: media generation through the cast's `image` slot. No
-/// `path` — generation reads no project (the prompt is the whole input), so there is
+/// Arguments to `generate`: media generation through the cast's `image` or `audio` slot.
+/// No `path` — generation reads no project (the prompt is the whole input), so there is
 /// nothing to scope to an allowed tree.
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct GenerateInput {
-    /// What to generate, described in prose.
+    /// What to generate, described in prose. For speech, the words to speak; a
+    /// direction in front sets the delivery ("Say warmly: good morning").
     pub prompt: String,
 
-    /// Cast (model team) whose `image` slot generates. Optional — the server default
-    /// applies; the cast must carry an `image` slot (kaibo://config lists casts).
+    /// `"image"` (the default) or `"audio"` — which of the cast's slots of that name
+    /// runs. `audio` on Gemini is speech; on Stability it is music or sound effects.
+    #[serde(default)]
+    pub media: Option<crate::media::MediaOutput>,
+
+    /// Cast (model team) whose `image` or `audio` slot generates. Optional — the server
+    /// default applies; the cast must carry the slot `media` names (kaibo://config lists
+    /// casts).
     #[serde(default)]
     pub cast: Option<String>,
 
@@ -728,15 +736,18 @@ pub struct GenerateInput {
     /// knobs, and the spellings are per-backend — BFL ignores a field it does not
     /// know (an `aspect_ratio` there changes nothing, measured), so size a FLUX
     /// image with width and height. `prompt` and `model` are reserved: use the
-    /// prompt parameter and the cast's image slot.
+    /// prompt parameter and the cast's media slot. Gemini speech: voice "Kore" (one
+    /// speaker), or speakers "Joe=Kore, Jane=Puck" for a dialogue whose prompt uses those
+    /// names; language_code "en-US".
     #[serde(default)]
     pub fields: Option<std::collections::BTreeMap<String, GenerateFieldValue>>,
 
-    /// Input images for the operations that take them, as a list of
+    /// Input images or audio for the operations that take them, as a list of
     /// `{"field": "<form-field>", "digest": "<digest>"}` — e.g.
-    /// `[{"field": "image", "digest": "..."}]` for image-to-image, or an `image` and a
-    /// `mask` entry where an operation takes both. Each digest is one `write_cas` or
-    /// `generate` handed back, so an image already in kaibo's store is reused by address
+    /// `[{"field": "image", "digest": "..."}]` for image-to-image, an `image` and a
+    /// `mask` entry where an operation takes both, or `[{"field": "audio", "digest":
+    /// "..."}]` for Stability's `audio-to-audio` and `inpaint`. Each digest is one `write_cas` or
+    /// `generate` handed back, so a file already in kaibo's store is reused by address
     /// and never re-sent. The field names are the provider's own; the store decides each
     /// part's format, not you.
     ///
@@ -761,6 +772,14 @@ pub struct GenerateInput {
     /// (image), `control/style` 5 credits (image), `control/style-transfer` 8 credits
     /// (init_image, style_image), `upscale/fast` 2 credits (image),
     /// `upscale/conservative` 40 credits (image).
+    ///
+    /// **Stability, `media = "audio"`:** the audio slot's model id picks the model
+    /// (`stable-audio-2.5` 20 credits, `stable-audio-2` 17 + 0.06 per step, 20 by default,
+    /// `stable-audio-3` 26 credits and answers with a `job-N`). `op`: `text-to-audio`
+    /// (the default), `audio-to-audio` (audio; `strength` 0-1), `inpaint` (audio;
+    /// `mask_start`, `mask_end` in seconds; not on `stable-audio-2`). `duration` in
+    /// seconds defaults to 190, the maximum; set it shorter for a sound effect. Output
+    /// is `mp3` unless `output_format` is `wav`.
     ///
     /// **An OpenAI-compatible images backend:** `edits` priced per image by model, size
     /// and quality (image; up to 16 `image` entries), `variations` priced per image by
@@ -955,9 +974,9 @@ const CAST_ENUM_RULES: &[CastEnumRule] = &[
     (
         &["generate"],
         Config::cast_can_generate,
-        "a cast with an `image` slot pointing at a media backend (kind `stability`, \
-         `openai-images`, `gemini-images`, `dashscope`, or `bfl`) — see the image-slot \
-         examples in \
+        "a cast with an `image` or `audio` slot pointing at a media backend (image: kind \
+         `stability`, `openai-images`, `gemini-media`, `dashscope`, or `bfl`; audio: \
+         `gemini-media` or `stability`) — see the media-slot examples in \
          docs/config.example.toml",
     ),
 ];
@@ -3008,17 +3027,17 @@ impl KaiboHandler {
     }
 
     #[tool(
-        description = "Store an image in kaibo's media store and get back its digest — \
-            the deposit half of `read_cas`, and how an image REACHES kaibo. Name the \
-            file in `path`: kaibo reads it itself, so the bytes never cost you a token. \
-            `content` takes base64 instead, for an image that is not a file; a real \
-            screenshot through `content` is megabytes you have to write out, so reach \
-            for `path` whenever the image is on disk. Pass exactly one. The result is a \
-            kaibo://cas/<digest> address, the mime, the size, and the real file path \
-            when the store is on disk. The format is read from the bytes themselves, so \
-            there is no mime to pass and none to get wrong: png, jpeg, gif and webp are \
-            accepted and anything else is refused. Images are capped at 8388608 bytes \
-            and a larger one is refused, not trimmed. `path` must be inside the allowed \
+        description = "Store an image or audio file in kaibo's media store and get back \
+            its digest — the deposit half of `read_cas`, and how a file REACHES kaibo as a \
+            `generate` input. Name the file in `path`: kaibo reads it itself, so the bytes \
+            never cost you a token. `content` takes base64 instead, for a file that is not \
+            on disk; a real screenshot through `content` is megabytes you have to write \
+            out, so reach for `path` whenever the file is on disk. Pass exactly one. The \
+            result is a kaibo://cas/<digest> address, the mime, the size, and the real \
+            file path when the store is on disk. The format is read from the bytes \
+            themselves, so there is no mime to pass and none to get wrong: png, jpeg, gif, \
+            webp, mp3 and wav are accepted and anything else is refused. Files are capped \
+            at 8388608 bytes and a larger one is refused, not trimmed. `path` must be inside the allowed \
             set, like every other path kaibo reads. Nothing is written to your project \
             — this store is kaibo's own, addressed only by content hash."
     )]
@@ -3197,25 +3216,28 @@ impl KaiboHandler {
     }
 
     #[tool(
-        description = "Generate images from a text prompt with the cast's `image` \
-            model (a media backend: Stability, an OpenAI-compatible images endpoint — \
-            hosted gpt-image or a local stable-diffusion.cpp sd-server — Gemini, \
-            DashScope's wan family, or Black Forest Labs' FLUX). \
+        description = "Generate images or audio from a text prompt. `media` picks the \
+            cast's slot: `image` (the default — Stability, an OpenAI-compatible images \
+            endpoint such as hosted gpt-image or a local stable-diffusion.cpp sd-server, \
+            Gemini, DashScope's wan family, or Black Forest Labs' FLUX) or `audio` \
+            (Gemini text-to-speech: the prompt is the words to speak, \
+            `fields {\"voice\": \"Kore\"}`; Stability's Stable Audio: music and sound \
+            effects). \
             Bytes are never inlined: each artifact lands in kaibo's content-addressed \
             media store and the result lists per-artifact digests — a \
             kaibo://cas/<digest> address, the mime, the provider's seed when reported, \
             and the real file path when the store is on disk. Fetch one with `read_cas` \
             (metadata first, ranges on request; a small image comes back viewable). \
             Provider-native options (aspect_ratio, size, n, output_format, seed, \
-            negative_prompt, style_preset, ...) pass through `fields` verbatim, each \
+            negative_prompt, voice, duration, ...) pass through `fields` verbatim, each \
             value's JSON type (string | number | boolean) preserved to the wire. \
             To generate FROM an image rather than from the prompt alone, pass its \
             digest in `inputs` under the provider's field name — \
             `inputs {\"image\": \"<digest>\"}` with `fields {\"strength\": 0.6}` is \
             image-to-image. Digests come from `write_cas` or an earlier `generate`, so \
             an image already in the store is reused by address and never re-sent. \
-            Stability, Gemini, and BFL accept input images; the others do not and say \
-            so. `op` picks an operation when the backend has more than one — \
+            Stability, Gemini image models, and BFL accept input images; the others do \
+            not and say so. `op` picks an operation when the backend has more than one — \
             Stability's edit, control and upscale routes, each with its required \
             `inputs` keys and its credit cost listed on the parameter; BFL's five FLUX \
             endpoints, priced per request. Omit `op` to generate from the prompt (BFL: \
@@ -3239,14 +3261,16 @@ impl KaiboHandler {
             ));
         };
         let cast = self.resolve_cast(input.cast)?;
-        let Some(slot) = cast.slot(ModelRole::Image) else {
+        let output = input.media.unwrap_or_default();
+        let media = output.key();
+        let Some(slot) = cast.slot(output.role()) else {
             return Err(McpError::invalid_params(
                 format!(
-                    "cast `{}` has no `image` slot — `generate` needs a cast whose \
-                     `image` slot points at a media backend (kind {}). kaibo://config \
-                     lists the configured casts and their slots.",
+                    "cast `{}` has no `{media}` slot, so it cannot generate {media}. Pick a \
+                     cast whose `{media}` slot points at a media backend (kind {}); \
+                     kaibo://config lists the configured casts and their slots.",
                     cast.name,
-                    crate::credentials::media_kinds_list(),
+                    crate::credentials::media_kinds_producing(Some(output)),
                 ),
                 None,
             ));
@@ -3259,8 +3283,8 @@ impl KaiboHandler {
             .map_err(|e| McpError::internal_error(format!("{e:#}"), None))?;
         // Building the arm resolves the provider key — a missing key is the operator's
         // setup gap, reported cleanly with the cast and slot named.
-        let arm = self.media_arms.build(backend, slot).map_err(|e| {
-            McpError::invalid_params(format!("cast `{}` image slot: {e:#}", cast.name), None)
+        let arm = self.media_arms.build(backend, slot, output).map_err(|e| {
+            McpError::invalid_params(format!("cast `{}` {media} slot: {e:#}", cast.name), None)
         })?;
         let fields: Vec<(String, crate::media::FieldValue)> = input
             .fields
@@ -3273,12 +3297,11 @@ impl KaiboHandler {
         // and `fields.model` would reroute the call (Stability's SD3 route, the
         // Images API's model field) while the sidecar records the slot's model — so
         // both are refused loudly, pointing at the real parameter.
+        let model_param =
+            format!("the cast's `{media}` slot (its model id picks the provider model/route)");
         for (key, param) in [
             ("prompt", "the `prompt` parameter"),
-            (
-                "model",
-                "the cast's `image` slot (its model id picks the provider model/route)",
-            ),
+            ("model", model_param.as_str()),
         ] {
             if fields.iter().any(|(name, _)| name == key) {
                 return Err(McpError::invalid_params(
@@ -3320,12 +3343,13 @@ impl KaiboHandler {
         // reroutes to another model, and a record naming the wrong one is worse than no
         // record. See `MediaArm::recorded_model`.
         let ran = arm.recorded_model(&request);
-        let span = tracing::info_span!("generate", cast = %cast.name, model = %ran);
+        let span = tracing::info_span!("generate", cast = %cast.name, model = %ran, media = %media);
         match arm.generate(&request).instrument(span).await {
             Ok(crate::media::MediaOutcome::Complete { artifacts, note }) => {
                 let rendered = match store_generated_artifacts(
                     &store,
                     &artifacts,
+                    output,
                     &input.prompt,
                     &ran,
                     &cast.name,
@@ -3346,7 +3370,7 @@ impl KaiboHandler {
                     with_provenance(
                         rendered,
                         &cast.name,
-                        &[("image", ran.as_str())],
+                        &[(media, ran.as_str())],
                         &Usage::new(),
                     ),
                 )]))
@@ -3357,7 +3381,7 @@ impl KaiboHandler {
             // stability::Operation::shape), never a sniffed response.
             Ok(crate::media::MediaOutcome::Deferred(provider_job)) => {
                 let progress_log = self.job_progress_log();
-                let label = format!("generate · cast {} · image {}", cast.name, ran);
+                let label = format!("generate · cast {} · {media} {}", cast.name, ran);
                 let prompt = input.prompt.clone();
                 let cast_name = cast.name.clone();
                 let slot_ref = ran.clone();
@@ -3369,7 +3393,7 @@ impl KaiboHandler {
                         match poll_arm.poll(&provider_job).await {
                             Ok(crate::media::MediaPollOutcome::Complete(artifacts)) => {
                                 let text = store_generated_artifacts(
-                                    &store, &artifacts, &prompt, &slot_ref, &cast_name,
+                                    &store, &artifacts, output, &prompt, &slot_ref, &cast_name,
                                 )
                                 .map_err(|e| {
                                     consultation_failure_text("generate", &cast_name, e)
@@ -3378,7 +3402,7 @@ impl KaiboHandler {
                                     answer: with_provenance(
                                         text,
                                         &cast_name,
-                                        &[("image", &slot_ref)],
+                                        &[(media, &slot_ref)],
                                         &Usage::new(),
                                     ),
                                     report: None,
@@ -3397,15 +3421,24 @@ impl KaiboHandler {
                                 }
                                 tokio::time::sleep(GENERATE_POLL_INTERVAL).await;
                             }
+                            // The id is the only way back to a result the provider may
+                            // still hold and has already charged for, so it rides the error.
                             Err(e) => {
-                                return Err(consultation_failure_text("generate", &cast_name, e))
+                                return Err(consultation_failure_text(
+                                    "generate",
+                                    &cast_name,
+                                    e.context(format!(
+                                        "collecting provider job `{}`",
+                                        provider_job.0
+                                    )),
+                                ))
                             }
                         }
                     }
                 });
                 Ok(CallToolResult::success(vec![ContentBlock::text(format!(
                     "Deferred: `{id}` — the provider is generating in the background \
-                     (cast `{}`, image `{}`). Collect it with `job_get {id}` or park on \
+                     (cast `{}`, {media} `{}`). Collect it with `job_get {id}` or park on \
                      `job_wait`; stop it with `job_cancel {id}`.",
                     cast.name, ran
                 ))]))
@@ -4615,35 +4648,39 @@ by waiting — the handles keep.
 
 ## Generate media: `generate`
 
-`generate` turns a text prompt into images through the cast's `image` slot — a media
-backend: Stability's v2beta family, an OpenAI-compatible images endpoint (hosted
-gpt-image, or a local stable-diffusion.cpp sd-server), or DashScope's wan family; one
-call may return several images via `n`. It is advertised only when a configured cast carries that slot and
-the media CAS is on. The result is never inline bytes: each artifact lands in kaibo's
-content-addressed store and you get its digest as a `kaibo://cas/<digest>` address, the
-mime, the provider's seed when reported, and — when the store is on disk — the real file
-path. Provider-native
-options ride the `fields` object verbatim, each value's JSON type preserved
-(Stability: `aspect_ratio` \"16:9\", `output_format` png|jpeg|webp, `seed`,
-`negative_prompt`, `style_preset`; OpenAI-compatible: `size` \"1024x1024\", `n`,
-`quality`, `output_format` png|jpeg|webp; DashScope: `size` \"1024*1024\", `n` 1-4,
-`seed`, `negative_prompt`). An operation the provider declares
-deferred hands back a `job-N` on the same collect verbs above — the lane is wired,
-though every route wired today answers in-call. Every artifact gets a provenance
-sidecar (prompt, model, cast, timestamp, mime, seed) beside it in the store.
+`generate` turns a text prompt into images or audio. `media` picks the cast's slot:
+`image` (the default) runs a media backend such as Stability's v2beta family, an
+OpenAI-compatible images endpoint (hosted gpt-image, or a local stable-diffusion.cpp
+sd-server), Gemini, DashScope's wan family, or Black Forest Labs' FLUX; `audio` runs
+Gemini text-to-speech (the prompt is the words to speak) or Stability's Stable Audio
+(music and sound effects). One call may return several images via `n`. It is advertised
+only when a configured cast carries a media slot and the media CAS is on. The result is
+never inline bytes: each artifact lands in kaibo's content-addressed store and you get its
+digest as a `kaibo://cas/<digest>` address, the mime, the provider's seed when reported,
+and — when the store is on disk — the real file path. Provider-native options ride the
+`fields` object verbatim, each value's JSON type preserved (Stability images:
+`aspect_ratio` \"16:9\", `output_format` png|jpeg|webp, `seed`, `negative_prompt`,
+`style_preset`; OpenAI-compatible: `size` \"1024x1024\", `n`, `quality`; DashScope:
+`size` \"1024*1024\", `n` 1-4; Gemini speech: `voice` \"Kore\", `speakers`
+\"Joe=Kore, Jane=Puck\", `language_code`; Stable Audio: `duration` in seconds, default
+190, `output_format` mp3|wav, `steps`, `seed`). An operation the provider declares
+deferred — Stable Audio 3 always, BFL when it is still working — hands back a `job-N` on
+the same collect verbs above. Every artifact gets a provenance sidecar (prompt, model,
+cast, timestamp, mime, seed) beside it in the store.
 
-## Getting an image in: `write_cas`
+## Getting a file in: `write_cas`
 
-`write_cas` is the deposit half, and how an image reaches kaibo at all. Pass the raw bytes
-base64-encoded in `content`; you get back a `kaibo://cas/<digest>` address, the mime, the
-size, and the real file path when the store is on disk.
+`write_cas` is the deposit half, and how an image or audio file reaches kaibo as a
+`generate` input. Name the file in `path` (inside the allowed set; kaibo reads it
+itself), or pass the raw bytes base64-encoded in `content` for a file that is not on
+disk — exactly one. You get back a `kaibo://cas/<digest>` address, the mime, the size,
+and the real file path when the store is on disk.
 
-There is no `mime` parameter and no path in either direction. The format is read out of the
-bytes themselves — png, jpeg, gif and webp are accepted, anything else is refused — so
+There is no `mime` parameter and no destination. The format is read out of the bytes
+themselves — png, jpeg, gif, webp, mp3 and wav are accepted, anything else is refused — so
 there is no claim to get wrong, and the address is the content hash, so there is nothing to
-aim. `content` is capped at 8388608 bytes before encoding, and a larger upload is refused
-rather than trimmed. An optional `label` records one short line about the image, which
-`read_cas` reports back.
+aim. A file is capped at 8388608 bytes, and a larger one is refused rather than trimmed.
+An optional `label` records one short line about the file, which `read_cas` reports back.
 
 Nothing here writes to your project. This is kaibo's own store, and the inner model team
 neither carries this tool nor knows the store exists.
@@ -4875,6 +4912,7 @@ pub(crate) const GENERATE_POLL_INTERVAL: std::time::Duration = std::time::Durati
 pub(crate) fn store_generated_artifacts(
     store: &crate::cas::MediaStore,
     artifacts: &[crate::media::MediaArtifact],
+    output: crate::media::MediaOutput,
     prompt: &str,
     model: &str,
     cast: &str,
@@ -4892,23 +4930,35 @@ pub(crate) fn store_generated_artifacts(
         .iter()
         .enumerate()
         .map(|(i, artifact)| {
-            // `is_image` and not merely "the store can name it": the store also names
-            // the text formats `save_artifact` writes, and an images provider handing
-            // back a text body is a provider fault, not an artifact. Keeping the
-            // refusal keyed to the media lane's own shape is what stopped growing
-            // `Extension` from quietly widening what `generate` accepts.
-            crate::cas::Extension::from_mime(&artifact.mime)
-                .filter(crate::cas::Extension::is_image)
-                .ok_or_else(|| {
-                    anyhow!(
-                        "artifact {} has mime {:?}, which is not an image format the \
-                         media store can name on disk — refusing the whole result \
-                         rather than storing it under an invented extension; nothing \
-                         was stored",
-                        i + 1,
-                        artifact.mime
-                    )
-                })
+            // The requested family and not merely "the store can name it": the store
+            // also names the text formats `save_artifact` writes and the other media
+            // family, and a provider handing back text, or an image where audio was
+            // asked for, is a provider fault, not an artifact. Keeping the refusal keyed
+            // to the family the call asked for is what stopped growing `Extension` from
+            // quietly widening what `generate` accepts.
+            // Two refusals, because they have different causes: a format the store has
+            // no name for, and a known format from the other family.
+            match crate::cas::Extension::from_mime(&artifact.mime) {
+                Some(ext) if output.admits(ext) => Ok(ext),
+                Some(_) => Err(anyhow!(
+                    "artifact {} has mime {:?}, but this call asked for {} — refusing the \
+                     whole result rather than storing the wrong kind of media; nothing was \
+                     stored. Check that the cast's `{}` slot names a model that produces {}.",
+                    i + 1,
+                    artifact.mime,
+                    output.key(),
+                    output.key(),
+                    output.key(),
+                )),
+                None => Err(anyhow!(
+                    "artifact {} has mime {:?}, which is not an {} format the media store \
+                     can name on disk — refusing the whole result rather than storing it \
+                     under an invented extension; nothing was stored",
+                    i + 1,
+                    artifact.mime,
+                    output.key(),
+                )),
+            }
         })
         .collect::<Result<_>>()?;
     let timestamp = now_epoch_secs();
@@ -6006,6 +6056,9 @@ mod tests {
 
         [casts.artist]
         image = "sd/core"
+
+        [casts.voice]
+        audio = "sd/stable-audio-2.5"
     "#;
 
     /// A factory handing every build the same scripted [`crate::media::MediaModel`] —
@@ -6017,6 +6070,7 @@ mod tests {
             &self,
             _backend: &Backend,
             slot: &ModelSlot,
+            _output: crate::media::MediaOutput,
         ) -> anyhow::Result<crate::media::MediaArm> {
             Ok(crate::media::MediaArm::new(
                 self.0.clone(),
@@ -6110,6 +6164,7 @@ mod tests {
         let result = h
             .generate(Parameters(GenerateInput {
                 prompt: "a lighthouse at dusk".to_string(),
+                media: None,
                 cast: Some("artist".to_string()),
                 fields: None,
                 inputs: None,
@@ -6192,6 +6247,7 @@ mod tests {
         let result = h
             .generate(Parameters(GenerateInput {
                 prompt: "a red door".to_string(),
+                media: None,
                 cast: Some("artist".to_string()),
                 fields: None,
                 inputs: None,
@@ -6223,6 +6279,7 @@ mod tests {
         let h = media_handler(Arc::new(SyncArtifacts(vec![artifact.clone()])));
         h.generate(Parameters(GenerateInput {
             prompt: "a red door".to_string(),
+            media: None,
             cast: Some("artist".to_string()),
             fields: None,
             inputs: None,
@@ -6260,6 +6317,7 @@ mod tests {
         let result = h
             .generate(Parameters(GenerateInput {
                 prompt: "slow art".to_string(),
+                media: None,
                 cast: Some("artist".to_string()),
                 fields: None,
                 inputs: None,
@@ -6331,6 +6389,7 @@ mod tests {
         let err = h
             .generate(Parameters(GenerateInput {
                 prompt: "A".to_string(),
+                media: None,
                 cast: Some("artist".to_string()),
                 fields: Some(
                     [(
@@ -6354,6 +6413,7 @@ mod tests {
         let err = h
             .generate(Parameters(GenerateInput {
                 prompt: "A".to_string(),
+                media: None,
                 cast: Some("artist".to_string()),
                 fields: Some(
                     [(
@@ -6385,6 +6445,7 @@ mod tests {
         let result = h
             .generate(Parameters(GenerateInput {
                 prompt: "p".to_string(),
+                media: None,
                 cast: Some("artist".to_string()),
                 fields: None,
                 inputs: None,
@@ -6396,6 +6457,63 @@ mod tests {
         assert!(
             result_text(result).contains("zero artifacts"),
             "the error names the empty completion"
+        );
+    }
+
+    /// **A failed poll names the provider's job id.** The provider has usually charged
+    /// by then and may still hold the result under that id; without it in the error, the
+    /// paid artifact is unrecoverable. Found live: a Stable Audio 3 result was refused on
+    /// a header and the error said nothing about which job it was.
+    #[tokio::test]
+    async fn generate_deferred_poll_failure_names_the_provider_job() {
+        struct FailingPoll;
+
+        #[async_trait::async_trait]
+        impl crate::media::MediaModel for FailingPoll {
+            async fn generate(
+                &self,
+                _request: &crate::media::MediaRequest,
+            ) -> anyhow::Result<crate::media::MediaOutcome> {
+                Ok(crate::media::MediaOutcome::Deferred(
+                    crate::media::MediaJobId("provider-job-7".to_string()),
+                ))
+            }
+
+            async fn poll(
+                &self,
+                _job: &crate::media::MediaJobId,
+            ) -> anyhow::Result<crate::media::MediaPollOutcome> {
+                anyhow::bail!("the result had no finish-reason header")
+            }
+        }
+
+        let h = media_handler(Arc::new(FailingPoll));
+        let result = h
+            .generate(Parameters(audio_call("voice")))
+            .await
+            .expect("a deferred call answers with a job");
+        let handle = result_text(result)
+            .split('`')
+            .nth(1)
+            .expect("the job handle is quoted")
+            .to_string();
+        let mut text = String::new();
+        for _ in 0..200 {
+            let r = h
+                .job_get(Parameters(HandleInput {
+                    handle: handle.clone(),
+                }))
+                .await
+                .expect("job_get answers");
+            if r.is_error == Some(true) {
+                text = result_text(r);
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert!(
+            text.contains("provider-job-7") && text.contains("finish-reason"),
+            "the failure names the job and the cause: {text}"
         );
     }
 
@@ -6413,6 +6531,7 @@ mod tests {
         let result = h
             .generate(Parameters(GenerateInput {
                 prompt: "p".to_string(),
+                media: None,
                 cast: Some("artist".to_string()),
                 fields: None,
                 inputs: None,
@@ -6456,6 +6575,7 @@ mod tests {
         let result = h
             .generate(Parameters(GenerateInput {
                 prompt: "p".to_string(),
+                media: None,
                 cast: Some("artist".to_string()),
                 fields: None,
                 inputs: None,
@@ -6511,6 +6631,7 @@ mod tests {
         let ack = result_text(
             h.generate(Parameters(GenerateInput {
                 prompt: "p".to_string(),
+                media: None,
                 cast: Some("artist".to_string()),
                 fields: None,
                 inputs: None,
@@ -6556,6 +6677,7 @@ mod tests {
         let err = h
             .generate(Parameters(GenerateInput {
                 prompt: "p".to_string(),
+                media: None,
                 cast: Some("anthropic".to_string()),
                 fields: None,
                 inputs: None,
@@ -6568,6 +6690,142 @@ mod tests {
             "the refusal names the missing slot and the cast, got: {}",
             err.message
         );
+    }
+
+    // --- media = "audio" ----------------------------------------------------------
+
+    fn wav(bytes: &[u8]) -> crate::media::MediaArtifact {
+        crate::media::MediaArtifact {
+            bytes: bytes.to_vec(),
+            mime: "audio/wav".to_string(),
+            seed: None,
+        }
+    }
+
+    fn audio_call(cast: &str) -> GenerateInput {
+        GenerateInput {
+            prompt: "Say warmly: good morning.".to_string(),
+            media: Some(crate::media::MediaOutput::Audio),
+            cast: Some(cast.to_string()),
+            fields: None,
+            inputs: None,
+            op: None,
+        }
+    }
+
+    /// Records which output each build asked for, so a test can prove the handler hands
+    /// the provider the slot it chose rather than always building an image arm.
+    struct RecordingMediaArms {
+        model: Arc<dyn crate::media::MediaModel>,
+        asked: Arc<std::sync::Mutex<Vec<crate::media::MediaOutput>>>,
+    }
+
+    impl crate::media::MediaArmFactory for RecordingMediaArms {
+        fn build(
+            &self,
+            _backend: &Backend,
+            slot: &ModelSlot,
+            output: crate::media::MediaOutput,
+        ) -> anyhow::Result<crate::media::MediaArm> {
+            self.asked.lock().unwrap().push(output);
+            Ok(crate::media::MediaArm::new(
+                self.model.clone(),
+                slot.qualified(),
+            ))
+        }
+    }
+
+    /// `media = "audio"` runs the cast's `audio` slot, builds the arm for audio, stores a
+    /// WAVE file under its own digest, and names the audio slot in the footer.
+    #[tokio::test]
+    async fn generate_audio_runs_the_audio_slot_and_stores_the_wav() {
+        let asked = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let artifact = wav(b"RIFF\x24\x00\x00\x00WAVEfmt speech");
+        let h = hermetic_handler_from_toml(MEDIA_CAST_TOML).with_media_arms(Arc::new(
+            RecordingMediaArms {
+                model: Arc::new(SyncArtifacts(vec![artifact.clone()])),
+                asked: asked.clone(),
+            },
+        ));
+        let result = h
+            .generate(Parameters(audio_call("voice")))
+            .await
+            .expect("generate succeeds");
+        assert_ne!(result.is_error, Some(true), "not a tool error");
+        let text = result_text(result);
+        assert_eq!(
+            *asked.lock().unwrap(),
+            vec![crate::media::MediaOutput::Audio],
+            "the arm is built for audio"
+        );
+        let digest = crate::cas::Digest::of_bytes(&artifact.bytes);
+        assert!(
+            text.contains(&format!("kaibo://cas/{}", digest.to_hex())),
+            "{text}"
+        );
+        assert_eq!(
+            h.media_store()
+                .expect("cas on")
+                .get(&digest)
+                .expect("readable"),
+            Some((artifact.bytes.clone(), crate::cas::Extension::Wav)),
+        );
+        assert!(
+            text.contains("audio") && text.contains("sd/stable-audio-2.5"),
+            "the footer names the audio slot and its model:\n{text}"
+        );
+    }
+
+    /// **An image where audio was asked for is refused, and nothing is stored.** The
+    /// family check keys on the call's `media`, so an audio call cannot quietly come back
+    /// with a picture.
+    #[tokio::test]
+    async fn generate_audio_refuses_an_image_from_the_provider() {
+        let h = media_handler(Arc::new(SyncArtifacts(vec![png(b"not-speech")])));
+        let result = h
+            .generate(Parameters(audio_call("voice")))
+            .await
+            .expect("a tool-result error, not a protocol error");
+        assert_eq!(result.is_error, Some(true));
+        let text = result_text(result);
+        assert!(
+            text.contains("image/png") && text.contains("this call asked for audio"),
+            "{text}"
+        );
+        let digest = crate::cas::Digest::of_bytes(b"not-speech");
+        assert_eq!(h.media_store().unwrap().get(&digest).unwrap(), None);
+    }
+
+    /// A cast with no `audio` slot refuses an audio call as a parameter mistake, naming
+    /// the slot and the kinds that can staff it.
+    #[tokio::test]
+    async fn generate_audio_on_a_cast_without_an_audio_slot_is_refused() {
+        let h = media_handler(Arc::new(SyncArtifacts(vec![wav(b"x")])));
+        let err = h
+            .generate(Parameters(audio_call("artist")))
+            .await
+            .expect_err("no audio slot must refuse");
+        assert!(
+            err.message.contains("`audio` slot")
+                && err.message.contains("artist")
+                && err.message.contains("`gemini-media`"),
+            "{}",
+            err.message
+        );
+    }
+
+    /// And the reverse: an audio-only cast refuses the default image call rather than
+    /// running its audio slot.
+    #[tokio::test]
+    async fn generate_image_on_an_audio_only_cast_is_refused() {
+        let h = media_handler(Arc::new(SyncArtifacts(vec![png(b"x")])));
+        let mut call = audio_call("voice");
+        call.media = None;
+        let err = h
+            .generate(Parameters(call))
+            .await
+            .expect_err("no image slot must refuse");
+        assert!(err.message.contains("`image` slot"), "{}", err.message);
     }
 
     /// The advertisement gate, all three legs: no image-slot cast → dropped; staffable
@@ -6626,6 +6884,7 @@ enabled = false
         let ack = result_text(
             h.generate(Parameters(GenerateInput {
                 prompt: "p".to_string(),
+                media: None,
                 cast: Some("artist".to_string()),
                 fields: None,
                 inputs: None,
@@ -6863,6 +7122,7 @@ enabled = false
         let h = media_handler(Arc::new(SyncArtifacts(vec![png(b"pretend-png-bytes")])));
         h.generate(Parameters(GenerateInput {
             prompt: "p".to_string(),
+            media: None,
             cast: Some("artist".to_string()),
             fields: None,
             inputs: None,
@@ -6900,6 +7160,7 @@ enabled = false
         let h = media_handler(Arc::new(SyncArtifacts(vec![png(&big)])));
         h.generate(Parameters(GenerateInput {
             prompt: "p".to_string(),
+            media: None,
             cast: Some("artist".to_string()),
             fields: None,
             inputs: None,
@@ -7110,6 +7371,7 @@ enabled = false
 
         h.generate(Parameters(GenerateInput {
             prompt: "erase the sign".to_string(),
+            media: None,
             cast: Some("artist".to_string()),
             fields: None,
             inputs: Some(vec![GenerateInputRef {
@@ -7155,6 +7417,7 @@ enabled = false
         let err = h
             .generate(Parameters(GenerateInput {
                 prompt: "anything".to_string(),
+                media: None,
                 cast: Some("artist".to_string()),
                 fields: None,
                 inputs: None,
@@ -7175,7 +7438,7 @@ enabled = false
             err.message
         );
         assert!(
-            err.message.contains("drop `op`"),
+            err.message.contains("Drop `op`"),
             "and what to do instead: {}",
             err.message
         );
@@ -7196,6 +7459,7 @@ enabled = false
         let err = h
             .generate(Parameters(GenerateInput {
                 prompt: "erase the sign".to_string(),
+                media: None,
                 cast: Some("artist".to_string()),
                 fields: None,
                 inputs: Some(vec![GenerateInputRef {
@@ -7278,7 +7542,7 @@ enabled = false
         }
     }
 
-    /// A minimal but real PNG header — enough that `sniff_image` reads a true signature.
+    /// A minimal but real PNG header — enough that `sniff_media` reads a true signature.
     fn png_bytes() -> Vec<u8> {
         let mut v = b"\x89PNG\r\n\x1a\n".to_vec();
         v.extend_from_slice(&[0, 0, 0, 13]);
@@ -7830,9 +8094,12 @@ enabled = false
                 "explore" => true,
                 "batch_submit" => h.require_batch_cast(cast).is_ok(),
                 "deliberate" => h.require_deliberate_cast(cast).is_ok(),
-                // `generate`'s call-time gate is the image slot's presence — the same
+                // `generate`'s call-time gate is a media slot's presence — the same
                 // predicate the enum rule uses, checked here through the cast itself.
-                "generate" => cast.slot(crate::config::ModelRole::Image).is_some(),
+                "generate" => {
+                    cast.slot(crate::config::ModelRole::Image).is_some()
+                        || cast.slot(crate::config::ModelRole::Audio).is_some()
+                }
                 other => panic!("unmapped cast-taking tool `{other}` — add its gate here"),
             }
         };
@@ -9646,11 +9913,21 @@ enabled = false
     /// as the server instructions, and silently. Every description kaibo advertises must
     /// fit, so a clause added to one (like the `run_kaish` exit codes) cannot push its
     /// own tail past the cut.
+    ///
+    /// The built-in config staffs no media slot, so `generate` is not advertised there;
+    /// a second handler with a media cast brings it into the check, and the check
+    /// asserts it was seen rather than trusting that it was.
     #[test]
     fn every_tool_description_fits_claude_code_budget() {
         let h = KaiboHandler::new(crate::config::Config::builtin()).expect("handler builds");
-        let tools = h.tool_router.list_all();
+        let media = hermetic_handler_from_toml(MEDIA_CAST_TOML);
+        let mut tools = h.tool_router.list_all();
+        tools.extend(media.tool_router.list_all());
         assert!(!tools.is_empty(), "the guard checked nothing");
+        assert!(
+            tools.iter().any(|t| t.name == "generate"),
+            "`generate` must be among the descriptions checked"
+        );
         for tool in tools {
             let len = tool.description.as_deref().unwrap_or("").chars().count();
             assert!(

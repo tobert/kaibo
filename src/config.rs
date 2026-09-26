@@ -220,7 +220,9 @@ impl Default for Defaults {
 /// **production** role, the one place kaibo emits rather than reasons, and it exists
 /// because Amy reopened image generation on 2026-07-25 with the media CAS as the write
 /// surface that makes it acceptable (see `src/cas.rs`'s module doc for why the CAS is
-/// safe by *shape* rather than by policy).
+/// safe by *shape* rather than by policy). `Audio` is its sibling (2026-09-26): speech
+/// and sound through the same `generate` tool and the same CAS, picked with
+/// `media = "audio"`. The two are the *media* roles ([`ModelRole::is_media`]).
 ///
 /// It lives here, on a cast slot, rather than as a config concept of its own. That was
 /// Amy's call (2026-07-30) over the alternative of a standalone `[image]` section keyed
@@ -235,17 +237,18 @@ impl Default for Defaults {
 ///
 /// A cast may omit any role: an absent slot means the capability is absent, not an error
 /// (the interactive built-ins carry explorer+synth; the batch built-ins carry synth
-/// only; none carries an image slot, so no built-in cast can staff an image tool).
+/// only; none carries a media slot, so no built-in cast can staff `generate`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum ModelRole {
     Explorer,
     Synth,
     Image,
+    Audio,
 }
 
 impl ModelRole {
     /// Every role, in table order — the source for "known roles" error text.
-    pub const ALL: [ModelRole; 3] = [Self::Explorer, Self::Synth, Self::Image];
+    pub const ALL: [ModelRole; 4] = [Self::Explorer, Self::Synth, Self::Image, Self::Audio];
 
     /// The role's config-table key (`[casts.<name>]`).
     pub fn key(self) -> &'static str {
@@ -253,15 +256,23 @@ impl ModelRole {
             Self::Explorer => "explorer",
             Self::Synth => "synth",
             Self::Image => "image",
+            Self::Audio => "audio",
         }
     }
 
     /// Whether this role runs a *reasoning* phase — an agent turn with a preamble, a
-    /// tool loop, and a thinking budget. `Image` does not: it is one request to an image
-    /// API, so the request-shaping machinery (`ModelShape`, effort, thinking style, turn
-    /// caps) neither applies to it nor should be resolved for it.
+    /// tool loop, and a thinking budget. The media roles do not: each is one request to
+    /// a media API, so the request-shaping machinery (`ModelShape`, effort, thinking
+    /// style, turn caps) neither applies to them nor should be resolved for them.
     pub fn is_reasoning(self) -> bool {
         matches!(self, Self::Explorer | Self::Synth)
+    }
+
+    /// Whether this role produces an artifact through a media backend — `image` or
+    /// `audio`. The complement of [`is_reasoning`](Self::is_reasoning), stated on its own
+    /// so a check reads as what it means.
+    pub fn is_media(self) -> bool {
+        !self.is_reasoning()
     }
 }
 
@@ -1445,15 +1456,16 @@ impl Config {
             .is_some_and(|c| c.slot(ModelRole::Explorer).is_some())
     }
 
-    /// Whether canonical cast `name` can staff a `generate` call: it carries an
-    /// **image** slot — the media member, the only slot `generate` runs. Load
-    /// validation already pinned that slot to a media-class backend, so
-    /// slot presence is the whole test here. Independent of the reasoning slots: a
-    /// cast may be image-only, and a full team's image slot is equally valid.
+    /// Whether canonical cast `name` can staff a `generate` call: it carries a media
+    /// slot — `image` or `audio`, the only slots `generate` runs. Load validation already
+    /// pinned each to a media-class backend that produces its output, so slot presence is
+    /// the whole test here. Independent of the reasoning slots: a cast may be media-only,
+    /// and a full team's media slots are equally valid. Which one a call runs is the
+    /// call's `media` argument, checked when the call arrives.
     pub fn cast_can_generate(&self, name: &str) -> bool {
-        self.casts
-            .get(name)
-            .is_some_and(|c| c.slot(ModelRole::Image).is_some())
+        self.casts.get(name).is_some_and(|c| {
+            c.slot(ModelRole::Image).is_some() || c.slot(ModelRole::Audio).is_some()
+        })
     }
 
     /// Whether canonical cast `name` is the configured default — comparing against the
@@ -2058,8 +2070,8 @@ impl Config {
                         "cast {name:?}: the {} slot points at backend {:?} (kind \
                          `{}`, a media kind), which generates artifacts and has no \
                          completion model to reason with — point {} at a completion \
-                         backend, and put backend {:?} on this cast's `image` slot \
-                         instead",
+                         backend, and put backend {:?} on this cast's `image` or `audio` \
+                         slot instead",
                         role.key(),
                         slot.backend,
                         kind.canonical_name(),
@@ -2067,14 +2079,41 @@ impl Config {
                         slot.backend,
                     );
                 }
-                if *role == ModelRole::Image && !is_media {
+                if role.is_media() && !is_media {
                     bail!(
-                        "cast {name:?}: the image slot points at backend {:?} (kind \
-                         `{}`, a completion wire), which cannot generate an image — \
-                         an image slot needs a media-kind backend",
+                        "cast {name:?}: the {} slot points at backend {:?} (kind \
+                         `{}`, a completion wire), which cannot generate {} — \
+                         an {} slot needs a media-kind backend ({})",
+                        role.key(),
                         slot.backend,
                         kind.canonical_name(),
+                        role.key(),
+                        role.key(),
+                        credentials::media_kinds_producing(crate::media::MediaOutput::of_role(
+                            *role
+                        )),
                     );
+                }
+                // A media kind must actually produce what the slot is for: every media
+                // kind makes images, only some make audio. Refused here so an operator
+                // reads a config error, not a provider 404 or an image stored where
+                // speech was asked for.
+                if let (credentials::ProviderClass::Media(media), Some(output)) =
+                    (kind.class(), crate::media::MediaOutput::of_role(*role))
+                {
+                    if !media.produces(output) {
+                        bail!(
+                            "cast {name:?}: the {} slot points at backend {:?} (kind \
+                             `{}`), which has no route that produces {} — point the {} \
+                             slot at a backend of kind {}",
+                            role.key(),
+                            slot.backend,
+                            kind.canonical_name(),
+                            role.key(),
+                            role.key(),
+                            credentials::media_kinds_producing(Some(output)),
+                        );
+                    }
                 }
                 // A slot's lane needs a fitting role and backend, caught here rather
                 // than as a baffling refusal or a 400 at submit/deliberate time. The
@@ -2912,6 +2951,8 @@ struct RawCast {
     synth: Option<RawSlot>,
     /// The production slot — a text-to-image model. See [`ModelRole::Image`].
     image: Option<RawSlot>,
+    /// The audio production slot — speech or sound. See [`ModelRole::Audio`].
+    audio: Option<RawSlot>,
 }
 
 impl RawCast {
@@ -2921,6 +2962,7 @@ impl RawCast {
             (ModelRole::Explorer, &self.explorer),
             (ModelRole::Synth, &self.synth),
             (ModelRole::Image, &self.image),
+            (ModelRole::Audio, &self.audio),
         ]
         .into_iter()
         .filter_map(|(role, slot)| slot.as_ref().map(|s| (role, s)))

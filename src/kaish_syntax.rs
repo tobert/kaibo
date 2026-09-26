@@ -303,7 +303,7 @@ fn casts_section(config: &Config, usable: &[(String, CastUsability)]) -> String 
             // key-gated, so it holds for every usable cast.
             //
             // A cast with no synth answers no text tool, so its line says which tool it
-            // does serve (`generate` for an image slot, `explore` for an explorer slot)
+            // does serve (`generate` for a media slot, `explore` for an explorer slot)
             // and names that slot's model instead. A bare name there read as a team
             // whose answering model was merely unknown. A name that does not resolve
             // still renders bare.
@@ -312,18 +312,22 @@ fn casts_section(config: &Config, usable: &[(String, CastUsability)]) -> String 
                 if let Some(slot) = cast.slot(ModelRole::Synth) {
                     return Some(slot);
                 }
-                let serves: Vec<&str> = [
+                let mut serves: Vec<&str> = [
                     (ModelRole::Explorer, "`explore`"),
                     (ModelRole::Image, "`generate`"),
+                    (ModelRole::Audio, "`generate`"),
                 ]
                 .into_iter()
                 .filter(|(role, _)| cast.slot(*role).is_some())
                 .map(|(_, tool)| tool)
                 .collect();
+                // Both media slots serve the same tool; name it once.
+                serves.dedup();
                 if !serves.is_empty() {
                     tags.push(format!("{} only", serves.join(" or ")));
                 }
                 cast.slot(ModelRole::Image)
+                    .or_else(|| cast.slot(ModelRole::Audio))
                     .or_else(|| cast.slot(ModelRole::Explorer))
             });
             let suffix = if tags.is_empty() {

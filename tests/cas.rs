@@ -703,8 +703,43 @@ fn extension_maps_mimes_both_ways_and_refuses_unknown() {
         Extension::from_mime("IMAGE/PNG; charset=binary"),
         Some(Extension::Png)
     );
-    assert_eq!(Extension::from_mime("audio/mpeg"), None);
     assert_eq!(Extension::from_mime("model/gltf-binary"), None);
+    assert_eq!(Extension::from_mime("audio/flac"), None);
+}
+
+/// Audio is a third family beside images and authored text: neither an image (so the
+/// image lane still refuses it) nor text (so retrieval serves it as bytes). The wire
+/// aliases providers actually send map onto one on-disk name each.
+#[test]
+fn audio_extensions_are_their_own_family_and_accept_the_wire_aliases() {
+    for (mime, ext) in [
+        ("audio/mpeg", Extension::Mp3),
+        ("audio/mp3", Extension::Mp3),
+        ("audio/wav", Extension::Wav),
+        ("audio/x-wav", Extension::Wav),
+        ("audio/wave", Extension::Wav),
+        ("audio/vnd.wave", Extension::Wav),
+        ("AUDIO/WAV; rate=44100", Extension::Wav),
+    ] {
+        assert_eq!(Extension::from_mime(mime), Some(ext), "{mime}");
+    }
+    for ext in [Extension::Mp3, Extension::Wav] {
+        assert!(ext.is_audio(), "{ext:?} is audio");
+        assert!(!ext.is_image(), "{ext:?} is not an image");
+        assert!(!ext.is_textual(), "{ext:?} is served as bytes");
+    }
+    for ext in Extension::ALL {
+        assert!(
+            [ext.is_image(), ext.is_audio(), ext.is_textual()]
+                .iter()
+                .filter(|b| **b)
+                .count()
+                == 1,
+            "{ext:?} belongs to exactly one family"
+        );
+    }
+    assert_eq!(Extension::Mp3.as_str(), "mp3");
+    assert_eq!(Extension::Wav.as_str(), "wav");
 }
 
 /// **An object that landed while its sidecar failed must say so, and must name the
@@ -887,6 +922,23 @@ fn text_and_jsonl_artifacts_round_trip_by_digest() {
         assert_eq!(found, ext);
         assert!(path.extension().is_some_and(|e| e == ext.as_str()));
         assert!(!ext.is_image(), "authored text is not a rendered image");
+    }
+}
+
+/// An audio object round-trips by digest and is found on disk under its own extension —
+/// including through the sidecar-less probe, which walks `Extension::ALL`.
+#[test]
+fn audio_artifacts_round_trip_by_digest() {
+    let (cas, _dir) = open_uncapped();
+    for (ext, body) in [
+        (Extension::Wav, b"RIFF\x24\x00\x00\x00WAVEfmt ".to_vec()),
+        (Extension::Mp3, b"ID3\x03\x00\x00\x00\x00audio".to_vec()),
+    ] {
+        let digest = cas.put(&body, ext, &prov_mime(ext.mime())).expect("put");
+        assert_eq!(cas.get(&digest).unwrap(), Some(body.clone()));
+        let (path, found) = cas.entry_for(&digest).expect("findable by digest");
+        assert_eq!(found, ext);
+        assert!(path.extension().is_some_and(|e| e == ext.as_str()));
     }
 }
 

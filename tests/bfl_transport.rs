@@ -13,7 +13,7 @@
 //! POST, naming a "poll" server's address as its `polling_url`; if kaibo ever
 //! reconstructed that URL from the create server's own base instead, the poll
 //! server would never see a connection and the test would hang until the request
-//! times out — the same negative-control shape `tests/gemini_images_transport.rs`
+//! times out — the same negative-control shape `tests/gemini_media_transport.rs`
 //! and `tests/dashscope_transport.rs` already rely on for their own "dials the
 //! right place" assertions.
 //!
