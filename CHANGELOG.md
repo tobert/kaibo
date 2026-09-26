@@ -33,6 +33,8 @@ record. Each later release appends a new section at the top.
 - The `oneshot` preamble says thinking comes before the reply and shares its output budget.
 
 ### Fixed
+- A consult turn cut off at `max_tokens` while reasoning gets one forced write-up from its evidence instead of discarding the investigation (a rig 0.42 regression).
+- A turn cut off at the output limit is reported as an empty answer with the budget named, not as a provider rejection.
 - A connection failure no longer reads as a provider rejection; the message names the checks to run.
 - `oneshot` and `deliberate`'s direct lane count each retried attempt, and per-call latency excludes kaibo's backoff.
 - Traces export `run_phase`'s `gen_ai.response.finish_reason` and `gen_ai.request.thinking`, which the allowlist dropped.
