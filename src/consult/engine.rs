@@ -736,10 +736,13 @@ impl AgentHook for CutOffStopHook {
     }
 }
 
-/// Whether a turn delivered nothing a caller or the loop can use: no non-empty text, no
+/// Whether a turn delivered nothing a caller or the loop can use: no non-blank text, no
 /// tool call, no image. Reasoning alone is not an answer. The same classification as
-/// rig-agent's `turn_delivered_no_answer` (crate-private there), and exhaustive for the
-/// same reason: a new content variant must fail this build and be classified.
+/// rig-agent's `turn_delivered_no_answer` (crate-private there) with one deliberate
+/// difference: whitespace-only text counts as nothing here, where rig counts any
+/// non-empty text as an answer, so a blank cut-off turn is also recovered rather than
+/// returned as an empty answer. Exhaustive for the same reason as rig's: a new content
+/// variant must fail this build and be classified.
 fn turn_wrote_nothing(content: &[AssistantContent]) -> bool {
     !content.iter().any(|c| match c {
         AssistantContent::Text(text) => !text.text.trim().is_empty(),
@@ -765,6 +768,15 @@ impl NoAnswer {
         match self {
             NoAnswer::Stopped => EMPTY_ANSWER_NOTE,
             NoAnswer::CutOff => CUT_OFF_NOTE,
+        }
+    }
+
+    /// What happened, as the published progress beat's first clause. Not "reached
+    /// research limit": the turn cap was not the cause.
+    fn beat(self) -> &'static str {
+        match self {
+            NoAnswer::Stopped => "the model stopped without writing an answer",
+            NoAnswer::CutOff => "the model hit its output limit while thinking",
         }
     }
 
@@ -841,7 +853,9 @@ where
         "phase ended with no answer text and evidence gathered — forcing one final \
          write-up turn"
     );
-    progress.emit(PhaseEvent::TurnCapReached);
+    progress.emit(PhaseEvent::AnswerForced {
+        cause: cause.beat(),
+    });
     let (answer, retry_usage) = forced_finish_turn(
         model,
         preamble,
@@ -1683,12 +1697,13 @@ where
         // completion call of a resume that ran no view_image. Keep it built here.
         // The run yields a `PromptResponse` carrying the token `usage` the provider
         // reported, summed across every turn of *this* run. The clean `Ok` path is the
-        // common case — one run, the full count. The two exceptional exits below (turn
-        // cap, view_image break) undercount: rig hands back no usage on
+        // common case — one run, the full count. Two exceptional exits below (turn cap,
+        // view_image break) undercount: rig hands back no usage on
         // `MaxTurnsError`/`PromptCancelled`, so the turns spent in a capped or broken
-        // run are lost and only the finalize/resumed run's usage survives. Deliberate —
-        // recovering it would mean summing per-completion through a hook; documented as
-        // a known undercount rather than silently exact.
+        // run are lost and only the finalize/resumed run's usage survives. The cut-off
+        // exit does not: `CutOffStopHook` sums this run's turns itself. Summing the other
+        // two the same way is possible and not yet done; until then they are a
+        // documented undercount rather than silently exact.
         let result = agent
             .runner(prompt.clone())
             .history(history.clone())
@@ -5813,6 +5828,22 @@ mod tests {
             1,
             "exactly one forced turn — the recovery must never stack"
         );
+    }
+
+    /// Which turns count as "wrote nothing": the predicate that decides whether a
+    /// `Length` turn is stopped and recovered, or left to run (a tool call still
+    /// executes; text is an answer).
+    #[test]
+    fn turn_wrote_nothing_classifies_every_content_kind() {
+        use rig_core::completion::message::Reasoning;
+        let text = |t: &str| AssistantContent::text(t);
+        let reasoning = AssistantContent::Reasoning(Reasoning::new("thinking"));
+        let call = AssistantContent::tool_call("c1", "run_kaish", serde_json::json!({}));
+        assert!(turn_wrote_nothing(&[]));
+        assert!(turn_wrote_nothing(std::slice::from_ref(&reasoning)));
+        assert!(turn_wrote_nothing(&[text("  \n"), reasoning.clone()]));
+        assert!(!turn_wrote_nothing(&[text("the answer")]));
+        assert!(!turn_wrote_nothing(&[reasoning, call]));
     }
 
     /// **The 2026-09-26 kaiseki job-1 shape.** A synth reads real files, then a later

@@ -48,6 +48,12 @@ pub enum PhaseEvent {
     },
     /// The phase exhausted its turn cap and is writing a forced final answer.
     TurnCapReached,
+    /// The phase ended with no answer text and is writing a forced answer from the
+    /// evidence it gathered. `cause` is a short published clause saying why: the model
+    /// stopped, or it hit its output limit while thinking. Kept apart from
+    /// [`TurnCapReached`](Self::TurnCapReached) because "reached research limit" is false
+    /// here, and a caller reads the cause to decide whether to raise `max_tokens`.
+    AnswerForced { cause: &'static str },
     /// The top-level tool finished and is about to return its answer/report.
     PhaseFinished { phase: &'static str },
 }
@@ -69,6 +75,9 @@ impl PhaseEvent {
                 format!("{agent} chat: {}", secs(*elapsed))
             }
             PhaseEvent::TurnCapReached => "reached research limit, writing the answer".to_string(),
+            PhaseEvent::AnswerForced { cause } => {
+                format!("{cause}; writing the answer from the evidence gathered")
+            }
             PhaseEvent::PhaseFinished { phase } => format!("{phase} complete"),
         }
     }
@@ -315,7 +324,7 @@ impl ProgressSink for ProgressLog {
 /// predicate stays pure.
 fn promotes_to_caller(event: &PhaseEvent, slow_chat_after: Option<Duration>) -> bool {
     match event {
-        PhaseEvent::TurnCapReached => true,
+        PhaseEvent::TurnCapReached | PhaseEvent::AnswerForced { .. } => true,
         PhaseEvent::ChatCompleted { elapsed, .. } => {
             slow_chat_after.is_some_and(|limit| *elapsed >= limit)
         }
@@ -419,6 +428,16 @@ mod tests {
         let limit = Some(Duration::from_secs(60));
         assert!(promotes_to_caller(&PhaseEvent::TurnCapReached, limit));
         assert!(promotes_to_caller(&PhaseEvent::TurnCapReached, None));
+        // A forced write-up changes how a caller reads the answer, like the turn cap.
+        let forced = PhaseEvent::AnswerForced {
+            cause: "the model hit its output limit while thinking",
+        };
+        assert!(promotes_to_caller(&forced, None));
+        assert_eq!(
+            forced.message(),
+            "the model hit its output limit while thinking; writing the answer from the \
+             evidence gathered"
+        );
         for event in [
             PhaseEvent::PhaseStarted { phase: "consult" },
             PhaseEvent::PhaseFinished { phase: "consult" },
