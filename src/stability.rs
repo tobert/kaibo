@@ -1,4 +1,4 @@
-//! Stability AI's image-generation family — kaibo's own facade, with rig's
+//! Stability AI's image and audio generation — kaibo's own facade, with rig's
 //! `image_generation` trait wired as a thin adapter over it.
 //!
 //! # Why a facade first, not a direct trait impl
@@ -7,13 +7,12 @@
 //! [`rig_core::image_generation::ImageGenerationModel`], and that trait's request shape
 //! (`prompt`/`width`/`height`/`additional_params`) is deliberately thin — it fits a
 //! single text-to-image call and nothing else. Stability's v2beta API is bigger than
-//! that: alongside `stable-image/generate/{core,ultra,sd3}` and the synchronous
-//! `edit`/`control`/`upscale` routes wired in [`STABLE_IMAGE_OPS`], it also ships the
-//! deferred half of upscale (creative) and edit (replace-background-and-relight),
-//! (inpaint/outpaint/erase/search-and-replace/remove-background), control
-//! (sketch/structure/style), audio (`stable-audio` text-to-audio/audio-to-audio), and
-//! 3D (`stable-fast-3d`) — and every one of the image-family operations, unlike
-//! generate, takes an **input image** alongside its other fields. Building straight to
+//! that: alongside `stable-image/generate/{core,ultra,sd3}`, the synchronous
+//! `edit`/`control`/`upscale` routes wired in [`STABLE_IMAGE_OPS`], and the Stable Audio
+//! routes wired as [`Operation::Audio`], it also ships the deferred half of upscale
+//! (creative) and edit (replace-background-and-relight), and 3D (`stable-fast-3d`) —
+//! and every one of the image-family operations, unlike generate, takes an **input
+//! image** alongside its other fields. Building straight to
 //! rig's shape would mean rewriting this module's core type the day any of those
 //! lands. So the primary abstraction here is [`StabilityRequest`]/[`Operation`] —
 //! provider-native, already carrying its named binary input parts — and
@@ -23,13 +22,16 @@
 //!
 //! # Sync vs deferred — declared, not sniffed
 //!
-//! Every operation wired so far — the `generate` family and every row of
-//! [`STABLE_IMAGE_OPS`] — is synchronous: the POST itself returns the artifact. But `upscale/creative`, `stable-audio`, and
-//! `stable-fast-3d` are **deferred** — the POST only returns a job id, and the artifact
-//! comes later from a poll. The tempting shortcut — "202 means deferred, 200 means
-//! sync" — is wrong: confirmed against the live
-//! `https://api.stability.ai/v2alpha/openapi` spec (2026-07-25), `POST
-//! .../upscale/creative` returns **`200`** with `{id}`, while `POST
+//! Every image operation wired so far — the `generate` family and every row of
+//! [`STABLE_IMAGE_OPS`] — is synchronous: the POST itself returns the artifact. Stable
+//! Audio is split by model family (live spec, 2026-09-26): `stable-audio-2` and
+//! `stable-audio-2.5` share the synchronous `audio/stable-audio-2/*` routes, while
+//! `stable-audio-3` has its own **deferred** `audio/stable-audio/*` routes — the POST
+//! only returns a job id, and the artifact comes later from a poll — see
+//! [`AudioModel`]. `upscale/creative` and `stable-fast-3d` are deferred too, and not
+//! wired. The tempting shortcut — "202 means deferred, 200 means sync" — is wrong:
+//! confirmed against the live `https://api.stability.ai/v2alpha/openapi` spec
+//! (2026-07-25), `POST .../upscale/creative` returns **`200`** with `{id}`, while `POST
 //! .../stable-audio/text-to-audio` returns **`202`** with `{id}`. The status code
 //! cannot tell sync from deferred — only the *route itself* knows what shape its
 //! response is. So [`Operation::shape`] is a fact the operation declares (`Shape::Sync`
@@ -44,18 +46,19 @@
 //!
 //! # Polling
 //!
-//! Deferred work is collected with `GET /v2beta/results/{id}` (shared across every
-//! deferred operation) or, for some operations, a dedicated poll route as well (e.g.
-//! `GET /v2beta/stable-image/upscale/creative/result/{id}`). Unlike the POST dispatch
+//! Deferred image work is collected with `GET /v2beta/results/{id}` or, for some
+//! operations, a dedicated poll route as well (e.g.
+//! `GET /v2beta/stable-image/upscale/creative/result/{id}`). Stable Audio 3 has its own,
+//! `GET /v2beta/audio/results/{id}` with `Accept: audio/*`: the shared route documents
+//! only image content types ([`StabilityClient::poll_audio`]). Unlike the POST dispatch
 //! above, a *poll* response's status code is exactly what it appears to be — confirmed
 //! live: **`202`** + `{id, status}` while pending, **`200`** + the artifact bytes when
 //! done, **`404`** once the id has expired. [`handle_poll_response`] is that three-way
 //! dispatch; [`StabilityClient::poll`] is the one-shot HTTP call over it — deliberately
 //! *not* a sleep/retry loop with wall-clock timing, so a caller (a test, a future MCP
 //! tool with its own cadence) drives the wait itself and this module never forces a
-//! timing model on it. No deferred `Operation` is wired yet — that's the next stage,
-//! deliberately out of scope here; this is the plumbing that lets one land as a new
-//! `Operation` variant + a `shape()`/route arm, not a redesign.
+//! timing model on it. Stable Audio 3 is the first deferred [`Operation`] wired; the
+//! `generate` tool owns its poll cadence.
 //!
 //! # `MediaType` — a closed six-variant enum, not a `String`
 //!
@@ -92,12 +95,12 @@
 //! image kind Stability returns (`png`/`jpeg`/`webp`) and additionally carries `gif`,
 //! which Stability never produces (that variant exists for some other CAS caller, not
 //! for symmetry with `MediaType`). `MediaType` is what Stability can *return* —
-//! including audio and 3D, which `Extension` has no shape for at all. Neither is a
-//! subset of the other, so [`MediaType::to_cas_extension`] refuses `audio/*` and
-//! `model/gltf-binary` loudly today ([`StabilityError::NoCasExtension`]). That refusal
-//! is a feature: when audio/3D support lands, it forces a deliberate decision — a new
-//! `Extension` variant? a different sidecar shape entirely? — instead of silently
-//! writing bytes to disk under an extension nobody can open them with. Permissive at
+//! including 3D, which `Extension` has no shape for at all. Neither is a subset of the
+//! other, so [`MediaType::to_cas_extension`] refuses `model/gltf-binary` loudly today
+//! ([`StabilityError::NoCasExtension`]). That refusal is a feature, and it worked as one:
+//! audio was refused the same way until 2026-09-26, when `Extension` gained `mp3` and
+//! `wav` as a deliberate decision rather than bytes written under an extension nobody
+//! could open them with. 3D waits for the same decision. Permissive at
 //! the wire (`MediaType` parses everything Stability can send), strict at the path
 //! (`Extension` stays closed — the only caller-influenced path component) — see
 //! `cas.rs`'s module doc for the other half of this boundary.
@@ -324,10 +327,10 @@ pub struct OpSpec {
 ///
 /// Deferred routes are deliberately absent: `upscale/creative` and
 /// `edit/replace-background-and-relight` return a job id rather than an artifact, so they
-/// need the deferred lane wired to a poll cadence, which is its own change. Audio and 3D
-/// are absent for a different reason — the media CAS cannot name `mp3`, `wav` or `glb` on
-/// disk yet, and storing them under an invented extension is exactly what
-/// `MediaType::to_cas_extension` refuses to do.
+/// need the deferred lane wired to a poll cadence, which is its own change. Audio is not
+/// an image route and lives in [`Operation::Audio`]; 3D is absent because the media CAS
+/// cannot name `glb` on disk yet, and storing it under an invented extension is exactly
+/// what `MediaType::to_cas_extension` refuses to do.
 pub const STABLE_IMAGE_OPS: &[OpSpec] = &[
     OpSpec {
         name: "edit/erase",
@@ -434,6 +437,98 @@ pub enum Operation {
     Generate(GenerateRoute),
     /// One row of [`STABLE_IMAGE_OPS`] — every `edit`, `control` and sync `upscale` route.
     StableImage(&'static OpSpec),
+    /// One Stable Audio route: which model family serves it, and what it does.
+    Audio {
+        model: AudioModel,
+        action: AudioAction,
+    },
+}
+
+/// The Stable Audio models, named as an `audio` slot's model id names them.
+///
+/// Two route families serve them, and they differ in shape, not just path (live spec,
+/// 2026-09-26): `stable-audio-2` and `stable-audio-2.5` share the **synchronous**
+/// `audio/stable-audio-2/*` routes, selected by a `model` form field that defaults to
+/// 2.0 on the provider's side; `stable-audio-3` has its own **deferred**
+/// `audio/stable-audio/*` routes, which answer `202 {id}` and are collected from
+/// `audio/results/{id}`, not the shared `results/{id}`. Model 3 is also gated per
+/// account (`x-launchDarklyEnableFlag: allow-access-stable-audio-3-api`), so an account
+/// without access sees a provider refusal, which kaibo passes through.
+///
+/// A closed set on purpose. An unknown id refuses before a request is sent: sent
+/// through, it would either 400 or, on the 2.x routes, fall back to the provider's 2.0
+/// default and record a model that did not run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AudioModel {
+    StableAudio2,
+    StableAudio25,
+    StableAudio3,
+}
+
+impl AudioModel {
+    pub const ALL: [AudioModel; 3] = [Self::StableAudio25, Self::StableAudio2, Self::StableAudio3];
+
+    /// The id a slot writes and the `model` form field carries.
+    pub fn id(self) -> &'static str {
+        match self {
+            Self::StableAudio2 => "stable-audio-2",
+            Self::StableAudio25 => "stable-audio-2.5",
+            Self::StableAudio3 => "stable-audio-3",
+        }
+    }
+
+    pub fn classify(model_id: &str) -> Result<Self, StabilityError> {
+        Self::ALL
+            .into_iter()
+            .find(|m| m.id().eq_ignore_ascii_case(model_id.trim()))
+            .ok_or_else(|| StabilityError::UnknownAudioModel {
+                asked: model_id.to_string(),
+            })
+    }
+
+    /// The route family after `/v2beta/audio/`.
+    fn family(self) -> &'static str {
+        match self {
+            Self::StableAudio2 | Self::StableAudio25 => "stable-audio-2",
+            Self::StableAudio3 => "stable-audio",
+        }
+    }
+
+    fn shape(self) -> Shape {
+        match self {
+            Self::StableAudio2 | Self::StableAudio25 => Shape::Sync,
+            Self::StableAudio3 => Shape::Deferred,
+        }
+    }
+}
+
+/// What a Stable Audio call does. Every model family has all three routes, with one
+/// exception [`StabilityImageModel::media_request`] enforces: the 2.x `inpaint` route
+/// has no `model` field and always runs 2.5.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AudioAction {
+    TextToAudio,
+    AudioToAudio,
+    Inpaint,
+}
+
+impl AudioAction {
+    pub const ALL: [AudioAction; 3] = [Self::TextToAudio, Self::AudioToAudio, Self::Inpaint];
+
+    /// The caller-facing `op` name, which is also the route's last path segment.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::TextToAudio => "text-to-audio",
+            Self::AudioToAudio => "audio-to-audio",
+            Self::Inpaint => "inpaint",
+        }
+    }
+}
+
+/// Every audio `op` name a caller may pass — for a refusal, rendered from the enum so it
+/// cannot drift from what the parser accepts.
+pub fn audio_op_names() -> Vec<&'static str> {
+    AudioAction::ALL.iter().map(|a| a.name()).collect()
 }
 
 /// Whether an operation's POST returns its artifact directly, or only a job id to poll
@@ -457,19 +552,30 @@ impl Operation {
         match self {
             Operation::Generate(route) => format!("stable-image/generate/{}", route.path_segment()),
             Operation::StableImage(spec) => spec.path.to_string(),
+            Operation::Audio { model, action } => {
+                format!("audio/{}/{}", model.family(), action.name())
+            }
         }
     }
 
-    /// This operation's response shape — see [`Shape`]. Every operation wired so far is
-    /// synchronous; the single arm exists so a future deferred `Operation` variant is a
-    /// new match arm here, not a rewrite of [`handle_response`]'s dispatch.
+    /// The `Accept` header this route answers to. A per-route fact: the audio routes
+    /// enumerate `audio/*` or `application/json`, and `image/*` is outside that list.
+    fn accept(&self) -> &'static str {
+        match self {
+            Operation::Generate(_) | Operation::StableImage(_) => "image/*",
+            Operation::Audio { .. } => "audio/*",
+        }
+    }
+
+    /// This operation's response shape — see [`Shape`]. Every image operation wired so
+    /// far is synchronous; audio depends on the model family.
     fn shape(&self) -> Shape {
         match self {
             // Every route in `STABLE_IMAGE_OPS` is synchronous by construction — the two
             // deferred `stable-image` routes are deliberately not in that table, so this
-            // arm cannot be wrong for a row that exists. A deferred operation arrives as
-            // its own variant with its own arm.
+            // arm cannot be wrong for a row that exists.
             Operation::Generate(_) | Operation::StableImage(_) => Shape::Sync,
+            Operation::Audio { model, .. } => model.shape(),
         }
     }
 }
@@ -664,8 +770,7 @@ pub enum StabilityError {
     /// a bug to paper over.
     UnknownMediaType(String),
     /// [`MediaType::to_cas_extension`] was asked to map a media type `cas.rs`'s
-    /// [`crate::cas::Extension`] has no shape for — today that's every `audio/*` variant
-    /// and `model/gltf-binary`. See the module doc's "`MediaType`" section for why this
+    /// [`crate::cas::Extension`] has no shape for — today that's `model/gltf-binary`. See the module doc's "`MediaType`" section for why this
     /// refusal is deliberate: the CAS genuinely cannot name these on disk yet, and
     /// writing them under a wrong or invented extension would be exactly the
     /// silent-garbage failure this module's whole design refuses.
@@ -675,6 +780,13 @@ pub enum StabilityError {
     /// wrong answer that looks entirely like a right one, and it costs the caller a
     /// generation to find out.
     UnknownOperation { asked: String },
+    /// An audio slot names a model Stability does not serve on its audio routes.
+    UnknownAudioModel { asked: String },
+    /// The caller named an audio `op` this facade does not wire.
+    UnknownAudioOperation { asked: String },
+    /// `inpaint` on a `stable-audio-2` slot: the 2.x inpaint route has no `model` field
+    /// and always runs 2.5, so running it would record a model that did not run.
+    InpaintNeedsNewerModel,
 }
 
 impl std::fmt::Display for StabilityError {
@@ -747,6 +859,25 @@ impl std::fmt::Display for StabilityError {
                  was generated. Pass one of: {}. Omit `op` entirely to generate from the \
                  prompt alone.",
                 op_names().join(", ")
+            ),
+            StabilityError::UnknownAudioModel { asked } => write!(
+                f,
+                "the audio slot's model id {asked:?} is not a Stable Audio model, so nothing \
+                 was generated. Set the cast's `audio` slot to one of: {}.",
+                AudioModel::ALL.map(AudioModel::id).join(", ")
+            ),
+            StabilityError::UnknownAudioOperation { asked } => write!(
+                f,
+                "`op` {asked:?} is not a Stable Audio operation, so nothing was generated. \
+                 With `media = \"audio\"`, pass one of: {} (the last two take an `audio` \
+                 entry in `inputs`). Omit `op` to generate from the prompt alone.",
+                audio_op_names().join(", ")
+            ),
+            StabilityError::InpaintNeedsNewerModel => write!(
+                f,
+                "`op` \"inpaint\" on a `stable-audio-2` slot was refused, so nothing was \
+                 generated: that route always runs stable-audio-2.5. Use a cast whose \
+                 `audio` slot is `stable-audio-2.5` or `stable-audio-3`."
             ),
         }
     }
@@ -824,10 +955,10 @@ impl MediaType {
     /// deliberately *not* the same set. `Extension` already covers every image kind
     /// Stability returns (`png`/`jpeg`/`webp`) and additionally carries `gif`, which
     /// Stability never produces (that variant serves some other CAS caller, not
-    /// symmetry with this type). This type additionally covers audio and 3D, which
-    /// `Extension` has no on-disk shape for at all. Neither enum is a subset of the
-    /// other, so this mapping is fallible on purpose: `audio/*` and
-    /// `model/gltf-binary` refuse loudly with [`StabilityError::NoCasExtension`] today.
+    /// symmetry with this type). Audio maps onto `Extension`'s `mp3`/`wav`. This type
+    /// additionally covers 3D, which `Extension` has no on-disk shape for at all.
+    /// Neither enum is a subset of the other, so this mapping is fallible on purpose:
+    /// `model/gltf-binary` refuses loudly with [`StabilityError::NoCasExtension`] today.
     /// That refusal is a feature, not an oversight — see the module doc's `MediaType`
     /// section for why forcing a decision beats a silent wrong-extension write.
     pub fn to_cas_extension(&self) -> Result<crate::cas::Extension, StabilityError> {
@@ -835,9 +966,9 @@ impl MediaType {
             MediaType::ImagePng => Ok(crate::cas::Extension::Png),
             MediaType::ImageJpeg => Ok(crate::cas::Extension::Jpeg),
             MediaType::ImageWebp => Ok(crate::cas::Extension::Webp),
-            MediaType::AudioMpeg | MediaType::AudioWav | MediaType::ModelGltfBinary => {
-                Err(StabilityError::NoCasExtension { media_type: *self })
-            }
+            MediaType::AudioMpeg => Ok(crate::cas::Extension::Mp3),
+            MediaType::AudioWav => Ok(crate::cas::Extension::Wav),
+            MediaType::ModelGltfBinary => Err(StabilityError::NoCasExtension { media_type: *self }),
         }
     }
 }
@@ -951,6 +1082,38 @@ fn parse_artifact(
     seed: Option<&str>,
     body: &[u8],
 ) -> Result<Artifact, StabilityError> {
+    parse_artifact_with(
+        content_type,
+        finish_reason,
+        seed,
+        body,
+        FinishReason::Required,
+    )
+}
+
+/// Whether a binary response must carry a `finish-reason` header.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FinishReason {
+    /// Every route but one: the header is documented as always present, and on the
+    /// image routes it is the only signal of a moderated (`CONTENT_FILTERED`) result, so
+    /// its absence is refused.
+    Required,
+    /// `GET audio/results/{id}`, which omits it. The spec documents the header there,
+    /// but a live 200 (2026-09-26) carried `content-type: audio/mpeg` and no
+    /// `finish-reason` or `seed`. The spec also says the only value it can take on the
+    /// audio routes is `SUCCESS`, and audio moderation arrives as a `403`, so an absent
+    /// header hides no filtered result. A present header that is not `SUCCESS` is still
+    /// refused.
+    OptionalOnAudioResults,
+}
+
+fn parse_artifact_with(
+    content_type: Option<&str>,
+    finish_reason: Option<&str>,
+    seed: Option<&str>,
+    body: &[u8],
+    rule: FinishReason,
+) -> Result<Artifact, StabilityError> {
     let Some(ct) = content_type else {
         return Err(StabilityError::MissingContentType);
     };
@@ -972,6 +1135,7 @@ fn parse_artifact(
     }
 
     match finish_reason {
+        None if rule == FinishReason::OptionalOnAudioResults => {}
         None => return Err(StabilityError::MissingFinishReason),
         Some(r) if r != "SUCCESS" => {
             return Err(StabilityError::NotSuccess {
@@ -1027,13 +1191,50 @@ pub fn handle_poll_response(
     seed: Option<&str>,
     body: &[u8],
 ) -> Result<PollOutcome, StabilityError> {
+    poll_response_with(
+        status,
+        content_type,
+        finish_reason,
+        seed,
+        body,
+        FinishReason::Required,
+    )
+}
+
+/// [`handle_poll_response`] for `GET audio/results/{id}`, which omits `finish-reason` on
+/// success — see [`FinishReason::OptionalOnAudioResults`].
+pub fn handle_audio_poll_response(
+    status: u16,
+    content_type: Option<&str>,
+    finish_reason: Option<&str>,
+    seed: Option<&str>,
+    body: &[u8],
+) -> Result<PollOutcome, StabilityError> {
+    poll_response_with(
+        status,
+        content_type,
+        finish_reason,
+        seed,
+        body,
+        FinishReason::OptionalOnAudioResults,
+    )
+}
+
+fn poll_response_with(
+    status: u16,
+    content_type: Option<&str>,
+    finish_reason: Option<&str>,
+    seed: Option<&str>,
+    body: &[u8],
+    rule: FinishReason,
+) -> Result<PollOutcome, StabilityError> {
     if status == 202 {
         return Ok(PollOutcome::Pending);
     }
     if !(200..300).contains(&status) {
         return Err(provider_error(status, body));
     }
-    parse_artifact(content_type, finish_reason, seed, body).map(PollOutcome::Complete)
+    parse_artifact_with(content_type, finish_reason, seed, body, rule).map(PollOutcome::Complete)
 }
 
 // --- The rig adapter ------------------------------------------------------------
@@ -1170,7 +1371,7 @@ impl StabilityClient {
             .http
             .post(&url)
             .header(AUTHORIZATION, format!("Bearer {}", self.api_key))
-            .header(ACCEPT, "image/*")
+            .header(ACCEPT, op.accept())
             .multipart(form)
             .send()
             .await
@@ -1196,22 +1397,52 @@ impl StabilityClient {
     /// pending-then-done deterministically with no `sleep` in the loop; a real caller
     /// awaits its own backoff between calls).
     pub async fn poll(&self, id: &JobId) -> Result<PollOutcome, StabilityError> {
-        let url = format!("{}/v2beta/results/{}", self.base_url, id.as_str());
-        let resp = self
+        self.poll_at("results", None, FinishReason::Required, id)
+            .await
+    }
+
+    /// Collect one deferred Stable Audio job with a single `GET
+    /// /v2beta/audio/results/{id}`. Stable Audio 3 has its own results route: the shared
+    /// `results/{id}` documents only image content types, and this one requires an
+    /// `Accept` of `audio/*` or `application/json`.
+    pub async fn poll_audio(&self, id: &JobId) -> Result<PollOutcome, StabilityError> {
+        self.poll_at(
+            "audio/results",
+            Some("audio/*"),
+            FinishReason::OptionalOnAudioResults,
+            id,
+        )
+        .await
+    }
+
+    async fn poll_at(
+        &self,
+        route: &str,
+        accept: Option<&str>,
+        rule: FinishReason,
+        id: &JobId,
+    ) -> Result<PollOutcome, StabilityError> {
+        let url = format!("{}/v2beta/{route}/{}", self.base_url, id.as_str());
+        let mut req = self
             .http
             .get(&url)
-            .header(AUTHORIZATION, format!("Bearer {}", self.api_key))
+            .header(AUTHORIZATION, format!("Bearer {}", self.api_key));
+        if let Some(accept) = accept {
+            req = req.header(ACCEPT, accept);
+        }
+        let resp = req
             .send()
             .await
             .map_err(|e| StabilityError::Transport(e.to_string()))?;
 
         let (status, content_type, finish_reason, seed, body) = interpret(resp).await?;
-        handle_poll_response(
+        poll_response_with(
             status,
             content_type.as_deref(),
             finish_reason.as_deref(),
             seed.as_deref(),
             &body,
+            rule,
         )
     }
 }
@@ -1256,6 +1487,9 @@ async fn interpret(
 pub struct StabilityImageModel {
     client: StabilityClient,
     model: String,
+    /// Which slot this model staffs. An `image` slot's id is a `generate` route
+    /// (`core`, `ultra`, an SD3.5 variant); an `audio` slot's is a Stable Audio model.
+    output: crate::media::MediaOutput,
 }
 
 /// Everything rig's [`RigImageGenerationModel::Response`] carries beyond the image
@@ -1274,6 +1508,7 @@ impl RigImageGenerationModel for StabilityImageModel {
         Self {
             client: client.clone(),
             model: model.into(),
+            output: crate::media::MediaOutput::Image,
         }
     }
 
@@ -1314,11 +1549,64 @@ impl StabilityImageModel {
     /// Build directly from a client + model id — the non-rig constructor
     /// [`crate::media::MediaArm::from_slot`] uses. Same shape as
     /// [`RigImageGenerationModel::make`], available without importing rig's trait.
-    pub fn from_parts(client: &StabilityClient, model: impl Into<String>) -> Self {
+    pub fn from_parts(
+        client: &StabilityClient,
+        model: impl Into<String>,
+        output: crate::media::MediaOutput,
+    ) -> Self {
         Self {
             client: client.clone(),
             model: model.into(),
+            output,
         }
+    }
+
+    /// The audio half of [`media_request`](Self::media_request): the slot's model id
+    /// picks the route family, `op` picks the action, and `output_format` is seeded as
+    /// `mp3` (the provider's own default, kept explicit) for the caller to override.
+    fn audio_request(
+        &self,
+        request: &crate::media::MediaRequest,
+    ) -> Result<(Operation, StabilityRequest), StabilityError> {
+        let model = AudioModel::classify(&self.model)?;
+        let action = match request.op.as_deref() {
+            None => AudioAction::TextToAudio,
+            Some(name) => AudioAction::ALL
+                .into_iter()
+                .find(|a| a.name() == name)
+                .ok_or_else(|| StabilityError::UnknownAudioOperation {
+                    asked: name.to_string(),
+                })?,
+        };
+        let mut fields: Vec<(String, String)> = Vec::new();
+        match (model, action) {
+            (AudioModel::StableAudio2, AudioAction::Inpaint) => {
+                return Err(StabilityError::InpaintNeedsNewerModel)
+            }
+            // The 2.x inpaint route documents no `model` field; it is 2.5 by definition.
+            (AudioModel::StableAudio25, AudioAction::Inpaint) => {}
+            // Every other audio route takes `model`, and on the 2.x family the provider's
+            // default is 2.0 — so it is always sent, never left to that default.
+            _ => fields.push(("model".to_string(), model.id().to_string())),
+        }
+        fields.push(("output_format".to_string(), "mp3".to_string()));
+        for (k, v) in &request.fields {
+            let v = v.to_wire_string();
+            if let Some(existing) = fields.iter_mut().find(|(name, _)| name == k) {
+                existing.1 = v;
+            } else {
+                fields.push((k.clone(), v));
+            }
+        }
+        Ok((
+            Operation::Audio { model, action },
+            StabilityRequest {
+                prompt: Some(request.prompt.clone()),
+                inputs: request.inputs.clone(),
+                aspect_ratio: None,
+                fields,
+            },
+        ))
     }
 
     /// The request-side translation shared with [`from_rig_request`]: classify the
@@ -1341,6 +1629,9 @@ impl StabilityImageModel {
         &self,
         request: &crate::media::MediaRequest,
     ) -> Result<(Operation, StabilityRequest), StabilityError> {
+        if self.output == crate::media::MediaOutput::Audio {
+            return self.audio_request(request);
+        }
         let route = GenerateRoute::classify(&self.model);
         let operation = match request.op.as_deref() {
             None => Operation::Generate(route.clone()),
@@ -1435,7 +1726,13 @@ impl crate::media::MediaModel for StabilityImageModel {
         &self,
         job: &crate::media::MediaJobId,
     ) -> AnyResult<crate::media::MediaPollOutcome> {
-        let outcome = self.client.poll(&JobId::new(job.0.clone())).await?;
+        // The model knows which slot it staffs, so it knows which results route its own
+        // deferred jobs live on — no route needs to ride inside the job id.
+        let id = JobId::new(job.0.clone());
+        let outcome = match self.output {
+            crate::media::MediaOutput::Image => self.client.poll(&id).await?,
+            crate::media::MediaOutput::Audio => self.client.poll_audio(&id).await?,
+        };
         Ok(match outcome {
             PollOutcome::Pending => crate::media::MediaPollOutcome::Pending,
             // One artifact per Stability poll, as a one-element list — see `generate`.
@@ -1569,7 +1866,11 @@ mod tests {
     fn a_named_op_selects_that_routes_endpoint_over_the_models() {
         let client = StabilityClient::new("k", "http://localhost", Duration::from_secs(1)).unwrap();
         // An sd3 model id, so a leaked default would be visibly wrong in the path.
-        let model = StabilityImageModel::from_parts(&client, "sd3.5-large");
+        let model = StabilityImageModel::from_parts(
+            &client,
+            "sd3.5-large",
+            crate::media::MediaOutput::Image,
+        );
         for spec in STABLE_IMAGE_OPS {
             let (op, _req) = model
                 .media_request(&crate::media::MediaRequest {
@@ -1590,7 +1891,11 @@ mod tests {
     #[test]
     fn the_sd3_model_field_rides_the_generate_route_only() {
         let client = StabilityClient::new("k", "http://localhost", Duration::from_secs(1)).unwrap();
-        let model = StabilityImageModel::from_parts(&client, "sd3.5-large");
+        let model = StabilityImageModel::from_parts(
+            &client,
+            "sd3.5-large",
+            crate::media::MediaOutput::Image,
+        );
 
         let (_, generate) = model
             .media_request(&crate::media::MediaRequest {
@@ -1629,7 +1934,8 @@ mod tests {
     #[test]
     fn an_unknown_op_refuses_and_lists_what_is_wired() {
         let client = StabilityClient::new("k", "http://localhost", Duration::from_secs(1)).unwrap();
-        let model = StabilityImageModel::from_parts(&client, "core");
+        let model =
+            StabilityImageModel::from_parts(&client, "core", crate::media::MediaOutput::Image);
         let err = model
             .media_request(&crate::media::MediaRequest {
                 prompt: "p".into(),
@@ -1644,6 +1950,171 @@ mod tests {
         assert!(msg.contains("nothing was generated"), "{msg}");
     }
 
+    // --- Stable Audio ----------------------------------------------------------------
+
+    fn audio_model(id: &str) -> StabilityImageModel {
+        let client = StabilityClient::new("k", "http://localhost", Duration::from_secs(1)).unwrap();
+        StabilityImageModel::from_parts(&client, id, crate::media::MediaOutput::Audio)
+    }
+
+    fn audio_req(op: Option<&str>) -> crate::media::MediaRequest {
+        crate::media::MediaRequest {
+            prompt: "rain on a tin roof".into(),
+            fields: Vec::new(),
+            inputs: Vec::new(),
+            op: op.map(str::to_string),
+        }
+    }
+
+    fn field<'a>(req: &'a StabilityRequest, name: &str) -> Option<&'a str> {
+        req.fields
+            .iter()
+            .rev()
+            .find(|(k, _)| k == name)
+            .map(|(_, v)| v.as_str())
+    }
+
+    /// **The slot's model id picks the route family, and the family decides the shape.**
+    /// 2 and 2.5 share the synchronous `stable-audio-2/*` routes; 3 has its own deferred
+    /// `stable-audio/*` routes. The `model` field is always sent, because the 2.x
+    /// provider default is 2.0 — leaving it out on a 2.5 slot would run the older model
+    /// and record the newer one.
+    #[test]
+    fn each_audio_model_routes_to_its_family_with_its_shape() {
+        for (id, path, shape) in [
+            (
+                "stable-audio-2.5",
+                "audio/stable-audio-2/text-to-audio",
+                Shape::Sync,
+            ),
+            (
+                "stable-audio-2",
+                "audio/stable-audio-2/text-to-audio",
+                Shape::Sync,
+            ),
+            (
+                "stable-audio-3",
+                "audio/stable-audio/text-to-audio",
+                Shape::Deferred,
+            ),
+        ] {
+            let (op, req) = audio_model(id).media_request(&audio_req(None)).unwrap();
+            assert_eq!(op.path(), path, "{id}");
+            assert_eq!(op.shape(), shape, "{id}");
+            assert_eq!(op.accept(), "audio/*", "{id}");
+            assert_eq!(field(&req, "model"), Some(id), "{id}");
+            assert_eq!(field(&req, "output_format"), Some("mp3"), "{id}");
+            assert_eq!(req.prompt.as_deref(), Some("rain on a tin roof"));
+        }
+    }
+
+    /// The image routes keep asking for `image/*`: the Accept value is per route.
+    #[test]
+    fn image_routes_still_accept_images() {
+        let client = StabilityClient::new("k", "http://localhost", Duration::from_secs(1)).unwrap();
+        let model =
+            StabilityImageModel::from_parts(&client, "core", crate::media::MediaOutput::Image);
+        let (op, _) = model.media_request(&audio_req(None)).unwrap();
+        assert_eq!(op.accept(), "image/*");
+        assert_eq!(op.path(), "stable-image/generate/core");
+    }
+
+    #[test]
+    fn audio_ops_route_to_their_endpoint() {
+        for (id, op_name, path) in [
+            (
+                "stable-audio-2.5",
+                "audio-to-audio",
+                "audio/stable-audio-2/audio-to-audio",
+            ),
+            (
+                "stable-audio-2.5",
+                "inpaint",
+                "audio/stable-audio-2/inpaint",
+            ),
+            (
+                "stable-audio-3",
+                "audio-to-audio",
+                "audio/stable-audio/audio-to-audio",
+            ),
+            ("stable-audio-3", "inpaint", "audio/stable-audio/inpaint"),
+            (
+                "stable-audio-3",
+                "text-to-audio",
+                "audio/stable-audio/text-to-audio",
+            ),
+        ] {
+            let (op, _) = audio_model(id)
+                .media_request(&audio_req(Some(op_name)))
+                .unwrap_or_else(|e| panic!("{id} {op_name}: {e}"));
+            assert_eq!(op.path(), path);
+        }
+    }
+
+    /// The 2.x `inpaint` route has no `model` field, so none is sent there — and on a
+    /// `stable-audio-2` slot it is refused, because it would run 2.5 and record 2.
+    #[test]
+    fn two_x_inpaint_sends_no_model_and_refuses_a_2_0_slot() {
+        let (_, req) = audio_model("stable-audio-2.5")
+            .media_request(&audio_req(Some("inpaint")))
+            .unwrap();
+        assert_eq!(field(&req, "model"), None, "{:?}", req.fields);
+        let err = audio_model("stable-audio-2")
+            .media_request(&audio_req(Some("inpaint")))
+            .expect_err("would record a model that did not run");
+        assert!(err.to_string().contains("stable-audio-2.5"), "{err}");
+    }
+
+    /// An unknown audio model refuses before any request, listing the ones that exist.
+    #[test]
+    fn an_unknown_audio_model_is_refused_with_the_real_ones() {
+        let err = audio_model("core")
+            .media_request(&audio_req(None))
+            .expect_err("core is an image route");
+        let msg = err.to_string();
+        for id in ["stable-audio-2.5", "stable-audio-2", "stable-audio-3"] {
+            assert!(msg.contains(id), "{msg}");
+        }
+        assert!(msg.contains("nothing was generated"), "{msg}");
+    }
+
+    /// An image operation named on an audio slot is refused, and the refusal lists the
+    /// audio operations rather than the image table.
+    #[test]
+    fn an_image_op_on_an_audio_slot_lists_the_audio_ops() {
+        let err = audio_model("stable-audio-2.5")
+            .media_request(&audio_req(Some("edit/inpaint")))
+            .expect_err("not an audio op");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("audio-to-audio") && msg.contains("inpaint"),
+            "{msg}"
+        );
+        assert!(
+            !msg.contains("upscale"),
+            "the image table is not offered: {msg}"
+        );
+    }
+
+    /// The caller's `output_format` replaces the seeded `mp3`, like every seeded field.
+    #[test]
+    fn a_caller_output_format_replaces_the_mp3_default() {
+        let mut r = audio_req(None);
+        r.fields = vec![(
+            "output_format".into(),
+            crate::media::FieldValue::Str("wav".into()),
+        )];
+        let (_, req) = audio_model("stable-audio-2.5").media_request(&r).unwrap();
+        assert_eq!(field(&req, "output_format"), Some("wav"));
+        assert_eq!(
+            req.fields
+                .iter()
+                .filter(|(k, _)| k == "output_format")
+                .count(),
+            1
+        );
+    }
+
     /// Typed neutral field values land on Stability's all-string multipart wire in
     /// their wire spelling — `seed = 42` (a caller number) becomes the text `42`,
     /// a bool becomes `true` — losslessly, since this wire was always text. The
@@ -1653,7 +2124,8 @@ mod tests {
     fn media_request_stringifies_typed_fields_for_the_form_wire() {
         use crate::media::FieldValue;
         let client = StabilityClient::new("k", "http://localhost", Duration::from_secs(1)).unwrap();
-        let model = StabilityImageModel::from_parts(&client, "core");
+        let model =
+            StabilityImageModel::from_parts(&client, "core", crate::media::MediaOutput::Image);
         let (_, req) = model
             .media_request(&crate::media::MediaRequest {
                 prompt: "p".to_string(),
@@ -1884,24 +2356,30 @@ mod tests {
         );
     }
 
-    /// Audio and 3D have no `cas::Extension` to land on yet — the mapping must refuse
-    /// loudly, naming the media type that was refused, rather than inventing an
-    /// extension or silently dropping the media family. See the module doc's
-    /// `MediaType` section for why this refusal is a deliberate feature.
+    /// Audio now lands on the CAS's own audio extensions; the family survives the
+    /// mapping, so an `mp3` is never stored as a `wav` or the reverse.
     #[test]
-    fn media_type_to_cas_extension_refuses_audio_and_3d() {
-        for media_type in [
-            MediaType::AudioMpeg,
-            MediaType::AudioWav,
-            MediaType::ModelGltfBinary,
-        ] {
-            let err = media_type.to_cas_extension().unwrap_err();
-            match err {
-                StabilityError::NoCasExtension { media_type: got } => {
-                    assert_eq!(got, media_type)
-                }
-                other => panic!("expected NoCasExtension for {media_type:?}, got {other:?}"),
-            }
+    fn media_type_to_cas_extension_maps_audio() {
+        assert_eq!(
+            MediaType::AudioMpeg.to_cas_extension(),
+            Ok(crate::cas::Extension::Mp3)
+        );
+        assert_eq!(
+            MediaType::AudioWav.to_cas_extension(),
+            Ok(crate::cas::Extension::Wav)
+        );
+    }
+
+    /// 3D has no `cas::Extension` to land on yet — the mapping must refuse loudly,
+    /// naming the media type that was refused, rather than inventing an extension or
+    /// silently dropping the media family. See the module doc's `MediaType` section for
+    /// why this refusal is a deliberate feature.
+    #[test]
+    fn media_type_to_cas_extension_refuses_3d() {
+        let media_type = MediaType::ModelGltfBinary;
+        match media_type.to_cas_extension().unwrap_err() {
+            StabilityError::NoCasExtension { media_type: got } => assert_eq!(got, media_type),
+            other => panic!("expected NoCasExtension for {media_type:?}, got {other:?}"),
         }
     }
 
@@ -2225,6 +2703,40 @@ mod tests {
             }
             PollOutcome::Pending => panic!("expected Complete, got Pending"),
         }
+    }
+
+    /// **`audio/results` omits `finish-reason` on success**, seen live on 2026-09-26: a
+    /// finished Stable Audio 3 job answered `audio/mpeg` with no `finish-reason` and no
+    /// `seed`. That route accepts the absence; a present non-`SUCCESS` value is still
+    /// refused there, and every other route still refuses the absence.
+    #[test]
+    fn audio_results_accept_a_missing_finish_reason_and_nothing_else_does() {
+        let body = b"ID3\x04\x00\x00\x00\x00bell";
+        match handle_audio_poll_response(200, Some("audio/mpeg"), None, None, body).unwrap() {
+            PollOutcome::Complete(a) => {
+                assert_eq!(a.media_type, MediaType::AudioMpeg);
+                assert_eq!(a.seed, None);
+            }
+            PollOutcome::Pending => panic!("a 200 is done"),
+        }
+        assert!(matches!(
+            handle_audio_poll_response(
+                200,
+                Some("audio/mpeg"),
+                Some("CONTENT_FILTERED"),
+                None,
+                body
+            ),
+            Err(StabilityError::NotSuccess { .. })
+        ));
+        assert!(matches!(
+            handle_poll_response(200, Some("audio/mpeg"), None, None, body),
+            Err(StabilityError::MissingFinishReason)
+        ));
+        assert!(matches!(
+            handle_response(Shape::Sync, 200, Some("audio/mpeg"), None, None, body),
+            Err(StabilityError::MissingFinishReason)
+        ));
     }
 
     /// The two-poll sequence a real caller drives itself (pending, then done) — proof

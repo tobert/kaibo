@@ -59,20 +59,21 @@
 //!   is itself a model, and a prompt-injected one asking kaibo to slurp `~/.ssh/id_rsa`
 //!   into the store and read it back is exactly the shape the boundary refuses.
 //! - **No `mime`.** The format is read out of the bytes' own magic number
-//!   ([`sniff_image`]), never asserted by the caller. A stated mime is a thing that can
+//!   ([`sniff_media`]), never asserted by the caller. A stated mime is a thing that can
 //!   be *wrong*: bytes stored under a lying extension make `read_cas` report a false
 //!   type and make every downstream [`Extension`] decision wrong, which is exactly the
 //!   silent corruption this codebase refuses. Deriving it means there is no parameter to
 //!   get wrong and no mismatch to detect.
 //!
-//! # Images only
+//! # Images and audio, never text
 //!
-//! [`sniff_image`] recognizes the four image containers the store can name, and refuses
-//! everything else. That mirrors `store_generated_artifacts`, which keys on
-//! [`Extension::is_image`] rather than "the store can name it" — the store also names the
-//! text formats `save_artifact` writes, and keeping the refusal tied to the media lane's
-//! own shape is what stops a widened [`Extension`] from quietly widening what the media
-//! tools accept.
+//! [`sniff_media`] recognizes the four image containers and the two audio containers the
+//! store can name, and refuses everything else. Audio joined on 2026-09-26 so a caller's
+//! own recording can feed Stability's `audio-to-audio` and `inpaint`. That mirrors
+//! `store_generated_artifacts`, which keys on the requested media family rather than "the
+//! store can name it" — the store also names the text formats `save_artifact` writes, and
+//! keeping the refusal tied to the media lane's own shapes is what stops a widened
+//! [`Extension`] from quietly widening what the media tools accept.
 
 use crate::cas::{Digest, Extension, MediaStore, Provenance};
 
@@ -90,48 +91,69 @@ pub const MAX_UPLOAD_BYTES: usize = 1 << 23;
 /// an unbounded one is payload no byte cap ever sees.
 pub const MAX_LABEL_BYTES: usize = 200;
 
-/// Every image container the store can name, with the byte signature that identifies it.
+/// Every container the store can name that has a single-prefix signature.
 ///
 /// A table rather than a `match` so the refusal message, the tool description, and the
 /// admission logic all render from the same list and cannot drift apart — the same
 /// argument `artifact::FORMATS` records.
 ///
-/// WebP is absent here because its signature is split (`RIFF` at 0, `WEBP` at 8) and does
-/// not fit a single-prefix table; [`sniff_image`] checks it separately.
+/// Three containers are absent because their signature is not one prefix, and
+/// [`sniff_media`] checks them separately: WebP and WAVE are both `RIFF` <u32 size> then
+/// `WEBP` or `WAVE` at byte 8, and an MP3 with no `ID3` tag starts at an MPEG frame header.
 const SIGNATURES: &[(&[u8], Extension)] = &[
     (b"\x89PNG\r\n\x1a\n", Extension::Png),
     (b"\xff\xd8\xff", Extension::Jpeg),
     (b"GIF87a", Extension::Gif),
     (b"GIF89a", Extension::Gif),
+    (b"ID3", Extension::Mp3),
 ];
 
 /// The format names this tool accepts, for a description or a refusal. Rendered from
-/// [`SIGNATURES`] plus WebP, so it cannot drift from what [`sniff_image`] admits.
+/// [`SIGNATURES`] plus the split-signature containers, so it cannot drift from what
+/// [`sniff_media`] admits.
 pub fn accepted_formats() -> Vec<&'static str> {
-    let mut names: Vec<&'static str> = SIGNATURES
+    SIGNATURES
         .iter()
-        .map(|(_, ext)| ext.as_str())
+        .map(|(_, ext)| *ext)
+        .chain([Extension::Webp, Extension::Wav])
+        .map(|ext| ext.as_str())
         .collect::<std::collections::BTreeSet<_>>()
         .into_iter()
-        .collect();
-    names.push(Extension::Webp.as_str());
-    names
+        .collect()
 }
 
-/// Identify an image container from its leading bytes.
+/// Whether two bytes are an MPEG audio **layer III** frame header: an 11-bit sync, a
+/// version other than the reserved `01`, and layer bits `01`. The layer check is what
+/// keeps AAC's ADTS header (`FF F1`, layer `00`) from being stored as an `mp3`, and the
+/// sync cannot match JPEG's `FF D8`.
+fn is_mp3_frame(bytes: &[u8]) -> bool {
+    match bytes {
+        [0xFF, b, ..] => b & 0xE0 == 0xE0 && b & 0x18 != 0x08 && b & 0x06 == 0x02,
+        _ => false,
+    }
+}
+
+/// Identify an image or audio container from its leading bytes.
 ///
 /// The format is a fact about the content, read from the content — never a claim the
 /// caller makes. Anything unrecognized is refused rather than stored under a guessed
 /// extension.
-pub fn sniff_image(bytes: &[u8]) -> Result<Extension, UploadError> {
+pub fn sniff_media(bytes: &[u8]) -> Result<Extension, UploadError> {
     for (signature, ext) in SIGNATURES {
         if bytes.starts_with(signature) {
             return Ok(*ext);
         }
     }
-    // WebP's signature straddles a 4-byte length field: `RIFF` <u32 size> `WEBP`.
-    if bytes.len() >= 12 && bytes.starts_with(b"RIFF") && &bytes[8..12] == b"WEBP" {
-        return Ok(Extension::Webp);
+    // WebP and WAVE straddle a 4-byte length field: `RIFF` <u32 size> `WEBP` | `WAVE`.
+    if bytes.len() >= 12 && bytes.starts_with(b"RIFF") {
+        match &bytes[8..12] {
+            b"WEBP" => return Ok(Extension::Webp),
+            b"WAVE" => return Ok(Extension::Wav),
+            _ => {}
+        }
+    }
+    if is_mp3_frame(bytes) {
+        return Ok(Extension::Mp3);
     }
     Err(UploadError::UnknownFormat {
         // Enough leading bytes to identify any container we might later add, and few
@@ -146,36 +168,36 @@ pub fn sniff_image(bytes: &[u8]) -> Result<Extension, UploadError> {
 #[derive(Debug, thiserror::Error)]
 pub enum UploadError {
     #[error(
-        "the upload is zero bytes. An upload stores an image, so there is nothing to \
-         store. Point `path` at an image file, or pass the image's bytes base64-encoded \
-         in `content`."
+        "the upload is zero bytes. An upload stores an image or audio file, so there is \
+         nothing to store. Point `path` at the file, or pass its bytes base64-encoded in \
+         `content`."
     )]
     Empty,
 
     #[error(
-        "`content` is not valid base64: {cause}. Encode the image's raw bytes as \
+        "`content` is not valid base64: {cause}. Encode the file's raw bytes as \
          standard base64 (padding included) and pass that string in `content`."
     )]
     BadBase64 { cause: String },
 
     #[error(
         "the upload is {actual} bytes, over the {cap}-byte cap. Nothing was stored. \
-         Reduce the image's resolution or re-encode it at a lower quality, then upload \
-         the smaller file."
+         Upload a smaller file: reduce an image's resolution or quality, or trim audio \
+         or re-encode it as mp3."
     )]
     TooLarge { cap: usize, actual: usize },
 
     #[error(
-        "these bytes do not begin with a recognized image signature (first bytes: \
-         {head:02x?}). kaibo's media store holds images: {}. Upload one of those \
-         formats, or convert this file to one first.",
+        "these bytes do not begin with a recognized image or audio signature (first \
+         bytes: {head:02x?}). kaibo's media store holds images and audio: {}. Upload \
+         one of those formats, or convert this file to one first.",
         Self::formats()
     )]
     UnknownFormat { head: Vec<u8> },
 
     #[error(
         "`label` is {actual} bytes, over the {cap}-byte cap, or carries a control \
-         character. Nothing was stored. Pass a single short line describing the image."
+         character. Nothing was stored. Pass a single short line describing the file."
     )]
     BadLabel { cap: usize, actual: usize },
 
@@ -197,8 +219,8 @@ pub enum UploadError {
 fn sanitize_store_error(e: &crate::cas::CasError) -> &'static str {
     match e {
         crate::cas::CasError::CapacityExceeded { .. } => {
-            "kaibo's media store has no room for this image, so nothing was stored. A \
-             smaller image may still fit."
+            "kaibo's media store has no room for this file, so nothing was stored. A \
+             smaller file may still fit."
         }
         _ => "kaibo's media store refused this write, so nothing was stored.",
     }
@@ -206,7 +228,7 @@ fn sanitize_store_error(e: &crate::cas::CasError) -> &'static str {
 
 impl UploadError {
     /// The accepted-format list, injected into [`UploadError::UnknownFormat`]'s message
-    /// at render time so the refusal and [`sniff_image`] cannot disagree about what is
+    /// at render time so the refusal and [`sniff_media`] cannot disagree about what is
     /// admitted.
     fn formats() -> String {
         accepted_formats().join(", ")
@@ -275,7 +297,7 @@ pub fn store_upload(
     store_bytes(store, &bytes, label, timestamp)
 }
 
-/// Identify and store one image's bytes, however they arrived.
+/// Identify and store one image or audio file's bytes, however they arrived.
 ///
 /// The single admission point both routes share, so `path` and `content` cannot drift
 /// apart on what they accept. Every check runs **before** the store is touched, so a
@@ -297,7 +319,7 @@ pub fn store_bytes(
             actual: bytes.len(),
         });
     }
-    let ext = sniff_image(bytes)?;
+    let ext = sniff_media(bytes)?;
 
     let provenance = Provenance {
         // A client uploaded these bytes. No prompt produced them, no model rendered
@@ -371,7 +393,7 @@ mod tests {
     use super::*;
 
     /// The smallest byte strings that carry each container's signature. Not valid
-    /// images — `sniff_image` reads the signature and nothing else, which is the point:
+    /// images — `sniff_media` reads the signature and nothing else, which is the point:
     /// kaibo names the container, it does not validate the pixels.
     fn png() -> Vec<u8> {
         b"\x89PNG\r\n\x1a\n".to_vec()
@@ -388,19 +410,19 @@ mod tests {
 
     #[test]
     fn sniff_identifies_every_accepted_container() {
-        assert_eq!(sniff_image(&png()).unwrap(), Extension::Png);
-        assert_eq!(sniff_image(&jpeg()).unwrap(), Extension::Jpeg);
-        assert_eq!(sniff_image(&webp()).unwrap(), Extension::Webp);
-        assert_eq!(sniff_image(b"GIF87a").unwrap(), Extension::Gif);
-        assert_eq!(sniff_image(b"GIF89a").unwrap(), Extension::Gif);
+        assert_eq!(sniff_media(&png()).unwrap(), Extension::Png);
+        assert_eq!(sniff_media(&jpeg()).unwrap(), Extension::Jpeg);
+        assert_eq!(sniff_media(&webp()).unwrap(), Extension::Webp);
+        assert_eq!(sniff_media(b"GIF87a").unwrap(), Extension::Gif);
+        assert_eq!(sniff_media(b"GIF89a").unwrap(), Extension::Gif);
     }
 
     #[test]
     fn sniff_refuses_text_and_names_what_it_accepts() {
-        let err = sniff_image(b"# a markdown file\n").unwrap_err();
+        let err = sniff_media(b"# a markdown file\n").unwrap_err();
         let msg = err.to_string();
         assert!(
-            msg.contains("recognized image signature"),
+            msg.contains("recognized image or audio signature"),
             "refusal should name the check that failed: {msg}"
         );
         for format in accepted_formats() {
@@ -411,35 +433,60 @@ mod tests {
         }
     }
 
-    /// The truncated-WebP case: `RIFF` alone is a container family, not a WebP, and
-    /// admitting it on the prefix would store an audio or video RIFF as an image.
+    /// `RIFF` alone is a container family: WebP and WAVE are admitted by the form type at
+    /// byte 8, and any other RIFF (an AVI here) is refused rather than stored as either.
     #[test]
-    fn sniff_refuses_a_riff_that_is_not_a_webp() {
-        let mut wave = b"RIFF".to_vec();
-        wave.extend_from_slice(&[0, 0, 0, 0]);
-        wave.extend_from_slice(b"WAVE");
-        assert!(sniff_image(&wave).is_err());
+    fn sniff_reads_the_riff_form_type() {
+        let riff = |form: &[u8]| {
+            let mut b = b"RIFF".to_vec();
+            b.extend_from_slice(&[0, 0, 0, 0]);
+            b.extend_from_slice(form);
+            b
+        };
+        assert_eq!(sniff_media(&riff(b"WAVE")).unwrap(), Extension::Wav);
+        assert_eq!(sniff_media(&riff(b"WEBP")).unwrap(), Extension::Webp);
+        assert!(sniff_media(&riff(b"AVI ")).is_err());
         // And a RIFF too short to carry the second half of the signature.
-        assert!(sniff_image(b"RIFF").is_err());
+        assert!(sniff_media(b"RIFF").is_err());
+    }
+
+    /// An MP3 is admitted by its ID3 tag or, untagged, by a layer III frame header. AAC's
+    /// ADTS header shares the sync bits and differs in the layer, so it is refused rather
+    /// than stored as an `mp3`.
+    #[test]
+    fn sniff_admits_mp3_and_refuses_aac() {
+        assert_eq!(sniff_media(b"ID3\x04\x00\x00").unwrap(), Extension::Mp3);
+        for header in [[0xFF, 0xFB], [0xFF, 0xF3], [0xFF, 0xE3]] {
+            assert_eq!(
+                sniff_media(&header).unwrap(),
+                Extension::Mp3,
+                "{header:02x?}"
+            );
+        }
+        for not_mp3 in [[0xFF, 0xF1], [0xFF, 0xF9], [0xFF, 0xEB]] {
+            assert!(sniff_media(&not_mp3).is_err(), "{not_mp3:02x?}");
+        }
     }
 
     #[test]
     fn sniff_refuses_a_prefix_too_short_to_identify() {
-        assert!(sniff_image(b"\x89PN").is_err());
-        assert!(sniff_image(b"").is_err());
+        assert!(sniff_media(b"\x89PN").is_err());
+        assert!(sniff_media(b"").is_err());
     }
 
     #[test]
-    fn accepted_formats_covers_every_signature_and_webp() {
+    fn accepted_formats_covers_every_signature_and_the_split_ones() {
         let names = accepted_formats();
         for (_, ext) in SIGNATURES {
             assert!(
                 names.contains(&ext.as_str()),
-                "{} is admitted by sniff_image but missing from accepted_formats",
+                "{} is admitted by sniff_media but missing from accepted_formats",
                 ext.as_str()
             );
         }
-        assert!(names.contains(&Extension::Webp.as_str()));
+        for ext in [Extension::Webp, Extension::Wav, Extension::Mp3] {
+            assert!(names.contains(&ext.as_str()), "{}", ext.as_str());
+        }
     }
 
     #[test]

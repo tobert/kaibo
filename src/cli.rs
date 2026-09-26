@@ -139,8 +139,8 @@ pub enum Command {
     Kaish(KaishArgs),
     /// Provider batch lanes — submit many prompts at once, collect results, list handles.
     Batch(BatchArgs),
-    /// Generate an image into kaibo's artifact store and print the digest that reads it
-    /// back.
+    /// Generate an image or audio into kaibo's artifact store and print the digest that
+    /// reads it back.
     Generate(GenerateCliArgs),
     /// Read an artifact kaibo stored, by its digest.
     Cas(CasArgs),
@@ -523,22 +523,28 @@ pub struct KaishArgs {
     pub json: bool,
 }
 
-/// `kaibo generate` — render an image through the cast's `image` slot into kaibo's own
-/// artifact store, and print the digest that reads it back.
+/// `kaibo generate` — render an image or audio through the cast's `image` or `audio` slot
+/// into kaibo's own artifact store, and print the digest that reads it back.
 ///
 /// Never writes into your project: the address is the content's hash and the store is
 /// kaibo's, which is the same contract the MCP tool holds. `kaibo cas read <digest>`
 /// fetches it, and in disk mode the printed path reaches it with any tool you like.
 #[derive(Args, Debug)]
 pub struct GenerateCliArgs {
-    /// What to generate, described in prose.
+    /// What to generate, described in prose. For speech, the words to speak; a direction
+    /// in front sets the delivery ("Say warmly: good morning").
     pub prompt: String,
+
+    /// Which of the cast's media slots runs: `image`, or `audio` (Gemini: speech;
+    /// Stability: music and sound effects).
+    #[arg(long, value_enum, default_value_t = crate::media::MediaOutput::Image)]
+    pub media: crate::media::MediaOutput,
 
     /// A provider-native option, `key=value`, passed through verbatim. Repeatable. The
     /// value is read as JSON when it parses as one, so `--field n=2` sends a number and
     /// `--field transparent=true` a boolean; anything else rides as a string
     /// (`--field size=1024x1024`). The provider validates its own knobs. `prompt` and
-    /// `model` are reserved — use the argument and the cast's image slot.
+    /// `model` are reserved — use the argument and the cast's media slot.
     #[arg(long = "field", value_name = "KEY=VALUE", action = clap::ArgAction::Append)]
     pub fields: Vec<String>,
 
@@ -547,7 +553,7 @@ pub struct GenerateCliArgs {
     pub json: bool,
 }
 
-/// `kaibo cas` — store an image, and read back what kaibo stored, by address.
+/// `kaibo cas` — store an image or audio file, and read back what kaibo stored, by address.
 ///
 /// `read` and `write` are the only verbs, on purpose. The store is content-addressed and
 /// opaque: you reach an object with a digest you already hold, and storing one is how you
@@ -565,7 +571,7 @@ pub struct CasArgs {
 pub enum CasCmd {
     /// Read one artifact by digest — metadata first, then a bounded window of content.
     Read(CasReadArgs),
-    /// Store an image file and print its digest.
+    /// Store an image or audio file and print its digest.
     Write(CasWriteArgs),
 }
 
@@ -594,9 +600,9 @@ pub struct CasReadArgs {
     pub json: bool,
 }
 
-/// `kaibo cas write` — store an image and print its digest. The command-line half of the
-/// `write_cas` MCP tool, and the same admission rules: the format is read from the bytes,
-/// and an image over 8388608 bytes is refused rather than trimmed.
+/// `kaibo cas write` — store an image or audio file and print its digest. The command-line
+/// half of the `write_cas` MCP tool, and the same admission rules: the format is read from
+/// the bytes, and a file over 8388608 bytes is refused rather than trimmed.
 ///
 /// There is no base64 input here and no allowed-set check on the path. Both differ from
 /// the MCP tool deliberately, and the path one deserves its reason stated plainly, because
@@ -609,11 +615,11 @@ pub struct CasReadArgs {
 /// hold an image that was never a file, and a shell user has a path.
 #[derive(Args, Debug)]
 pub struct CasWriteArgs {
-    /// The image file to store. png, jpeg, gif or webp — the format is read from the
+    /// The file to store: png, jpeg, gif, webp, mp3 or wav. The format is read from the
     /// file's own bytes, so there is nothing to declare and nothing to get wrong.
     pub path: PathBuf,
 
-    /// One short line describing the image, recorded beside it and shown by
+    /// One short line describing the file, recorded beside it and shown by
     /// `kaibo cas read`. At most 200 bytes, single-line.
     #[arg(long, value_name = "TEXT")]
     pub label: Option<String>,
@@ -2051,14 +2057,16 @@ async fn generate_inner(
     let cast = resolver
         .resolve_cast(common.cast.clone())
         .map_err(SetupError::usage)?;
-    let slot = cast.slot(ModelRole::Image).ok_or_else(|| SetupError {
+    let output = args.media;
+    let media = output.key();
+    let slot = cast.slot(output.role()).ok_or_else(|| SetupError {
         kind: "usage",
         message: format!(
-            "cast `{}` has no `image` slot — `generate` needs a cast whose `image` slot \
-             points at a media backend (kind {}). `kaibo config` lists the configured \
-             casts and their slots.",
+            "cast `{}` has no `{media}` slot, so it cannot generate {media}. Pick a cast \
+             whose `{media}` slot points at a media backend (kind {}); `kaibo config` \
+             lists the configured casts and their slots.",
             cast.name,
-            crate::credentials::media_kinds_list(),
+            crate::credentials::media_kinds_producing(Some(output)),
         ),
         code: EXIT_USAGE,
     })?;
@@ -2072,11 +2080,12 @@ async fn generate_inner(
         })?;
     // Building the arm resolves the provider key — a missing one is the operator's setup
     // gap, named with the cast and slot.
-    let arm = crate::media::MediaArmFactory::build(&crate::media::LiveMediaArms, backend, slot)
-        .map_err(|e| SetupError {
+    let arm =
+        crate::media::MediaArmFactory::build(&crate::media::LiveMediaArms, backend, slot, output)
+            .map_err(|e| SetupError {
             kind: "setup",
             message: format!(
-                "`generate` cannot use cast `{}`: its `image` slot did not build — {e:#}",
+                "`generate` cannot use cast `{}`: its `{media}` slot did not build — {e:#}",
                 cast.name
             ),
             code: EXIT_SETUP,
@@ -2084,6 +2093,29 @@ async fn generate_inner(
     let mut fields = Vec::with_capacity(args.fields.len());
     for raw in &args.fields {
         fields.push(parse_generate_field(raw)?);
+    }
+    // Reserved, as the MCP tool reserves them: recorded provenance must describe the
+    // request that ran. `prompt` would send one prompt while the sidecar records the
+    // argument, and `model` would reroute the call (Stability's `model` form field picks
+    // the SD3.5 variant or the Stable Audio model) while the sidecar records the slot.
+    for (key, param) in [
+        ("prompt", "the PROMPT argument"),
+        (
+            "model",
+            "the cast's media slot, whose model id picks the provider model",
+        ),
+    ] {
+        if fields.iter().any(|(name, _)| name == key) {
+            return Err(SetupError {
+                kind: "usage",
+                message: format!(
+                    "`--field {key}` is reserved, so nothing was generated: it would make the \
+                     recorded provenance disagree with the request that ran. Set it through \
+                     {param} instead."
+                ),
+                code: EXIT_USAGE,
+            });
+        }
     }
     // The store settles the same way it does on the MCP road, and an artifact with
     // nowhere to land is refused before a provider is paid.
@@ -2127,7 +2159,7 @@ async fn generate_inner(
         crate::media::MediaOutcome::Deferred(job) => {
             eprintln!(
                 "kaibo: the provider is rendering in the background — this process waits \
-                 for it (cast `{}`, image `{}`).",
+                 for it (cast `{}`, {media} `{}`).",
                 cast.name,
                 arm.slot_ref()
             );
@@ -2155,7 +2187,16 @@ async fn generate_inner(
                         }
                         tokio::time::sleep(crate::server::GENERATE_POLL_INTERVAL).await;
                     }
-                    Err(e) => return Ok(fail_consultation(args.json, "generate", &cast.name, e)),
+                    // The id is the only way back to a result the provider may still
+                    // hold and has already charged for, so it rides the error.
+                    Err(e) => {
+                        return Ok(fail_consultation(
+                            args.json,
+                            "generate",
+                            &cast.name,
+                            e.context(format!("collecting provider job `{}`", job.0)),
+                        ))
+                    }
                 }
             }
         }
@@ -2163,6 +2204,7 @@ async fn generate_inner(
     let text = match crate::server::store_generated_artifacts(
         &store,
         &artifacts,
+        output,
         &args.prompt,
         arm.slot_ref(),
         &cast.name,
@@ -2171,14 +2213,11 @@ async fn generate_inner(
         Err(e) => return Ok(fail_consultation(args.json, "generate", &cast.name, e)),
     };
     if args.json {
-        println!(
-            "{}",
-            serde_json::json!({
-                "result": text,
-                "cast": cast.name,
-                "image": arm.slot_ref(),
-            })
-        );
+        // The slot's model rides under the slot's own name (`image` or `audio`), the
+        // key an image-only envelope has always carried.
+        let mut envelope = serde_json::json!({ "result": text, "cast": cast.name });
+        envelope[media] = serde_json::json!(arm.slot_ref());
+        println!("{envelope}");
     } else {
         println!("{text}");
     }
@@ -3746,6 +3785,80 @@ mod tests {
         );
     }
 
+    /// `--media audio` on a cast with no `audio` slot is refused the same way, naming the
+    /// audio slot and the kinds that can staff it.
+    #[tokio::test]
+    async fn generate_audio_on_a_cast_without_an_audio_slot_is_a_usage_error_exit_2() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config::builtin();
+        config.root = Some(dir.path().to_path_buf());
+        let resolver = Resolver::from_config(Arc::new(config)).unwrap();
+
+        let cli = Cli::parse_from([
+            "kaibo", "generate", "hello", "--media", "audio", "--cast", "deepseek",
+        ]);
+        let common = cli.common.clone();
+        let args = match cli.command {
+            Some(Command::Generate(g)) => g,
+            other => panic!("expected generate, got {other:?}"),
+        };
+        let err = generate_inner(&common, &args, &resolver)
+            .await
+            .expect_err("a cast with no audio slot must be refused");
+        assert_eq!(err.code, EXIT_USAGE);
+        assert!(
+            err.message.contains("`audio` slot") && err.message.contains("`gemini-media`"),
+            "{}",
+            err.message
+        );
+    }
+
+    /// **`--field prompt=` and `--field model=` are refused, as the MCP tool refuses
+    /// them.** Either would send one thing while the provenance sidecar records another:
+    /// a Stability audio slot's model is chosen by the `model` form field, so
+    /// `--field model=stable-audio-2` on a `stable-audio-2.5` slot would run 2 and record
+    /// 2.5. Refused before any store is opened or request sent.
+    #[tokio::test]
+    async fn generate_refuses_reserved_field_keys_exit_2() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config::from_toml_str(
+            r#"
+            [backends.sd]
+            kind = "stability"
+            key_optional = true
+
+            [casts.foley]
+            audio = "sd/stable-audio-2.5"
+            "#,
+        )
+        .unwrap();
+        config.root = Some(dir.path().to_path_buf());
+        let resolver = Resolver::from_config(Arc::new(config)).unwrap();
+
+        for field in ["model=stable-audio-2", "prompt=something else"] {
+            let cli = Cli::parse_from([
+                "kaibo", "generate", "rain", "--media", "audio", "--cast", "foley", "--field",
+                field,
+            ]);
+            let common = cli.common.clone();
+            let args = match cli.command {
+                Some(Command::Generate(g)) => g,
+                other => panic!("expected generate, got {other:?}"),
+            };
+            let err = generate_inner(&common, &args, &resolver)
+                .await
+                .expect_err("a reserved field must be refused");
+            let key = field.split('=').next().unwrap();
+            assert_eq!(err.code, EXIT_USAGE, "{field}");
+            assert!(
+                err.message.contains(&format!("`--field {key}`"))
+                    && err.message.contains("reserved"),
+                "{}",
+                err.message
+            );
+        }
+    }
+
     /// A real read, end to end: a disk-mode store, an object put in it, and the digest
     /// read back through the command — the path that reaches `plan` and then writes to
     /// stdout. Everything else here stops at a refusal, so without this the byte-serving
@@ -3818,7 +3931,7 @@ mod tests {
         assert_eq!(err.code, EXIT_USAGE);
     }
 
-    /// A minimal but real PNG header — a true signature, so `sniff_image` is not being
+    /// A minimal but real PNG header — a true signature, so `sniff_media` is not being
     /// fed a lie the way a fixture of arbitrary bytes would be.
     #[cfg(test)]
     fn png_file_bytes() -> Vec<u8> {

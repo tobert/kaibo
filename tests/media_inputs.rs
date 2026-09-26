@@ -23,7 +23,7 @@
 use kaibo::cas::{Cas, Digest, Extension, MediaStore, Provenance};
 use kaibo::media::{
     refuse_binary_inputs, resolve_inputs, MediaArm, MediaInput, MediaJobId, MediaModel,
-    MediaOutcome, MediaPollOutcome, MediaRequest,
+    MediaOutcome, MediaOutput, MediaPollOutcome, MediaRequest,
 };
 use tempfile::TempDir;
 
@@ -134,19 +134,32 @@ fn a_digest_the_store_does_not_hold_is_refused_with_the_way_in() {
 }
 
 /// The store also names the text formats `save_artifact` writes. An input part is an
-/// image, and keeping the refusal keyed to that is what stops a widened `Extension` from
-/// quietly widening what the media lane accepts.
+/// image or audio, and keeping the refusal keyed to the media families is what stops a
+/// widened `Extension` from quietly widening what the media lane accepts.
 #[test]
-fn a_stored_object_that_is_not_an_image_is_refused_as_an_input() {
+fn a_stored_object_that_is_not_media_is_refused_as_an_input() {
     let (store, _d) = store();
     let text = put(&store, b"a corpus of shell commands", Extension::Txt);
-    let err = resolve_inputs(&store, &asked(&[("image", &text)])).expect_err("not an image");
+    let err = resolve_inputs(&store, &asked(&[("image", &text)])).expect_err("not media");
     let msg = format!("{err:#}");
-    assert!(msg.contains("not an image"), "{msg}");
+    assert!(msg.contains("an image or audio"), "{msg}");
     assert!(
         msg.contains("text/plain"),
         "names what it actually is: {msg}"
     );
+}
+
+/// Audio is an input too: Stability's audio-to-audio and inpaint routes take an `audio`
+/// part, so a stored WAVE file resolves with its own name and type.
+#[test]
+fn a_stored_audio_object_resolves_as_an_input() {
+    let (store, _d) = store();
+    let digest = put(&store, b"RIFF\x24\x00\x00\x00WAVEfmt ", Extension::Wav);
+    let parts = resolve_inputs(&store, &asked(&[("audio", &digest)])).expect("audio resolves");
+    assert_eq!(parts.len(), 1);
+    assert_eq!(parts[0].field, "audio");
+    assert_eq!(parts[0].filename, "audio.wav");
+    assert_eq!(parts[0].mime, "audio/wav");
 }
 
 /// **The dangerous direction, pinned.** A provider with no input-image route must refuse.
@@ -159,7 +172,8 @@ fn a_provider_without_an_input_route_refuses_rather_than_dropping() {
         MediaInput::new("image", Extension::Png, b"photo".to_vec()),
         MediaInput::new("mask", Extension::Png, b"mask".to_vec()),
     ]);
-    let err = refuse_binary_inputs(&request, "dashscope/wan2.2").expect_err("no route for inputs");
+    let err = refuse_binary_inputs(&request, "dashscope/wan2.2", MediaOutput::Image)
+        .expect_err("no route for inputs");
     let msg = format!("{err:#}");
     assert!(msg.contains("dashscope/wan2.2"), "names the backend: {msg}");
     assert!(
@@ -172,11 +186,50 @@ fn a_provider_without_an_input_route_refuses_rather_than_dropping() {
     );
 }
 
+/// **An audio call is told about its own slot.** A speech model takes no input, and the
+/// refusal must say to drop `inputs` or fix the `audio` slot — never point a speech
+/// caller at its `image` slot.
+#[test]
+fn an_audio_refusal_names_the_audio_slot_not_the_image_one() {
+    let request = request_with(vec![MediaInput::new(
+        "audio",
+        Extension::Wav,
+        b"RIFF".to_vec(),
+    )]);
+    let msg = format!(
+        "{:#}",
+        refuse_binary_inputs(&request, "gmedia/gemini-3.8-flash-tts", MediaOutput::Audio)
+            .expect_err("speech takes no input")
+    );
+    assert!(
+        msg.contains("`audio` slot") && msg.contains("Drop `inputs`"),
+        "{msg}"
+    );
+    assert!(!msg.contains("image"), "{msg}");
+
+    let mut with_op = request_with(Vec::new());
+    with_op.op = Some("inpaint".into());
+    let msg = format!(
+        "{:#}",
+        kaibo::media::refuse_operation(&with_op, "gmedia/tts", MediaOutput::Audio)
+            .expect_err("no audio ops")
+    );
+    assert!(
+        msg.contains("`audio` slot") && !msg.contains("`image`"),
+        "{msg}"
+    );
+}
+
 /// The same guard must not fire on an ordinary text-to-image call — otherwise it would
 /// break every provider that has no input route and never needed one.
 #[test]
 fn a_request_with_no_binary_parts_passes_the_guard() {
-    assert!(refuse_binary_inputs(&request_with(Vec::new()), "dashscope/wan2.2").is_ok());
+    assert!(refuse_binary_inputs(
+        &request_with(Vec::new()),
+        "dashscope/wan2.2",
+        MediaOutput::Image
+    )
+    .is_ok());
 }
 
 /// `MediaInput::new` builds the wire filename from the field name and the store's
@@ -357,8 +410,12 @@ fn an_unknown_operation_name_is_refused_with_the_wired_list() {
 /// text-to-image render for an inpaint request.
 #[test]
 fn a_provider_without_an_operation_vocabulary_refuses_a_named_op() {
-    let err = refuse_operation(&request_with_op("edit/inpaint"), "dashscope/wan2.2")
-        .expect_err("no vocabulary");
+    let err = refuse_operation(
+        &request_with_op("edit/inpaint"),
+        "dashscope/wan2.2",
+        MediaOutput::Image,
+    )
+    .expect_err("no vocabulary");
     let msg = format!("{err:#}");
     assert!(
         msg.contains("edit/inpaint"),
@@ -370,7 +427,12 @@ fn a_provider_without_an_operation_vocabulary_refuses_a_named_op() {
 
 #[test]
 fn a_request_with_no_op_passes_the_guard() {
-    assert!(refuse_operation(&request_with(Vec::new()), "dashscope/wan2.2").is_ok());
+    assert!(refuse_operation(
+        &request_with(Vec::new()),
+        "dashscope/wan2.2",
+        MediaOutput::Image
+    )
+    .is_ok());
 }
 
 /// And the arm enforces it at the single dispatch point, the same place the inputs guard

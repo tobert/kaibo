@@ -325,11 +325,12 @@ impl Digest {
 /// for the rest of the path. Extend this list as new producers/formats land; never
 /// widen it to `String`.
 ///
-/// The image variants come from `generate` (a provider rendered them); the text
-/// variants come from `save_artifact` (a model on kaibo's own team authored them).
-/// [`Extension::is_image`] tells them apart, which is what keeps `generate`'s "an
-/// images provider returned something that is not an image" refusal exactly as loud as
-/// it was when this enum held images alone.
+/// Three families, and every variant belongs to exactly one. The image and audio
+/// variants come from `generate` (a provider rendered them); the text variants come
+/// from `save_artifact` (a model on kaibo's own team authored them).
+/// [`Extension::is_image`] and [`Extension::is_audio`] tell them apart, which is what
+/// keeps `generate`'s "the provider returned something other than what was asked for"
+/// refusal exactly as loud as it was when this enum held images alone.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Extension {
     Png,
@@ -342,13 +343,19 @@ pub enum Extension {
     Jsonl,
     /// Markdown: the shape a model naturally writes a report in.
     Md,
+    /// MPEG audio layer III — what Stability's audio routes return by default.
+    Mp3,
+    /// RIFF/WAVE audio. Gemini's speech models return raw PCM, which kaibo wraps in a
+    /// WAVE header before storing (see `crate::gemini_media`), so the object on disk is
+    /// always a playable file.
+    Wav,
 }
 
 impl Extension {
     /// Every variant, in the order [`Cas::entry_for`] probes them when an object has no
     /// readable provenance sidecar to name its format. The sidecar is the authority;
     /// this order only decides the answer for an object that lost one.
-    pub const ALL: [Extension; 7] = [
+    pub const ALL: [Extension; 9] = [
         Extension::Png,
         Extension::Jpeg,
         Extension::Webp,
@@ -356,6 +363,8 @@ impl Extension {
         Extension::Txt,
         Extension::Jsonl,
         Extension::Md,
+        Extension::Mp3,
+        Extension::Wav,
     ];
 
     /// The bare filename extension (no leading dot).
@@ -368,6 +377,8 @@ impl Extension {
             Extension::Txt => "txt",
             Extension::Jsonl => "jsonl",
             Extension::Md => "md",
+            Extension::Mp3 => "mp3",
+            Extension::Wav => "wav",
         }
     }
 
@@ -384,6 +395,8 @@ impl Extension {
             Extension::Txt => "text/plain; charset=utf-8",
             Extension::Jsonl => "application/jsonl",
             Extension::Md => "text/markdown; charset=utf-8",
+            Extension::Mp3 => "audio/mpeg",
+            Extension::Wav => "audio/wav",
         }
     }
 
@@ -395,19 +408,42 @@ impl Extension {
     pub fn is_image(&self) -> bool {
         match self {
             Extension::Png | Extension::Jpeg | Extension::Webp | Extension::Gif => true,
-            Extension::Txt | Extension::Jsonl | Extension::Md => false,
+            Extension::Txt | Extension::Jsonl | Extension::Md | Extension::Mp3 | Extension::Wav => {
+                false
+            }
+        }
+    }
+
+    /// Is this rendered audio (a `generate` output from an `audio` slot)? The audio
+    /// counterpart of [`is_image`](Self::is_image), and prevalidated the same way: an
+    /// audio slot's provider handing back an image or text is refused, not stored.
+    pub fn is_audio(&self) -> bool {
+        match self {
+            Extension::Mp3 | Extension::Wav => true,
+            Extension::Png
+            | Extension::Jpeg
+            | Extension::Webp
+            | Extension::Gif
+            | Extension::Txt
+            | Extension::Jsonl
+            | Extension::Md => false,
         }
     }
 
     /// Should retrieval serve this format as a **string** rather than base64? The
     /// producers mark what they make — `save_artifact` writes these formats from UTF-8
-    /// input, `generate` writes images — and this is where retrieval reads the mark.
-    /// Deliberately not `!is_image()`: a future format (audio, an archive) is neither
-    /// an image nor text, so each new variant must answer both questions on its own.
+    /// input, `generate` writes images and audio — and this is where retrieval reads the mark.
+    /// Deliberately not `!is_image()`: audio is neither an image nor text, and so would
+    /// any later format be, so each variant answers every family question on its own.
     pub fn is_textual(&self) -> bool {
         match self {
             Extension::Txt | Extension::Jsonl | Extension::Md => true,
-            Extension::Png | Extension::Jpeg | Extension::Webp | Extension::Gif => false,
+            Extension::Png
+            | Extension::Jpeg
+            | Extension::Webp
+            | Extension::Gif
+            | Extension::Mp3
+            | Extension::Wav => false,
         }
     }
 
@@ -434,6 +470,11 @@ impl Extension {
             | "application/x-ndjson"
             | "application/jsonlines"
             | "application/x-jsonlines" => Some(Extension::Jsonl),
+            // `audio/mpeg` is the registered name; `audio/mp3` is common in the wild.
+            "audio/mpeg" | "audio/mp3" => Some(Extension::Mp3),
+            // WAVE never settled on one registered name, so every spelling seen from
+            // providers and browsers is accepted; `audio/wav` is what kaibo renders.
+            "audio/wav" | "audio/x-wav" | "audio/wave" | "audio/vnd.wave" => Some(Extension::Wav),
             _ => None,
         }
     }

@@ -498,18 +498,20 @@ code + stdout + stderr. For an agent that already has a shell tool, this mostly 
 *safety* — writes and external commands are refused, so exploration leaves nothing to
 review: there's no diff, because nothing it runs can change your tree.
 
-### `generate` — images through the cast's media member
+### `generate` — images and audio through the cast's media members
 
 kaibo's first artifact-*producing* tool: a text prompt in, generated images out —
 through a cast's `image` slot. Image generation spans Stability's v2beta family and
 OpenAI-compatible image endpoints (hosted gpt-image, or a local stable-diffusion.cpp
-`sd-server` speaking the same `/v1/images/generations` shape). The bytes never inline into
+`sd-server` speaking the same `/v1/images/generations` shape). With `media = "audio"`
+the same tool runs the cast's `audio` slot instead: Gemini text-to-speech, or Stability's
+Stable Audio for music and sound effects. The bytes never inline into
 your context: each artifact lands in kaibo's content-addressed media store with a
 provenance sidecar (prompt, model, cast, seed), and the result lists per-artifact
 digests as `kaibo://cas/<digest>` addresses — plus the real file path when the store is
 on disk. Fetch one with the `read_cas` tool: metadata first, bounded reads (text pages by
 `offset`, an image up to 5 MiB comes back viewable), and never a wall of base64 you didn't
-ask for. Advertised only when a configured cast carries an `image` slot and
+ask for. Advertised only when a configured cast carries an `image` or `audio` slot and
 the `[cas]` store is on; the project stays untouched — the store lives at a fixed XDG
 data path the model can't steer. See "Media CAS" in [`docs/config.md`](docs/config.md).
 
@@ -528,13 +530,13 @@ config has three concepts for configuring models:
 
 - **backend** — a *connection*: which wire protocol (the completion kinds `anthropic`
   | `deepseek` | `gemini` | `openrouter` | `openai`, or the media kinds `stability` |
-  `openai-images` | `gemini-images` | `dashscope` | `bfl` behind the `image` role), base URL, and where its key
+  `openai-images` | `gemini-media` | `dashscope` | `bfl` behind the `image` and `audio` roles), base URL, and where its key
   comes from.
   Secrets never live in the TOML — only the *name* of an env var or the path to a key
   file. `openrouter` is a keyed gateway with a fixed endpoint — one key reaching every
   major model family, reasoning on by default via its unified `effort` param.
 - **role** — a *job* a model does: `explorer` (fast surveys), `synth` (the voice that
-  answers), and `image` (the media member behind `generate`). A reasoning slot that
+  answers), and `image` and `audio` (the media members behind `generate`). A reasoning slot that
   reads images carries a `vision` pin (see [`docs/casts.md`](docs/casts.md)).
 - **cast** — a *composition*: a named team assigning models to roles. The `cast` call
   argument selects the ensemble; the calling agent sees these names in its tool listing,

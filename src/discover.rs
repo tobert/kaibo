@@ -158,7 +158,7 @@ pub fn discovery_endpoint_page(backend: &Backend, cursor: Option<&str>) -> Resul
             ) => "the endpoint's own model names, e.g. gpt-image-1 hosted or whatever a \
                   local sd-server has loaded",
             crate::credentials::ProviderClass::Media(
-                crate::credentials::MediaKind::GeminiImages,
+                crate::credentials::MediaKind::GeminiMedia,
             ) => "a Gemini model that returns images, e.g. a gemini-*-image variant. \
                   Image generation rides the same generateContent endpoint as text, so a \
                   `kind = \"gemini\"` backend lists the catalog",
