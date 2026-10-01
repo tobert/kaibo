@@ -11,14 +11,14 @@
 //! 1. The project root is mounted with [`LocalFs::read_only`], so every write,
 //!    delete, `mkdir`, `touch` (its mtime bump now routes through the backend's
 //!    `set_mtime`, which the read-only mount rejects), etc. returns
-//!    `PermissionDenied` at the VFS layer — regardless of which builtin issued it.
+//!    `ReadOnlyFilesystem` at the VFS layer — regardless of which builtin issued it.
 //!    This stops `rm`/`mv`/`cp`/`mkdir`/`tee`/`write`/`touch`.
 //! 2. `/` is [`MemoryFs`], so paths *outside* the project resolve to ephemeral
 //!    in-memory scratch that vanishes with the kernel and never touches disk —
 //!    including where `mktemp` lands (it resolves its parent through the VFS, so a
 //!    temp file is created in memory, never on the real `/tmp`).
-//! 3. [`KernelConfig::with_allow_external_commands(false)`] — belt-and-suspenders
-//!    now that `subprocess` is off; refuses any external-command path.
+//! 3. [`KernelConfig::with_allow_unwrapped_commands(false)`] — belt-and-suspenders
+//!    now that `subprocess` is off; refuses PATH lookup, `exec`, `spawn`, and `env CMD`.
 //!
 //! There used to be a fourth lever: a hardcoded `DENYLIST` shadow-blocking `touch`
 //! and `mktemp`, which reached real state directly via `std::fs` and bypassed the
@@ -65,8 +65,8 @@ impl Tool for Blocked {
     async fn execute(&self, _args: ToolArgs, _ctx: &mut dyn ToolCtx) -> ExecResult {
         // Exit **126** = a builtin an operator disabled in config. NOT the read-only
         // refusal: the mount refuses a write structurally, with the VFS's own exit 1
-        // and `permission denied: filesystem is read-only`. Conflating the two is the
-        // error six published strings carried for two months; keep them apart here.
+        // and `read-only filesystem`. Conflating the two is the error six published
+        // strings carried for two months; keep them apart here.
         // The kernel's other non-zero codes a caller may see: 124 = killed for
         // exceeding [`KAISH_EXEC_TIMEOUT`], 130 = cancelled, 127 = command not
         // found, -1 = kaish could not run the script (parse, validation, or an
@@ -283,7 +283,7 @@ fn build_readonly_kernel_and_vfs(
     // orientation repo-map, which enumerates through this same kernel.
     let config = KernelConfig::agent()
         .with_cwd(root)
-        .with_allow_external_commands(false)
+        .with_allow_unwrapped_commands(false)
         .with_request_timeout(sandbox.exec_timeout)
         .with_output_limit(output_limit)
         .with_ignore_config(sandbox.ignore.clone());
