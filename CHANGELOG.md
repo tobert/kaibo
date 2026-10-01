@@ -38,6 +38,7 @@ record. Each later release appends a new section at the top.
 - The `gemini-images` backend kind is now `gemini-media`; the old name still loads.
 
 ### Fixed
+- `list_models` on a Gemini or Stability media backend names the `audio` slot and its model ids, not only `image`.
 - A deferred `generate` whose result cannot be collected names the provider's job id, so a paid result stays reachable.
 - `kaibo generate` refuses `--field prompt=` and `--field model=`, as the MCP tool does, so provenance names what ran.
 - A consult turn cut off at `max_tokens` while reasoning gets one forced write-up from its evidence, thinking at effort `medium`, instead of discarding the investigation (a rig 0.42 regression).
