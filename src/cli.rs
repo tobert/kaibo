@@ -84,8 +84,8 @@ EXIT CODES
 `kaibo kaish` is the one exception: it exits with kaish's own code instead of
 this table (0 ok, 1 the command failed, 124 timed out, 127 command not found,
 255 on Unix when kaish could not run the script: a parse or validation failure,
-where nothing ran, or a shell error partway through, where stdout keeps what ran
-before it; stderr says why, and `--json` reports it as `exit_code` -1).
+where nothing ran, or a shell error partway through, where stdout and stderr keep
+what ran before it; stderr says why, and `--json` reports it as `exit_code` -1).
 A refused write exits 1, and its stderr line ends `read-only filesystem`, as in
 `rm: src/lib.rs: read-only filesystem`.";
 

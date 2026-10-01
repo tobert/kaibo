@@ -2731,9 +2731,10 @@ impl KaiboHandler {
             refused (exit 1, stderr ending `read-only filesystem`) and external commands \
             are unreachable (exit 127); 124 = timed out; -1 = kaish could not run the \
             script (a parse or validation failure, where nothing ran, or a shell error \
-            partway through, where stdout keeps what ran before it; stderr says why). \
+            partway through, where stdout and stderr keep what ran before it; stderr says \
+            why). \
             `grep` reads GNU BRE, as GNU grep does: `grep -rn 'fn consult(' src` finds \
-            the text `fn consult(`, and alternation takes `-E`: \
+            the text `fn consult(`, and for alternation use `-E`: \
             `grep -rnE 'consult|explore' src`. Each call starts fresh at the project root. \
             See `kaibo://kaish/*` (or `help` in the script) for idioms and the bash \
             habits that don't carry over."
@@ -4729,10 +4730,11 @@ A few habits from `bash` that *won't* carry over here — reach for the kaish fo
   Refusals and ordinary failures share exit `1`, so read the stderr line when you need to
   tell them apart.
 - `grep` reads GNU BRE, as GNU grep does: `grep -rn 'fn consult(' src` finds the text
-  `fn consult(`, and alternation takes `-E`: `grep -rnE 'consult|explore' src`. `\\d` is
-  a literal `d` in both, so write `[0-9]`; `-F` makes every character literal.
+  `fn consult(`, and for alternation use `-E`: `grep -rnE 'consult|explore' src`. `\\d`
+  is a literal `d` in both, so write `[0-9]`; `-F` makes every character literal.
 - A script that fails to parse or validate exits `-1` before anything runs, and stderr
-  says why. A fault partway through also exits `-1`, and stdout keeps what ran before it.
+  says why. A fault partway through also exits `-1`; stdout and stderr keep what ran
+  before it, and the reason comes last on stderr.
 
 Learn more without spending a turn: the `kaibo://kaish/*` resources (syntax, builtins,
 vfs, scatter, …) and `kaibo://kaish/sandbox`, or run `help` / `help syntax` /
@@ -9960,7 +9962,7 @@ enabled = false
         for needle in [
             "-1 = kaish could not run the script",
             "a parse or validation failure, where nothing ran, or a shell error partway \
-             through, where stdout keeps what ran before it",
+             through, where stdout and stderr keep what ran before it",
             "`grep` reads GNU BRE",
             "`grep -rn 'fn consult(' src`",
             "`grep -rnE 'consult|explore' src`",
@@ -10030,6 +10032,11 @@ enabled = false
             text.starts_with("exit: -1\n") && text.contains("--- stderr ---"),
             "an unbalanced `(` under -E must fail validation with exit -1 and a reason: {text}"
         );
+        // The sandbox doc says stderr names the fix, `\(`; pin the fix it names.
+        assert!(
+            text.contains("write `\\(` to match a literal `(`"),
+            "the -1 reason must name the escape the sandbox doc quotes: {text}"
+        );
         let text = run("grep -rn 'fn consult(' .").await;
         assert!(
             text.starts_with("exit: 0\n") && text.contains("pub fn consult("),
@@ -10042,7 +10049,8 @@ enabled = false
         );
     }
 
-    /// The prose says alternation takes `-E`. Bind that to the shell: without `-E` the
+    /// The prose says to use `-E` for alternation, that `\d` is a literal `d`, and that
+    /// grep exits 2 for a file it cannot read. Bind each to the shell: without `-E` the
     /// `|` is text, so `consult|explore` finds nothing and exits 1, which a model would
     /// read as "no such code"; with `-E` it alternates and finds the line. A kaish bump
     /// that returns grep to an ERE default makes the first search match and fails here.
@@ -10050,6 +10058,7 @@ enabled = false
     async fn grep_alternation_takes_dash_e_as_the_prose_says() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("lib.rs"), "pub fn consult(q: &str) {}\n").unwrap();
+        std::fs::write(dir.path().join("notes.txt"), "count 12345\nword only\n").unwrap();
         let mut config = crate::config::Config::builtin();
         config.root = Some(dir.path().to_path_buf());
         config.infer_cwd = false;
@@ -10074,6 +10083,29 @@ enabled = false
         assert!(
             text.starts_with("exit: 0\n") && text.contains("pub fn consult("),
             "with -E, `|` alternates and finds the line: {text}"
+        );
+        // GNU BRE's own alternation, which kaish's help teaches, still works.
+        let text = run("grep -rn 'consult\\|explore' .").await;
+        assert!(
+            text.starts_with("exit: 0\n") && text.contains("pub fn consult("),
+            "in BRE, `\\|` alternates: {text}"
+        );
+        // `\d` is a literal `d`: it finds the line with a `d` and no digit, and misses
+        // the line with digits and no `d`. `[0-9]` is the form the prose teaches.
+        let text = run("grep -n '\\d' notes.txt").await;
+        assert!(
+            text.starts_with("exit: 0\n") && text.contains("word only") && !text.contains("12345"),
+            "`\\d` must match a literal d, not a digit: {text}"
+        );
+        let text = run("grep -n '[0-9]' notes.txt").await;
+        assert!(
+            text.starts_with("exit: 0\n") && text.contains("12345") && !text.contains("word only"),
+            "`[0-9]` must match the digits: {text}"
+        );
+        let text = run("grep -n x missing.txt").await;
+        assert!(
+            text.starts_with("exit: 2\n"),
+            "grep must exit 2 for a file it cannot read, so 1 stays \"no line matched\": {text}"
         );
     }
 
@@ -10101,20 +10133,20 @@ enabled = false
         );
         let text = read_text(TOOLS_URI, &[]);
         for needle in [
-            "attach",                                     // the attachment guidance moved here
-            "inlined",             // the consult-vs-oneshot attach distinction
-            "whole file",          // the toolless-model whole-files steer
-            "verbatim",            // the model-id override semantics
-            "_backend",            // the retarget-the-slot mechanic
-            "job-N",               // the consult handle shape
-            "backend/provider-id", // the batch handle shape
-            "fire-and-forget",     // the async-workflow framing
-            "read-only",           // the kaish shell boundary
+            "attach",                        // the attachment guidance moved here
+            "inlined",                       // the consult-vs-oneshot attach distinction
+            "whole file",                    // the toolless-model whole-files steer
+            "verbatim",                      // the model-id override semantics
+            "_backend",                      // the retarget-the-slot mechanic
+            "job-N",                         // the consult handle shape
+            "backend/provider-id",           // the batch handle shape
+            "fire-and-forget",               // the async-workflow framing
+            "read-only",                     // the kaish shell boundary
             "ending `read-only filesystem`", // how a refusal names itself
             "grep -rnE",                     // alternation takes -E under GNU BRE
-            "worktree",            // attach/path reaches a followed git worktree
-            "Reviewing a change",  // prefer whole files over a diff for review
-            "view_image",          // consult opens an attached image with view_image
+            "worktree",                      // attach/path reaches a followed git worktree
+            "Reviewing a change",            // prefer whole files over a diff for review
+            "view_image",                    // consult opens an attached image with view_image
         ] {
             assert!(
                 text.contains(needle),

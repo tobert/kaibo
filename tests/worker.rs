@@ -175,4 +175,20 @@ async fn worker_keeps_the_output_that_ran_before_a_fault() {
         r.stderr.contains("divides by zero"),
         "stderr must still name the fault, got {r:?}"
     );
+    // Kept once each, in order: the script's own stderr, then the reason. A fault
+    // carried in both `output.err` and the error's message would name it twice, and a
+    // flattening that copied stdout into stderr would put `left` there.
+    assert_eq!(
+        r.stderr.matches("divides by zero").count(),
+        1,
+        "the fault must be named once, got {r:?}"
+    );
+    assert!(
+        !r.stderr.contains("left"),
+        "stdout must not be duplicated into stderr, got {r:?}"
+    );
+    assert!(
+        r.stderr.find("warned") < r.stderr.find("divides by zero"),
+        "the script's own stderr comes before the reason, got {r:?}"
+    );
 }
