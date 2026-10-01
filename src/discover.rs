@@ -129,6 +129,83 @@ pub struct DiscoveryRequest {
     pub query: Vec<(String, String)>,
 }
 
+/// The refusal `list_models` returns for a media-kind backend. It names each slot the
+/// kind fills and the ids that slot takes, since where a model id comes from differs by
+/// kind. The slots agree with [`MediaKind::produces`], and the discover tests check
+/// that both ways, so a kind that gains a slot cannot leave this text naming only the
+/// old one.
+///
+/// [`MediaKind::produces`]: crate::credentials::MediaKind::produces
+fn media_listing_refusal(backend: &Backend, media: crate::credentials::MediaKind) -> String {
+    use crate::credentials::MediaKind;
+    use crate::media::MediaOutput;
+    let image: std::borrow::Cow<str> = match media {
+        MediaKind::Stability => {
+            "the documented generate routes: core, ultra, or an sd3.5 variant".into()
+        }
+        MediaKind::OpenAiImages => {
+            "the endpoint's own model names, e.g. gpt-image-1 hosted or whatever a local \
+             sd-server has loaded"
+                .into()
+        }
+        MediaKind::GeminiMedia => {
+            "a Gemini model that returns images, e.g. a gemini-*-image variant".into()
+        }
+        MediaKind::DashScope => "the wan image models, e.g. wan2.6-t2i".into(),
+        MediaKind::Bfl => format!(
+            "the FLUX operations kaibo wires: {}",
+            crate::bfl::op_names().join(", ")
+        )
+        .into(),
+    };
+    let audio = match media {
+        MediaKind::Stability => Some(format!(
+            "{} (music and sound effects)",
+            crate::stability::AudioModel::ALL.map(|m| m.id()).join(", ")
+        )),
+        MediaKind::GeminiMedia => {
+            Some("a Gemini speech model, e.g. gemini-3.8-flash-tts".to_string())
+        }
+        MediaKind::OpenAiImages | MediaKind::DashScope | MediaKind::Bfl => None,
+    };
+    let catalog = match media {
+        MediaKind::GeminiMedia => Some(
+            "Gemini media rides the same generateContent endpoint as text, so a \
+             `kind = \"gemini\"` backend with the same key lists the catalog, speech \
+             models included.",
+        ),
+        MediaKind::DashScope => Some(
+            "A DashScope host serves its catalog on an OpenAI-compatible endpoint, so \
+             point a `kind = \"openai\"` backend at that host's `/compatible-mode/v1` \
+             base URL to list them.",
+        ),
+        MediaKind::Stability | MediaKind::OpenAiImages | MediaKind::Bfl => None,
+    };
+    let listable = crate::credentials::ProviderKind::ALL
+        .iter()
+        .filter(|k| k.wire().is_some())
+        .map(|k| format!("`{}`", k.canonical_name()))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let mut msg = format!(
+        "backend {:?} is kind `{}`, a media kind, and kaibo lists models only for the \
+         text kinds: {listable}. Name this backend's model ids on a cast slot instead.",
+        backend.name,
+        backend.kind.canonical_name()
+    );
+    msg.push_str(&format!(" The `{}` slot takes {image}.", MediaOutput::Image.key()));
+    // `audio` is Some exactly when `produces(Audio)` is true. The discover tests
+    // hold the two together, so a slot named here is one config load accepts.
+    if let Some(audio) = audio {
+        msg.push_str(&format!(" The `{}` slot takes {audio}.", MediaOutput::Audio.key()));
+    }
+    if let Some(catalog) = catalog {
+        msg.push(' ');
+        msg.push_str(catalog);
+    }
+    msg
+}
+
 /// Build the first-page discovery request for `backend`. Pure aside from
 /// [`Backend::resolve_key`] (env/key-file read, no network) — mirrors `Arm::from_slot`'s
 /// "builds offline" contract (`consult/engine.rs`). Dispatches on `backend.kind`; see
@@ -143,45 +220,15 @@ pub fn discovery_endpoint(backend: &Backend) -> Result<DiscoveryRequest> {
 /// have no continuation — `cursor` is ignored for them, since [`discover_models`] never
 /// loops on those kinds anyway.
 pub fn discovery_endpoint_page(backend: &Backend, cursor: Option<&str>) -> Result<DiscoveryRequest> {
-    // A media kind publishes no model-listing endpoint in the `/models` shape this
-    // module speaks. Refusing loudly beats inventing a URL that would 404, and
+    // kaibo has no model-listing route for a media kind: this module speaks only the
+    // text kinds' listing shapes. Refusing loudly beats inventing a URL that would 404, and
     // beats returning an empty list that would read as "this backend serves no
-    // models". Classified up front so the wire match below stays media-free; the
-    // hint is per media kind, since where a model id comes from differs by kind.
+    // models". Classified up front so the wire match below stays media-free.
     let Some(wire) = backend.kind.wire() else {
-        let hint = match backend.kind.class() {
-            crate::credentials::ProviderClass::Media(crate::credentials::MediaKind::Stability) => {
-                "the documented generate routes: core, ultra, or an sd3.5 variant"
-            }
-            crate::credentials::ProviderClass::Media(
-                crate::credentials::MediaKind::OpenAiImages,
-            ) => "the endpoint's own model names, e.g. gpt-image-1 hosted or whatever a \
-                  local sd-server has loaded",
-            crate::credentials::ProviderClass::Media(
-                crate::credentials::MediaKind::GeminiMedia,
-            ) => "a Gemini model that returns images, e.g. a gemini-*-image variant. \
-                  Image generation rides the same generateContent endpoint as text, so a \
-                  `kind = \"gemini\"` backend lists the catalog",
-            crate::credentials::ProviderClass::Media(crate::credentials::MediaKind::DashScope) => {
-                "the wan image models, e.g. wan2.6-t2i. A DashScope host serves its \
-                 catalog on an OpenAI-compatible endpoint, so point a `kind = \"openai\"` \
-                 backend at that base URL to list them"
-            }
-            crate::credentials::ProviderClass::Media(crate::credentials::MediaKind::Bfl) => {
-                "the documented FLUX operations: flux-dev, flux-2-pro, flux-2-flex, \
-                 flux-pro-1.1-ultra, or flux-kontext-pro — the cast's image-slot model id \
-                 names one directly"
-            }
-            // The `else` above already proved this kind has no completion wire.
-            crate::credentials::ProviderClass::Wire(_) => unreachable!("wire() was None"),
+        let crate::credentials::ProviderClass::Media(media) = backend.kind.class() else {
+            unreachable!("wire() was None, so the kind is a media kind")
         };
-        anyhow::bail!(
-            "backend {:?} is kind `{}`, a media kind — it publishes no model-listing \
-             endpoint in the `/models` shape this tool speaks. Its models are named on \
-             a cast's `image` slot: {hint}",
-            backend.name,
-            backend.kind.canonical_name()
-        )
+        anyhow::bail!("{}", media_listing_refusal(backend, media))
     };
     let key = backend.resolve_key()?;
     match wire {
@@ -652,6 +699,56 @@ mod tests {
         let path = dir.path().join("key");
         std::fs::write(&path, contents).expect("write test key file");
         (dir, path.to_string_lossy().to_string())
+    }
+
+    // --- media kinds: the refusal names the slots the kind fills ----------------
+
+    /// The listing refusal tells the caller where a media kind's model id goes. It
+    /// once hardcoded the `image` slot, and when #207 gave Gemini and Stability an
+    /// `audio` slot the text went stale. So the slots named are checked against
+    /// `MediaKind::produces`, the one place that fact is written, both ways.
+    #[test]
+    fn media_kind_refusal_names_every_slot_the_kind_fills_and_no_other() {
+        use crate::credentials::ProviderClass;
+        use crate::media::MediaOutput;
+        let mut checked = 0;
+        for kind in ProviderKind::ALL {
+            let ProviderClass::Media(media) = kind.class() else {
+                continue;
+            };
+            let err = discovery_endpoint(&backend(kind))
+                .expect_err("a media kind has no listing endpoint")
+                .to_string();
+            for out in [MediaOutput::Image, MediaOutput::Audio] {
+                let named = err.contains(&format!("`{}` slot", out.key()));
+                assert_eq!(
+                    named,
+                    media.produces(out),
+                    "{kind:?} fills the {out:?} slot: {}, but the refusal {} it: {err}",
+                    media.produces(out),
+                    if named { "names" } else { "omits" },
+                );
+            }
+            checked += 1;
+        }
+        assert!(checked >= 5, "expected every media kind, checked {checked}");
+    }
+
+    /// The closed id sets are rendered from the tables the facades check against, and
+    /// matched as the whole joined list: `stable-audio-2` is a prefix of
+    /// `stable-audio-2.5`, so a per-id `contains` would pass with it missing.
+    #[test]
+    fn refusals_name_the_ids_each_slot_takes() {
+        let refusal = |kind| discovery_endpoint(&backend(kind)).unwrap_err().to_string();
+        let err = refusal(ProviderKind::Stability);
+        let audio = crate::stability::AudioModel::ALL.map(|m| m.id()).join(", ");
+        assert!(err.contains(&audio), "expected {audio}: {err}");
+        let err = refusal(ProviderKind::Bfl);
+        let ops = crate::bfl::op_names().join(", ");
+        assert!(err.contains(&ops), "expected {ops}: {err}");
+        // Gemini has no id allowlist; pin the example the template and guide use.
+        let err = refusal(ProviderKind::GeminiMedia);
+        assert!(err.contains("gemini-3.8-flash-tts"), "no Gemini speech model: {err}");
     }
 
     // --- discovery_endpoint: exact URL/headers/query per kind -------------------
