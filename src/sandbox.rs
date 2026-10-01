@@ -43,8 +43,8 @@ use kaish_kernel::interpreter::ExecResult;
 use kaish_kernel::tools::{Tool, ToolArgs, ToolCtx, ToolRegistry, ToolSchema};
 use kaish_kernel::vfs::{ByteBudget, Filesystem, LocalFs, MemoryFs, VfsRouter};
 use kaish_kernel::{
-    IgnoreConfig, Kernel, KernelBackend, KernelConfig, LocalBackend, OutputLimitConfig, ReadRange,
-    RECOMMENDED_STACK_SIZE,
+    IgnoreConfig, Kernel, KernelBackend, KernelConfig, KernelError, LocalBackend,
+    OutputLimitConfig, ReadRange, RECOMMENDED_STACK_SIZE,
 };
 
 /// Wraps a real builtin, preserving its identity and schema but refusing to run.
@@ -329,12 +329,11 @@ pub fn builtin_names() -> Result<Vec<String>> {
 /// Run one kaish script in the sandbox and hand back the raw kernel result.
 ///
 /// A non-zero `code` (or non-empty `err`) is a normal in-band outcome the
-/// explorer should see — we only `Err` on a kernel-level failure.
-pub async fn run(kernel: &Kernel, script: &str) -> Result<ExecResult> {
-    kernel
-        .execute(script)
-        .await
-        .context("kaish kernel execution failed")
+/// explorer should see. This returns `Err` only when kaish could not run the
+/// script: a parse or validation rejection, or a fault partway through. The error
+/// stays typed so [`KaishOutput::from_error`] can keep the output a fault carries.
+pub async fn run(kernel: &Kernel, script: &str) -> std::result::Result<ExecResult, KernelError> {
+    kernel.execute(script).await
 }
 
 /// A plain, `Send` snapshot of one execution — what crosses the worker boundary.
@@ -389,6 +388,35 @@ impl KaishOutput {
             stdout: r.text_out().into_owned(),
             stderr: r.err.clone(),
         }
+    }
+
+    /// Flatten a script kaish could not run into the `-1` snapshot.
+    ///
+    /// Every [`KernelError`] is `-1`, with the reason on stderr after the
+    /// `kaish kernel execution failed:` prefix the worker has always written. A
+    /// rejection (parse or validation) ran nothing, so it carries no output. A fault
+    /// partway through ([`KernelError::Execution`], kaish 0.18) carries what ran
+    /// before it: the stdout and stderr of the earlier statements, and the part of
+    /// the faulting statement that ran. That output goes through
+    /// [`Self::from_result`], binary guard included, so `echo left; x=$((1/0))`
+    /// shows `left` instead of an empty stdout beside the error. The reason comes
+    /// last on stderr, after anything the script wrote there itself.
+    pub fn from_error(e: &KernelError) -> Self {
+        let reason = format!("kaish kernel execution failed: {e:#}");
+        let mut out = match e {
+            KernelError::Execution { output, .. } => Self::from_result(output),
+            _ => Self {
+                code: -1,
+                stdout: String::new(),
+                stderr: String::new(),
+            },
+        };
+        out.code = -1;
+        if !out.stderr.is_empty() && !out.stderr.ends_with('\n') {
+            out.stderr.push('\n');
+        }
+        out.stderr.push_str(&reason);
+        out
     }
 }
 
@@ -490,11 +518,7 @@ impl KaishWorker {
                             Job::Run { script, reply } => {
                                 let out = match run(&kernel, &script).await {
                                     Ok(r) => KaishOutput::from_result(&r),
-                                    Err(e) => KaishOutput {
-                                        code: -1,
-                                        stdout: String::new(),
-                                        stderr: format!("{e:#}"),
-                                    },
+                                    Err(e) => KaishOutput::from_error(&e),
                                 };
                                 // Receiver gone (caller cancelled) is fine — drop it.
                                 let _ = reply.send(out);
