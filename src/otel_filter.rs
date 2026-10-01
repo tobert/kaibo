@@ -134,6 +134,8 @@ pub const SAFE_ATTRIBUTES: &[&str] = &[
     "slot",
     "phase",
     "role",
+    // What a `generate` call asked for: `image` or `audio`, a closed vocabulary.
+    "media",
     // The configured backend a `job_list` sweep is reading, by name.
     "backend",
     // Loop shape: how many turns, how many delegations. The numbers that answer

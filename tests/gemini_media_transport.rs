@@ -1,4 +1,4 @@
-//! The gemini-images client over a real socket, offline.
+//! The gemini-media client over a real socket, offline.
 //!
 //! The transport truths the pure-function tests cannot see: the URL actually dialled
 //! (Gemini puts the model *in the path* with a `:generateContent` suffix, which is
@@ -12,8 +12,8 @@
 use std::time::Duration;
 
 use base64::Engine as _;
-use kaibo::gemini_images::GeminiImagesClient;
-use kaibo::media::{MediaOutcome, MediaRequest};
+use kaibo::gemini_media::GeminiMediaClient;
+use kaibo::media::{FieldValue, MediaOutcome, MediaOutput, MediaRequest};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
@@ -99,7 +99,7 @@ async fn the_model_is_in_the_path_and_the_key_is_in_a_header() {
     })
     .to_string();
     let (base, rx) = one_shot(200, response).await;
-    let client = GeminiImagesClient::new("k-secret", &base, Duration::from_secs(5)).unwrap();
+    let client = GeminiMediaClient::new("k-secret", &base, Duration::from_secs(5)).unwrap();
 
     let outcome = client
         .generate(
@@ -110,6 +110,7 @@ async fn the_model_is_in_the_path_and_the_key_is_in_a_header() {
                 inputs: Vec::new(),
                 op: None,
             },
+            MediaOutput::Image,
         )
         .await
         .expect("round trips");
@@ -151,7 +152,7 @@ async fn a_text_only_answer_becomes_an_error_carrying_the_models_words() {
     })
     .to_string();
     let (base, _rx) = one_shot(200, response).await;
-    let client = GeminiImagesClient::new("k", &base, Duration::from_secs(5)).unwrap();
+    let client = GeminiMediaClient::new("k", &base, Duration::from_secs(5)).unwrap();
     let err = client
         .generate(
             "gemini-3-flash-image",
@@ -161,8 +162,55 @@ async fn a_text_only_answer_becomes_an_error_carrying_the_models_words() {
                 inputs: Vec::new(),
                 op: None,
             },
+            MediaOutput::Image,
         )
         .await
         .expect_err("no image came back");
     assert!(err.to_string().contains("I can't do that."), "{err}");
+}
+
+/// Speech over the wire: the request asks for `AUDIO` with the voice in `speechConfig`,
+/// and raw PCM comes back as a WAVE file carrying the rate from the mime.
+#[tokio::test]
+async fn speech_round_trips_to_a_wav_artifact() {
+    let samples = [0x10u8, 0x00, 0x20, 0x00];
+    let response = serde_json::json!({
+        "candidates": [{"content": {"parts": [
+            {"inlineData": {"mimeType": "audio/L16;codec=pcm;rate=24000", "data": b64(&samples)}}
+        ]}}]
+    })
+    .to_string();
+    let (base, rx) = one_shot(200, response).await;
+    let client = GeminiMediaClient::new("k", &base, Duration::from_secs(5)).unwrap();
+    let outcome = client
+        .generate(
+            "gemini-2.5-flash-preview-tts",
+            &MediaRequest {
+                prompt: "Say warmly: good morning, Amy.".into(),
+                fields: vec![("voice".into(), FieldValue::Str("Kore".into()))],
+                inputs: Vec::new(),
+                op: None,
+            },
+            MediaOutput::Audio,
+        )
+        .await
+        .expect("round trips");
+    let MediaOutcome::Complete { artifacts, .. } = outcome else {
+        panic!("generateContent is synchronous")
+    };
+    assert_eq!(artifacts.len(), 1);
+    assert_eq!(artifacts[0].mime, "audio/wav");
+    assert_eq!(&artifacts[0].bytes[0..4], b"RIFF");
+    assert_eq!(&artifacts[0].bytes[44..], &samples);
+
+    let cap = rx.await.unwrap();
+    assert_eq!(
+        cap.body["generationConfig"]["responseModalities"],
+        serde_json::json!(["AUDIO"])
+    );
+    assert_eq!(
+        cap.body["generationConfig"]["speechConfig"]["voiceConfig"]["prebuiltVoiceConfig"]
+            ["voiceName"],
+        "Kore"
+    );
 }

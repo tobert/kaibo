@@ -5,7 +5,7 @@
 //!
 //! - **The format is a fact about the bytes, not a claim.** There is no `mime`
 //!   parameter, so the only way an artifact gets the wrong extension is if
-//!   `sniff_image` gets it wrong. Store real container headers, read the store's own
+//!   `sniff_media` gets it wrong. Store real container headers, read the store's own
 //!   answer back.
 //! - **A refusal stores nothing.** Every check runs before the store is touched; the
 //!   tests assert the store is still empty afterward, not merely that an `Err` came
@@ -17,7 +17,7 @@
 //! - **Content addressing holds across uploads.** The same image twice is one object,
 //!   and `create_new` means the second put is a no-op rather than a rewrite.
 //!
-//! Teeth: change `sniff_image` to fall back to PNG instead of refusing, and
+//! Teeth: change `sniff_media` to fall back to PNG instead of refusing, and
 //! `an_unrecognized_format_is_refused_and_stores_nothing` fails; drop the `tool` field
 //! from the upload's provenance and `provenance_records_the_depositing_tool` fails.
 
@@ -52,6 +52,18 @@ fn jpeg() -> Vec<u8> {
     let mut v = b"\xff\xd8\xff\xe0".to_vec();
     v.extend_from_slice(b"\x00\x10JFIF\x00");
     v
+}
+
+/// A real WAVE file: kaibo's own header over four PCM samples.
+fn wav() -> Vec<u8> {
+    kaibo::wav::wrap_pcm16(
+        &[0, 0, 1, 0, 2, 0, 3, 0],
+        kaibo::wav::PcmFormat {
+            sample_rate: 24_000,
+            channels: 1,
+        },
+    )
+    .expect("a valid header")
 }
 
 /// How many objects the store holds — the check that makes "nothing was stored" mean
@@ -98,7 +110,12 @@ fn an_upload_round_trips_and_the_store_names_the_format_itself() {
 #[test]
 fn each_accepted_container_lands_under_its_own_extension() {
     let (store, _dir) = store();
-    for (bytes, expected) in [(png(), Extension::Png), (jpeg(), Extension::Jpeg)] {
+    for (bytes, expected) in [
+        (png(), Extension::Png),
+        (jpeg(), Extension::Jpeg),
+        (wav(), Extension::Wav),
+        (b"ID3\x04\x00\x00\x00\x00\x00\x00".to_vec(), Extension::Mp3),
+    ] {
         let stored = store_upload(&store, &b64(&bytes), None, 1).expect("uploads");
         assert_eq!(
             store.extension_for(&stored.digest),

@@ -22,6 +22,10 @@ record. Each later release appends a new section at the top.
 - `kaibo config-guide` prints the configuration reference, even when the config is broken.
 - The configuration reference has a host agents section, starting with Codex MCP access, timeouts, and approval.
 - DeepSeek's `deepseek-flash` reads images: attachments and `view_image` work on the `deepseek` cast.
+- `generate` makes audio: `media = "audio"` runs a cast's new `audio` slot (`kaibo generate --media audio` on the CLI).
+- Gemini text-to-speech on an `audio` slot, with `voice`, two-voice `speakers`, and `language_code` fields; raw PCM is stored as WAVE.
+- Stable Audio 2, 2.5 and 3 on a Stability `audio` slot, with `audio-to-audio` and `inpaint` ops that take an audio input.
+- The artifact store holds `mp3` and `wav`; `write_cas` and `kaibo cas write` accept them, and `inputs` takes them.
 
 ### Changed
 - The configuration reference and template are less than half their former length.
@@ -31,8 +35,11 @@ record. Each later release appends a new section at the top.
 - turso 0.7.2, with every turso crate now pinned exactly; a plain `cargo update` had moved the engine past the pin.
 - rmcp 3.4: `initialize` asking for MCP `2026-07-28` now gets `2025-11-25`; a `2026-07-28` client enters with `server/discover`.
 - The `oneshot` preamble says thinking comes before the reply and shares its output budget.
+- The `gemini-images` backend kind is now `gemini-media`; the old name still loads.
 
 ### Fixed
+- A deferred `generate` whose result cannot be collected names the provider's job id, so a paid result stays reachable.
+- `kaibo generate` refuses `--field prompt=` and `--field model=`, as the MCP tool does, so provenance names what ran.
 - A consult turn cut off at `max_tokens` while reasoning gets one forced write-up from its evidence instead of discarding the investigation (a rig 0.42 regression).
 - A turn cut off at the output limit is reported as an empty answer with the budget named, not as a provider rejection.
 - A connection failure no longer reads as a provider rejection; the message names the checks to run.
