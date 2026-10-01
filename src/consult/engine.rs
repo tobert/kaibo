@@ -1580,6 +1580,8 @@ where
     // Surface the exact reasoning/sampling params this phase ships (constant across the
     // resume loop), so a trace shows whether — and at what depth — thinking was on: the
     // wire truth behind the `chat` spans' `reasoning_tokens`. Inert with no exporter.
+    // One turn can differ: the write-up after a cut-off may send a lowered effort, which
+    // `write_up_or_fail` records on its warn event and the `AnswerForced` beat instead.
     if let Some(t) = thinking {
         tracing::Span::current().record("gen_ai.request.thinking", tracing::field::display(t));
     }
@@ -5997,6 +5999,21 @@ mod tests {
         .await
         .expect("a phase with evidence must be written up, not failed");
         sink
+    }
+
+    /// The write-up effort must pass rig's own request builder on each wire that checks
+    /// effort against a closed list. `Arm::from_slot` preflights only the slot's effort,
+    /// so a write-up effort rig refused would fail inside the call, mid-recovery, as a
+    /// bare serde error that names no slot.
+    #[test]
+    fn the_cut_off_write_up_effort_passes_every_closed_effort_wire() {
+        use super::super::shaping::{accepted_efforts, EffortWire};
+        for wire in [EffortWire::Gemini, EffortWire::OpenaiResponses] {
+            assert!(
+                accepted_efforts(wire).contains(&CUT_OFF_WRITE_UP_EFFORT),
+                "{wire:?} must accept {CUT_OFF_WRITE_UP_EFFORT:?}"
+            );
+        }
     }
 
     /// The write-up after a cut-off thinks at [`CUT_OFF_WRITE_UP_EFFORT`], not at the

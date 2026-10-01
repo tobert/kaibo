@@ -41,7 +41,7 @@ record. Each later release appends a new section at the top.
 - `list_models` on a Gemini or Stability media backend names the `audio` slot and its model ids, not only `image`.
 - A deferred `generate` whose result cannot be collected names the provider's job id, so a paid result stays reachable.
 - `kaibo generate` refuses `--field prompt=` and `--field model=`, as the MCP tool does, so provenance names what ran.
-- A consult turn cut off at `max_tokens` while reasoning gets one forced write-up from its evidence, thinking at effort `medium`, instead of discarding the investigation (a rig 0.42 regression).
+- A `consult` or `explore` turn cut off at `max_tokens` while reasoning gets one forced write-up from its evidence, thinking at effort `medium`, instead of discarding the investigation (a rig 0.42 regression).
 - A turn cut off at the output limit is reported as an empty answer with the budget named, not as a provider rejection.
 - A connection failure no longer reads as a provider rejection; the message names the checks to run.
 - `oneshot` and `deliberate`'s direct lane count each retried attempt, and per-call latency excludes kaibo's backoff.
