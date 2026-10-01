@@ -53,9 +53,21 @@ pub enum PhaseEvent {
     /// stopped, or it hit its output limit while thinking. Kept apart from
     /// [`TurnCapReached`](Self::TurnCapReached) because "reached research limit" is false
     /// here, and a caller reads the cause to decide whether to raise `max_tokens`.
-    AnswerForced { cause: &'static str },
+    /// `effort` is set when the forced turn reasons at a lower effort than the slot's,
+    /// so the caller knows the answer came from a shallower turn.
+    AnswerForced {
+        cause: &'static str,
+        effort: Option<EffortLowered>,
+    },
     /// The top-level tool finished and is about to return its answer/report.
     PhaseFinished { phase: &'static str },
+}
+
+/// A reasoning effort kaibo lowered for one turn: the slot's effort, and the one it sent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EffortLowered {
+    pub from: String,
+    pub to: &'static str,
 }
 
 impl PhaseEvent {
@@ -75,9 +87,19 @@ impl PhaseEvent {
                 format!("{agent} chat: {}", secs(*elapsed))
             }
             PhaseEvent::TurnCapReached => "reached research limit, writing the answer".to_string(),
-            PhaseEvent::AnswerForced { cause } => {
+            PhaseEvent::AnswerForced {
+                cause,
+                effort: None,
+            } => {
                 format!("{cause}; writing the answer from the evidence gathered")
             }
+            PhaseEvent::AnswerForced {
+                cause,
+                effort: Some(EffortLowered { from, to }),
+            } => format!(
+                "{cause}; writing the answer from the evidence gathered, with effort lowered \
+                 from {from} to {to}"
+            ),
             PhaseEvent::PhaseFinished { phase } => format!("{phase} complete"),
         }
     }
@@ -430,13 +452,27 @@ mod tests {
         assert!(promotes_to_caller(&PhaseEvent::TurnCapReached, None));
         // A forced write-up changes how a caller reads the answer, like the turn cap.
         let forced = PhaseEvent::AnswerForced {
-            cause: "the model hit its output limit while thinking",
+            cause: "the model stopped without writing an answer",
+            effort: None,
         };
         assert!(promotes_to_caller(&forced, None));
         assert_eq!(
             forced.message(),
-            "the model hit its output limit while thinking; writing the answer from the \
+            "the model stopped without writing an answer; writing the answer from the \
              evidence gathered"
+        );
+        let lowered = PhaseEvent::AnswerForced {
+            cause: "the model hit its output limit while thinking",
+            effort: Some(EffortLowered {
+                from: "max".into(),
+                to: "medium",
+            }),
+        };
+        assert!(promotes_to_caller(&lowered, None));
+        assert_eq!(
+            lowered.message(),
+            "the model hit its output limit while thinking; writing the answer from the \
+             evidence gathered, with effort lowered from max to medium"
         );
         for event in [
             PhaseEvent::PhaseStarted { phase: "consult" },

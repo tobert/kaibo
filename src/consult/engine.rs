@@ -33,7 +33,7 @@ use crate::completion_watch::{watched, CompletionLog};
 use crate::config::{Backend, Defaults, ModelRole, ModelSlot};
 use crate::credentials::WireKind;
 use crate::explorer::RunKaish;
-use crate::progress::{PhaseEvent, ProgressSink};
+use crate::progress::{EffortLowered, PhaseEvent, ProgressSink};
 use crate::sandbox::{KaishWorker, SandboxConfig};
 use crate::session::{QaTurn, Sessions};
 use crate::sweep_attach::{SweepAttach, SweepAttachSink, SweepConsumer, SweepConsumerKind};
@@ -652,7 +652,7 @@ curated report) from what you already have.";
 /// front-and-back repetition, different fact.
 const EMPTY_ANSWER_NOTE: &str = "\
 Your last turn contained no answer text — the response came back empty. You have \
-already gathered evidence in this conversation, so nothing more needs investigating. \
+already gathered evidence in this conversation. \
 Using only that evidence, write your COMPLETE final response now, with its concrete \
 `file:line` citations. Where the evidence runs out, say so plainly: naming what you \
 do not know is part of a complete answer, not a reason to keep investigating. Do not \
@@ -663,19 +663,29 @@ what you already have.";
 /// the output limit** before it wrote anything: the model spent its whole `max_tokens`
 /// reasoning. Distinct from [`EMPTY_ANSWER_NOTE`] (the model stopped by itself) and
 /// [`FINALIZE_NOTE`] (out of turns), because each names a different fact. It uses the
-/// same vocabulary as the oneshot and batch preambles ("thinking … draws on the same
-/// output budget") and asks for an order, not a size, per the no-size-cue rule.
+/// same vocabulary as the oneshot and batch preambles (thinking shares the output
+/// budget) and asks for an order, not a size, per the no-size-cue rule.
+///
+/// Short on purpose, unlike its two siblings. This turn follows one that spent the whole
+/// budget thinking, and every obligation a note adds is one more thing for the model to
+/// plan before it writes. So it states the cause, the one fact that explains it, and the
+/// order to write in. It does not repeat "no tools": [`forced_finish_turn`] sends
+/// `ToolChoice::None`. The turn also thinks at [`CUT_OFF_WRITE_UP_EFFORT`], which does
+/// more to shorten the thinking than any wording can.
 const CUT_OFF_NOTE: &str = "\
-Your last turn was cut off at the output limit while you were still thinking, so it \
-ended before you wrote anything. Your thinking happens before your reply and draws on \
-the same output budget as the reply. You have already gathered evidence in this \
-conversation, so nothing more needs investigating: move from thinking to writing as \
-soon as you know what the evidence shows. Using only that evidence, write your \
-COMPLETE final response now, with its concrete `file:line` citations. Lead with the \
-conclusion and write it in full, then give your reasoning after it. Where the evidence \
-runs out, say so plainly: naming what you do not know is part of a complete answer. \
-Do not call any tool. Do not ask to continue. Write the full answer (or curated \
-report) from what you already have.";
+Your last turn reached the output limit while you were still thinking, before you \
+wrote anything. Thinking and your reply share one output budget. Move to writing as \
+soon as you know what the evidence in this conversation shows: lead with the \
+conclusion, cite `file:line` for each claim, then give your reasoning, and say where \
+the evidence runs out.";
+
+/// The effort the write-up after a cut-off thinks at, when the slot's effort is higher.
+/// Lowered through [`lower_effort`](super::shaping::lower_effort), so a slot already at
+/// or below it, an effort kaibo cannot rank, or a wire with no effort (Anthropic's budget
+/// style) is sent unchanged. DeepSeek runs `medium` as `high` (it has three rungs:
+/// `docs/config.md`), so the built-in `deepseek` cast's write-up runs at `high`, one
+/// rung under its `max`.
+const CUT_OFF_WRITE_UP_EFFORT: &str = "medium";
 
 /// The reason [`CutOffStopHook`] stops a run with, matched in [`run_phase_loop`]. Never
 /// shown to a model or a caller.
@@ -845,17 +855,35 @@ where
             ),
         ));
     }
+    // A turn cut off while thinking is likely to be cut off again at the same depth, so
+    // its write-up thinks at a lower effort. A model that stopped by itself had budget
+    // left, and keeps the slot's effort.
+    let lowered = match cause {
+        NoAnswer::CutOff => super::shaping::lower_effort(thinking, CUT_OFF_WRITE_UP_EFFORT),
+        NoAnswer::Stopped => None,
+    };
+    let effort = lowered.as_ref().map(|(_, from)| EffortLowered {
+        from: from.clone(),
+        to: CUT_OFF_WRITE_UP_EFFORT,
+    });
+    let asked_at = match &effort {
+        Some(e) => format!(" at effort {} (the slot sets {})", e.to, e.from),
+        None => String::new(),
+    };
     tracing::warn!(
         model = model_name,
         turns,
         output_tokens = spent.output_tokens,
         cause = ?cause,
+        effort = ?effort,
         "phase ended with no answer text and evidence gathered — forcing one final \
          write-up turn"
     );
     progress.emit(PhaseEvent::AnswerForced {
         cause: cause.beat(),
+        effort,
     });
+    let thinking = lowered.as_ref().map(|(params, _)| params).or(thinking);
     let (answer, retry_usage) = forced_finish_turn(
         model,
         preamble,
@@ -870,7 +898,7 @@ where
     .map_err(|e| {
         anyhow!(
             "model {model_name} returned an empty answer ({}), and the forced final-answer \
-             turn also failed: {e}",
+             turn{asked_at} also failed: {e}",
             cause.what()
         )
     })?;
@@ -885,7 +913,8 @@ where
             log.last_finish_reason().as_deref(),
             max_tokens,
             &format!(
-                "{}; it was asked once to write the answer it owed and came back empty again",
+                "{}; it was asked once{asked_at} to write the answer it owed and came back \
+                 empty again",
                 cause.what()
             ),
         ));
@@ -2826,7 +2855,7 @@ pub async fn consult(
 
 #[cfg(test)]
 mod tests {
-    use super::super::shaping::thinking_params;
+    use super::super::shaping::{thinking_params, ModelShape, ThinkingStyleOverride};
     use super::*;
     use std::time::Duration;
 
@@ -5930,6 +5959,185 @@ mod tests {
         // The cut-off turn was billed; it stays on the record (17,158 + 32,768 + 4,000).
         assert_eq!(out.usage.output_tokens, 53_926);
         assert_eq!(out.usage.reasoning_tokens, 32_768);
+    }
+
+    /// The effort a recorded request carried, read from DeepSeek's `reasoning_effort`.
+    fn deepseek_effort(r: &crate::test_support::RecordedRequest) -> Option<String> {
+        r.additional_params
+            .as_ref()
+            .and_then(|p| p["reasoning_effort"].as_str())
+            .map(str::to_string)
+    }
+
+    /// A consult whose synth arm reasons at `max` on DeepSeek's wire, with a sink on the
+    /// progress beats. Returns the sink so a test can read what the caller was told.
+    async fn consult_at_max_effort(client: &ScriptedClient, synth: &str) -> Arc<RecordingSink> {
+        let params =
+            ModelShape::resolve(ProviderKind::DeepSeek, synth, ThinkingStyleOverride::Auto)
+                .to_params(8192, None, None, "max");
+        let sink = Arc::new(RecordingSink::default());
+        let cfg = ConsultConfig {
+            explore: ExploreConfig {
+                phase: PhaseContext {
+                    progress: sink.clone(),
+                    ..PhaseContext::default()
+                },
+                ..ExploreConfig::default()
+            },
+            ..ConsultConfig::default()
+        };
+        let dir = project_with_marker();
+        consult_with(
+            "review src/foo.rs",
+            dir.path(),
+            &arm(client, "cheap-explorer"),
+            &arm_with(client, synth, params),
+            &cfg,
+        )
+        .await
+        .expect("a phase with evidence must be written up, not failed");
+        sink
+    }
+
+    /// The write-up after a cut-off thinks at [`CUT_OFF_WRITE_UP_EFFORT`], not at the
+    /// slot's effort: the turn before it spent the whole output budget reasoning, and the
+    /// same depth would likely spend it again. The progress beat names both efforts, so a
+    /// caller knows the answer came from a shallower turn. Every other turn keeps `max`.
+    #[tokio::test]
+    async fn a_cut_off_write_up_thinks_at_medium_effort_and_says_so() {
+        const SYNTH: &str = "deepseek-flash";
+        let client = ScriptedClient::builder()
+            .on_model(SYNTH, |req| {
+                if is_finalize_turn(req) {
+                    Ok(text_response("REVIEW: src/foo.rs:1 defines the marker."))
+                } else if transcript_text(req).contains("target_marker") {
+                    Ok(truncated(with_usage(
+                        reasoning_response("Now weighing each function against the tests..."),
+                        Usage {
+                            reasoning_tokens: 32_768,
+                            ..usage(64_688, 32_768)
+                        },
+                    )))
+                } else {
+                    Ok(tool_call_response(
+                        "c1",
+                        "run_kaish",
+                        json!({"script": "cat -n src/foo.rs"}),
+                    ))
+                }
+            })
+            .build();
+
+        let sink = consult_at_max_effort(&client, SYNTH).await;
+
+        let (finalizes, turns): (Vec<_>, Vec<_>) = client
+            .requests_for(SYNTH)
+            .into_iter()
+            .partition(is_finalize_request);
+        assert_eq!(finalizes.len(), 1, "exactly one forced write-up turn");
+        assert_eq!(deepseek_effort(&finalizes[0]).as_deref(), Some("medium"));
+        assert_eq!(turns.len(), 2, "the read turn and the cut-off turn");
+        for turn in &turns {
+            assert_eq!(deepseek_effort(turn).as_deref(), Some("max"));
+        }
+
+        let beats: Vec<_> = sink
+            .events()
+            .into_iter()
+            .filter(|e| matches!(e, PhaseEvent::AnswerForced { .. }))
+            .map(|e| e.message())
+            .collect();
+        assert_eq!(beats.len(), 1, "{beats:?}");
+        assert!(
+            beats[0].contains("max") && beats[0].contains("medium"),
+            "the beat must name the slot's effort and the lowered one: {:?}",
+            beats[0]
+        );
+    }
+
+    /// When the lowered write-up is cut off too, the error says it already ran at the
+    /// lower effort, so the advice to lower `effort` reads against what was tried.
+    #[tokio::test]
+    async fn a_cut_off_write_up_that_is_cut_off_again_names_the_effort_it_ran_at() {
+        const SYNTH: &str = "deepseek-flash";
+        let client = ScriptedClient::builder()
+            .on_model(SYNTH, |req| {
+                if is_finalize_turn(req) || transcript_text(req).contains("target_marker") {
+                    Ok(truncated(with_usage(
+                        reasoning_response("Still weighing..."),
+                        Usage {
+                            reasoning_tokens: 16_384,
+                            ..usage(64_688, 16_384)
+                        },
+                    )))
+                } else {
+                    Ok(tool_call_response(
+                        "c1",
+                        "run_kaish",
+                        json!({"script": "cat -n src/foo.rs"}),
+                    ))
+                }
+            })
+            .build();
+        let params =
+            ModelShape::resolve(ProviderKind::DeepSeek, SYNTH, ThinkingStyleOverride::Auto)
+                .to_params(8192, None, None, "max");
+        let dir = project_with_marker();
+        let err = consult_with(
+            "review src/foo.rs",
+            dir.path(),
+            &arm(&client, "cheap-explorer"),
+            &arm_with(&client, SYNTH, params),
+            &ConsultConfig::default(),
+        )
+        .await
+        .expect_err("a write-up cut off twice is an empty answer");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("at effort medium (the slot sets max)"),
+            "{msg}"
+        );
+    }
+
+    /// A model that stopped by itself did not run out of budget, so its write-up keeps
+    /// the slot's effort, and the beat claims no change.
+    #[tokio::test]
+    async fn an_empty_answer_write_up_keeps_the_slot_effort() {
+        const SYNTH: &str = "deepseek-flash";
+        let client = ScriptedClient::builder()
+            .on_model(SYNTH, |req| {
+                if is_finalize_turn(req) {
+                    Ok(text_response("REVIEW: src/foo.rs:1 defines the marker."))
+                } else if transcript_text(req).contains("SWEEP_DONE") {
+                    Ok(reasoning_response("I have finished reviewing."))
+                } else {
+                    Ok(tool_call_response(
+                        "t-explore",
+                        "explore",
+                        json!({ "question": "review the diff" }),
+                    ))
+                }
+            })
+            .on_model("cheap-explorer", |_req| Ok(text_response("SWEEP_DONE")))
+            .build();
+
+        let sink = consult_at_max_effort(&client, SYNTH).await;
+
+        let finalizes: Vec<_> = client
+            .requests_for(SYNTH)
+            .into_iter()
+            .filter(is_finalize_request)
+            .collect();
+        assert_eq!(finalizes.len(), 1, "exactly one forced write-up turn");
+        assert_eq!(deepseek_effort(&finalizes[0]).as_deref(), Some("max"));
+        let beats: Vec<_> = sink
+            .events()
+            .into_iter()
+            .filter(|e| matches!(e, PhaseEvent::AnswerForced { .. }))
+            .map(|e| e.message())
+            .collect();
+        assert_eq!(beats.len(), 1, "{beats:?}");
+        assert!(!beats[0].contains("medium"), "{:?}", beats[0]);
     }
 
     /// The gate still holds on the cut-off path: a first turn that reasons until it is
