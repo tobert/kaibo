@@ -2728,12 +2728,13 @@ impl KaiboHandler {
             returns exit code + stdout + stderr. Read generously with line numbers — \
             `cat -n FILE` for a whole file, `grep -rn PATTERN` to locate across \
             files — and compose builtins with pipes (grep/jq/awk/find/...). Writes are \
-            refused (exit 1, stderr `permission denied: filesystem is read-only`) and \
-            external commands are unreachable (exit 127); 124 = timed out; -1 = kaish \
-            could not run the script (a parse or validation failure, where nothing ran, \
-            or a shell error partway through; stderr says why). A \
-            grep PATTERN is a regex: search literal text with \
-            `grep -rnF 'fn consult(' src`. Each call starts fresh at the project root. \
+            refused (exit 1, stderr ending `read-only filesystem`) and external commands \
+            are unreachable (exit 127); 124 = timed out; -1 = kaish could not run the \
+            script (a parse or validation failure, where nothing ran, or a shell error \
+            partway through, where stdout keeps what ran before it; stderr says why). \
+            `grep` reads GNU BRE, as GNU grep does: `grep -rn 'fn consult(' src` finds \
+            the text `fn consult(`, and alternation takes `-E`: \
+            `grep -rnE 'consult|explore' src`. Each call starts fresh at the project root. \
             See `kaibo://kaish/*` (or `help` in the script) for idioms and the bash \
             habits that don't carry over."
     )]
@@ -4722,13 +4723,16 @@ A few habits from `bash` that *won't* carry over here — reach for the kaish fo
 - Adjacent tokens don't paste together — quote to join: `\"$dir/file.txt\"`, not
   `$dir/file.txt`.
 - This shell is **read-only**: a write or a redirect that would create a file is refused
-  with exit `1` and the message `permission denied: filesystem is read-only`; an external
-  command is unreachable and exits `127`. That's the boundary working, not a bug — read
-  freely, and don't try to mutate. Refusals and ordinary failures share exit `1`, so read
-  the stderr line when you need to tell them apart.
-- A `grep` PATTERN is a regex, and a script that fails to parse or validate exits `-1`
-  before anything runs; stderr says why. An unbalanced `(` is the common case, so search
-  literal text with `-F`: `grep -rnF 'fn consult(' src`.
+  with exit `1` and a message ending `read-only filesystem`, as in
+  `rm: src/lib.rs: read-only filesystem`; an external command is unreachable and exits
+  `127`. That's the boundary working, not a bug — read freely, and don't try to mutate.
+  Refusals and ordinary failures share exit `1`, so read the stderr line when you need to
+  tell them apart.
+- `grep` reads GNU BRE, as GNU grep does: `grep -rn 'fn consult(' src` finds the text
+  `fn consult(`, and alternation takes `-E`: `grep -rnE 'consult|explore' src`. `\\d` is
+  a literal `d` in both, so write `[0-9]`; `-F` makes every character literal.
+- A script that fails to parse or validate exits `-1` before anything runs, and stderr
+  says why. A fault partway through also exits `-1`, and stdout keeps what ran before it.
 
 Learn more without spending a turn: the `kaibo://kaish/*` resources (syntax, builtins,
 vfs, scatter, …) and `kaibo://kaish/sandbox`, or run `help` / `help syntax` /
@@ -9902,8 +9906,10 @@ enabled = false
             "124",
             "127",
             "`-1` — kaish could not run the script",
+            "grep -rnE",
             "grep -rnF",
-            "permission denied: filesystem is read-only",
+            "`2` — a usage error",
+            "ends `read-only filesystem`",
         ] {
             assert!(text.contains(needle), "sandbox doc must mention {needle:?}");
         }
@@ -9943,8 +9949,9 @@ enabled = false
     /// a shell error partway through also returns -1 (`sandbox.rs`, the worker's `Run`
     /// arm), so the text does not claim "nothing ran" for every -1. It was 4.1% of
     /// 11,195 calls and no
-    /// kaibo text named it. The description also carries the example that avoids the
-    /// most common cause, a literal `(` in a grep pattern.
+    /// kaibo text named it. The most common cause was a literal `(` in a grep pattern;
+    /// kaish 0.18's GNU BRE default made that pattern run, so the description now
+    /// carries the BRE example and the `-E` form alternation needs instead.
     #[test]
     fn run_kaish_description_names_the_parse_failure_code() {
         let h = KaiboHandler::new(crate::config::Config::builtin()).expect("handler builds");
@@ -9953,17 +9960,52 @@ enabled = false
         for needle in [
             "-1 = kaish could not run the script",
             "a parse or validation failure, where nothing ran, or a shell error partway \
-             through",
-            "grep -rnF 'fn consult(' src",
+             through, where stdout keeps what ran before it",
+            "`grep` reads GNU BRE",
+            "`grep -rn 'fn consult(' src`",
+            "`grep -rnE 'consult|explore' src`",
+            "ending `read-only filesystem`",
         ] {
             assert!(d.contains(needle), "run_kaish description must name {needle:?}: {d}");
         }
     }
 
-    /// The code the text documents is the code the shell returns. A grep pattern with an
-    /// unbalanced `(` fails kaish's validation before anything runs, and `run_kaish`
-    /// reports `exit: -1` with the reason on stderr; the fixed-string form of the same
-    /// search runs and finds the line. A kaish bump that changes either answer fails here.
+    /// The grep examples in the two server texts that teach the shell, the `run_kaish`
+    /// description and `kaibo://tools`, read as GNU BRE: no bare `|`, `+`, `?`, or `{`
+    /// without `-E`, and no `\d`. The same scan guards the addendum and the sandbox doc
+    /// in `kaish_syntax.rs`; a kaish idiom is never in one file.
+    #[test]
+    fn server_grep_examples_read_as_gnu_bre() {
+        let h = KaiboHandler::new(crate::config::Config::builtin()).expect("handler builds");
+        let tool = h
+            .tool_router
+            .get("run_kaish")
+            .expect("run_kaish advertised");
+        let description = tool.description.as_deref().unwrap_or("").to_string();
+        let mut seen = 0;
+        for (label, text) in [
+            ("run_kaish", description.as_str()),
+            ("kaibo://tools", TOOLS_DOC),
+        ] {
+            let (examined, misread) = crate::kaish_syntax::grep_examples_misread_as_ere(text);
+            seen += examined;
+            assert!(
+                misread.is_empty(),
+                "{label}: these grep examples mean something else under GNU BRE: {misread:#?}"
+            );
+        }
+        assert!(
+            seen >= 4,
+            "the scan must examine the grep examples it guards, saw {seen}"
+        );
+    }
+
+    /// The code the text documents is the code the shell returns. An `-E` pattern with
+    /// an unbalanced `(` fails kaish's validation before anything runs, and `run_kaish`
+    /// reports `exit: -1` with the reason on stderr. The same text without `-E` is GNU
+    /// BRE, where `(` is literal, so it runs and finds the line; so does `-F`. A kaish
+    /// bump that changes any answer fails here. Until kaish 0.18 the BRE line was the
+    /// failing one: grep defaulted to ERE and the bare `(` failed validation.
     #[tokio::test]
     async fn a_script_that_fails_validation_exits_minus_one() {
         let dir = tempfile::tempdir().unwrap();
@@ -9983,15 +10025,55 @@ enabled = false
                 out.content[0].as_text().expect("text body").text.clone()
             }
         };
-        let text = run(r#"grep -rn "fn consult(" ."#).await;
+        let text = run(r#"grep -rnE "fn consult(" ."#).await;
         assert!(
             text.starts_with("exit: -1\n") && text.contains("--- stderr ---"),
-            "an unbalanced `(` must fail validation with exit -1 and a reason: {text}"
+            "an unbalanced `(` under -E must fail validation with exit -1 and a reason: {text}"
+        );
+        let text = run("grep -rn 'fn consult(' .").await;
+        assert!(
+            text.starts_with("exit: 0\n") && text.contains("pub fn consult("),
+            "the BRE search must run and find the line, as the prose says: {text}"
         );
         let text = run("grep -rnF 'fn consult(' .").await;
         assert!(
             text.starts_with("exit: 0\n") && text.contains("pub fn consult("),
             "the fixed-string search must run and find the line: {text}"
+        );
+    }
+
+    /// The prose says alternation takes `-E`. Bind that to the shell: without `-E` the
+    /// `|` is text, so `consult|explore` finds nothing and exits 1, which a model would
+    /// read as "no such code"; with `-E` it alternates and finds the line. A kaish bump
+    /// that returns grep to an ERE default makes the first search match and fails here.
+    #[tokio::test]
+    async fn grep_alternation_takes_dash_e_as_the_prose_says() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("lib.rs"), "pub fn consult(q: &str) {}\n").unwrap();
+        let mut config = crate::config::Config::builtin();
+        config.root = Some(dir.path().to_path_buf());
+        config.infer_cwd = false;
+        let h = KaiboHandler::new(config).expect("handler builds");
+        let run = |script: &str| {
+            let script = script.to_string();
+            let h = &h;
+            async move {
+                let out = h
+                    .run_kaish(Parameters(RunKaishInput { script, path: None }))
+                    .await
+                    .expect("the tool call itself succeeds");
+                out.content[0].as_text().expect("text body").text.clone()
+            }
+        };
+        let text = run("grep -rn 'consult|explore' .").await;
+        assert!(
+            text.starts_with("exit: 1\n") && !text.contains("pub fn consult("),
+            "without -E, `|` is text and nothing matches: {text}"
+        );
+        let text = run("grep -rnE 'consult|explore' .").await;
+        assert!(
+            text.starts_with("exit: 0\n") && text.contains("pub fn consult("),
+            "with -E, `|` alternates and finds the line: {text}"
         );
     }
 
@@ -10028,7 +10110,8 @@ enabled = false
             "backend/provider-id", // the batch handle shape
             "fire-and-forget",     // the async-workflow framing
             "read-only",           // the kaish shell boundary
-            "permission denied: filesystem is read-only", // how a refusal names itself
+            "ending `read-only filesystem`", // how a refusal names itself
+            "grep -rnE",                     // alternation takes -E under GNU BRE
             "worktree",            // attach/path reaches a followed git worktree
             "Reviewing a change",  // prefer whole files over a diff for review
             "view_image",          // consult opens an attached image with view_image

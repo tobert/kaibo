@@ -54,24 +54,27 @@ pub const KAISH_SANDBOX_ADDENDUM: &str = "\
 In kaibo this shell runs over a READ-ONLY snapshot of one project, offline: writes, \
 `git`, `touch`, and external commands are refused, so your work here is reading. Read \
 files WHOLE by default with `cat -n FILE`; `grep -rn PATTERN` searches the \
-whole project and prefixes every hit with its path from the root. PATTERN is a \
-regex; search literal text with `-F`, as in `grep -rnF 'fn consult(' src`. When a \
-grep hit lands in a large file, read a \
+whole project and prefixes every hit with its path from the root. PATTERN is GNU \
+BRE, as in GNU grep: `grep -rn 'fn consult(' src` finds the text `fn consult(`, and \
+alternation takes `-E`, as in `grep -rnE 'consult|explore' src`. Write `[0-9]` for a \
+digit, because `\\d` is a literal `d`. With `-F` every character is literal, as in \
+`grep -rnF 'args[0]' src`. When a grep hit lands in a large file, read a \
 wide span around it with `cat -n FILE | sed -n '120,400p'`, which returns that range \
 with its real line numbers. Run `file FILE` on an unfamiliar file first; it names \
 the content as text or binary, so you know what you are about to read. \
 Each call starts at the project root; \
 there is no persistent cwd. Read the exit code: 0 is success; -1 means kaish could \
 not run the script (a parse or validation failure, where nothing ran, or a shell error \
-partway through), and stderr says why; 3 means the output \
-was too large and came back as a head+tail sample (not a failure); 124 means the \
-script was killed for running past its time budget; 127 is how every external \
-command answers here — its message names the refusal, as in `curl: external \
-commands are not available in this build of the shell`; 1 is an ordinary failure, \
-and a refused \
-write is one of those — its message reads `permission denied: filesystem is \
-read-only`. Read the message and not only the code, because that sentence is what \
-tells a refusal apart from a mistake. \
+partway through, where stdout keeps what ran before it), and stderr says why; 3 means \
+the output was too large and came back as a head+tail sample (not a failure); 124 \
+means the script was killed for running past its time budget; 127 is how every \
+external command answers here — its message names the refusal, as in `curl: \
+external commands are not available in this build of the shell`; 2 is a usage \
+error, such as an unknown flag or a missing operand, and grep also exits 2 for a file \
+it cannot read; 1 is an ordinary failure, and from grep it means only that no line \
+matched. A refused write exits 1 too, and its stderr line ends `read-only \
+filesystem`, as in `rm: src/lib.rs: read-only filesystem`. Read the message and not \
+only the code, because that phrase is what tells a refusal apart from a mistake. \
 To learn more, run `help`, `help syntax`, or `help <builtin>` in any \
 script, or read the `kaibo://kaish/*` resources.";
 
@@ -480,8 +483,11 @@ pub fn kaibo_sandbox_doc() -> String {
          - `grep -rn -B3 -A6 PATTERN` — preview matches in context across files\n\
          - `grep -rn PATTERN DIR/` — narrow to a subtree; hits are prefixed with the operand as written, so a named directory still cites a usable path\n\
          - `grep -rl PATTERN src` — just the file names that match\n\
-         - `grep -rnF 'fn consult(' src` — a literal search; PATTERN is otherwise a regex, \
-         and an unbalanced `(` fails validation with exit `-1`\n\
+         - `grep -rn 'fn consult(' src` — PATTERN is GNU BRE, as in GNU grep, so a bare \
+         `( ) {{ }} | + ?` is text\n\
+         - `grep -rnE 'consult|explore' src` — `-E` for ERE: alternation, groups, `+`, `?`, \
+         `{{n}}`. In both dialects `\\d` is a literal `d`; write `[0-9]`\n\
+         - `grep -rnF 'args[0]' src` — every character literal, `.`, `*`, and `[` included\n\
          - `cat -n FILE | sed -n '1200,2400p'` — a targeted wide span of a truncated giant (`grep -n SYMBOL FILE` pins where to aim), and the follow-up to a grep hit in a large file\n\
          - `file FILE` — what a file is, text or binary, read from its content rather than its name\n\n\
          ## Read-only boundary\n\
@@ -492,15 +498,19 @@ pub fn kaibo_sandbox_doc() -> String {
          ## Exit codes\n\
          The code tells you the shape of the outcome; the message tells you which \
          outcome it was. A refused write and an ordinary mistake both exit `1`, so \
-         read the stderr line: a refusal says `permission denied: filesystem is \
-         read-only`.\n\
+         read the stderr line: a refusal ends `read-only filesystem`, as in \
+         `rm: src/lib.rs: read-only filesystem`.\n\
          - `0` — success\n\
          - `-1` — kaish could not run the script. Either it failed to parse or \
-         validate, so nothing ran, or the shell hit an error partway through and the \
-         output is dropped; stderr says why. The common cause is a grep pattern with a \
-         literal `(`: search it with `grep -rnF`\n\
-         - `1` — the command failed. A refused write is one of these, and its message \
-         reads `permission denied: filesystem is read-only`\n\
+         validate, so nothing ran, or the shell hit an error partway through, and \
+         stdout keeps what ran before it; stderr says why. A regex that does not \
+         compile is a common cause, such as `grep -E 'fn consult('`, where `(` opens a \
+         group; stderr names the fix: write `\\(`, or drop `-E`\n\
+         - `1` — the command failed. From `grep` it means only that no line matched. A \
+         refused write is one of these, and its stderr line ends `read-only filesystem`\n\
+         - `2` — a usage error the caller can fix: an unknown flag, a missing operand, \
+         or a flag value the builtin cannot use. `grep` also exits `2` for a file it \
+         cannot read\n\
          - `3` — output exceeded the cap and was truncated to a head+tail sample \
          (not a failure; the full output is not returned)\n\
          - `124` — killed for exceeding the per-exec time budget\n\
@@ -519,6 +529,43 @@ pub fn kaibo_sandbox_doc() -> String {
          `kaibo://kaish/builtin/grep`). All of it is also available inside a script: \
          `help`, `help syntax`, `help <builtin>`.\n"
     )
+}
+
+/// Scan `text` for backticked `grep` examples and return how many it examined plus
+/// the ones whose pattern means something else under GNU BRE: a bare `|`, `+`, `?`, or
+/// `{` in a pattern grep reads as BRE (no `-E`, `-F`), or a `\d` in any dialect. Test
+/// support for every published text that teaches grep (`server` reuses it for the
+/// `run_kaish` description and `kaibo://tools`).
+#[cfg(test)]
+pub(crate) fn grep_examples_misread_as_ere(text: &str) -> (usize, Vec<String>) {
+    let mut examined = 0;
+    let mut misread = Vec::new();
+    for (i, span) in text.split('`').enumerate() {
+        // Odd segments sit between a pair of backticks.
+        if i % 2 == 0 || !span.starts_with("grep ") {
+            continue;
+        }
+        let Some(open) = span.find('\'') else {
+            continue;
+        };
+        let Some(len) = span[open + 1..].find('\'') else {
+            continue;
+        };
+        examined += 1;
+        let flags: String = span[..open]
+            .split_whitespace()
+            .filter(|w| w.starts_with('-') && !w.starts_with("--"))
+            .collect();
+        let pattern = &span[open + 1..open + 1 + len];
+        let bre = !flags.contains('E') && !flags.contains('F');
+        let bare_ere = pattern
+            .char_indices()
+            .any(|(j, c)| matches!(c, '|' | '+' | '?' | '{') && !pattern[..j].ends_with('\\'));
+        if pattern.contains("\\d") || (bre && bare_ere) {
+            misread.push(span.to_string());
+        }
+    }
+    (examined, misread)
 }
 
 #[cfg(test)]
@@ -634,13 +681,21 @@ mod tests {
             "grep -rn",
             "124",
             "127",
-            "permission denied: filesystem is read-only",
+            // The refusal's ending and its example. kaish 0.18 reworded it from
+            // `permission denied: filesystem is read-only`; `tests/sandbox.rs` pins this
+            // exact shape against the shell.
+            "ends `read-only filesystem`",
+            "`rm: src/lib.rs: read-only filesystem`",
             // 4.1% of 11,195 `run_kaish` calls returned -1, most often a grep pattern
-            // with a literal `(`; nothing in kaibo's text named the code.
+            // with a literal `(`; nothing in kaibo's text named the code. kaish 0.18's
+            // GNU BRE default made that pattern run, so the example below teaches it
+            // plain, and alternation moved to `-E`.
             "-1 means kaish could not run the script",
             "a parse or validation failure, where nothing ran, or a shell error partway \
-             through",
-            "`grep -rnF 'fn consult(' src`",
+             through, where stdout keeps what ran before it",
+            "`grep -rn 'fn consult(' src`",
+            "`grep -rnE 'consult|explore' src`",
+            "2 is a usage error",
         ] {
             assert!(
                 KAISH_SANDBOX_ADDENDUM.contains(needle),
@@ -702,6 +757,50 @@ mod tests {
             "the addendum must carry at least one `sed -n` span for the scan above to \
              mean anything:\n{a}"
         );
+    }
+
+    /// kaish 0.18 made `grep` read GNU BRE: a bare `|`, `+`, `?`, or `{` is text, and
+    /// `\d` is a literal `d` in every dialect. A teaching example written for the old
+    /// ERE default still runs, but it searches for the wrong text and exits 1, which a
+    /// model reads as "not found". This scans every backticked `grep` example in the
+    /// two texts that teach the shell and refuses those two misreadings. The count
+    /// assertion keeps the scan honest: an extractor that finds nothing passes
+    /// everything.
+    #[test]
+    fn grep_examples_read_as_gnu_bre() {
+        let doc = kaibo_sandbox_doc();
+        let mut seen = 0;
+        for text in [KAISH_SANDBOX_ADDENDUM, doc.as_str()] {
+            let (examined, misread) = grep_examples_misread_as_ere(text);
+            seen += examined;
+            assert!(
+                misread.is_empty(),
+                "these grep examples mean something else under GNU BRE: {misread:#?}"
+            );
+        }
+        assert!(
+            seen >= 6,
+            "the scan must examine the grep examples it guards, saw only {seen}"
+        );
+        // The scan itself must catch both misreadings, or a clean result means nothing.
+        for (bad, why) in [
+            ("`grep -rn 'consult|explore' src`", "a bare `|` without -E"),
+            ("`grep -rn 'a+b' src`", "a bare `+` without -E"),
+            ("`grep -rnE '\\d+' src`", "`\\d` under -E"),
+        ] {
+            assert_eq!(
+                grep_examples_misread_as_ere(bad),
+                (1, vec![bad.trim_matches('`').to_string()]),
+                "the scan must flag {why}"
+            );
+        }
+        for good in [
+            "`grep -rnE 'consult|explore' src`",
+            "`grep -rn 'consult\\|explore' src`",
+            "`grep -rnF 'a|b' src`",
+        ] {
+            assert_eq!(grep_examples_misread_as_ere(good).1, Vec::<String>::new());
+        }
     }
 
     #[test]

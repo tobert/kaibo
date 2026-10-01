@@ -47,11 +47,11 @@ the message classifies the block:
 
 | exit | meaning |
 |---:|---|
-| `1` | a builtin's structural refusal (e.g. `permission denied: filesystem is read-only`) |
+| `1` | a builtin's structural refusal (e.g. `rm: Cargo.toml: read-only filesystem`) |
 | `126` | a config-`disable_builtins` shadow-block (`… disabled in kaibo's read-only sandbox`) |
 | `127` | command not found — an external/uncompiled command (the host is unreachable) |
 | `124` | killed for exceeding the exec timeout (30s default) |
-| `-1` | kaish could not run the script: a parse or validation failure (nothing ran) or a shell error partway through; stderr says why |
+| `-1` | kaish could not run the script: a parse or validation failure (nothing ran) or a shell error partway through (stdout keeps what ran before it); stderr says why |
 
 ---
 
@@ -87,14 +87,14 @@ ls $ROOT | grep -iE 'pwn|\.bak|\.copy' ; echo "leftovers=$?"
 ```
 
 **Pass:** every write reports a non-zero exit; `leftovers` greps empty (`exit 1`).
-Eight of the nine name `permission denied: filesystem is read-only`. **`ln -s` is the
-exception since kaish 0.17**, which refuses a cross-mount symlink target *by name*
-before the read-only mount is consulted: `/etc/passwd` is on mount `/` and the link is
-on the project mount, so the message is `a link cannot cross mounts`. Both are
-refusals; only the reason differs. Point `ln -s` at an in-mount target
-(`ln -s Cargo.toml link_inside`) to exercise the read-only leg itself, which still
-answers `permission denied: filesystem is read-only`. Confirm on the host too —
-nothing should exist on real disk:
+Eight of the nine end `read-only filesystem` (through kaish 0.17 the message was
+`permission denied: filesystem is read-only`). **`ln -s` is the exception since kaish
+0.17**, which refuses a cross-mount symlink target *by name* before the read-only mount
+is consulted: `/etc/passwd` is on mount `/` and the link is on the project mount, so the
+message is `a link cannot cross mounts`. Both are refusals; only the reason differs.
+Point `ln -s` at an in-mount target (`ln -s Cargo.toml link_inside`) to exercise the
+read-only leg itself, which answers `ln: failed to create symbolic link 'link_inside':
+read-only filesystem`. Confirm on the host too — nothing should exist on real disk:
 
 ```sh
 ls -la "$ROOT" | grep -iE 'pwn|\.bak|\.copy|pwndir' || echo "clean"
