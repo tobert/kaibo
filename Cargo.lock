@@ -1860,9 +1860,9 @@ dependencies = [
 
 [[package]]
 name = "kaish-glob"
-version = "0.17.2"
+version = "0.18.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6a8f0120878d1b18b3608cb0eacfcb55db97fd6b7a8374ee1fd44b507780985f"
+checksum = "83edc924cbc73043e9e823bdc12b468b4bbef523ccc1a8cb656399a5bd25f5b6"
 dependencies = [
  "async-trait",
  "ignore",
@@ -1872,18 +1872,18 @@ dependencies = [
 
 [[package]]
 name = "kaish-help"
-version = "0.17.2"
+version = "0.18.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1181e0536c6114d2a3395e089aec38f2526ff25bbda16224f3b995e4815dfa5b"
+checksum = "6ea8cc3b75814767c06e1fd2e2de0ea976e2b0b22c63837abfc8f834390e0064"
 dependencies = [
  "kaish-types",
 ]
 
 [[package]]
 name = "kaish-kernel"
-version = "0.17.2"
+version = "0.18.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "198f122a3f1238e1bdad93f7893360f6968e8895c77aacc490e7a38536688dd8"
+checksum = "a0a51df774877613bc0b46fb8995f4bb58d2f59ebc5d124bb4b7f347c889e160"
 dependencies = [
  "anyhow",
  "ariadne",
@@ -1932,9 +1932,9 @@ dependencies = [
 
 [[package]]
 name = "kaish-tool-api"
-version = "0.17.2"
+version = "0.18.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9a5bc69b72b8673b23e88ef1cfd0c10eec1c64f62fcea8c3a2fcebc721316924"
+checksum = "e9b9080adee980d7d56a27d90928b94e0c2ab7f922347a0641e2971c4b82f207"
 dependencies = [
  "async-trait",
  "clap",
@@ -1943,9 +1943,9 @@ dependencies = [
 
 [[package]]
 name = "kaish-types"
-version = "0.17.2"
+version = "0.18.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "093211624f8fc7dd646c1e4240ad2f77a092c2208e304a7a096c2c4e245d1cc1"
+checksum = "c831e88c275a40e8b0899949b9d7435840a1c87ef12f5facc18d8ec9583749aa"
 dependencies = [
  "base64 0.22.1",
  "serde",
@@ -1957,9 +1957,9 @@ dependencies = [
 
 [[package]]
 name = "kaish-vfs"
-version = "0.17.2"
+version = "0.18.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8fc0e3aa081885961267f10b36b19e06611b8560ec7c57b3f8bf84c64d3391e0"
+checksum = "c35edf7b28d5fefc31215f6db5310c5087c649f99a43047d5ca28ade62b7307d"
 dependencies = [
  "async-trait",
  "getrandom 0.3.4",
