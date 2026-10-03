@@ -4725,7 +4725,8 @@ A few habits from `bash` that *won't* carry over here — reach for the kaish fo
   `$dir/file.txt`.
 - This shell is **read-only**: a write or a redirect that would create a file is refused
   with exit `1` and a message ending `read-only filesystem`, as in
-  `rm: src/lib.rs: read-only filesystem`; an external command is unreachable and exits
+  `rm: src/lib.rs: read-only filesystem` (`cp` names no path, and `ln -s` across mounts
+  ends `a link cannot cross mounts`); an external command is unreachable and exits
   `127`. That's the boundary working, not a bug — read freely, and don't try to mutate.
   Refusals and ordinary failures share exit `1`, so read the stderr line when you need to
   tell them apart.

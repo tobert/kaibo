@@ -66,14 +66,16 @@ Each call starts at the project root; \
 there is no persistent cwd. Read the exit code: 0 is success; -1 means kaish could \
 not run the script (a parse or validation failure, where nothing ran, or a shell error \
 partway through, where stdout and stderr keep what ran before it), and stderr says \
-why; 3 means the output was too large and came back as a head+tail sample (not a \
-failure); 124 means the script was killed for running past its time budget; 127 is \
+why; 3 means the output was too large and came back as a sample of it, the start and \
+sometimes the end (not a failure; a cut stream can also exit 0, so look for the \
+`[output truncated` line); 124 means the script was killed for running past its time budget; 127 is \
 how every external command answers here — its message names the refusal, as in \
 `curl: external commands are not available in this build of the shell`; 2 is a usage \
 error, such as an unknown flag or a missing operand, and grep also exits 2 for a file \
 it cannot read; 1 is an ordinary failure, and from grep it means only that no line \
 matched. A refused write exits 1 too, and its stderr line ends `read-only \
-filesystem`, as in `rm: src/lib.rs: read-only filesystem`. Read the message and not \
+filesystem`, as in `rm: src/lib.rs: read-only filesystem`; `cp` ends it with no path, and `ln -s` \
+across mounts ends `a link cannot cross mounts`. Read the message and not \
 only the code, because that phrase is what tells a refusal apart from a mistake. \
 To learn more, run `help`, `help syntax`, or `help <builtin>` in any \
 script, or read the `kaibo://kaish/*` resources.";
@@ -499,7 +501,8 @@ pub fn kaibo_sandbox_doc() -> String {
          The code tells you the shape of the outcome; the message tells you which \
          outcome it was. A refused write and an ordinary mistake both exit `1`, so \
          read the stderr line: a refusal ends `read-only filesystem`, as in \
-         `rm: src/lib.rs: read-only filesystem`.\n\
+         `rm: src/lib.rs: read-only filesystem` (`cp` names no path, and `ln -s` across \
+         mounts ends `a link cannot cross mounts`).\n\
          - `0` — success\n\
          - `-1` — kaish could not run the script. Either it failed to parse or \
          validate, so nothing ran, or the shell hit an error partway through, and \
@@ -511,8 +514,9 @@ pub fn kaibo_sandbox_doc() -> String {
          - `2` — a usage error the caller can fix: an unknown flag, a missing operand, \
          or a flag value the builtin cannot use. `grep` also exits `2` for a file it \
          cannot read\n\
-         - `3` — output exceeded the cap and was truncated to a head+tail sample \
-         (not a failure; the full output is not returned)\n\
+         - `3` — output exceeded the cap and was truncated to a sample, the start and \
+         sometimes the end (not a failure; the full output is not returned; a cut stream \
+         can also exit 0, so look for the `[output truncated` line)\n\
          - `124` — killed for exceeding the per-exec time budget\n\
          - `126` — a builtin the operator disabled in kaibo's config; the default \
          config disables none, so you will rarely see this\n\
