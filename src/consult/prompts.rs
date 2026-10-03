@@ -980,8 +980,8 @@ mod tests {
         );
         assert!(
             p.contains("instead, with `cat -n FILE | sed -n '120,400p'`."),
-            "the span example must be written with the range QUOTED — unquoted, kaish \
-             0.13 refuses the comma with a parse error: {p}"
+            "the span example must be written with the range QUOTED, as every other \
+             `sed -n` example in the preamble is: {p}"
         );
         assert!(
             p.contains("keeps the real line numbers"),
@@ -1053,9 +1053,9 @@ mod tests {
                 let rest = &text[i + "sed -n ".len()..];
                 assert!(
                     rest.starts_with('\''),
-                    "{label}: every `sed -n` range must be quoted — unquoted, kaish 0.13 \
-                     refuses the comma with a parse error and the model loses the \
-                     turn:\n{text}"
+                    "{label}: every `sed -n` range must be quoted — unquoted, the preamble \
+                     would show two spellings of one range, which reads as a distinction \
+                     kaibo is not drawing:\n{text}"
                 );
             }
             assert!(seen > 0, "{label} must still teach a span read:\n{text}");

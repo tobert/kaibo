@@ -28,6 +28,8 @@ record. Each later release appends a new section at the top.
 - The artifact store holds `mp3` and `wav`; `write_cas` and `kaibo cas write` accept them, and `inputs` takes them.
 
 ### Changed
+- kaish 0.18: `grep` and `sed` read GNU basic regex, so `grep -rn 'fn consult(' src` runs; use `-E` for `|` alternation.
+- kaish 0.18: a write to the read-only mount reports `read-only filesystem`, and usage errors exit 2.
 - The configuration reference and template are less than half their former length.
 - A failed consultation tells the calling agent to ask the user whether to retry, use another cast, or continue without it.
 - rig 0.42: OpenRouter's output budget is now sent by rig as `max_tokens`, replacing kaibo's `max_completion_tokens` workaround.
@@ -38,6 +40,7 @@ record. Each later release appends a new section at the top.
 - The `gemini-images` backend kind is now `gemini-media`; the old name still loads.
 
 ### Fixed
+- A shell fault partway through a script keeps the stdout and stderr of the statements that ran before it.
 - `list_models` on a Gemini or Stability media backend names the `audio` slot and its model ids, not only `image`.
 - A deferred `generate` whose result cannot be collected names the provider's job id, so a paid result stays reachable.
 - `kaibo generate` refuses `--field prompt=` and `--field model=`, as the MCP tool does, so provenance names what ran.
