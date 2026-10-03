@@ -11,7 +11,7 @@ use std::time::Duration;
 use anyhow::{anyhow, Context, Result};
 use rig_agent::agent::hook::{
     AgentHook, CompletionCall, CompletionCallAction, HookContext, InvalidToolCallAction,
-    InvalidToolCallContext, ToolResultAction, ToolResultEvent,
+    InvalidToolCallContext, ModelTurnAction, ModelTurnFinished, ToolResultAction, ToolResultEvent,
 };
 use rig_agent::agent::AgentBuilder;
 use rig_agent::completion::PromptError;
@@ -21,7 +21,7 @@ use rig_core::completion::message::{
     AssistantContent, DocumentSourceKind, Image, ImageMediaType, MimeType, ToolChoice, ToolResult,
     ToolResultContent, UserContent,
 };
-use rig_core::completion::{CompletionModel, Message, Usage};
+use rig_core::completion::{CompletionModel, FinishReason, Message, Usage};
 use rig_core::providers::{anthropic, deepseek, gemini, openai, openrouter};
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -33,7 +33,7 @@ use crate::completion_watch::{watched, CompletionLog};
 use crate::config::{Backend, Defaults, ModelRole, ModelSlot};
 use crate::credentials::WireKind;
 use crate::explorer::RunKaish;
-use crate::progress::{PhaseEvent, ProgressSink};
+use crate::progress::{EffortLowered, PhaseEvent, ProgressSink};
 use crate::sandbox::{KaishWorker, SandboxConfig};
 use crate::session::{QaTurn, Sessions};
 use crate::sweep_attach::{SweepAttach, SweepAttachSink, SweepConsumer, SweepConsumerKind};
@@ -652,12 +652,275 @@ curated report) from what you already have.";
 /// front-and-back repetition, different fact.
 const EMPTY_ANSWER_NOTE: &str = "\
 Your last turn contained no answer text — the response came back empty. You have \
-already gathered evidence in this conversation, so nothing more needs investigating. \
+already gathered evidence in this conversation. \
 Using only that evidence, write your COMPLETE final response now, with its concrete \
 `file:line` citations. Where the evidence runs out, say so plainly: naming what you \
 do not know is part of a complete answer, not a reason to keep investigating. Do not \
 call any tool. Do not ask to continue. Write the full answer (or curated report) from \
 what you already have.";
+
+/// The forced-finish instruction for a phase whose last turn the provider **cut off at
+/// the output limit** before it wrote anything: the model spent its whole `max_tokens`
+/// reasoning. Distinct from [`EMPTY_ANSWER_NOTE`] (the model stopped by itself) and
+/// [`FINALIZE_NOTE`] (out of turns), because each names a different fact. It uses the
+/// same vocabulary as the oneshot and batch preambles (thinking shares the output
+/// budget) and asks for an order, not a size, per the no-size-cue rule.
+///
+/// Short on purpose, unlike its two siblings. This turn follows one that spent the whole
+/// budget thinking, and every obligation a note adds is one more thing for the model to
+/// plan before it writes. So it states the cause, the one fact that explains it, and the
+/// order to write in. It does not repeat "no tools": [`forced_finish_turn`] sends
+/// `ToolChoice::None`. The turn also thinks at [`CUT_OFF_WRITE_UP_EFFORT`], which does
+/// more to shorten the thinking than any wording can.
+const CUT_OFF_NOTE: &str = "\
+Your last turn reached the output limit while you were still thinking, before you \
+wrote anything. Thinking and your reply share one output budget. Move to writing as \
+soon as you know what the evidence in this conversation shows: lead with the \
+conclusion, cite `file:line` for each claim, then give your reasoning, and say where \
+the evidence runs out.";
+
+/// The effort the write-up after a cut-off thinks at, when the slot's effort is higher.
+/// Lowered through [`lower_effort`](super::shaping::lower_effort), so a slot already at
+/// or below it, an effort kaibo cannot rank, or a wire with no effort (Anthropic's budget
+/// style) is sent unchanged. DeepSeek runs `medium` as `high` (it has three rungs:
+/// `docs/config.md`), so the built-in `deepseek` cast's write-up runs at `high`, one
+/// rung under its `max`.
+const CUT_OFF_WRITE_UP_EFFORT: &str = "medium";
+
+/// The reason [`CutOffStopHook`] stops a run with, matched in [`run_phase_loop`]. Never
+/// shown to a model or a caller.
+const CUT_OFF_STOP: &str = "kaibo:cut_off_at_output_limit";
+
+/// Stops the run at a turn the provider cut off at the output limit before it wrote
+/// anything, so [`run_phase_loop`] gets the transcript back and can recover.
+///
+/// **Why a stop, not a retry.** rig-agent 0.42 checks every accepted turn and raises
+/// `ResponseError("the model produced no answer and stopped with finish_reason=Length")`
+/// when one was cut short with no text and no tool call (`run/mod.rs`, the
+/// `truncating_finish_reason` check). That error carries no transcript, so every turn of
+/// reading already done was lost, and before 0.42 the same turn came back as an empty
+/// `Ok` that the evidence-gated write-up recovered. `on_model_turn_finished` fires
+/// before that check, and `ModelTurnAction::Stop` ends the run as `PromptCancelled`
+/// carrying the full history, which is the shape the view_image break already resumes
+/// from. A `Retry` here would resend the same request at the same effort and budget,
+/// inside the run's turn budget, with no way to forbid tools; see [`write_up_or_fail`]
+/// for the turn kaibo runs instead.
+///
+/// **Only `Length`.** A turn that carried text or a tool call is left alone, as rig
+/// leaves it (a tool call in progress still executes). A content-filter stop keeps rig's
+/// own error: the budget is not its cause, and a forced write-up would not address it.
+///
+/// It also sums the usage of every turn it sees, because `PromptCancelled` carries none,
+/// and the cut-off turn was billed in full.
+#[derive(Clone, Default)]
+struct CutOffStopHook {
+    seen: Arc<Mutex<(Usage, usize)>>,
+}
+
+impl CutOffStopHook {
+    /// The usage summed over this run's turns, and the one-based index of the last turn
+    /// seen (the cut-off turn, when the hook stopped the run).
+    fn spent(&self) -> (Usage, usize) {
+        *self.seen.lock().expect("cut-off hook poisoned")
+    }
+}
+
+impl AgentHook for CutOffStopHook {
+    async fn on_model_turn_finished(
+        &self,
+        _ctx: &HookContext,
+        event: ModelTurnFinished<'_>,
+    ) -> ModelTurnAction {
+        {
+            let mut seen = self.seen.lock().expect("cut-off hook poisoned");
+            seen.0 += event.usage;
+            seen.1 = event.turn;
+        }
+        if matches!(event.finish_reason, Some(FinishReason::Length))
+            && turn_wrote_nothing(event.content)
+        {
+            ModelTurnAction::stop(CUT_OFF_STOP)
+        } else {
+            ModelTurnAction::continue_run()
+        }
+    }
+}
+
+/// Whether a turn delivered nothing a caller or the loop can use: no non-blank text, no
+/// tool call, no image. Reasoning alone is not an answer. The same classification as
+/// rig-agent's `turn_delivered_no_answer` (crate-private there) with one deliberate
+/// difference: whitespace-only text counts as nothing here, where rig counts any
+/// non-empty text as an answer, so a blank cut-off turn is also recovered rather than
+/// returned as an empty answer. Exhaustive for the same reason as rig's: a new content
+/// variant must fail this build and be classified.
+fn turn_wrote_nothing(content: &[AssistantContent]) -> bool {
+    !content.iter().any(|c| match c {
+        AssistantContent::Text(text) => !text.text.trim().is_empty(),
+        AssistantContent::ToolCall(_) => true,
+        AssistantContent::Image(_) => true,
+        AssistantContent::Reasoning(_) => false,
+    })
+}
+
+/// Why a phase ended without answer text. It decides the note the one forced write-up
+/// turn carries and the words its errors use, because telling a model or a caller the
+/// wrong cause changes what they do next.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NoAnswer {
+    /// The model ended a turn by itself with no text: rig returned an empty `Ok`.
+    Stopped,
+    /// The provider cut the turn off at the output limit before it wrote anything.
+    CutOff,
+}
+
+impl NoAnswer {
+    fn note(self) -> &'static str {
+        match self {
+            NoAnswer::Stopped => EMPTY_ANSWER_NOTE,
+            NoAnswer::CutOff => CUT_OFF_NOTE,
+        }
+    }
+
+    /// What happened, as the published progress beat's first clause. Not "reached
+    /// research limit": the turn cap was not the cause.
+    fn beat(self) -> &'static str {
+        match self {
+            NoAnswer::Stopped => "the model stopped without writing an answer",
+            NoAnswer::CutOff => "the model hit its output limit while thinking",
+        }
+    }
+
+    /// What happened, as the first clause of the error detail.
+    fn what(self) -> &'static str {
+        match self {
+            NoAnswer::Stopped => "it stopped without answering",
+            NoAnswer::CutOff => "its turn was cut off at the output limit before it wrote anything",
+        }
+    }
+}
+
+/// The recovery for a phase that ended with no answer text: one forced write-up turn
+/// when the transcript holds evidence, an [`empty_answer_error`] when it does not.
+///
+/// **At most once, and structurally so.** Every path returns (the forced turn's answer,
+/// or an error), so it never re-enters the loop and cannot stack a second re-ask. That
+/// is a stronger guarantee than a `finalized` flag, which a later edit could reset.
+/// Pinned by `an_empty_forced_write_up_turn_errors_and_is_never_retried_twice`.
+///
+/// **Why not rig-agent's `ModelTurnAction::Retry`?** Evaluated 2026-08-02 (rig-agent
+/// 0.41 `hook.rs`) and rejected, and still true at 0.42: (1) a retry cannot constrain
+/// the retried turn, where [`forced_finish_turn`] sends `ToolChoice::None`, so the model
+/// must write rather than spend the nudge on another tool call; (2) a hook retry
+/// "consumes the run's existing total model-call budget", so an empty answer at the cap
+/// would get no recovery, where this turn runs deliberately outside the budget; (3)
+/// `Stop(reason)` is a string, and [`empty_answer_error`]'s diagnostics would flatten
+/// into it.
+///
+/// `spent` is what the phase already used; the forced turn's usage is added to it,
+/// never substituted.
+#[allow(clippy::too_many_arguments)] // mirrors run_phase's loop inputs
+async fn write_up_or_fail<M>(
+    model: &M,
+    log: &CompletionLog,
+    model_name: &str,
+    preamble: &str,
+    max_tokens: u64,
+    temperature: Option<f64>,
+    thinking: Option<&Value>,
+    tools: Vec<DynamicTool>,
+    transcript: Vec<Message>,
+    spent: Usage,
+    turns: usize,
+    max_turns: usize,
+    role: ModelRole,
+    progress: &dyn ProgressSink,
+    cause: NoAnswer,
+) -> Result<(String, Usage)>
+where
+    M: CompletionModel + Clone + 'static,
+{
+    if !transcript_has_tool_results(&transcript) {
+        return Err(empty_answer_error(
+            model_name,
+            role,
+            turns,
+            max_turns,
+            &spent,
+            log.last_finish_reason().as_deref(),
+            max_tokens,
+            &format!(
+                "{}, and its transcript holds no tool results to write up — asking it to \
+                 answer anyway would invite an ungrounded review",
+                cause.what()
+            ),
+        ));
+    }
+    // A turn cut off while thinking is likely to be cut off again at the same depth, so
+    // its write-up thinks at a lower effort. A model that stopped by itself had budget
+    // left, and keeps the slot's effort.
+    let lowered = match cause {
+        NoAnswer::CutOff => super::shaping::lower_effort(thinking, CUT_OFF_WRITE_UP_EFFORT),
+        NoAnswer::Stopped => None,
+    };
+    let effort = lowered.as_ref().map(|(_, from)| EffortLowered {
+        from: from.clone(),
+        to: CUT_OFF_WRITE_UP_EFFORT,
+    });
+    let asked_at = match &effort {
+        Some(e) => format!(" at effort {} (the slot sets {})", e.to, e.from),
+        None => String::new(),
+    };
+    tracing::warn!(
+        model = model_name,
+        turns,
+        output_tokens = spent.output_tokens,
+        cause = ?cause,
+        effort = ?effort,
+        "phase ended with no answer text and evidence gathered — forcing one final \
+         write-up turn"
+    );
+    progress.emit(PhaseEvent::AnswerForced {
+        cause: cause.beat(),
+        effort,
+    });
+    let thinking = lowered.as_ref().map(|(params, _)| params).or(thinking);
+    let (answer, retry_usage) = forced_finish_turn(
+        model,
+        preamble,
+        max_tokens,
+        temperature,
+        thinking,
+        tools,
+        transcript,
+        cause.note(),
+    )
+    .await
+    .map_err(|e| {
+        anyhow!(
+            "model {model_name} returned an empty answer ({}), and the forced final-answer \
+             turn{asked_at} also failed: {e}",
+            cause.what()
+        )
+    })?;
+    let usage = spent + retry_usage;
+    if answer.trim().is_empty() {
+        return Err(empty_answer_error(
+            model_name,
+            role,
+            turns + 1,
+            max_turns,
+            &usage,
+            log.last_finish_reason().as_deref(),
+            max_tokens,
+            &format!(
+                "{}; it was asked once{asked_at} to write the answer it owed and came back \
+                 empty again",
+                cause.what()
+            ),
+        ));
+    }
+    Ok((answer, usage))
+}
 
 /// Build the forced final turn from a partial transcript.
 ///
@@ -1317,6 +1580,8 @@ where
     // Surface the exact reasoning/sampling params this phase ships (constant across the
     // resume loop), so a trace shows whether — and at what depth — thinking was on: the
     // wire truth behind the `chat` spans' `reasoning_tokens`. Inert with no exporter.
+    // One turn can differ: the write-up after a cut-off may send a lowered effort, which
+    // `write_up_or_fail` records on its warn event and the `AnswerForced` beat instead.
     if let Some(t) = thinking {
         tracing::Span::current().record("gen_ai.request.thinking", tracing::field::display(t));
     }
@@ -1453,6 +1718,9 @@ where
             builder = builder.additional_params(params.clone());
         }
         let agent = builder.dynamic_tools(make_tools()?).build();
+        // Fresh per iteration for the same reason as the image-break hook below: the
+        // usage it sums and the turn it records belong to this run only.
+        let cut_off = CutOffStopHook::default();
 
         // A fresh hook per loop iteration is load-bearing: its `saw_tool_image` flag
         // must be scoped to *this* turn. Hoisting it out of the loop (or reusing the
@@ -1460,12 +1728,13 @@ where
         // completion call of a resume that ran no view_image. Keep it built here.
         // The run yields a `PromptResponse` carrying the token `usage` the provider
         // reported, summed across every turn of *this* run. The clean `Ok` path is the
-        // common case — one run, the full count. The two exceptional exits below (turn
-        // cap, view_image break) undercount: rig hands back no usage on
+        // common case — one run, the full count. Two exceptional exits below (turn cap,
+        // view_image break) undercount: rig hands back no usage on
         // `MaxTurnsError`/`PromptCancelled`, so the turns spent in a capped or broken
-        // run are lost and only the finalize/resumed run's usage survives. Deliberate —
-        // recovering it would mean summing per-completion through a hook; documented as
-        // a known undercount rather than silently exact.
+        // run are lost and only the finalize/resumed run's usage survives. The cut-off
+        // exit does not: `CutOffStopHook` sums this run's turns itself. Summing the other
+        // two the same way is possible and not yet done; until then they are a
+        // documented undercount rather than silently exact.
         let result = agent
             .runner(prompt.clone())
             .history(history.clone())
@@ -1476,6 +1745,7 @@ where
             // (`oneshot`, `deliberate`'s direct synth) bypass the agent entirely via
             // `Arm::complete` and can raise no tool call at all.
             .add_hook(UnknownToolFeedbackHook::new(model_name))
+            .add_hook(cut_off.clone())
             .max_turns(remaining)
             .run()
             .await;
@@ -1491,92 +1761,65 @@ where
             // carried only a `Reasoning` block, which rig's text extraction filters out.
             Ok(resp) => {
                 // The spent-so-far usage is real and must survive into whatever we return
-                // — this is the `Ok` path, so rig reported it exactly. The retry's usage is
-                // ADDED to it below, never substituted (the turn-cap path may legitimately
-                // replace, because rig reports none on `MaxTurnsError`).
-                let spent = resp.usage;
+                // — this is the `Ok` path, so rig reported it exactly.
+                //
                 // rig builds this response at exactly one place and always attaches the
                 // transcript (`with_messages`, `prompt_request/mod.rs:918`), so `Some` is
                 // the structural case. `None` is unreachable-by-construction defensive
                 // code, and it fails CLOSED: no transcript means no evidence to gate on,
                 // and re-asking blind is the fabrication risk the gate exists to refuse.
                 let turns = count_model_turns(&history) + resp.completion_calls.len();
-                let transcript = resp.messages.unwrap_or_default();
-                if !transcript_has_tool_results(&transcript) {
-                    return Err(empty_answer_error(
-                        model_name,
-                        role,
-                        turns,
-                        max_turns,
-                        &spent,
-                        log.last_finish_reason().as_deref(),
-                        max_tokens,
-                        "it stopped without answering, and its transcript holds no tool \
-                         results to write up — asking it to answer anyway would invite an \
-                         ungrounded review",
-                    ));
-                }
-                // Evidence in hand: ask for the write-up it owed. **At most once, and
-                // structurally so** — this arm returns on every path (the forced turn's
-                // answer, or an error), so it never re-enters the loop and cannot stack a
-                // second re-ask. That is a stronger guarantee than a `finalized` flag,
-                // which a later edit could reset; the shape itself forbids the loop. Pinned
-                // by `an_empty_forced_write_up_turn_errors_and_is_never_retried_twice`.
-                //
-                // **Why not rig-agent's `on_model_turn_finished` + `ModelTurnAction::
-                // Retry`?** Evaluated 2026-08-02 (rig-agent 0.41 `hook.rs`) and rejected:
-                // the first-class retry is weaker than this recovery on the three counts
-                // that matter here. (1) `Retry(Feedback)` cannot constrain the retried
-                // turn — [`forced_finish_turn`] sends `ToolChoice::None`, so the model
-                // must write rather than spend the nudge on another tool call. (2) A hook
-                // retry "consumes the run's existing total model-call budget", so an
-                // empty answer at the cap would get no recovery, where this path runs the
-                // write-up turn deliberately outside the budget. (3) `Stop(reason)` is a
-                // string; [`empty_answer_error`]'s diagnostics (turns, tokens, the
-                // provider's finish_reason off the [`CompletionLog`]) would flatten into
-                // it. Re-evaluate if rig grows a constrained retry.
-                tracing::warn!(
-                    model = model_name,
-                    turns,
-                    output_tokens = spent.output_tokens,
-                    "phase returned an empty answer with evidence gathered — forcing one \
-                     final write-up turn"
-                );
-                progress.emit(PhaseEvent::TurnCapReached);
                 let mut full = history;
-                full.extend(transcript);
-                let (answer, retry_usage) = forced_finish_turn(
+                full.extend(resp.messages.unwrap_or_default());
+                return write_up_or_fail(
                     model,
+                    log,
+                    model_name,
                     preamble,
                     max_tokens,
                     temperature,
                     thinking,
                     make_tools()?,
                     full,
-                    EMPTY_ANSWER_NOTE,
+                    resp.usage,
+                    turns,
+                    max_turns,
+                    role,
+                    progress,
+                    NoAnswer::Stopped,
                 )
-                .await
-                .map_err(|e| {
-                    anyhow!(
-                        "model {model_name} returned an empty answer, and the forced \
-                         final-answer turn also failed: {e}"
-                    )
-                })?;
-                let usage = spent + retry_usage;
-                if answer.trim().is_empty() {
-                    return Err(empty_answer_error(
-                        model_name,
-                        role,
-                        turns + 1,
-                        max_turns,
-                        &usage,
-                        log.last_finish_reason().as_deref(),
-                        max_tokens,
-                        "it was asked once to write the answer it owed and came back empty \
-                         again",
-                    ));
-                }
-                return Ok((answer, usage));
+                .await;
+            }
+            // A turn the provider cut off at the output limit before it wrote anything —
+            // a reasoning model that spent its whole `max_tokens` thinking. rig-agent 0.42
+            // turns that into a `ResponseError` with no transcript, which threw away the
+            // whole investigation; [`CutOffStopHook`] stops the run one step earlier, so
+            // rig hands back the transcript instead. From here it is the same recovery as
+            // the empty `Ok` above, told the true reason.
+            Err(PromptError::PromptCancelled {
+                chat_history,
+                reason,
+            }) if reason == CUT_OFF_STOP => {
+                let (spent, cut_off_turn) = cut_off.spent();
+                let turns = count_model_turns(&history) + cut_off_turn;
+                return write_up_or_fail(
+                    model,
+                    log,
+                    model_name,
+                    preamble,
+                    max_tokens,
+                    temperature,
+                    thinking,
+                    make_tools()?,
+                    chat_history,
+                    spent,
+                    turns,
+                    max_turns,
+                    role,
+                    progress,
+                    NoAnswer::CutOff,
+                )
+                .await;
             }
             Err(PromptError::MaxTurnsError { chat_history, .. }) => {
                 // The loop hit its cap and is about to write a forced final answer —
@@ -2614,7 +2857,7 @@ pub async fn consult(
 
 #[cfg(test)]
 mod tests {
-    use super::super::shaping::thinking_params;
+    use super::super::shaping::{thinking_params, ModelShape, ThinkingStyleOverride};
     use super::*;
     use std::time::Duration;
 
@@ -2622,7 +2865,7 @@ mod tests {
     use crate::session::{SessionStore, Sessions};
     use crate::test_support::{
         has_tool, is_finalize_turn, provider_error, reasoning_response, text_response,
-        tool_call_response, transcript_text, usage, with_raw, with_usage, CaptureHttp,
+        tool_call_response, transcript_text, truncated, usage, with_raw, with_usage, CaptureHttp,
         RecordingSink, ScriptedClient,
     };
     use rig_core::completion::CompletionRequest;
@@ -5618,6 +5861,357 @@ mod tests {
         );
     }
 
+    /// Which turns count as "wrote nothing": the predicate that decides whether a
+    /// `Length` turn is stopped and recovered, or left to run (a tool call still
+    /// executes; text is an answer).
+    #[test]
+    fn turn_wrote_nothing_classifies_every_content_kind() {
+        use rig_core::completion::message::Reasoning;
+        let text = |t: &str| AssistantContent::text(t);
+        let reasoning = AssistantContent::Reasoning(Reasoning::new("thinking"));
+        let call = AssistantContent::tool_call("c1", "run_kaish", serde_json::json!({}));
+        assert!(turn_wrote_nothing(&[]));
+        assert!(turn_wrote_nothing(std::slice::from_ref(&reasoning)));
+        assert!(turn_wrote_nothing(&[text("  \n"), reasoning.clone()]));
+        assert!(!turn_wrote_nothing(&[text("the answer")]));
+        assert!(!turn_wrote_nothing(&[reasoning, call]));
+    }
+
+    /// **The 2026-09-26 kaiseki job-1 shape.** A synth reads real files, then a later
+    /// turn reasons until the provider cuts it off at `max_tokens` (`finish_reason`
+    /// `length`, every output token counted as reasoning) and writes nothing. Since
+    /// rig 0.42 the agent loop turns that into
+    /// `ResponseError("the model produced no answer and stopped with finish_reason=Length")`,
+    /// which carries no transcript, so the whole investigation was thrown away and the
+    /// caller was told the provider "rejected the request". Before 0.42 the same turn came
+    /// back as an empty `Ok` and the evidence-gated write-up above recovered it.
+    ///
+    /// With evidence in hand, the cut-off turn gets the same one forced write-up turn,
+    /// told the true reason (the shared output budget ran out while reasoning), and the
+    /// cut-off turn's spend stays on the bill.
+    #[tokio::test]
+    async fn a_turn_cut_off_at_the_output_limit_mid_loop_is_written_up_from_its_evidence() {
+        const SYNTH: &str = "deepseek-flash";
+        const RECOVERED: &str = "REVIEW: src/foo.rs:1 defines the marker.";
+        let client = ScriptedClient::builder()
+            .on_model(SYNTH, |req| {
+                if is_finalize_turn(req) {
+                    Ok(with_usage(text_response(RECOVERED), usage(70_000, 4_000)))
+                } else if transcript_text(req).contains("target_marker") {
+                    // The evidence is in; this turn reasons until it is cut off.
+                    Ok(truncated(with_usage(
+                        reasoning_response("Now weighing each function against the tests..."),
+                        Usage {
+                            reasoning_tokens: 32_768,
+                            ..usage(64_688, 32_768)
+                        },
+                    )))
+                } else {
+                    Ok(with_usage(
+                        tool_call_response(
+                            "c1",
+                            "run_kaish",
+                            json!({"script": "cat -n src/foo.rs"}),
+                        ),
+                        usage(8_578, 17_158),
+                    ))
+                }
+            })
+            .build();
+
+        let dir = project_with_marker();
+        let out = consult_with(
+            "review src/foo.rs",
+            dir.path(),
+            &arm(&client, "explorer-unused"),
+            &arm(&client, SYNTH),
+            &ConsultConfig::default(),
+        )
+        .await
+        .expect("a turn cut off after real evidence must be recovered, not failed");
+
+        assert!(out.answer.contains(RECOVERED), "{:?}", out.answer);
+
+        let finalizes: Vec<_> = client
+            .requests_for(SYNTH)
+            .into_iter()
+            .filter(is_finalize_request)
+            .collect();
+        assert_eq!(finalizes.len(), 1, "exactly one forced write-up turn");
+        assert!(
+            finalizes[0].transcript.contains("target_marker"),
+            "the forced turn must replay the gathered evidence: {:?}",
+            finalizes[0].transcript
+        );
+        // The true reason, not the empty-answer note and not the turn-cap note.
+        assert!(
+            finalizes[0].transcript.contains("output budget"),
+            "the forced turn must say the output budget ran out: {:?}",
+            finalizes[0].transcript
+        );
+        assert!(
+            !finalizes[0].transcript.contains("came back empty")
+                && !finalizes[0]
+                    .transcript
+                    .contains("reached your research limit"),
+            "the forced turn must not claim a cause that did not happen: {:?}",
+            finalizes[0].transcript
+        );
+
+        // The cut-off turn was billed; it stays on the record (17,158 + 32,768 + 4,000).
+        assert_eq!(out.usage.output_tokens, 53_926);
+        assert_eq!(out.usage.reasoning_tokens, 32_768);
+    }
+
+    /// The effort a recorded request carried, read from DeepSeek's `reasoning_effort`.
+    fn deepseek_effort(r: &crate::test_support::RecordedRequest) -> Option<String> {
+        r.additional_params
+            .as_ref()
+            .and_then(|p| p["reasoning_effort"].as_str())
+            .map(str::to_string)
+    }
+
+    /// A consult whose synth arm reasons at `max` on DeepSeek's wire, with a sink on the
+    /// progress beats. Returns the sink so a test can read what the caller was told.
+    async fn consult_at_max_effort(client: &ScriptedClient, synth: &str) -> Arc<RecordingSink> {
+        let params =
+            ModelShape::resolve(ProviderKind::DeepSeek, synth, ThinkingStyleOverride::Auto)
+                .to_params(8192, None, None, "max");
+        let sink = Arc::new(RecordingSink::default());
+        let cfg = ConsultConfig {
+            explore: ExploreConfig {
+                phase: PhaseContext {
+                    progress: sink.clone(),
+                    ..PhaseContext::default()
+                },
+                ..ExploreConfig::default()
+            },
+            ..ConsultConfig::default()
+        };
+        let dir = project_with_marker();
+        consult_with(
+            "review src/foo.rs",
+            dir.path(),
+            &arm(client, "cheap-explorer"),
+            &arm_with(client, synth, params),
+            &cfg,
+        )
+        .await
+        .expect("a phase with evidence must be written up, not failed");
+        sink
+    }
+
+    /// The write-up effort must pass rig's own request builder on each wire that checks
+    /// effort against a closed list. `Arm::from_slot` preflights only the slot's effort,
+    /// so a write-up effort rig refused would fail inside the call, mid-recovery, as a
+    /// bare serde error that names no slot.
+    #[test]
+    fn the_cut_off_write_up_effort_passes_every_closed_effort_wire() {
+        use super::super::shaping::{accepted_efforts, EffortWire};
+        for wire in [EffortWire::Gemini, EffortWire::OpenaiResponses] {
+            assert!(
+                accepted_efforts(wire).contains(&CUT_OFF_WRITE_UP_EFFORT),
+                "{wire:?} must accept {CUT_OFF_WRITE_UP_EFFORT:?}"
+            );
+        }
+    }
+
+    /// The write-up after a cut-off thinks at [`CUT_OFF_WRITE_UP_EFFORT`], not at the
+    /// slot's effort: the turn before it spent the whole output budget reasoning, and the
+    /// same depth would likely spend it again. The progress beat names both efforts, so a
+    /// caller knows the answer came from a shallower turn. Every other turn keeps `max`.
+    #[tokio::test]
+    async fn a_cut_off_write_up_thinks_at_medium_effort_and_says_so() {
+        const SYNTH: &str = "deepseek-flash";
+        let client = ScriptedClient::builder()
+            .on_model(SYNTH, |req| {
+                if is_finalize_turn(req) {
+                    Ok(text_response("REVIEW: src/foo.rs:1 defines the marker."))
+                } else if transcript_text(req).contains("target_marker") {
+                    Ok(truncated(with_usage(
+                        reasoning_response("Now weighing each function against the tests..."),
+                        Usage {
+                            reasoning_tokens: 32_768,
+                            ..usage(64_688, 32_768)
+                        },
+                    )))
+                } else {
+                    Ok(tool_call_response(
+                        "c1",
+                        "run_kaish",
+                        json!({"script": "cat -n src/foo.rs"}),
+                    ))
+                }
+            })
+            .build();
+
+        let sink = consult_at_max_effort(&client, SYNTH).await;
+
+        let (finalizes, turns): (Vec<_>, Vec<_>) = client
+            .requests_for(SYNTH)
+            .into_iter()
+            .partition(is_finalize_request);
+        assert_eq!(finalizes.len(), 1, "exactly one forced write-up turn");
+        assert_eq!(deepseek_effort(&finalizes[0]).as_deref(), Some("medium"));
+        assert_eq!(turns.len(), 2, "the read turn and the cut-off turn");
+        for turn in &turns {
+            assert_eq!(deepseek_effort(turn).as_deref(), Some("max"));
+        }
+
+        let beats: Vec<_> = sink
+            .events()
+            .into_iter()
+            .filter(|e| matches!(e, PhaseEvent::AnswerForced { .. }))
+            .map(|e| e.message())
+            .collect();
+        assert_eq!(beats.len(), 1, "{beats:?}");
+        assert!(
+            beats[0].contains("max") && beats[0].contains("medium"),
+            "the beat must name the slot's effort and the lowered one: {:?}",
+            beats[0]
+        );
+    }
+
+    /// When the lowered write-up is cut off too, the error says it already ran at the
+    /// lower effort, so the advice to lower `effort` reads against what was tried.
+    #[tokio::test]
+    async fn a_cut_off_write_up_that_is_cut_off_again_names_the_effort_it_ran_at() {
+        const SYNTH: &str = "deepseek-flash";
+        let client = ScriptedClient::builder()
+            .on_model(SYNTH, |req| {
+                if is_finalize_turn(req) || transcript_text(req).contains("target_marker") {
+                    Ok(truncated(with_usage(
+                        reasoning_response("Still weighing..."),
+                        Usage {
+                            reasoning_tokens: 16_384,
+                            ..usage(64_688, 16_384)
+                        },
+                    )))
+                } else {
+                    Ok(tool_call_response(
+                        "c1",
+                        "run_kaish",
+                        json!({"script": "cat -n src/foo.rs"}),
+                    ))
+                }
+            })
+            .build();
+        let params =
+            ModelShape::resolve(ProviderKind::DeepSeek, SYNTH, ThinkingStyleOverride::Auto)
+                .to_params(8192, None, None, "max");
+        let dir = project_with_marker();
+        let err = consult_with(
+            "review src/foo.rs",
+            dir.path(),
+            &arm(&client, "cheap-explorer"),
+            &arm_with(&client, SYNTH, params),
+            &ConsultConfig::default(),
+        )
+        .await
+        .expect_err("a write-up cut off twice is an empty answer");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("at effort medium (the slot sets max)"),
+            "{msg}"
+        );
+    }
+
+    /// A model that stopped by itself did not run out of budget, so its write-up keeps
+    /// the slot's effort, and the beat claims no change.
+    #[tokio::test]
+    async fn an_empty_answer_write_up_keeps_the_slot_effort() {
+        const SYNTH: &str = "deepseek-flash";
+        let client = ScriptedClient::builder()
+            .on_model(SYNTH, |req| {
+                if is_finalize_turn(req) {
+                    Ok(text_response("REVIEW: src/foo.rs:1 defines the marker."))
+                } else if transcript_text(req).contains("SWEEP_DONE") {
+                    Ok(reasoning_response("I have finished reviewing."))
+                } else {
+                    Ok(tool_call_response(
+                        "t-explore",
+                        "explore",
+                        json!({ "question": "review the diff" }),
+                    ))
+                }
+            })
+            .on_model("cheap-explorer", |_req| Ok(text_response("SWEEP_DONE")))
+            .build();
+
+        let sink = consult_at_max_effort(&client, SYNTH).await;
+
+        let finalizes: Vec<_> = client
+            .requests_for(SYNTH)
+            .into_iter()
+            .filter(is_finalize_request)
+            .collect();
+        assert_eq!(finalizes.len(), 1, "exactly one forced write-up turn");
+        assert_eq!(deepseek_effort(&finalizes[0]).as_deref(), Some("max"));
+        let beats: Vec<_> = sink
+            .events()
+            .into_iter()
+            .filter(|e| matches!(e, PhaseEvent::AnswerForced { .. }))
+            .map(|e| e.message())
+            .collect();
+        assert_eq!(beats.len(), 1, "{beats:?}");
+        assert!(!beats[0].contains("medium"), "{:?}", beats[0]);
+    }
+
+    /// The gate still holds on the cut-off path: a first turn that reasons until it is
+    /// cut off has gathered nothing, so kaibo does not ask it to answer anyway. The
+    /// failure is the empty-answer class, with the budget diagnosis and the two config
+    /// keys that change the outcome. Before this, the caller saw rig's "raise
+    /// max_tokens for this request" (a caller cannot, per call) under a "the provider
+    /// rejected the request; retrying is unlikely to help" frame.
+    #[tokio::test]
+    async fn a_turn_cut_off_before_any_evidence_fails_as_an_empty_answer_naming_the_budget() {
+        const SYNTH: &str = "deepseek-flash";
+        let client = ScriptedClient::builder()
+            .on_model(SYNTH, |_req| {
+                Ok(truncated(with_usage(
+                    reasoning_response("Twenty-five cases; start with the first..."),
+                    Usage {
+                        reasoning_tokens: 16_384,
+                        ..usage(8_000, 16_384)
+                    },
+                )))
+            })
+            .build();
+
+        let dir = project_with_marker();
+        let err = consult_with(
+            "classify these cases",
+            dir.path(),
+            &arm(&client, "explorer-unused"),
+            &arm(&client, SYNTH),
+            &ConsultConfig::default(),
+        )
+        .await
+        .expect_err("a cut-off turn with no evidence must fail");
+
+        assert_eq!(failure_class(&err), "empty_answer", "{err:#}");
+        let msg = format!("{err:#}");
+        for needle in [
+            "EMPTY answer",
+            "finish_reason \"length\"",
+            "max_tokens 16384",
+            "16384 of 16384 output tokens",
+            "`effort`",
+            "`max_tokens`",
+            "`synth` slot",
+            "no tool results",
+            "cut off at the output limit",
+            // The cut-off turn counts: it was the one model call this phase made.
+            "1 of 200 turns used",
+        ] {
+            assert!(msg.contains(needle), "the error must name {needle}: {msg}");
+        }
+        assert!(
+            !client.requests_for(SYNTH).iter().any(is_finalize_request),
+            "a model with no evidence must not be asked to write an answer anyway"
+        );
+    }
+
     /// The same hole through the *other* door: a terminal turn whose text block is
     /// present but empty. rig normalizes that to "no assistant output"
     /// (`is_empty_assistant_turn`, `prompt_request/mod.rs:561`) and still returns
@@ -5934,17 +6528,16 @@ mod tests {
     async fn an_explorer_that_spends_its_budget_on_reasoning_names_the_explorer_slot() {
         const EXPLORER: &str = "deepseek-flash";
         let client = ScriptedClient::builder()
+            // `truncated`, not `with_raw` alone: this runs the agent loop, where a real
+            // provider's normalized `Length` is what rig-agent 0.42 acts on.
             .on_model(EXPLORER, |_req| {
-                Ok(with_raw(
-                    with_usage(
-                        reasoning_response("surveying..."),
-                        Usage {
-                            reasoning_tokens: 16384,
-                            ..usage(2_000, 16384)
-                        },
-                    ),
-                    json!({"choices": [{"index": 0, "finish_reason": "length"}]}),
-                ))
+                Ok(truncated(with_usage(
+                    reasoning_response("surveying..."),
+                    Usage {
+                        reasoning_tokens: 16384,
+                        ..usage(2_000, 16384)
+                    },
+                )))
             })
             .build();
         let dir = tempdir().unwrap();

@@ -93,7 +93,15 @@ fn classify_failure(err: &anyhow::Error) -> FailureKind {
     // malformed and transient vocabularies below, so a forced write-up turn that died on a
     // fumbled tool call or an overload is framed by the more specific diagnosis rather than
     // generically empty.
-    let empty_answer = s.contains("returned an empty answer");
+    //
+    // "produced no answer … finish_reason=length" is rig-agent's own wording (0.42,
+    // `run/mod.rs`) for a turn cut off at the output limit before it wrote anything. The
+    // loop recovers that turn itself (`CutOffStopHook` in `consult/engine.rs`), but a
+    // forced final turn runs without the hook, so rig's text can still arrive here. It
+    // is the same outcome: a model ran and wrote nothing. rig's content-filter variant
+    // of the message keeps the provider framing, because the budget is not its cause.
+    let cut_off = s.contains("produced no answer") && s.contains("finish_reason=length");
+    let empty_answer = s.contains("returned an empty answer") || cut_off;
     let reached_a_model = s.contains("model loop failed")
         || s.contains("model call failed")
         || s.contains("model used all")
@@ -1097,6 +1105,37 @@ mod tests {
             assert!(
                 !lower.contains("retrying is unlikely to help"),
                 "must not contradict the guard's own retry advice: {body} -> {text}"
+            );
+        }
+    }
+
+    /// rig-agent 0.42 raises its own error when a turn is cut off at the output limit
+    /// with no answer: `the model produced no answer and stopped with
+    /// finish_reason=Length`. It still reaches a caller when the forced turn after a
+    /// turn cap is the one cut off. That is the empty-answer outcome (the model ran and
+    /// wrote nothing), and how long a model reasons varies per call, so a retry can
+    /// succeed. The 2026-09-26 kaiseki job-1 failure read "rejected the request; retrying
+    /// is unlikely to help", and the same question succeeded minutes later.
+    #[test]
+    fn a_turn_cut_off_at_the_output_limit_is_an_empty_answer_not_a_rejection() {
+        for body in [
+            "consult loop: model loop failed: CompletionError: ResponseError: the model \
+             produced no answer and stopped with finish_reason=Length; the turn ran out of \
+             output budget before producing one — raise max_tokens for this request",
+            "consult loop: model used all 200 turns, and the forced final-answer turn also \
+             failed to conclude: CompletionError: ResponseError: the model produced no \
+             answer and stopped with finish_reason=Length; the turn ran out of output \
+             budget before producing one — raise max_tokens for this request",
+        ] {
+            assert_eq!(
+                classify_failure(&anyhow::anyhow!(body)),
+                FailureKind::EmptyAnswer,
+                "{body}"
+            );
+            let text = consultation_failure_text("consult", "deepseek", anyhow::anyhow!(body));
+            assert!(
+                !text.to_lowercase().contains("retrying is unlikely to help"),
+                "a cut-off turn is worth a retry: {text}"
             );
         }
     }

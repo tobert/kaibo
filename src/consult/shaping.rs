@@ -79,6 +79,39 @@ pub fn known_efforts() -> Vec<&'static str> {
     std::iter::once(EFFORT_OFF).chain(EFFORT_LADDER).collect()
 }
 
+/// Where each wire's effort sits in a shaped blob, as JSON pointers: DeepSeek and the bare
+/// OpenAI-compatible key, Anthropic adaptive, Gemini's level, then OpenRouter and the
+/// hosted OpenAI Responses wire (the same `reasoning.effort`).
+const EFFORT_POINTERS: [&str; 4] = [
+    "/reasoning_effort",
+    "/output_config/effort",
+    "/generationConfig/thinkingConfig/thinkingLevel",
+    "/reasoning/effort",
+];
+
+/// `params` with its reasoning effort lowered to `to`, and the effort it replaced. `None`
+/// when there is nothing to lower: no effort on the wire (Anthropic's budget style, a
+/// model with no toggle, reasoning switched off), an effort already at or below `to`, or
+/// an effort [`effort_rank`] cannot place, which is left as the operator set it.
+///
+/// It rewrites the keys [`ModelShape::write_thinking`] and
+/// [`hosted_openai_responses_params`] write, and `a_lowered_effort_matches_the_blob_built_at_that_effort`
+/// fails when either writes an effort somewhere [`EFFORT_POINTERS`] does not name.
+pub fn lower_effort(params: Option<&Value>, to: &str) -> Option<(Value, String)> {
+    let target = effort_rank(to)?;
+    let mut out = params?.clone();
+    let pointer = EFFORT_POINTERS
+        .iter()
+        .find(|p| out.pointer(p).is_some_and(Value::is_string))?;
+    let slot = out.pointer_mut(pointer)?;
+    let from = slot.as_str()?.to_string();
+    if effort_rank(&from)? <= target {
+        return None;
+    }
+    *slot = json!(to);
+    Some((out, from))
+}
+
 /// Which Anthropic models want **adaptive** thinking (`{type:"adaptive"}` plus an
 /// `output_config.effort`) instead of the legacy `{type:"enabled", budget_tokens}`.
 ///
@@ -800,6 +833,137 @@ pub fn inject_provider_prefs(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// One (provider, model, override) that resolves to `style`. Exhaustive on purpose:
+    /// a new [`ThinkingStyle`] fails this build until it is given a case here, which puts
+    /// it in front of [`lower_effort`]'s tests.
+    fn representative(style: ThinkingStyle) -> (ProviderKind, &'static str, ThinkingStyleOverride) {
+        match style {
+            ThinkingStyle::AnthropicBudget => (
+                ProviderKind::Anthropic,
+                "claude-opus-4-8",
+                ThinkingStyleOverride::Budget,
+            ),
+            ThinkingStyle::AnthropicAdaptive => (
+                ProviderKind::Anthropic,
+                "claude-opus-4-8",
+                ThinkingStyleOverride::Adaptive,
+            ),
+            ThinkingStyle::GeminiLevel => (
+                ProviderKind::Gemini,
+                "gemini-3.5-flash",
+                ThinkingStyleOverride::Auto,
+            ),
+            ThinkingStyle::DeepSeekEffort => (
+                ProviderKind::DeepSeek,
+                "deepseek-flash",
+                ThinkingStyleOverride::Auto,
+            ),
+            ThinkingStyle::OpenRouterEffort => (
+                ProviderKind::OpenRouter,
+                "z-ai/glm-5.3",
+                ThinkingStyleOverride::Auto,
+            ),
+            ThinkingStyle::EffortOnly => (
+                ProviderKind::Openai,
+                "gemma-4-31b",
+                ThinkingStyleOverride::Auto,
+            ),
+            ThinkingStyle::None => (
+                ProviderKind::DeepSeek,
+                "deepseek-flash",
+                ThinkingStyleOverride::Off,
+            ),
+        }
+    }
+
+    const ALL_STYLES: [ThinkingStyle; 7] = [
+        ThinkingStyle::AnthropicBudget,
+        ThinkingStyle::AnthropicAdaptive,
+        ThinkingStyle::GeminiLevel,
+        ThinkingStyle::DeepSeekEffort,
+        ThinkingStyle::OpenRouterEffort,
+        ThinkingStyle::EffortOnly,
+        ThinkingStyle::None,
+    ];
+
+    /// Every blob kaibo can build for one effort: one per [`ThinkingStyle`], plus the
+    /// hosted OpenAI Responses blob, which replaces the [`ModelShape`] blob at the call
+    /// site. Sampling is set so the tests also prove a rewrite leaves it alone.
+    fn every_blob_at(effort: &str) -> Vec<(String, Option<Value>)> {
+        let mut blobs: Vec<_> = ALL_STYLES
+            .iter()
+            .map(|&style| {
+                let (kind, model, ovr) = representative(style);
+                let shape = ModelShape::resolve(kind, model, ovr);
+                assert_eq!(shape.thinking, style, "{model} must resolve to {style:?}");
+                let blob = shape.to_params(8192, Some(0.4), Some(0.9), effort);
+                (format!("{style:?}"), blob)
+            })
+            .collect();
+        blobs.push((
+            "OpenAI Responses".into(),
+            hosted_openai_responses_params(
+                "gpt-5.6-sol",
+                Some(0.9),
+                effort,
+                ThinkingStyleOverride::Auto,
+            ),
+        ));
+        blobs
+    }
+
+    /// A lowered blob is the blob kaibo would have built at the lower effort, for every
+    /// style that puts an effort on the wire. This ties [`lower_effort`] to
+    /// [`ModelShape::write_thinking`] and [`hosted_openai_responses_params`]: when either
+    /// writes an effort under a new key, this fails until `lower_effort` knows the key.
+    #[test]
+    fn a_lowered_effort_matches_the_blob_built_at_that_effort() {
+        let mut lowered = 0;
+        for from in ["high", "xhigh", "max"] {
+            let target = every_blob_at("medium");
+            for ((name, blob), (_, want)) in every_blob_at(from).into_iter().zip(target) {
+                let got = lower_effort(blob.as_ref(), "medium");
+                if blob == want {
+                    // This style puts no effort on the wire, so there is nothing to lower.
+                    assert_eq!(got, None, "{name} at {from}: nothing to lower");
+                    continue;
+                }
+                let (got, replaced) =
+                    got.unwrap_or_else(|| panic!("{name} at {from} must be lowered"));
+                assert_eq!(
+                    Some(got),
+                    want,
+                    "{name}: lowered {from} must equal a medium blob"
+                );
+                assert_eq!(replaced, from, "{name}: reports the effort it replaced");
+                lowered += 1;
+            }
+        }
+        // Five effort-bearing styles plus Responses, at three rungs each. Fewer means a
+        // style stopped putting its effort on the wire and the loop above went vacuous.
+        assert_eq!(lowered, 18);
+    }
+
+    /// Lowering never raises an effort, never guesses at a rung it cannot rank, and leaves
+    /// reasoning that is switched off switched off.
+    #[test]
+    fn lower_effort_only_lowers_a_rankable_effort_above_the_target() {
+        for effort in ["medium", "low", "minimal", "none", "ultra"] {
+            for (name, blob) in every_blob_at(effort) {
+                assert_eq!(
+                    lower_effort(blob.as_ref(), "medium"),
+                    None,
+                    "{name} at {effort} must be left alone"
+                );
+            }
+        }
+        assert_eq!(
+            lower_effort(None, "medium"),
+            None,
+            "no params, nothing to lower"
+        );
+    }
 
     /// The Gemini 3-line's depth lever IS the per-role effort: a slot's `effort`
     /// must land as `thinkingLevel` (the values align — "high"/"low" are valid
