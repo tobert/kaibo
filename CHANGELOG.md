@@ -39,6 +39,8 @@ record. Each later release appends a new section at the top.
 - The `gemini-images` backend kind is now `gemini-media`; the old name still loads.
 
 ### Fixed
+- `effort = "none"` on an adaptive Anthropic model (Opus 4.6+, Sonnet 4.6+, Fable 5.x) is refused when the arm or batch client is built, naming the slot and suggesting a rung such as `low`; it used to send `output_config.effort: "none"` and 400 mid-call.
+- Opus 5.5 and Sonnet 5.5 are classified as adaptive-thinking models; they were sent the budget shape and rejected.
 - `list_models` on a Gemini or Stability media backend names the `audio` slot and its model ids, not only `image`.
 - A deferred `generate` whose result cannot be collected names the provider's job id, so a paid result stays reachable.
 - `kaibo generate` refuses `--field prompt=` and `--field model=`, as the MCP tool does, so provenance names what ran.

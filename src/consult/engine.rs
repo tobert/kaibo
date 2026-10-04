@@ -319,6 +319,9 @@ impl Arm {
     ) -> Result<Self> {
         let t = slot.tunables(role, defaults);
         let shape = ModelShape::resolve(backend.kind, &slot.id, t.thinking_style);
+        shape.check_effort(&t.effort).map_err(|e| {
+            anyhow!("model {:?} (backend {:?}, {} slot): {e}", slot.id, backend.name, role.key())
+        })?;
         // Re-assert the budget rule at the single live construction point: config
         // load validates every *configured* slot, but per-call overrides build
         // bare slots that never saw it — an inverted pair must be the same
@@ -7383,6 +7386,33 @@ mod tests {
         };
         Arm::from_slot(&default_backend, &slot, ModelRole::Synth, &defaults)
             .expect("a keyless anthropic arm with no base_url still builds offline");
+    }
+
+    /// `effort = "none"` on an adaptive Anthropic model has no wire form, so the arm
+    /// refuses at construction, naming the slot, rather than 400ing mid-call.
+    #[test]
+    fn effort_none_on_adaptive_anthropic_is_refused_at_construction() {
+        let backend = crate::config::Backend {
+            name: "anthropic".into(),
+            kind: ProviderKind::Anthropic,
+            base_url: None,
+            api_key_env: None,
+            api_key_file: None,
+            api_key_cmd: None,
+            key_optional: true,
+            request_timeout: Duration::from_secs(30),
+            data_collection: Default::default(),
+            wire: None,
+        };
+        let mut defaults = crate::config::Defaults::default();
+        defaults.synth_effort = "none".into();
+        let slot = ModelSlot::bare("anthropic", "claude-opus-5-5");
+        let err = Arm::from_slot(&backend, &slot, ModelRole::Synth, &defaults)
+            .err()
+            .expect("none has no wire form on the adaptive tier");
+        let msg = err.to_string();
+        assert!(msg.contains("claude-opus-5-5") && msg.contains("synth"), "{msg}");
+        assert!(msg.contains("`low`"), "{msg}");
     }
 
     /// A gemini-kind backend pointed at a custom `base_url` (a Gemini-API-compatible

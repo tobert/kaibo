@@ -779,6 +779,9 @@ impl AnthropicBatch {
     pub fn from_slot(backend: &Backend, slot: &ModelSlot, defaults: &Defaults) -> Result<Self> {
         Self::require_anthropic(backend)?;
         let tunables = slot.tunables(ModelRole::Synth, defaults);
+        crate::consult::ModelShape::resolve(backend.kind, &slot.id, tunables.thinking_style)
+            .check_effort(&tunables.effort)
+            .map_err(|e| anyhow::anyhow!("model {:?} (backend {:?}, batch): {e}", slot.id, backend.name))?;
         let (max_tokens, params) = batch_shaping(backend.kind, &slot.id, &tunables);
         Ok(Self {
             http: batch_http_client(backend)?,
@@ -1332,6 +1335,9 @@ impl GeminiBatch {
     pub fn from_slot(backend: &Backend, slot: &ModelSlot, defaults: &Defaults) -> Result<Self> {
         Self::require_gemini(backend)?;
         let tunables = slot.tunables(ModelRole::Synth, defaults);
+        crate::consult::ModelShape::resolve(backend.kind, &slot.id, tunables.thinking_style)
+            .check_effort(&tunables.effort)
+            .map_err(|e| anyhow::anyhow!("model {:?} (backend {:?}, batch): {e}", slot.id, backend.name))?;
         let (max_tokens, params) = batch_shaping(backend.kind, &slot.id, &tunables);
         Ok(Self {
             http: batch_http_client(backend)?,
@@ -2477,6 +2483,23 @@ mod tests {
             "a batch item with reasoning off must actually run with it off: {params}"
         );
         assert!(params.get("reasoning_effort").is_none(), "{params}");
+    }
+
+    /// An adaptive Anthropic synth with `effort = "none"` is refused when the batch
+    /// client is built, not rejected by the API after submit.
+    #[test]
+    fn anthropic_batch_refuses_effort_none_on_the_adaptive_tier() {
+        let mut backend = anthropic_backend();
+        backend.key_optional = true;
+        let defaults = Defaults {
+            synth_effort: "none".into(),
+            ..Defaults::default()
+        };
+        let slot = ModelSlot::bare("anthropic", "claude-opus-5-5");
+        let err = AnthropicBatch::from_slot(&backend, &slot, &defaults)
+            .err()
+            .expect("none has no wire form on the adaptive tier");
+        assert!(err.to_string().contains("`low`"), "{err}");
     }
 
     /// `batch_effort`'s floor only exists if `BATCH_EFFORT` is rankable. Set it to
