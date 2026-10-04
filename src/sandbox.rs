@@ -397,7 +397,9 @@ impl KaishOutput {
 /// The kernel (and its `!Send` execution future) stay on the worker thread; the
 /// handle holds only a `Send` channel, so [`KaishWorker::run`]'s future is `Send`
 /// and can be awaited from inside a rig tool's `call`. The kernel persists across
-/// calls, so the explorer gets shell continuity (cwd, vars) within a session.
+/// calls, so the explorer keeps its variables within a session. The working directory
+/// is reset to the project root before each call, so a relative path means the same
+/// thing in every call and matches the fresh-worker shells (`run_kaish`, `kaibo kaish`).
 ///
 /// `Clone` shares one kernel thread: the handle is just a `Send` channel sender, so
 /// two tools backed by the same worker (e.g. `run_kaish` + `view_image`) drive the
@@ -485,9 +487,14 @@ impl KaishWorker {
                             return;
                         }
                     };
+                    // Every call starts where the kernel started, so a `cd` lasts for
+                    // its own script and no longer. Variables still carry over: only
+                    // the working directory changes what a relative path means.
+                    let start_cwd = kernel.cwd().await;
                     while let Some(job) = jobs_rx.recv().await {
                         match job {
                             Job::Run { script, reply } => {
+                                kernel.set_cwd(start_cwd.clone()).await;
                                 let out = match run(&kernel, &script).await {
                                     Ok(r) => KaishOutput::from_result(&r),
                                     Err(e) => KaishOutput {

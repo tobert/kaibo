@@ -6,7 +6,7 @@ use kaibo::sandbox::KaishWorker;
 use tempfile::tempdir;
 
 #[tokio::test]
-async fn worker_reads_and_persists_across_calls() {
+async fn worker_keeps_variables_but_resets_cwd_each_call() {
     let dir = tempdir().unwrap();
     fs::write(dir.path().join("hello.txt"), "kai\n").unwrap();
     fs::create_dir(dir.path().join("sub")).unwrap();
@@ -18,15 +18,36 @@ async fn worker_reads_and_persists_across_calls() {
     assert!(r.ok(), "cat should succeed: {r:?}");
     assert!(r.stdout.contains("kai"));
 
-    // A second call reuses the same kernel — and cwd from `cd` must carry over,
-    // which is the shell-continuity claim KaishWorker makes.
-    let r = worker.run("cd sub").await.unwrap();
-    assert!(r.ok(), "cd should succeed: {r:?}");
-    let r = worker.run("pwd").await.unwrap();
+    // A second call reuses the same kernel, so a variable carries over. The working
+    // directory does not: every call starts at the project root, so a `cd` lasts
+    // for the rest of its own script and no longer.
+    let r = worker.run("X=kept").await.unwrap();
+    assert!(r.ok(), "assignment should succeed: {r:?}");
+    let r = worker.run("echo $X").await.unwrap();
     assert!(
-        r.stdout.contains("sub"),
-        "cwd must persist across calls, got pwd={:?}",
+        r.stdout.contains("kept"),
+        "variables persist across calls, got {:?}",
         r.stdout
+    );
+
+    let r = worker.run("cd sub; pwd").await.unwrap();
+    assert!(r.ok(), "cd should succeed: {r:?}");
+    assert!(
+        r.stdout.trim_end().ends_with("/sub"),
+        "cd must take effect inside its own script, got pwd={:?}",
+        r.stdout
+    );
+    let r = worker.run("pwd").await.unwrap();
+    assert_eq!(
+        r.stdout.trim_end(),
+        dir.path().canonicalize().unwrap().to_str().unwrap(),
+        "the next call must start at the project root, got pwd={:?}",
+        r.stdout
+    );
+    let r = worker.run("cat hello.txt").await.unwrap();
+    assert!(
+        r.ok() && r.stdout.contains("kai"),
+        "a root-relative path must work after a cd in an earlier call: {r:?}"
     );
 }
 

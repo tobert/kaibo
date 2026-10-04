@@ -60,8 +60,8 @@ grep hit lands in a large file, read a \
 wide span around it with `cat -n FILE | sed -n '120,400p'`, which returns that range \
 with its real line numbers. Run `file FILE` on an unfamiliar file first; it names \
 the content as text or binary, so you know what you are about to read. \
-Each call starts at the project root; \
-there is no persistent cwd. Read the exit code: 0 is success; -1 means kaish could \
+Each call starts at the project root, and a `cd` lasts only until its script \
+ends, so use absolute paths whenever possible. Read the exit code: 0 is success; -1 means kaish could \
 not run the script (a parse or validation failure, where nothing ran, or a shell error \
 partway through), and stderr says why; 3 means the output \
 was too large and came back as a head+tail sample (not a failure); 124 means the \
@@ -1377,6 +1377,25 @@ mod tests {
         assert!(
             render_builtin_help("definitely-not-a-builtin", &schemas).is_none(),
             "an unregistered builtin must render to None, not a stub"
+        );
+    }
+
+    /// The addendum tells the model what the worker does: each call starts at the
+    /// project root, a `cd` ends with its script, and absolute paths are the safe
+    /// spelling. `tests/worker.rs` binds the behavior; this binds the words.
+    #[test]
+    fn addendum_says_a_cd_ends_with_its_script_and_asks_for_absolute_paths() {
+        let text = kaish_syntax_core();
+        for needle in [
+            "Each call starts at the project root",
+            "a `cd` lasts only until its script ends",
+            "use absolute paths whenever possible",
+        ] {
+            assert!(text.contains(needle), "addendum must say {needle:?}:\n{text}");
+        }
+        assert!(
+            !text.contains("persistent cwd"),
+            "the old 'no persistent cwd' wording must not return:\n{text}"
         );
     }
 }
