@@ -70,14 +70,14 @@ api_key_env = "OPENAI_API_KEY"
 
 [casts.chimera]
 explorer = "deepseek/deepseek-flash"        # reads the tree and cites — DeepSeek family
-synth    = "claude/claude-sonnet-4-6"       # the voice that answers — hosted family
+synth    = "claude/claude-sonnet-5-5"       # the voice that answers — hosted family
 
 [casts.local-only]                          # privacy posture: nothing leaves the box
 explorer = "gemma/Gemma-4-E4B-it-GGUF"
 synth    = "gemma/Gemma-4-26B-A4B-it-GGUF"
 
 # A slot needing capability pins or tunables takes the table form:
-# synth = { backend = "claude", id = "claude-opus-4-8", effort = "max" }
+# synth = { backend = "claude", id = "claude-opus-5-5", effort = "max" }
 ```
 
 Slot forms: `"backend/model-id"` (the common case; the *first* `/` splits, so
@@ -157,7 +157,7 @@ server.rs: resolve_cast("chimera")
 │    └─ Arm { client: rig(deepseek backend, lazy key), model,
 │             params: ModelShape(DeepSeek, model) + explorer effort/temp,
 │             caps: vision=true }
-└─ synth = "claude/claude-sonnet-4-6"
+└─ synth = "claude/claude-sonnet-5-5"
      └─ Arm { client: rig(anthropic backend), model, adaptive-thinking params,
               caps: vision=true → toolset gains view_image }
 

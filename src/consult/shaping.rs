@@ -115,16 +115,25 @@ pub fn lower_effort(params: Option<&Value>, to: &str) -> Option<(Value, String)>
 /// Which Anthropic models want **adaptive** thinking (`{type:"adaptive"}` plus an
 /// `output_config.effort`) instead of the legacy `{type:"enabled", budget_tokens}`.
 ///
-/// **Empirical — confirm by probe**: Opus 4.7/4.8 and Fable 5 *reject* enabled/budget
-/// and sampling outright (400); Opus 4.6 / Sonnet 4.6 take adaptive too — it's the
+/// **Empirical — confirm by probe**: Opus 4.7/4.8, Opus 5.5, Sonnet 5.5, and Fable 5.x
+/// *reject* enabled/budget and sampling outright (400), and Opus 5.5 / Sonnet 5.5 also
+/// reject `thinking:{type:"disabled"}`; Opus 4.6 / Sonnet 4.6 take adaptive too — it's the
 /// recommended shape, `budget_tokens` is deprecated there. Everything older, and Haiku
 /// 4.5, stays on enabled/budget. Matched by `contains` so a vendor-prefixed id still
 /// resolves. Add ids as they ship; a slot (or `[defaults]`) can force a tier via
 /// `thinking_style`.
 fn is_anthropic_adaptive(model: &str) -> bool {
-    ["opus-4-6", "opus-4-7", "opus-4-8", "sonnet-4-6", "fable-5"]
-        .iter()
-        .any(|tier| model.contains(tier))
+    [
+        "opus-4-6",
+        "opus-4-7",
+        "opus-4-8",
+        "opus-5",
+        "sonnet-4-6",
+        "sonnet-5",
+        "fable-5",
+    ]
+    .iter()
+    .any(|tier| model.contains(tier))
 }
 
 /// What one (provider, model) can perceive — and *how* an image reaches it. Capability

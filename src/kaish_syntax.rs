@@ -865,7 +865,7 @@ mod tests {
         );
         // The interactive cast names its synth (Claude Sonnet, the built-in anthropic synth).
         assert!(
-            text.contains("anthropic/claude-sonnet-4-6"),
+            text.contains("anthropic/claude-sonnet-5-5"),
             "roster must name the anthropic cast's synth model:\n{text}"
         );
         // The batch cast names Gemini Pro — the whole point: Pro is reachable only here.
@@ -1029,7 +1029,7 @@ mod tests {
             .collect();
         assert_eq!(
             roster.first().copied(),
-            Some("- `anthropic` (default, no usable key) → anthropic/claude-sonnet-4-6"),
+            Some("- `anthropic` (default, no usable key) → anthropic/claude-sonnet-5-5"),
             "an unusable default leads the roster, tagged unusable:\n{text}"
         );
     }

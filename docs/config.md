@@ -184,10 +184,10 @@ A role table. Each slot takes one of two forms:
 ```toml
 [casts.chimera]
 explorer = "deepseek/deepseek-flash"        # reads the tree and cites
-synth    = "claude/claude-sonnet-4-6"       # the model that answers
+synth    = "claude/claude-sonnet-5-5"       # the model that answers
 
 # table form: id + capability pins + per-slot tunables
-# synth = { backend = "claude", id = "claude-opus-4-8", effort = "max" }
+# synth = { backend = "claude", id = "claude-opus-5-5", effort = "max" }
 # explorer = { backend = "openai-local", id = "Gemma-4-E4B-it", preamble = "..." }
 ```
 
@@ -357,7 +357,7 @@ or through `KAIBO_*_EFFORT`, kaibo warns at startup and reports `effort` under
 `inert_tunables` in `kaibo://config`. An inherited built-in effort stays quiet.
 
 **`thinking_style`.** Forces the thinking shape instead of the built-in classifier.
-`auto` picks adaptive for Opus 4.6+, Sonnet 4.6, and Fable 5, and enabled-budget for
+`auto` picks adaptive for Opus 4.6+, Sonnet 4.6+, and Fable 5, and enabled-budget for
 older models plus Haiku 4.5. Set `adaptive` or `budget` when a new or misclassified
 Anthropic model ships; those two are no-ops for other kinds. An unknown value is a load
 error.
@@ -451,13 +451,13 @@ not OpenAI Platform's own but should still take the Responses shape; see
 
 | cast | explorer | synth | synth lane |
 |---|---|---|---|
-| `anthropic` | `anthropic/claude-haiku-4-5` | `anthropic/claude-sonnet-4-6` | |
+| `anthropic` | `anthropic/claude-haiku-4-5` | `anthropic/claude-sonnet-5-5` | |
 | `deepseek` | `deepseek/deepseek-flash` | `deepseek/deepseek-flash` | |
 | `gemini` | `gemini/gemini-flash-lite-latest` | `gemini/gemini-3.5-flash` | |
 | `openrouter` | `openrouter/qwen/qwen3.6-flash` | `openrouter/qwen/qwen3.7-max` | |
 | `openai-local` | `openai-local/Gemma-4-E4B-it-GGUF` | `openai-local/Gemma-4-26B-A4B-it-GGUF` | |
 | `gemini-batch` | — | `gemini/gemini-pro-latest` | `batch` |
-| `anthropic-batch` | — | `anthropic/claude-opus-4-8` | `batch` |
+| `anthropic-batch` | — | `anthropic/claude-opus-5-5` | `batch` |
 
 The built-in OpenRouter explorer has `vision = true`; its synth is text-only.
 Use the live model catalog when changing model IDs or capabilities.
@@ -1003,7 +1003,7 @@ result with `kaibo://prompts`.
 ```toml
 [casts.custom]
 explorer = { backend = "openai-local", id = "Gemma-4-E4B-it", preamble = "You are a careful reader. Cite exact numbered lines." }
-synth = "anthropic/claude-sonnet-4-6"
+synth = "anthropic/claude-sonnet-5-5"
 ```
 
 Precedence: `slot.preamble` > `[prompts].<phase>` > built-in. A synth slot's preamble

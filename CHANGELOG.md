@@ -28,6 +28,7 @@ record. Each later release appends a new section at the top.
 - The artifact store holds `mp3` and `wav`; `write_cas` and `kaibo cas write` accept them, and `inputs` takes them.
 
 ### Changed
+- The built-in `anthropic` cast's synth is `claude-sonnet-5-5` and `anthropic-batch` synths `claude-opus-5-5`; Opus 5.5, Sonnet 5.5, and Fable 5.x take adaptive thinking.
 - The configuration reference and template are less than half their former length.
 - A failed consultation tells the calling agent to ask the user whether to retry, use another cast, or continue without it.
 - rig 0.42: OpenRouter's output budget is now sent by rig as `max_tokens`, replacing kaibo's `max_completion_tokens` workaround.

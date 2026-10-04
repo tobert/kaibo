@@ -1499,11 +1499,11 @@ mod tests {
         // the slot's backend kind and id: Anthropic and `deepseek-flash` see, the
         // generic local kind is blind until pinned).
         assert!(
-            body.contains("anthropic/claude-sonnet-4-6"),
+            body.contains("anthropic/claude-sonnet-5-5"),
             "slots render as backend/id:\n{body}"
         );
         let anthropic_synth = body
-            .find("anthropic/claude-sonnet-4-6")
+            .find("anthropic/claude-sonnet-5-5")
             .map(|i| &body[i..i + 120])
             .unwrap();
         assert!(

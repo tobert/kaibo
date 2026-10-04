@@ -146,7 +146,7 @@ api_key_cmd = ["op", "read", "op://Vault/Kaibo/Deepseek-key"]
 # String slots split at the first slash. Table slots accept per-model tunables.
 [casts.chimera]
 explorer = "deepseek/deepseek-flash"
-synth = "claude/claude-sonnet-4-6"
+synth = "claude/claude-sonnet-5-5"
 
 [casts.local-only]
 explorer = "gemma/Gemma-4-E4B-it-GGUF"
@@ -160,7 +160,7 @@ synth = { backend = "llama", id = "qwen2.5-vl-32b", vision = true }
 [casts.deep-dive]
 aliases = ["deep"]
 explorer = { backend = "deepseek", id = "deepseek-flash", temperature = 0.0, thinking_budget = 4096, thinking_style = "auto" }
-synth = { backend = "claude", id = "claude-opus-4-8", effort = "max", max_tokens = 32768 }
+synth = { backend = "claude", id = "claude-opus-5-5", effort = "max", max_tokens = 32768 }
 
 [casts.or-deep]
 explorer = "openrouter/~google/gemini-flash-latest"
@@ -169,7 +169,7 @@ synth = { backend = "openrouter", id = "~anthropic/claude-sonnet-latest", effort
 # Slot preamble > [prompts].phase > built-in; one synth slot can serve several phases.
 [casts.tuned-local]
 explorer = { backend = "gemma", id = "Gemma-4-E4B-it-GGUF", preamble = "You are a careful reader. Cite exact numbered lines." }
-synth = "claude/claude-sonnet-4-6"
+synth = "claude/claude-sonnet-5-5"
 
 [casts.gpt]
 explorer = { backend = "gpt", id = "gpt-5.6-luna", vision = true, effort = "low" }
@@ -192,7 +192,7 @@ explorer = { backend = "gpt", id = "gpt-5.6-luna", vision = true, effort = "low"
 synth = { backend = "gpt", id = "gpt-5.6-sol", lane = "batch" }
 
 [casts.fable]
-explorer = "anthropic/claude-sonnet-4-6"
+explorer = "anthropic/claude-sonnet-5-5"
 synth = { backend = "anthropic", id = "claude-fable-5", lane = "batch" }
 
 [casts.gemini-deliberate]

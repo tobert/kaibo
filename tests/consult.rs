@@ -317,7 +317,14 @@ fn anthropic_newest_models_get_adaptive_thinking() {
     // Opus 4.7/4.8 and Fable 5 *require* adaptive: enabled/budget AND temperature/top_p
     // all 400. Each gets `{thinking:{type:adaptive}, output_config:{effort}}` and no
     // sampling. (Mirrors the live "fix anthropic" goal — these would 400 on the old shape.)
-    for model in ["claude-opus-4-8", "claude-opus-4-7", "claude-fable-5"] {
+    for model in [
+        "claude-opus-4-8",
+        "claude-opus-4-7",
+        "claude-fable-5",
+        "claude-fable-5-1",
+        "claude-opus-5-5",
+        "claude-sonnet-5-5",
+    ] {
         let a = request_params(
             ProviderKind::Anthropic,
             model,
@@ -359,6 +366,9 @@ fn anthropic_classifier_boundary() {
         "claude-opus-4-7",
         "claude-opus-4-8",
         "claude-fable-5",
+        "claude-fable-5-1",
+        "claude-opus-5-5",
+        "claude-sonnet-5-5",
     ] {
         assert_eq!(
             thinking_type(model),
@@ -1463,6 +1473,34 @@ async fn two_phase_consult_via_deepseek() {
         "answer should explain the read-only sandbox mechanism, got: {}",
         out.answer
     );
+}
+
+/// The built-in Anthropic synths (Sonnet 5.5, Opus 5.5) accept the request kaibo shapes:
+/// adaptive thinking plus a top-level `output_config.effort`. Either would 400 on the
+/// budget shape, so this is the live half of `anthropic_classifier_boundary`.
+#[tokio::test]
+#[ignore = "hits the Anthropic API (two tiny oneshots, a few cents); run with --ignored and a key"]
+async fn oneshot_via_builtin_anthropic_synths() {
+    if let Err(e) = load(ProviderKind::Anthropic) {
+        panic!("no Anthropic credential for live test: {e}");
+    }
+    let cfg = Config::from_toml_str(
+        "[backends.anthropic]\napi_key_file = \"~/.anthropic-key.txt\"\n",
+    )
+    .expect("config with an Anthropic key file");
+    for cast in ["anthropic", "anthropic-batch"] {
+        let arm = arm_from(&cfg, cast, ModelRole::Synth);
+        let (answer, _usage) = oneshot(
+            "Reply with the single word: ok",
+            &[],
+            &arm,
+            &PhaseContext::default(),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("{cast} oneshot should succeed: {e}"));
+        eprintln!("=== {cast} ({}) ===\n{answer}\n", arm.model);
+        assert!(answer.to_lowercase().contains("ok"), "{cast}: {answer}");
+    }
 }
 
 #[tokio::test]
