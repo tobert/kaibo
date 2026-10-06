@@ -71,7 +71,8 @@ async fn jev_answers_all_three_question_kinds() {
         "git push --force origin main".into(),
         questions,
     )
-    .unwrap();
+    .unwrap()
+    .deny_data_collection();
     let client =
         DecisionClient::new(OPENROUTER_DECISIONS_URL, key(), Duration::from_secs(30)).unwrap();
     let resp = client.decide(&req).await.expect("a live decision");

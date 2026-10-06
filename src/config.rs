@@ -2161,8 +2161,8 @@ impl Config {
                     if *role != ModelRole::Synth {
                         bail!(
                             "cast {name:?}: the {} slot declares lane = {:?}, but only a \
-                             synth slot may run offline — the explorer always runs \
-                             interactively",
+                             synth slot may run offline; the other slots always \
+                             run interactively",
                             role.key(),
                             lane.as_str()
                         );

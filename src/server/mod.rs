@@ -689,8 +689,9 @@ pub struct GenerateInputRef {
 #[serde(deny_unknown_fields)]
 pub struct DecideInput {
     /// What to decide about: a string, or a JSON object or array. The model reads nothing
-    /// else, so include everything the questions need. Context limit about 32k tokens,
-    /// questions included.
+    /// else, so include everything the questions need. The provider refuses a state past
+    /// its context limit (about 32k tokens) with `max_tokens_exceeded`; it does not
+    /// truncate.
     pub state: serde_json::Value,
 
     /// The questions, as an object from your own question id to
@@ -2801,9 +2802,10 @@ impl KaiboHandler {
         let Some(slot) = cast.slot(ModelRole::Decision) else {
             return Err(McpError::invalid_params(
                 format!(
-                    "cast `{}` has no `decision` slot, so it cannot decide. Pick a cast \
-                     whose `decision` slot points at an `openrouter` backend; \
-                     kaibo://config lists the configured casts and their slots.",
+                    "cast `{}` has no `decision` slot, so it cannot decide. Pass `cast` \
+                     naming one whose `decision` slot points at an `openrouter` backend; \
+                     when `cast` is omitted the default applies, set by `[server] cast` in \
+                     config.toml. kaibo://config lists the configured casts and their slots.",
                     cast.name,
                 ),
                 None,
@@ -2828,12 +2830,18 @@ impl KaiboHandler {
                 ))
             }
         };
+        // Validate before resolving the key: the key may come from an operator command.
+        let mut request =
+            crate::decide::DecisionRequest::new(slot.id.clone(), input.state, input.questions)
+                .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
+        // The backend's `data_collection` pin rides this request too, as it does every
+        // OpenRouter completion.
+        if backend.data_collection == crate::config::DataCollection::Deny {
+            request = request.deny_data_collection();
+        }
         let key = backend.resolve_key().map_err(|e| {
             McpError::invalid_params(format!("cast `{}` decision slot: {e:#}", cast.name), None)
         })?;
-        let request =
-            crate::decide::DecisionRequest::new(slot.id.clone(), input.state, input.questions)
-                .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
         let client = crate::decide::DecisionClient::new(url, key, backend.request_timeout)
             .map_err(|e| McpError::internal_error(format!("{e:#}"), None))?;
 
@@ -2848,17 +2856,22 @@ impl KaiboHandler {
                 let body = serde_json::to_string_pretty(&resp.answers)
                     .map_err(|e| McpError::internal_error(e.to_string(), None))?;
                 Ok(CallToolResult::success(vec![ContentBlock::text(format!(
-                    "{body}\n\n———\nkaibo · cast `{}` · model `{}`\n{}",
+                    "{body}\n\n———\nkaibo · cast `{}` · model `{}`{}",
                     cast.name,
                     resp.model,
-                    resp.usage.footer(),
+                    resp.usage
+                        .footer()
+                        .map(|line| format!("\n{line}"))
+                        .unwrap_or_default(),
                 ))]))
             }
             Err(e) => {
                 span.record("otel.status_code", "ERROR");
                 Ok(CallToolResult::error(vec![ContentBlock::text(format!(
-                    "decide failed on cast `{}` (model `{}`): {e}",
-                    cast.name, slot.id,
+                    "decide failed on cast `{}` (model `{}`): {e}. {}",
+                    cast.name,
+                    slot.id,
+                    e.next_step(),
                 ))]))
             }
         }
@@ -6257,6 +6270,25 @@ mod tests {
         assert!(text.contains("120 in · 30 out · $0.000010"), "{text}");
     }
 
+    /// A reply with no usage prints no tokens line: a `0 in · 0 out` line would claim a free
+    /// call the provider never reported.
+    #[tokio::test]
+    async fn decide_omits_the_tokens_line_when_usage_is_unreported() {
+        let url = decide_server(
+            200,
+            r#"{"model":"m","answers":{"verdict":{"type":"choice","choice":"safe","probabilities":{"safe":1,"risky":0},"confidence":1}}}"#,
+        )
+        .await;
+        let h = hermetic_handler_from_toml(DECIDE_CAST_TOML).with_decisions_url(url);
+        let text = result_text(
+            h.decide(Parameters(decide_input(None, risk_question())))
+                .await
+                .unwrap(),
+        );
+        assert!(text.contains("model `m`"), "{text}");
+        assert!(!text.contains("tokens"), "{text}");
+    }
+
     #[tokio::test]
     async fn decide_on_a_cast_without_a_decision_slot_is_refused_naming_the_slot() {
         let h = hermetic_handler_from_toml(DECIDE_CAST_TOML);
@@ -6298,6 +6330,7 @@ mod tests {
         let text = result_text(out);
         assert!(text.contains("HTTP 400"), "{text}");
         assert!(text.contains("does not exist"), "{text}");
+        assert!(text.contains("change the request, not the timing"), "{text}");
         assert!(text.contains("cast `judge`"), "{text}");
     }
 
@@ -10187,13 +10220,17 @@ enabled = false
     fn every_tool_description_fits_claude_code_budget() {
         let h = KaiboHandler::new(crate::config::Config::builtin()).expect("handler builds");
         let media = hermetic_handler_from_toml(MEDIA_CAST_TOML);
+        let decide = hermetic_handler_from_toml(DECIDE_CAST_TOML);
         let mut tools = h.tool_router.list_all();
         tools.extend(media.tool_router.list_all());
+        tools.extend(decide.tool_router.list_all());
         assert!(!tools.is_empty(), "the guard checked nothing");
-        assert!(
-            tools.iter().any(|t| t.name == "generate"),
-            "`generate` must be among the descriptions checked"
-        );
+        for name in ["generate", "decide"] {
+            assert!(
+                tools.iter().any(|t| t.name == name),
+                "`{name}` must be among the descriptions checked"
+            );
+        }
         for tool in tools {
             let len = tool.description.as_deref().unwrap_or("").chars().count();
             assert!(

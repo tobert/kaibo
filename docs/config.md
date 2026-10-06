@@ -673,7 +673,7 @@ Which cast shape staffs which tool:
 | `run_kaish`, `list_models` | no cast at all; advertised whenever their flag is on |
 
 No built-in cast has a media slot or pairs an explorer with an offline synth, so
-`generate` and `deliberate` need a configured cast before they appear.
+`generate`, `deliberate`, and `decide` need a configured cast before they appear.
 
 ### Finding out why a tool is missing
 

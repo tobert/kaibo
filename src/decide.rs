@@ -55,13 +55,43 @@ pub enum QuestionKind {
 }
 
 /// What a `choice` or `score` question's `criteria` holds.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Serialize, JsonSchema)]
 #[serde(untagged)]
 pub enum Criteria {
-    /// `choice`: label to its meaning, in the order the caller wrote them.
+    /// `choice`: label to its meaning. Labels are sent sorted.
     Options(BTreeMap<String, String>),
     /// `score`: level names, lowest first.
     Levels(Vec<String>),
+}
+
+/// Hand-written, as `RawSlot` is in `config.rs`: an untagged derive reduces a bad shape
+/// to "did not match any variant", naming neither the bad value nor the fix.
+impl<'de> Deserialize<'de> for Criteria {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        use serde::de::Error;
+        match serde_json::Value::deserialize(d)? {
+            v @ serde_json::Value::Object(_) => {
+                serde_json::from_value(v).map(Self::Options).map_err(|e| {
+                    D::Error::custom(format!(
+                        "`criteria` as an object maps each option label to a string \
+                         meaning ({e}); use it for a `choice`"
+                    ))
+                })
+            }
+            v @ serde_json::Value::Array(_) => {
+                serde_json::from_value(v).map(Self::Levels).map_err(|e| {
+                    D::Error::custom(format!(
+                        "`criteria` as an array lists level names as strings ({e}); use \
+                         it for a `score`"
+                    ))
+                })
+            }
+            other => Err(D::Error::custom(format!(
+                "`criteria` is an object from option label to meaning (for `choice`) or \
+                 an array of level names (for `score`), got {other}"
+            ))),
+        }
+    }
 }
 
 /// One typed question. Its id is the key it sits under in the request's map.
@@ -118,6 +148,9 @@ impl Question {
                         l.len()
                     )));
                 }
+                if l.iter().any(|n| n.trim().is_empty()) {
+                    return Err(bad("a level name is empty".into()));
+                }
                 Ok(())
             }
             (QuestionKind::Score, _) => Err(bad(
@@ -139,6 +172,16 @@ pub struct DecisionRequest {
     model: String,
     state: serde_json::Value,
     questions: BTreeMap<String, Question>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    provider: Option<ProviderPrefs>,
+}
+
+/// The `provider` routing preferences OpenRouter accepts on a decisions request. A live
+/// probe (2026-10-06) found it validates `data_collection` as `deny` or `allow` and
+/// rejects any other value or shape, so a sent preference is read, not ignored.
+#[derive(Debug, Clone, Serialize)]
+struct ProviderPrefs {
+    data_collection: &'static str,
 }
 
 impl DecisionRequest {
@@ -158,7 +201,18 @@ impl DecisionRequest {
             model: model.into(),
             state,
             questions,
+            provider: None,
         })
+    }
+
+    /// Route only to hosts that do not retain or train on the state
+    /// (`provider.data_collection = "deny"`), the same pin OpenRouter completions carry
+    /// for a backend whose `data_collection` is `deny`.
+    pub fn deny_data_collection(mut self) -> Self {
+        self.provider = Some(ProviderPrefs {
+            data_collection: "deny",
+        });
+        self
     }
 
     pub fn model(&self) -> &str {
@@ -199,8 +253,12 @@ pub struct DecisionUsage {
 }
 
 impl DecisionUsage {
-    /// One footer line: tokens, and the cost when the gateway reported it.
-    pub fn footer(&self) -> String {
+    /// One footer line: tokens and the cost when the gateway reported them, `None` when
+    /// it reported nothing (a zero line would claim a free call).
+    pub fn footer(&self) -> Option<String> {
+        if self.input_tokens == 0 && self.output_tokens == 0 && self.cost.is_none() {
+            return None;
+        }
         let mut line = format!(
             "tokens · {} in · {} out",
             self.input_tokens, self.output_tokens
@@ -208,7 +266,7 @@ impl DecisionUsage {
         if let Some(cost) = self.cost {
             line.push_str(&format!(" · ${cost:.6}"));
         }
-        line
+        Some(line)
     }
 }
 
@@ -249,8 +307,28 @@ impl DecisionResponse {
                         ));
                     }
                 }
-                (QuestionKind::Score, Answer::Score { .. }, _)
-                | (QuestionKind::Noul, Answer::Noul { .. }, _) => {}
+                (QuestionKind::Score, Answer::Score { legend, .. }, Some(Criteria::Levels(l))) => {
+                    let echoed =
+                        l.iter().enumerate().all(|(i, name)| {
+                            legend.get(&i.to_string()).is_some_and(|got| got == name)
+                        }) && legend.len() == l.len();
+                    if !echoed {
+                        return Err(mismatch(
+                            id,
+                            format!(
+                                "the answer's legend {legend:?} is not the levels asked, {l:?}"
+                            ),
+                        ));
+                    }
+                }
+                (QuestionKind::Noul, Answer::Noul { noul }, _) => {
+                    if !(0.0..=1.0).contains(noul) {
+                        return Err(mismatch(
+                            id,
+                            format!("a noul answer must be a probability from 0 to 1, got {noul}"),
+                        ));
+                    }
+                }
                 (_, other, _) => {
                     return Err(mismatch(
                         id,
@@ -297,6 +375,30 @@ pub enum DecideError {
     Unreadable(String),
     #[error("the decisions request failed before an answer arrived: {0}")]
     Transport(String),
+}
+
+impl DecideError {
+    /// What the caller can do next, from the failure's class: a 429, a 5xx, or a transport
+    /// failure may pass on a retry; any other refusal needs a different request.
+    pub fn next_step(&self) -> &'static str {
+        match self {
+            Self::Provider { status, .. } if *status == 429 || *status >= 500 => {
+                "The provider was busy or down; send the same request again in a moment."
+            }
+            Self::Transport(_) => {
+                "No answer arrived; send the same request again, and check the network if it repeats."
+            }
+            Self::Provider { .. } => {
+                "The provider refused this request; change the request, not the timing."
+            }
+            Self::Mismatch { .. } | Self::Unreadable(_) => {
+                "The provider's reply was not usable; send the request again, and use `consult` if it repeats."
+            }
+            Self::NoQuestions | Self::InvalidQuestion { .. } => {
+                "Fix the question and send it again."
+            }
+        }
+    }
 }
 
 /// Pull the human message out of the provider's `{"error": {"message", "code"}}` body,
@@ -552,6 +654,111 @@ mod tests {
         assert_eq!(
             provider_message("<html>bad gateway</html>"),
             "<html>bad gateway</html>"
+        );
+    }
+
+    #[test]
+    fn a_legend_that_is_not_the_levels_asked_is_an_error() {
+        let mut r: DecisionResponse = serde_json::from_str(PROBED).unwrap();
+        if let Some(Answer::Score { legend, .. }) = r.answers.get_mut("undo") {
+            legend.insert("1".into(), "medium".into());
+        }
+        let err = r.check_against(&probed_request()).unwrap_err();
+        assert!(err.to_string().contains("legend"), "{err}");
+    }
+
+    #[test]
+    fn a_noul_outside_zero_to_one_is_an_error() {
+        let mut r: DecisionResponse = serde_json::from_str(PROBED).unwrap();
+        r.answers
+            .insert("pushes".into(), Answer::Noul { noul: 1.5 });
+        let err = r.check_against(&probed_request()).unwrap_err();
+        assert!(err.to_string().contains("pushes"), "{err}");
+    }
+
+    #[test]
+    fn empty_level_names_are_refused() {
+        let q = Question {
+            kind: QuestionKind::Score,
+            instructions: "how".into(),
+            criteria: Some(Criteria::Levels(vec!["".into(), "hard".into()])),
+        };
+        assert!(DecisionRequest::new("m", "s".into(), qs("q", q)).is_err());
+    }
+
+    #[test]
+    fn a_bad_criteria_shape_names_the_fix() {
+        let err = serde_json::from_value::<Question>(
+            serde_json::json!({"type": "choice", "instructions": "x", "criteria": {"a": 1}}),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("string meaning") && err.contains("`choice`"),
+            "{err}"
+        );
+        let err = serde_json::from_value::<Question>(
+            serde_json::json!({"type": "score", "instructions": "x", "criteria": "easy,hard"}),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("object from option label") && err.contains("array"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn data_collection_deny_serializes_as_the_probed_provider_field() {
+        let q = qs(
+            "q",
+            Question {
+                kind: QuestionKind::Noul,
+                instructions: "x".into(),
+                criteria: None,
+            },
+        );
+        let plain = serde_json::to_value(DecisionRequest::new("m", "s".into(), q.clone()).unwrap())
+            .unwrap();
+        assert!(plain.get("provider").is_none(), "{plain}");
+        let denied = serde_json::to_value(
+            DecisionRequest::new("m", "s".into(), q)
+                .unwrap()
+                .deny_data_collection(),
+        )
+        .unwrap();
+        assert_eq!(
+            denied["provider"],
+            serde_json::json!({"data_collection": "deny"})
+        );
+    }
+
+    #[test]
+    fn unreported_usage_has_no_footer() {
+        assert_eq!(DecisionUsage::default().footer(), None);
+        let u = DecisionUsage {
+            input_tokens: 5,
+            output_tokens: 2,
+            cost: Some(0.000001),
+        };
+        assert_eq!(u.footer().unwrap(), "tokens · 5 in · 2 out · $0.000001");
+    }
+
+    #[test]
+    fn next_step_separates_retry_from_change_the_request() {
+        let busy = DecideError::Provider {
+            status: 429,
+            message: "x".into(),
+        };
+        let bad = DecideError::Provider {
+            status: 400,
+            message: "x".into(),
+        };
+        assert!(busy.next_step().contains("again"), "{}", busy.next_step());
+        assert!(
+            bad.next_step().contains("change the request"),
+            "{}",
+            bad.next_step()
         );
     }
 }

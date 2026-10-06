@@ -67,6 +67,10 @@ async fn one_shot_server(
     (format!("http://{addr}/api/alpha/decisions"), rx)
 }
 
+fn denied_request() -> DecisionRequest {
+    request().deny_data_collection()
+}
+
 fn request() -> DecisionRequest {
     let q = BTreeMap::from([
         (
@@ -169,4 +173,20 @@ async fn an_unreadable_reply_is_named_as_unreadable() {
     let (url, _cap) = one_shot_server(200, r#"{"not":"a decision"}"#).await;
     let err = client(url).decide(&request()).await.unwrap_err();
     assert!(matches!(err, DecideError::Unreadable(_)), "{err}");
+}
+
+#[tokio::test]
+async fn a_data_collection_pin_reaches_the_wire() {
+    let (url, captured) = one_shot_server(200, OK_BODY).await;
+    client(url).decide(&denied_request()).await.unwrap();
+    let cap = captured.await.unwrap();
+    assert_eq!(cap.body["provider"]["data_collection"], "deny");
+}
+
+#[tokio::test]
+async fn no_pin_means_no_provider_field() {
+    let (url, captured) = one_shot_server(200, OK_BODY).await;
+    client(url).decide(&request()).await.unwrap();
+    let cap = captured.await.unwrap();
+    assert!(cap.body.get("provider").is_none(), "{}", cap.body);
 }
