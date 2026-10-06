@@ -826,6 +826,7 @@ fn synthless_cast_refusal(cast: &Cast, tool: &str) -> String {
         (ModelRole::Explorer, "`explore`"),
         (ModelRole::Image, "`generate`"),
         (ModelRole::Audio, "`generate`"),
+        (ModelRole::Decision, "`decide`"),
     ]
     .into_iter()
     .filter(|(role, _)| cast.slot(*role).is_some())

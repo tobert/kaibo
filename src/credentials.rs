@@ -309,6 +309,16 @@ impl ProviderKind {
         }
     }
 
+    /// The Decisions endpoint this kind serves, or `None` when it has no Decisions route.
+    /// Only a `decision` cast slot reads it (see `src/decide.rs`); a kind with a route
+    /// keeps every other use it already has.
+    pub fn decisions_url(self) -> Option<&'static str> {
+        match self {
+            ProviderKind::OpenRouter => Some(crate::decide::OPENROUTER_DECISIONS_URL),
+            _ => None,
+        }
+    }
+
     /// Is this a media-generation kind (no completion model behind it)?
     pub fn is_media(self) -> bool {
         matches!(self.class(), ProviderClass::Media(_))

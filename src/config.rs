@@ -244,11 +244,22 @@ pub enum ModelRole {
     Synth,
     Image,
     Audio,
+    /// The decision slot — a model behind a Decisions API that answers typed questions
+    /// with probabilities and writes no text. Not a reasoning phase (no preamble, tool
+    /// loop, or thinking budget) and not a media role (it emits nothing into the CAS);
+    /// `decide` is its tool. See `src/decide.rs`.
+    Decision,
 }
 
 impl ModelRole {
     /// Every role, in table order — the source for "known roles" error text.
-    pub const ALL: [ModelRole; 4] = [Self::Explorer, Self::Synth, Self::Image, Self::Audio];
+    pub const ALL: [ModelRole; 5] = [
+        Self::Explorer,
+        Self::Synth,
+        Self::Image,
+        Self::Audio,
+        Self::Decision,
+    ];
 
     /// The role's config-table key (`[casts.<name>]`).
     pub fn key(self) -> &'static str {
@@ -257,6 +268,7 @@ impl ModelRole {
             Self::Synth => "synth",
             Self::Image => "image",
             Self::Audio => "audio",
+            Self::Decision => "decision",
         }
     }
 
@@ -269,10 +281,10 @@ impl ModelRole {
     }
 
     /// Whether this role produces an artifact through a media backend — `image` or
-    /// `audio`. The complement of [`is_reasoning`](Self::is_reasoning), stated on its own
-    /// so a check reads as what it means.
+    /// `audio`. Not the complement of [`is_reasoning`](Self::is_reasoning): `decision`
+    /// is neither, so each class is listed on its own.
     pub fn is_media(self) -> bool {
-        !self.is_reasoning()
+        matches!(self, Self::Image | Self::Audio)
     }
 }
 
@@ -1468,6 +1480,15 @@ impl Config {
         })
     }
 
+    /// Whether canonical cast `name` can staff a `decide` call: it carries a `decision`
+    /// slot. Load validation already pinned the slot to a backend with a Decisions route,
+    /// so slot presence is the whole test. Independent of the reasoning slots.
+    pub fn cast_can_decide(&self, name: &str) -> bool {
+        self.casts
+            .get(name)
+            .is_some_and(|c| c.slot(ModelRole::Decision).is_some())
+    }
+
     /// Whether canonical cast `name` is the configured default — comparing against the
     /// *resolved* default, so an alias default (`server.cast = "claude"`) still matches
     /// its canonical cast (`anthropic`). The roster renderer (`casts_section`) gets
@@ -2065,6 +2086,16 @@ impl Config {
                 // bail on — if the two ever disagree, both refuse rather than
                 // improvise.
                 let is_media = matches!(kind.class(), credentials::ProviderClass::Media(_));
+                if *role == ModelRole::Decision && kind.decisions_url().is_none() {
+                    bail!(
+                        "cast {name:?}: the decision slot points at backend {:?} (kind \
+                         `{}`), which has no Decisions route — point the slot at a \
+                         backend of kind `openrouter`, e.g. `decision = \"openrouter/\
+                         typesafe/jev-1.13\"`",
+                        slot.backend,
+                        kind.canonical_name(),
+                    );
+                }
                 if is_media && role.is_reasoning() {
                     bail!(
                         "cast {name:?}: the {} slot points at backend {:?} (kind \
@@ -2346,6 +2377,9 @@ impl Config {
         if disable.generate {
             self.tools.generate = false;
         }
+        if disable.decide {
+            self.tools.decide = false;
+        }
         // Non-empty CLI allow_paths replaces lower layers (env/file).
         if !allow_paths.is_empty() {
             self.allow_paths = allow_paths;
@@ -2376,6 +2410,7 @@ pub struct ToolDisables {
     pub batch: bool,
     pub list_models: bool,
     pub generate: bool,
+    pub decide: bool,
 }
 
 /// Register `alias → target` at one level (backend or cast), rejecting a clash
@@ -2818,6 +2853,7 @@ struct RawTools {
     batch: Option<bool>,
     list_models: Option<bool>,
     generate: Option<bool>,
+    decide: Option<bool>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -2953,6 +2989,9 @@ struct RawCast {
     image: Option<RawSlot>,
     /// The audio production slot — speech or sound. See [`ModelRole::Audio`].
     audio: Option<RawSlot>,
+    /// The decision slot — typed questions answered with probabilities. See
+    /// [`ModelRole::Decision`].
+    decision: Option<RawSlot>,
 }
 
 impl RawCast {
@@ -2963,6 +3002,7 @@ impl RawCast {
             (ModelRole::Synth, &self.synth),
             (ModelRole::Image, &self.image),
             (ModelRole::Audio, &self.audio),
+            (ModelRole::Decision, &self.decision),
         ]
         .into_iter()
         .filter_map(|(role, slot)| slot.as_ref().map(|s| (role, s)))
@@ -3336,6 +3376,7 @@ fn merge_tools(raw: RawTools) -> ToolGating {
         batch: raw.batch.unwrap_or(d.batch),
         list_models: raw.list_models.unwrap_or(d.list_models),
         generate: raw.generate.unwrap_or(d.generate),
+        decide: raw.decide.unwrap_or(d.decide),
     }
 }
 
@@ -3412,6 +3453,9 @@ fn apply_raw_env(raw: &mut RawConfig, get: &impl Fn(&str) -> Option<String>) -> 
     }
     if env_flag(get, "KAIBO_NO_GENERATE") {
         tools.generate = Some(false);
+    }
+    if env_flag(get, "KAIBO_NO_DECIDE") {
+        tools.decide = Some(false);
     }
 
     let defaults = raw.defaults.get_or_insert_with(Default::default);

@@ -16,6 +16,7 @@ record. Each later release appends a new section at the top.
 ## [Unreleased]
 
 ### Added
+- `decide` asks a fast decision model typed questions (`choice`, `score`, `noul`) about a state and returns probabilities, no text; it runs a cast's new `decision` slot on an `openrouter` backend (`typesafe/jev-1.13`), and `--no-decide` drops it.
 - `job_get` shows each role's model latency on a running job, so a slow backend shows at the first poll.
 - An async model call that reaches `slow_chat_secs` (default 60, `0` off) warns the caller through `job_wait`.
 - A retried model call is timed per attempt, so latency is the provider's time, never kaibo's backoff.

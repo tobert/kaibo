@@ -536,7 +536,7 @@ config has three concepts for configuring models:
   file. `openrouter` is a keyed gateway with a fixed endpoint — one key reaching every
   major model family, reasoning on by default via its unified `effort` param.
 - **role** — a *job* a model does: `explorer` (fast surveys), `synth` (the voice that
-  answers), and `image` and `audio` (the media members behind `generate`). A reasoning slot that
+  answers), `image` and `audio` (the media members behind `generate`), and `decision` (typed questions answered with probabilities, behind `decide`). A reasoning slot that
   reads images carries a `vision` pin (see [`docs/casts.md`](docs/casts.md)).
 - **cast** — a *composition*: a named team assigning models to roles. The `cast` call
   argument selects the ensemble; the calling agent sees these names in its tool listing,
