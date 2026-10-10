@@ -454,10 +454,7 @@ mod tests {
 
     /// Every (metric name, attributes, recorded sum) the exporter saw, flattened —
     /// enough to assert both that a metric was recorded and what it was labelled with.
-    fn collected(
-        provider: &SdkMeterProvider,
-        exporter: &InMemoryMetricExporter,
-    ) -> Vec<Point> {
+    fn collected(provider: &SdkMeterProvider, exporter: &InMemoryMetricExporter) -> Vec<Point> {
         provider.force_flush().expect("flush the test reader");
         let mut out = Vec::new();
         for rm in exporter.get_finished_metrics().expect("read metrics") {
@@ -612,7 +609,11 @@ mod tests {
 
         let rows = collected(&provider, &exporter);
         let duration = find(&rows, "gen_ai.client.operation.duration");
-        assert_eq!(duration.len(), 1, "a failed call is still recorded: {rows:?}");
+        assert_eq!(
+            duration.len(),
+            1,
+            "a failed call is still recorded: {rows:?}"
+        );
         assert_eq!(
             attr(duration[0], "error.type").as_deref(),
             Some("http_error"),
@@ -674,11 +675,20 @@ mod tests {
     fn a_tool_execution_carries_its_name_and_failure_class() {
         let (provider, exporter, inst) = reader();
         record_tool_execution_on(&inst, "run_kaish", Duration::from_millis(12), None);
-        record_tool_execution_on(&inst, "view_image", Duration::from_millis(5), Some("timeout"));
+        record_tool_execution_on(
+            &inst,
+            "view_image",
+            Duration::from_millis(5),
+            Some("timeout"),
+        );
 
         let rows = collected(&provider, &exporter);
         let tools = find(&rows, "gen_ai.execute_tool.duration");
-        assert_eq!(tools.len(), 2, "one series per (tool, error) pair: {rows:?}");
+        assert_eq!(
+            tools.len(),
+            2,
+            "one series per (tool, error) pair: {rows:?}"
+        );
         let failed = tools
             .iter()
             .find(|r| attr(r, "gen_ai.tool.name").as_deref() == Some("view_image"))

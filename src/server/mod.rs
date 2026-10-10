@@ -8259,7 +8259,13 @@ enabled = false
             .require_interactive_cast(artist, "oneshot")
             .expect_err("an image-only cast must be refused by `oneshot`");
         let msg = err.message.to_string();
-        for needle in ["`artist`", "no `synth` slot", "`oneshot`", "`image`", "`generate`"] {
+        for needle in [
+            "`artist`",
+            "no `synth` slot",
+            "`oneshot`",
+            "`image`",
+            "`generate`",
+        ] {
             assert!(msg.contains(needle), "refusal must name {needle}: {msg}");
         }
         let scout = h.config.resolve_cast("scout").unwrap();
@@ -8267,7 +8273,13 @@ enabled = false
             .require_interactive_cast(scout, "consult")
             .expect_err("an explorer-only cast must be refused by `consult`");
         let msg = err.message.to_string();
-        for needle in ["`scout`", "no `synth` slot", "`consult`", "`explorer`", "`explore`"] {
+        for needle in [
+            "`scout`",
+            "no `synth` slot",
+            "`consult`",
+            "`explorer`",
+            "`explore`",
+        ] {
             assert!(msg.contains(needle), "refusal must name {needle}: {msg}");
         }
     }
@@ -8433,10 +8445,22 @@ enabled = false
                 .find(|m| m.contains("default cast"))
         };
         let msg = warned("artist").expect("an image-only default must warn at startup");
-        for needle in ["`artist`", "`consult`", "`[server] cast`", "no `synth` slot"] {
-            assert!(msg.contains(needle), "the warning must name {needle}: {msg}");
+        for needle in [
+            "`artist`",
+            "`consult`",
+            "`[server] cast`",
+            "no `synth` slot",
+        ] {
+            assert!(
+                msg.contains(needle),
+                "the warning must name {needle}: {msg}"
+            );
         }
-        assert_eq!(warned("inter"), None, "a default that staffs consult must not warn");
+        assert_eq!(
+            warned("inter"),
+            None,
+            "a default that staffs consult must not warn"
+        );
     }
 
     /// And `explore`: a synth-only fixture has no explorer slot anywhere, so the sweep
@@ -9948,7 +9972,10 @@ enabled = false
     #[test]
     fn run_kaish_description_names_the_parse_failure_code() {
         let h = KaiboHandler::new(crate::config::Config::builtin()).expect("handler builds");
-        let tool = h.tool_router.get("run_kaish").expect("run_kaish advertised");
+        let tool = h
+            .tool_router
+            .get("run_kaish")
+            .expect("run_kaish advertised");
         let d = tool.description.as_deref().unwrap_or("");
         for needle in [
             "-1 = kaish could not run the script",
@@ -9956,7 +9983,10 @@ enabled = false
              through",
             "grep -rnF 'fn consult(' src",
         ] {
-            assert!(d.contains(needle), "run_kaish description must name {needle:?}: {d}");
+            assert!(
+                d.contains(needle),
+                "run_kaish description must name {needle:?}: {d}"
+            );
         }
     }
 

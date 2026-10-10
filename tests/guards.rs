@@ -41,7 +41,10 @@ async fn a_slow_script_is_killed_at_the_budget() {
     let r = run(&kernel, "sleep 10").await.unwrap();
     let elapsed = started.elapsed();
 
-    assert_eq!(r.code, 124, "a slow script must be killed with 124, got {r:?}");
+    assert_eq!(
+        r.code, 124,
+        "a slow script must be killed with 124, got {r:?}"
+    );
     assert!(
         elapsed < Duration::from_secs(5),
         "the timeout must fire fast, not run the full sleep — took {elapsed:?}"
@@ -100,7 +103,10 @@ async fn disable_builtins_blocks_an_otherwise_working_builtin() {
     let kernel = build_readonly_kernel_with(dir.path(), &sandbox).unwrap();
     let r = run(&kernel, "cat f.txt").await.unwrap();
 
-    assert_eq!(r.code, 126, "a config-disabled builtin must be refused (126), got {r:?}");
+    assert_eq!(
+        r.code, 126,
+        "a config-disabled builtin must be refused (126), got {r:?}"
+    );
     assert!(
         r.err.contains("read-only sandbox") || r.text_out().contains("read-only sandbox"),
         "the refusal should carry the sandbox marker, got {r:?}"
@@ -116,7 +122,10 @@ async fn custom_output_limit_is_honored() {
     let body = "y".repeat(1 << 12); // 4 KiB, well under the 64 KiB default but past our 512 B cap
     fs::write(dir.path().join("mid.txt"), &body).unwrap();
 
-    let sandbox = SandboxConfig { output_limit_bytes: 512, ..SandboxConfig::default() };
+    let sandbox = SandboxConfig {
+        output_limit_bytes: 512,
+        ..SandboxConfig::default()
+    };
     let kernel = build_readonly_kernel_with(dir.path(), &sandbox).unwrap();
     let r = run(&kernel, "cat mid.txt").await.unwrap();
 

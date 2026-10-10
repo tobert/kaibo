@@ -19,8 +19,12 @@ async fn generate_core_returns_a_real_png_with_a_seed() {
         Ok(k) => k,
         Err(e) => panic!("no Stability credential for live test: {e}"),
     };
-    let client = StabilityClient::new(key, kaibo::stability::STABILITY_API_BASE, Duration::from_secs(60))
-        .expect("client construction");
+    let client = StabilityClient::new(
+        key,
+        kaibo::stability::STABILITY_API_BASE,
+        Duration::from_secs(60),
+    )
+    .expect("client construction");
 
     let request = StabilityRequest {
         prompt: Some("a small lighthouse on a rocky cliff, watercolor".to_string()),
@@ -54,7 +58,11 @@ async fn generate_core_returns_a_real_png_with_a_seed() {
     assert!(!image.bytes.is_empty(), "must return non-empty image bytes");
     // PNG magic bytes — confirms this is really an image, not e.g. a stray JSON body
     // that slipped past `handle_response`'s content-type check.
-    assert_eq!(&image.bytes[..8], b"\x89PNG\r\n\x1a\n", "expected PNG magic bytes");
+    assert_eq!(
+        &image.bytes[..8],
+        b"\x89PNG\r\n\x1a\n",
+        "expected PNG magic bytes"
+    );
     assert_eq!(image.media_type, MediaType::ImagePng);
     assert!(
         image.seed.is_some(),

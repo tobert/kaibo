@@ -99,7 +99,13 @@ pub fn kaish_operating_contract() -> &'static str {
 /// is what keeps that true.
 pub fn kaish_syntax_core() -> &'static str {
     static CORE: OnceLock<String> = OnceLock::new();
-    CORE.get_or_init(|| format!("{}\n\n{}", kaish_operating_contract(), KAISH_SANDBOX_ADDENDUM))
+    CORE.get_or_init(|| {
+        format!(
+            "{}\n\n{}",
+            kaish_operating_contract(),
+            KAISH_SANDBOX_ADDENDUM
+        )
+    })
 }
 
 /// The internal `run_kaish` (rig) tool description shown to kaibo's own models. It
@@ -284,9 +290,7 @@ fn casts_section(config: &Config, usable: &[(String, CastUsability)]) -> String 
             }
             match state {
                 None => tags.push("no usable key".to_string()),
-                Some(CastUsability::LocalUnverified) => {
-                    tags.push("local, unverified".to_string())
-                }
+                Some(CastUsability::LocalUnverified) => tags.push("local, unverified".to_string()),
                 Some(_) => {}
             }
             // A batch cast runs synth alone on the `batch_submit` lane (no explorer),
@@ -914,7 +918,9 @@ mod tests {
             "the interactive cast must still render:\n{text}"
         );
         assert!(
-            text.contains("- `mydirect` (local, unverified, direct) → openai-local/big-local-model"),
+            text.contains(
+                "- `mydirect` (local, unverified, direct) → openai-local/big-local-model"
+            ),
             "a direct-lane cast is listed with its lane:\n{text}"
         );
     }
@@ -969,7 +975,10 @@ mod tests {
             .lines()
             .find(|l| l.contains("not-in-config"))
             .expect("the name has a roster line");
-        assert_eq!(line, "- `not-in-config`", "an unresolvable name renders bare");
+        assert_eq!(
+            line, "- `not-in-config`",
+            "an unresolvable name renders bare"
+        );
     }
 
     /// The default cast always makes the roster, tagged for what it is. A default on
@@ -987,7 +996,10 @@ mod tests {
             Cast {
                 name: "local-direct".to_string(),
                 slots: std::collections::BTreeMap::from([
-                    (ModelRole::Explorer, ModelSlot::bare("openai-local", "small")),
+                    (
+                        ModelRole::Explorer,
+                        ModelSlot::bare("openai-local", "small"),
+                    ),
                     (ModelRole::Synth, synth),
                 ]),
             },
@@ -1006,7 +1018,9 @@ mod tests {
             &usable,
         );
         assert!(
-            text.contains("- `local-direct` (default, local, unverified, direct) → openai-local/big-local"),
+            text.contains(
+                "- `local-direct` (default, local, unverified, direct) → openai-local/big-local"
+            ),
             "a direct-lane default is listed with its lane:\n{text}"
         );
 
@@ -1087,10 +1101,7 @@ mod tests {
                 name.to_string(),
                 Cast {
                     name: name.to_string(),
-                    slots: std::collections::BTreeMap::from([(
-                        role,
-                        ModelSlot::bare(backend, id),
-                    )]),
+                    slots: std::collections::BTreeMap::from([(role, ModelSlot::bare(backend, id))]),
                 },
             );
         }
@@ -1279,7 +1290,10 @@ mod tests {
         assert_eq!(trees.len(), ALLOWED_TREE_MAX_LINES + 1, "{text}");
         assert_eq!(
             trees[ALLOWED_TREE_MAX_LINES],
-            format!("  - +{} more: `kaibo://config`", 10 - ALLOWED_TREE_MAX_LINES),
+            format!(
+                "  - +{} more: `kaibo://config`",
+                10 - ALLOWED_TREE_MAX_LINES
+            ),
             "{text}"
         );
     }

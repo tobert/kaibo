@@ -528,7 +528,10 @@ fn the_generic_openai_path_asks_for_reasoning_by_default() {
         p.get("thinking").is_none(),
         "no `thinking` block on this wire — a strict gateway 403s the whole request: {p}"
     );
-    assert!(p.get("reasoning").is_none(), "that shape is OpenRouter's: {p}");
+    assert!(
+        p.get("reasoning").is_none(),
+        "that shape is OpenRouter's: {p}"
+    );
 }
 
 /// The off-switch on the **Responses** wire, checked where the request is really built.
@@ -542,12 +545,14 @@ fn the_generic_openai_path_asks_for_reasoning_by_default() {
 #[test]
 fn thinking_style_off_reaches_the_responses_wire_too() {
     // Reasoning is on for this model by default...
-    let on = hosted_openai_responses_params("gpt-5.6-sol", None, "high", ThinkingStyleOverride::Auto)
-        .expect("a gpt-5 model takes reasoning");
+    let on =
+        hosted_openai_responses_params("gpt-5.6-sol", None, "high", ThinkingStyleOverride::Auto)
+            .expect("a gpt-5 model takes reasoning");
     assert_eq!(on["reasoning"]["effort"], "high");
 
     // ...and `off` must remove it here, not merely in the shape the engine throws away.
-    let off = hosted_openai_responses_params("gpt-5.6-sol", None, "high", ThinkingStyleOverride::Off);
+    let off =
+        hosted_openai_responses_params("gpt-5.6-sol", None, "high", ThinkingStyleOverride::Off);
     assert!(
         off.as_ref().and_then(|v| v.get("reasoning")).is_none(),
         "thinking_style = off must silence the Responses wire, got {off:?}"
@@ -699,7 +704,9 @@ fn builtin_openai_cast_is_cheap_gemma_explorer_strong_gemma_synth() {
 
     // And the built-in `openai` cast resolves to exactly those, on the openai backend.
     let cfg = Config::builtin();
-    let cast = cfg.resolve_cast("openai-local").expect("built-in openai cast");
+    let cast = cfg
+        .resolve_cast("openai-local")
+        .expect("built-in openai cast");
     let e = cast
         .require_slot(ModelRole::Explorer)
         .expect("explorer slot");
@@ -1617,11 +1624,7 @@ async fn openrouter_reasoning_accounting_live() {
     // The built-in cast's explorer alias — the slot the doctrine most needs to
     // hold on, since the explorer runs the most turns.
     let model = "~google/gemini-flash-latest";
-    let shape = ModelShape::resolve(
-        ProviderKind::OpenRouter,
-        model,
-        ThinkingStyleOverride::Auto,
-    );
+    let shape = ModelShape::resolve(ProviderKind::OpenRouter, model, ThinkingStyleOverride::Auto);
 
     // Default posture: effort = high ⇒ the gateway bills reasoning tokens. The
     // no-collection routing pin rides along exactly as every live arm sends it —

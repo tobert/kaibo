@@ -394,7 +394,6 @@ fn builtin_schemas_enumerate_the_read_toolbox() {
     }
 }
 
-
 /// Oversize output is truncated in memory and never lands on the host disk.
 ///
 /// kaish's agent profile defaults to `SpillMode::Disk`: overflow is written whole to a

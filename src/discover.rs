@@ -102,9 +102,12 @@ pub struct DiscoveredModel {
 /// endpoint rather than a negative claim.
 fn parse_reasoning_support(item: &Value) -> Option<bool> {
     let params = item.get("supported_parameters")?.as_array()?;
-    Some(params.iter().filter_map(Value::as_str).any(|p| {
-        matches!(p, "reasoning_effort" | "reasoning" | "include_reasoning")
-    }))
+    Some(
+        params
+            .iter()
+            .filter_map(Value::as_str)
+            .any(|p| matches!(p, "reasoning_effort" | "reasoning" | "include_reasoning")),
+    )
 }
 
 /// Per-token price, kept as the provider's own string (fractional USD/token) rather
@@ -193,11 +196,17 @@ fn media_listing_refusal(backend: &Backend, media: crate::credentials::MediaKind
         backend.name,
         backend.kind.canonical_name()
     );
-    msg.push_str(&format!(" The `{}` slot takes {image}.", MediaOutput::Image.key()));
+    msg.push_str(&format!(
+        " The `{}` slot takes {image}.",
+        MediaOutput::Image.key()
+    ));
     // `audio` is Some exactly when `produces(Audio)` is true. The discover tests
     // hold the two together, so a slot named here is one config load accepts.
     if let Some(audio) = audio {
-        msg.push_str(&format!(" The `{}` slot takes {audio}.", MediaOutput::Audio.key()));
+        msg.push_str(&format!(
+            " The `{}` slot takes {audio}.",
+            MediaOutput::Audio.key()
+        ));
     }
     if let Some(catalog) = catalog {
         msg.push(' ');
@@ -219,7 +228,10 @@ pub fn discovery_endpoint(backend: &Backend) -> Result<DiscoveryRequest> {
 /// `None` builds the first page. OpenAI-shaped kinds (`Openai`/`OpenRouter`/`DeepSeek`)
 /// have no continuation — `cursor` is ignored for them, since [`discover_models`] never
 /// loops on those kinds anyway.
-pub fn discovery_endpoint_page(backend: &Backend, cursor: Option<&str>) -> Result<DiscoveryRequest> {
+pub fn discovery_endpoint_page(
+    backend: &Backend,
+    cursor: Option<&str>,
+) -> Result<DiscoveryRequest> {
     // kaibo has no model-listing route for a media kind: this module speaks only the
     // text kinds' listing shapes. Refusing loudly beats inventing a URL that would 404, and
     // beats returning an empty list that would read as "this backend serves no
@@ -497,30 +509,38 @@ pub async fn discover_models(
         return discovery_endpoint_page(backend, None).map(|_| Vec::new());
     };
     match wire {
-        WireKind::Anthropic => discover_paginated(
-            backend,
-            fetcher,
-            parse_anthropic_models,
-            |body| body.get("has_more").and_then(Value::as_bool).unwrap_or(false),
-            |body| {
-                body.get("last_id")
-                    .and_then(Value::as_str)
-                    .map(str::to_string)
-            },
-        )
-        .await,
-        WireKind::Gemini => discover_paginated(
-            backend,
-            fetcher,
-            parse_gemini_models,
-            |body| body.get("nextPageToken").and_then(Value::as_str).is_some(),
-            |body| {
-                body.get("nextPageToken")
-                    .and_then(Value::as_str)
-                    .map(str::to_string)
-            },
-        )
-        .await,
+        WireKind::Anthropic => {
+            discover_paginated(
+                backend,
+                fetcher,
+                parse_anthropic_models,
+                |body| {
+                    body.get("has_more")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false)
+                },
+                |body| {
+                    body.get("last_id")
+                        .and_then(Value::as_str)
+                        .map(str::to_string)
+                },
+            )
+            .await
+        }
+        WireKind::Gemini => {
+            discover_paginated(
+                backend,
+                fetcher,
+                parse_gemini_models,
+                |body| body.get("nextPageToken").and_then(Value::as_str).is_some(),
+                |body| {
+                    body.get("nextPageToken")
+                        .and_then(Value::as_str)
+                        .map(str::to_string)
+                },
+            )
+            .await
+        }
         WireKind::Openai | WireKind::OpenRouter | WireKind::DeepSeek => {
             let req = discovery_endpoint(backend)?;
             let body = fetcher.get_json(&req).await?;
@@ -631,7 +651,9 @@ pub fn render_models(results: &BTreeMap<String, Result<Vec<DiscoveredModel>, Str
 /// The same multi-backend sweep as a structured JSON envelope — the `--json` /
 /// `structured_content` face of [`render_models`]. Per backend: `ok` + either `models`
 /// (each carrying the normalized fields plus `raw`) or `error`.
-pub fn models_json_envelope(results: &BTreeMap<String, Result<Vec<DiscoveredModel>, String>>) -> Value {
+pub fn models_json_envelope(
+    results: &BTreeMap<String, Result<Vec<DiscoveredModel>, String>>,
+) -> Value {
     serde_json::json!({
         "backends": results
             .iter()
@@ -748,7 +770,10 @@ mod tests {
         assert!(err.contains(&ops), "expected {ops}: {err}");
         // Gemini has no id allowlist; pin the example the template and guide use.
         let err = refusal(ProviderKind::GeminiMedia);
-        assert!(err.contains("gemini-3.8-flash-tts"), "no Gemini speech model: {err}");
+        assert!(
+            err.contains("gemini-3.8-flash-tts"),
+            "no Gemini speech model: {err}"
+        );
     }
 
     // --- discovery_endpoint: exact URL/headers/query per kind -------------------
@@ -824,10 +849,7 @@ mod tests {
             "anthropic-version".to_string(),
             rig_core::providers::anthropic::completion::ANTHROPIC_VERSION_LATEST.to_string()
         )));
-        assert_eq!(
-            req.query,
-            vec![("limit".to_string(), "1000".to_string())]
-        );
+        assert_eq!(req.query, vec![("limit".to_string(), "1000".to_string())]);
     }
 
     #[test]
@@ -1008,7 +1030,10 @@ mod tests {
         assert_eq!(m.display_name.as_deref(), Some("Claude X"));
         assert_eq!(m.created, Some(1_767_225_600));
         assert_eq!(m.context_window, Some(200_000));
-        assert_eq!(m.output_ceiling, None, "anthropic's list reports no ceiling");
+        assert_eq!(
+            m.output_ceiling, None,
+            "anthropic's list reports no ceiling"
+        );
         assert_eq!(m.raw, body["data"][0]);
     }
 
@@ -1104,7 +1129,10 @@ mod tests {
         // fetcher never hits a real network — key_optional here just lets
         // discovery_endpoint build offline without configuring env/file credentials.
         let models = discover_models(&b, &fetcher).await.unwrap();
-        assert_eq!(models.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(), ["a", "b"]);
+        assert_eq!(
+            models.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
+            ["a", "b"]
+        );
 
         let calls = fetcher.calls.lock().unwrap();
         assert_eq!(calls.len(), 2);
@@ -1127,7 +1155,10 @@ mod tests {
         let mut b = backend(ProviderKind::Gemini);
         b.key_optional = true;
         let models = discover_models(&b, &fetcher).await.unwrap();
-        assert_eq!(models.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(), ["a", "b"]);
+        assert_eq!(
+            models.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
+            ["a", "b"]
+        );
 
         let calls = fetcher.calls.lock().unwrap();
         assert_eq!(calls.len(), 2);
@@ -1165,7 +1196,11 @@ mod tests {
         let models = discover_models(&b, &fetcher).await.unwrap();
         // First page has no cursor set yet (cursor=None), so it's fetched; its
         // last_id becomes the cursor for page 2, which repeats it — loop stops there.
-        assert_eq!(models.len(), 2, "expected exactly two pages before the repeat guard stops the loop");
+        assert_eq!(
+            models.len(),
+            2,
+            "expected exactly two pages before the repeat guard stops the loop"
+        );
         assert_eq!(fetcher.calls.lock().unwrap().len(), 2);
     }
 
@@ -1245,7 +1280,10 @@ mod tests {
         );
         let text = render_models(&results);
         assert!(text.contains("(output: 16384)"), "got: {text}");
-        assert!(!text.contains("context"), "no context means no context label, got: {text}");
+        assert!(
+            !text.contains("context"),
+            "no context means no context label, got: {text}"
+        );
     }
 
     #[test]
@@ -1265,7 +1303,10 @@ mod tests {
             }]),
         );
         let text = render_models(&results);
-        assert!(!text.contains('['), "no pricing means no bracketed suffix, got: {text}");
+        assert!(
+            !text.contains('['),
+            "no pricing means no bracketed suffix, got: {text}"
+        );
     }
 
     #[test]
@@ -1404,7 +1445,6 @@ mod tests {
         // .raw still carries the (empty) pricing object verbatim.
         assert_eq!(models[0].raw["pricing"], serde_json::json!({}));
     }
-
 }
 
 #[cfg(test)]

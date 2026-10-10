@@ -1127,8 +1127,13 @@ mod tests {
     /// `/chat/completions` shape, which stays toggle-less for local servers.
     #[test]
     fn hosted_openai_responses_params_are_model_aware_about_sampling() {
-        let params = hosted_openai_responses_params("gpt-5.6-sol", Some(0.95), DEFAULT_EFFORT, ThinkingStyleOverride::Auto)
-            .expect("hosted OpenAI sends Responses params");
+        let params = hosted_openai_responses_params(
+            "gpt-5.6-sol",
+            Some(0.95),
+            DEFAULT_EFFORT,
+            ThinkingStyleOverride::Auto,
+        )
+        .expect("hosted OpenAI sends Responses params");
         assert_eq!(
             params["reasoning"]["effort"], "high",
             "the per-role effort reaches OpenAI Responses"
@@ -1146,8 +1151,13 @@ mod tests {
             "Responses maps core max_tokens to max_output_tokens itself"
         );
 
-        let params = hosted_openai_responses_params("gpt-4.1-mini", Some(0.95), "low", ThinkingStyleOverride::Auto)
-            .expect("older chat GPT families keep sampling");
+        let params = hosted_openai_responses_params(
+            "gpt-4.1-mini",
+            Some(0.95),
+            "low",
+            ThinkingStyleOverride::Auto,
+        )
+        .expect("older chat GPT families keep sampling");
         assert!(
             params.get("reasoning").is_none(),
             "older chat GPT families reject reasoning.effort"
@@ -1162,7 +1172,13 @@ mod tests {
             "known sampling-compatible GPT families keep typed temperature"
         );
 
-        let params = hosted_openai_responses_params("gpt-5.6-sol", None, "none", ThinkingStyleOverride::Auto).unwrap();
+        let params = hosted_openai_responses_params(
+            "gpt-5.6-sol",
+            None,
+            "none",
+            ThinkingStyleOverride::Auto,
+        )
+        .unwrap();
         assert_eq!(
             params["reasoning"]["effort"], "none",
             "the explicit no-reasoning effort passes through to rig's Responses enum"
@@ -1170,7 +1186,13 @@ mod tests {
         assert!(params.get("top_p").is_none());
 
         assert!(
-            hosted_openai_responses_params("unknown-openai-model", Some(0.95), "high", ThinkingStyleOverride::Auto).is_none(),
+            hosted_openai_responses_params(
+                "unknown-openai-model",
+                Some(0.95),
+                "high",
+                ThinkingStyleOverride::Auto
+            )
+            .is_none(),
             "unknown hosted models get no guessed provider-specific params"
         );
     }
