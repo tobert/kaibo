@@ -33,8 +33,8 @@ fn builtin_arm(cast: &str, role: ModelRole) -> Arm {
     arm_from(&Config::builtin(), cast, role)
 }
 
-/// A throwaway explorer arm for the driver-only `view_image` tests. `consult` needs
-/// an explorer arm to assemble its toolset, but these tests never make the driver
+/// A throwaway explorer arm for the driver-only `view_image` tests. These tests pin
+/// the two-stage toolset, so they pass an explorer arm; they never make the driver
 /// delegate a sweep, so it is never invoked — it just has to exist. Shares the
 /// synth's scripted client under a model id the test never scripts.
 fn unused_explorer(client: &ScriptedClient) -> Arm {

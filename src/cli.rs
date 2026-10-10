@@ -369,8 +369,8 @@ pub struct ConsultArgs {
 
     /// Also print the explorer's aggregated report. Under --json it is the `report`
     /// field on stdout; otherwise it goes to stderr under a `--- explorer report ---`
-    /// header, so a pipe still captures only the answer. Empty when the consult
-    /// delegated no sweep.
+    /// header, so a pipe still captures only the answer. Empty when no sweep ran: the
+    /// synth read everything itself, or the cast has no explorer.
     #[arg(long)]
     pub include_report: bool,
 

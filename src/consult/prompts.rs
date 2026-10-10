@@ -1070,6 +1070,7 @@ mod tests {
         for (label, text) in [
             ("explorer", report_preamble(ReportReader::SynthesisAgent)),
             ("consult", consult_preamble()),
+            ("consult solo", consult_solo_preamble()),
             (
                 "oversize attachment",
                 consult_user_prompt("q", None, &[], &[oversize_attach("src/big.rs", 900_000)]),
@@ -1135,6 +1136,7 @@ mod tests {
     fn synth_phases_share_one_role_identity_and_own_the_written_answer() {
         for (label, p) in [
             ("consult", consult_preamble()),
+            ("consult solo", consult_solo_preamble()),
             ("oneshot", oneshot_preamble()),
             ("batch", batch_preamble()),
         ] {
@@ -1285,6 +1287,7 @@ mod tests {
         for (label, text) in [
             ("explorer", report_preamble(ReportReader::SynthesisAgent)),
             ("consult", consult_preamble()),
+            ("consult solo", consult_solo_preamble()),
             ("oneshot", oneshot_preamble()),
             ("batch", batch_preamble()),
             ("deliberation", deliberation_prompt("Q", "D")),
@@ -1397,6 +1400,10 @@ mod tests {
             consult_preamble()
         );
         assert_eq!(
+            resolve_phase_preamble(Phase::ConsultSolo, &base, None, None),
+            consult_solo_preamble()
+        );
+        assert_eq!(
             resolve_phase_preamble(Phase::Oneshot, &base, None, None),
             oneshot_preamble()
         );
@@ -1408,11 +1415,17 @@ mod tests {
         let map = "PROJECT FILES.\nsrc/lib.rs";
         let rules = "operator house rule";
         // The reading phases splice both project layers.
-        for phase in [
-            Phase::Explorer(ReportReader::SynthesisAgent),
-            Phase::Explorer(ReportReader::CallingAgent),
-            Phase::Consult,
-        ] {
+        // Every project-reading phase, derived so a new one cannot be left out.
+        let reading: Vec<Phase> = Phase::ALL
+            .into_iter()
+            .filter(|p| p.reads_project())
+            .collect();
+        assert_eq!(
+            reading.len(),
+            4,
+            "explorer ×2, consult, consult solo: {reading:?}"
+        );
+        for phase in reading {
             let p = resolve_phase_preamble(phase, &base, Some(map), Some(rules));
             assert!(
                 p.contains(map) && p.contains(rules),
@@ -1823,11 +1836,17 @@ mod tests {
     #[test]
     fn a_composed_preamble_still_ends_on_its_deliverable() {
         let overrides = PromptOverrides::default();
-        for phase in [
-            Phase::Explorer(ReportReader::SynthesisAgent),
-            Phase::Explorer(ReportReader::CallingAgent),
-            Phase::Consult,
-        ] {
+        // Every project-reading phase, derived so a new one cannot be left out.
+        let reading: Vec<Phase> = Phase::ALL
+            .into_iter()
+            .filter(|p| p.reads_project())
+            .collect();
+        assert_eq!(
+            reading.len(),
+            4,
+            "explorer ×2, consult, consult solo: {reading:?}"
+        );
+        for phase in reading {
             let composed = resolve_phase_preamble(
                 phase,
                 &overrides,
@@ -1943,6 +1962,7 @@ mod tests {
         for (name, prompt) in [
             ("explorer", report_preamble(ReportReader::SynthesisAgent)),
             ("consult", consult_preamble()),
+            ("consult solo", consult_solo_preamble()),
             ("oneshot", oneshot_preamble()),
             ("batch", batch_preamble()),
             (

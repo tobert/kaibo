@@ -365,7 +365,8 @@ pub struct ConsultInput {
 
     /// Attach the explorer's aggregated report as `structured_content` alongside the
     /// answer, for debugging the hand-off. Off by default (it can be large; an empty
-    /// report means the consult delegated no sweep).
+    /// report means no sweep ran: the synth read everything itself, or the cast has no
+    /// explorer).
     #[serde(default)]
     pub include_report: bool,
 
@@ -4811,14 +4812,16 @@ fn render_prompts_resource(config: &Config, cast: Option<&Cast>) -> String {
     }
 
     for phase in Phase::ALL {
-        // A cast runs exactly one of the two `consult` drivers — with `explore′` when it
-        // has an explorer slot, single-stage when it has none — so its own view shows that
-        // one. The base doc shows both.
+        // A cast with an interactive synth runs exactly one of the two `consult` drivers
+        // — with `explore′` when it has an explorer slot, single-stage when it has none —
+        // so its own view shows that one. A cast with no interactive synth runs neither.
+        // The base doc shows both.
         if let Some(c) = cast {
+            let interactive = c.slot(ModelRole::Synth).is_some() && c.synth_lane().is_none();
             let has_explorer = c.slot(ModelRole::Explorer).is_some();
             match phase {
-                Phase::Consult if !has_explorer => continue,
-                Phase::ConsultSolo if has_explorer => continue,
+                Phase::Consult if !interactive || !has_explorer => continue,
+                Phase::ConsultSolo if !interactive || has_explorer => continue,
                 _ => {}
             }
         }
@@ -8183,6 +8186,37 @@ enabled = false
         assert!(h.require_interactive_cast(solo, "consult").is_ok());
         assert!(h.require_interactive_cast(solo, "consult_submit").is_ok());
         assert!(h.config.cast_is_interactive("solo"));
+
+        // An explorer model override with no backend has no slot to replace on a
+        // synth-only cast; the refusal names the arg that adds one.
+        let mut cast = solo.clone();
+        let err = h
+            .resolver
+            .apply_model_override(
+                &mut cast,
+                ModelRole::Explorer,
+                Some("lite"),
+                None,
+                "explorer_model",
+                "explorer_backend",
+            )
+            .expect_err("no explorer slot and no backend");
+        let msg = err.message.to_string();
+        for needle in ["`solo`", "`explorer_backend`", "`--explorer-backend`"] {
+            assert!(msg.contains(needle), "refusal must name {needle}: {msg}");
+        }
+        // With the backend it becomes two-stage.
+        h.resolver
+            .apply_model_override(
+                &mut cast,
+                ModelRole::Explorer,
+                Some("lite"),
+                Some("gem"),
+                "explorer_model",
+                "explorer_backend",
+            )
+            .expect("a backend adds the slot");
+        assert!(cast.slot(ModelRole::Explorer).is_some());
     }
 
     /// A cast with no synth slot has no model to answer a text tool: `consult`,
@@ -10210,10 +10244,19 @@ enabled = false
 
             [casts.solo]
             synth    = "anthropic/claude-opus-4-8"
+
+            [casts.offline]
+            explorer = "anthropic/claude-haiku-4-5"
+            synth    = { backend = "anthropic", id = "claude-opus-4-8", lane = "batch" }
             "#,
         )
         .expect("config parses");
         let heading = |p: Phase| format!("## {}\n", p.label());
+        // An offline synth runs no `consult` driver at all.
+        let offline =
+            render_prompts_resource(&config, Some(config.resolve_cast("offline").unwrap()));
+        assert!(!offline.contains(&heading(Phase::Consult)), "{offline}");
+        assert!(!offline.contains(&heading(Phase::ConsultSolo)), "{offline}");
         let team = render_prompts_resource(&config, Some(config.resolve_cast("team").unwrap()));
         assert!(team.contains(&heading(Phase::Consult)), "{team}");
         assert!(!team.contains(&heading(Phase::ConsultSolo)), "{team}");
@@ -10758,7 +10801,7 @@ enabled = false
             .override_model(&mut cast, ModelRole::Synth, "bare-id", None)
             .unwrap_err();
         let msg = err.to_string();
-        assert!(msg.contains("has no synth slot"), "got: {msg}");
+        assert!(msg.contains("has no `synth` slot"), "got: {msg}");
         assert!(
             msg.contains("backend"),
             "names the escape hatch, got: {msg}"

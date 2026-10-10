@@ -4,7 +4,8 @@
 //! a bounded tool loop. Every tool on the surface is that loop wearing different
 //! clothes:
 //!
-//! - [`consult`] — the synthesis agent · `{run_kaish, explore′}` · optional context → a
+//! - [`consult`] — the synthesis agent · `{run_kaish, explore′}` (or `{run_kaish}` alone
+//!   on a cast with no explorer — single-stage) · optional context → a
 //!   cited answer. No rigid explorer→synth hand-off: the synthesis agent decides when
 //!   to delegate a broad sweep to the cheap [`RunExplore`] sub-agent vs. read a span
 //!   directly. The `explore′` sweep ([`report_preamble`]) is internal to this loop.

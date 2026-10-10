@@ -458,10 +458,12 @@ impl Resolver {
             None => cast.slot(role).map(|s| s.backend.clone()).ok_or_else(|| {
                 McpError::invalid_params(
                     format!(
-                        "cast {:?} has no {} slot to override — pass the matching \
-                         backend override arg to target one",
-                        cast.name,
-                        role.key()
+                        "cast `{name}` has no `{role}` slot for this model override to replace. \
+                         Pass `{role}_backend` (CLI: `--{role}-backend`) with it to add \
+                         the slot on that backend, or pick a cast that carries the \
+                         `{role}` slot.",
+                        name = cast.name,
+                        role = role.key()
                     ),
                     None,
                 )

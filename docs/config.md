@@ -215,8 +215,9 @@ valid config, and the tool needing the missing role fails at call time naming th
 
 **Single-stage `consult`.** A cast with an interactive `synth` and no `explorer` runs
 `consult` as one model: the synth does every read itself through `run_kaish`, and it is
-not offered `explore`. Its preamble is the `consult` driver's with the delegation
-paragraph removed, and a `[prompts] consult` override applies to both. The provenance
+not offered `explore`. Its preamble is the `consult` driver's, with the delegation
+paragraph replaced by one on searching with `grep -rn`; a `[prompts] consult` override
+applies to both. The provenance
 footer names only the synth, and the CLI `--json` envelope sets `models.explorer` to
 `null`. `explore` and `deliberate` still need an `explorer` slot.
 
