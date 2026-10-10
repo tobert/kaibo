@@ -133,8 +133,12 @@ pub enum Phase {
     /// reading guidance, and differ only in who receives the report
     /// ([`ReportReader`]).
     Explorer(ReportReader),
-    /// The `consult` driver.
+    /// The `consult` driver, with an `explore′` sweep to delegate to.
     Consult,
+    /// The `consult` driver on a synth-only cast: one model, no explorer, every read its
+    /// own. Shares the `consult` override key, since an operator tuning the driver means
+    /// both shapes.
+    ConsultSolo,
     /// The thin, toolless `oneshot`.
     Oneshot,
     /// The offline synth: `batch_submit` and `deliberate`'s synth, on either lane.
@@ -190,10 +194,11 @@ impl Phase {
     /// Every prompt kaibo can send, for callers that enumerate them (the resource).
     /// Both explorer readers appear: they render different text, so a listing that
     /// showed one would misreport what the other tool sends.
-    pub const ALL: [Phase; 5] = [
+    pub const ALL: [Phase; 6] = [
         Phase::Explorer(ReportReader::SynthesisAgent),
         Phase::Explorer(ReportReader::CallingAgent),
         Phase::Consult,
+        Phase::ConsultSolo,
         Phase::Oneshot,
         Phase::Batch,
     ];
@@ -206,6 +211,7 @@ impl Phase {
             }
             Phase::Explorer(ReportReader::CallingAgent) => "explorer → calling agent (explore)",
             Phase::Consult => "consult driver",
+            Phase::ConsultSolo => "consult driver, single-stage (synth-only cast)",
             Phase::Oneshot => "oneshot",
             Phase::Batch => "batch / deliberate synth (offline)",
         }
@@ -217,6 +223,7 @@ impl Phase {
         match self {
             Phase::Explorer(reader) => report_preamble(reader),
             Phase::Consult => consult_preamble(),
+            Phase::ConsultSolo => consult_solo_preamble(),
             Phase::Oneshot => oneshot_preamble(),
             Phase::Batch => batch_preamble(),
         }
@@ -229,7 +236,7 @@ impl Phase {
     fn closing_obligation(self) -> &'static str {
         match self {
             Phase::Explorer(_) => "Your last turn is the report itself, written out in full.",
-            Phase::Consult => {
+            Phase::Consult | Phase::ConsultSolo => {
                 "When you have what the question needs, your next turn is that answer, \
                  written out in full."
             }
@@ -246,7 +253,7 @@ impl Phase {
     pub fn override_in(self, p: &PromptOverrides) -> Option<&str> {
         match self {
             Phase::Explorer(_) => p.explorer.as_deref(),
-            Phase::Consult => p.consult.as_deref(),
+            Phase::Consult | Phase::ConsultSolo => p.consult.as_deref(),
             Phase::Oneshot => p.oneshot.as_deref(),
             Phase::Batch => p.batch.as_deref(),
         }
@@ -258,7 +265,10 @@ impl Phase {
     /// it), so neither project layer reaches them — the seam that used to sit as a bare
     /// `None, None` at each of those call sites now lives here, in one place.
     pub fn reads_project(self) -> bool {
-        matches!(self, Phase::Explorer(_) | Phase::Consult)
+        matches!(
+            self,
+            Phase::Explorer(_) | Phase::Consult | Phase::ConsultSolo
+        )
     }
 
     /// Which cast slot's `preamble` frames this phase: the **explorer** slot drives the
@@ -269,7 +279,7 @@ impl Phase {
     pub fn slot_role(self) -> ModelRole {
         match self {
             Phase::Explorer(_) => ModelRole::Explorer,
-            Phase::Consult | Phase::Oneshot | Phase::Batch => ModelRole::Synth,
+            Phase::Consult | Phase::ConsultSolo | Phase::Oneshot | Phase::Batch => ModelRole::Synth,
         }
     }
 }
@@ -809,11 +819,9 @@ pub fn sweep_evidence_block(consumer: &SweepConsumer, delivery: &SweepDelivery) 
 /// declarative sentences, one instruction each, no idiom and no metaphor, because most
 /// of the models that read this are not English-first.
 pub fn consult_preamble() -> String {
-    let core = kaish_syntax_core();
-    format!(
-        "You are the synthesis agent on a two-model team. You investigate a project \
-         tree and write the answer that another agent will act on. Ground every claim in \
-         evidence and cite the concrete `file:line`. {core}\n\n\
+    driver_preamble(
+        "You are the synthesis agent on a two-model team.",
+        "\n\n\
          You also have `explore`. It sends a broad sweep to the fast explorer on your \
          team, which searches the repository on the same read-only shell and returns \
          a curated report: RelevantLocations with `file:line`, key symbols, and \
@@ -821,7 +829,32 @@ pub fn consult_preamble() -> String {
          where something lives or gathering the relevant files. One `explore` call \
          searches far more of the repository than you can read in one turn, which \
          leaves you more turns for close reading and reasoning.\n\n\
-         Use `run_kaish` to read the files yourself when you need a specific span. \
+         Use `run_kaish` to read the files yourself when you need a specific span.",
+    )
+}
+
+/// The `consult` driver's system prompt on a synth-only cast: the same driver, with no
+/// explorer on the team. It reads everything through `run_kaish`, so the delegation
+/// paragraph is gone and the role line names no team. Everything after that is shared
+/// with [`consult_preamble`] through [`driver_preamble`], so the two cannot drift.
+pub fn consult_solo_preamble() -> String {
+    driver_preamble(
+        "You are the synthesis agent.",
+        "\n\n\
+         You do every read yourself with `run_kaish`. Search for where things live \
+         with `grep -rn PATTERN .`, then read the files the question touches.",
+    )
+}
+
+/// The body both `consult` drivers share. `role` opens it; `reads` is the paragraph
+/// that says how this driver gets its evidence, and it ends just before the
+/// whole-file reading guidance.
+fn driver_preamble(role: &str, reads: &str) -> String {
+    let core = kaish_syntax_core();
+    format!(
+        "{role} You investigate a project \
+         tree and write the answer that another agent will act on. Ground every claim in \
+         evidence and cite the concrete `file:line`. {core}{reads} \
          Read files WHOLE with `cat -n FILE`; nearly every file comes back whole in \
          one command. The project file list gives each file's size, so read \
          whole every file it does not mark, and when you have no size read whole \

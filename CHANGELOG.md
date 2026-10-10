@@ -26,6 +26,7 @@ record. Each later release appends a new section at the top.
 - Gemini text-to-speech on an `audio` slot, with `voice`, two-voice `speakers`, and `language_code` fields; raw PCM is stored as WAVE.
 - Stable Audio 2, 2.5 and 3 on a Stability `audio` slot, with `audio-to-audio` and `inpaint` ops that take an audio input.
 - The artifact store holds `mp3` and `wav`; `write_cas` and `kaibo cas write` accept them, and `inputs` takes them.
+- `consult` runs single-stage on a cast with no `explorer`: the synth does every read itself, with no `explore` tool.
 
 ### Changed
 - The configuration reference and template are less than half their former length.

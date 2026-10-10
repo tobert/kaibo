@@ -84,8 +84,8 @@ use render::{
     wait_level_floor, wait_level_label,
 };
 pub(crate) use render::{
-    batch_within_window, consultation_failure_text, now_epoch_secs, with_provenance,
-    BATCH_RECENCY_WINDOW_SECS,
+    batch_within_window, consult_models, consultation_failure_text, now_epoch_secs,
+    with_provenance, BATCH_RECENCY_WINDOW_SECS,
 };
 
 /// kaibo's resource URI namespace. Everything kaish-related hangs off `kaibo://kaish/`.
@@ -935,15 +935,10 @@ type CastEnumRule = (
 /// budget-limited display (it caps the line count and always lists the default, usable or
 /// not) — a presentation choice distinct from tool eligibility.
 const CAST_ENUM_RULES: &[CastEnumRule] = &[
+    // `consult` runs single-stage on a synth-only cast (the synth reads for itself) and
+    // `oneshot` runs the synth alone, so all three need only an interactive synth.
     (
-        &["consult", "consult_submit"],
-        Config::cast_can_consult,
-        "a cast with an `explorer` slot and a `synth` slot that answers interactively (a \
-         synth with no offline `lane`)",
-    ),
-    // `oneshot` runs the synth alone, so a synth-only cast staffs it.
-    (
-        &["oneshot"],
+        &["consult", "consult_submit", "oneshot"],
         Config::cast_is_interactive,
         "a cast with a `synth` slot that answers interactively (a synth with no offline \
          `lane`)",
@@ -1027,15 +1022,14 @@ fn default_cast_consult_warning(
     eligible: &std::collections::HashMap<&'static str, Vec<String>>,
 ) -> Option<String> {
     let cast = config.resolve_cast(&config.default_cast).ok()?;
-    if config.cast_can_consult(&cast.name) {
+    if config.cast_is_interactive(&cast.name) {
         return None;
     }
-    let why = if cast.slot(ModelRole::Synth).is_none() {
-        "it has no `synth` slot".to_string()
-    } else if let Some(lane) = cast.synth_lane() {
-        format!("its synth runs on the offline `{}` lane", lane.as_str())
-    } else {
-        "it has no `explorer` slot".to_string()
+    let why = match cast.synth_lane() {
+        Some(lane) if cast.slot(ModelRole::Synth).is_some() => {
+            format!("its synth runs on the offline `{}` lane", lane.as_str())
+        }
+        _ => "it has no `synth` slot".to_string(),
     };
     let example = eligible
         .get("consult")
@@ -1045,8 +1039,7 @@ fn default_cast_consult_warning(
     Some(format!(
         "default cast `{name}` cannot staff `consult`: {why}. Every `consult` or \
          `consult_submit` call that omits `cast` will be refused. Set `[server] cast` in \
-         config.toml to a cast with an `explorer` slot and an interactive `synth` \
-         slot{example} (`kaibo example-config` shows the shape).",
+         config.toml to a cast with an interactive `synth` slot{example} (`kaibo example-config` shows the shape).",
         name = cast.name,
     ))
 }
@@ -1680,11 +1673,6 @@ impl KaiboHandler {
         self.resolver.require_interactive_cast(cast, tool)
     }
 
-    /// Shim over [`Resolver::require_consult_cast`].
-    fn require_consult_cast(&self, cast: &Cast, tool: &str) -> Result<(), McpError> {
-        self.resolver.require_consult_cast(cast, tool)
-    }
-
     /// Shim over [`Resolver::require_batch_cast`] — the resolution glue lives on the
     /// shared resolver so the CLI `batch submit` front door runs the same gate.
     fn require_batch_cast(&self, cast: &Cast) -> Result<(), McpError> {
@@ -1863,7 +1851,7 @@ impl KaiboHandler {
             answer with `file:line` citations. A synthesis agent (DeepSeek, Gemini, \
             Anthropic, OpenRouter, or local — pick with `cast`) drives a READ-ONLY shell over \
             the project: it reads the real, current source, delegates broad sweeps to a fast \
-            explorer, and answers with evidence, never modifying anything. Describe your \
+            explorer when its cast has one, and answers with evidence, never modifying anything. Describe your \
             intent in prose; kaibo locates the code itself, so you don't paste files or \
             diffs. `attach` puts specific files in front of it; `session_id` threads a \
             multi-turn consultation. For a toolless opinion use `oneshot`; to run in the \
@@ -1879,7 +1867,7 @@ impl KaiboHandler {
         // Resolve the cast, layer per-call model overrides onto the clone, then
         // resolve each phase's slot into its own arm (client + request shape).
         let mut cast = self.resolve_cast(input.cast)?;
-        self.require_consult_cast(&cast, "consult")?;
+        self.require_interactive_cast(&cast, "consult")?;
         self.apply_model_override(
             &mut cast,
             ModelRole::Explorer,
@@ -1896,7 +1884,8 @@ impl KaiboHandler {
             "synth_model",
             "synth_backend",
         )?;
-        let explorer = self.arm(&cast, ModelRole::Explorer)?;
+        // A synth-only cast has no explorer: `consult` runs single-stage.
+        let explorer = self.resolver.optional_arm(&cast, ModelRole::Explorer)?;
         let synth = self.arm(&cast, ModelRole::Synth)?;
         // Progress rides the whole investigation: sweeps and direct reads emit beats
         // onto the wire when the client supplied a token, else a no-op sink.
@@ -1956,7 +1945,7 @@ impl KaiboHandler {
         let span = tracing::info_span!(
             "consult",
             cast = %cast.name,
-            explorer_model = %explorer.model,
+            explorer_model = explorer.as_ref().map_or("none", |a| a.model.as_str()),
             synth_model = %synth.model,
             session = session.is_some(),
         );
@@ -1965,7 +1954,7 @@ impl KaiboHandler {
             &input.question,
             input.context.as_deref(),
             root,
-            &explorer,
+            explorer.as_ref(),
             &synth,
             &cfg,
             session,
@@ -2000,7 +1989,7 @@ impl KaiboHandler {
             &out.warnings,
             cfg.artifacts.as_deref(),
             &cast.name,
-            &[("explorer", &explorer.model), ("synth", &synth.model)],
+            &consult_models(explorer.as_ref().map(|a| a.model.as_str()), &synth.model),
             &out.usage,
         );
         Ok(consult_result(answer, out.report, input.include_report))
@@ -2023,7 +2012,7 @@ impl KaiboHandler {
         // refusable work (bad cast, bad path, missing key) happens *here*, synchronously,
         // so a bad submit is a clean error, not a job that fails on poll.
         let mut cast = self.resolve_cast(input.cast)?;
-        self.require_consult_cast(&cast, "consult_submit")?;
+        self.require_interactive_cast(&cast, "consult_submit")?;
         self.apply_model_override(
             &mut cast,
             ModelRole::Explorer,
@@ -2040,7 +2029,7 @@ impl KaiboHandler {
             "synth_model",
             "synth_backend",
         )?;
-        let explorer = self.arm(&cast, ModelRole::Explorer)?;
+        let explorer = self.resolver.optional_arm(&cast, ModelRole::Explorer)?;
         let synth = self.arm(&cast, ModelRole::Synth)?;
         let defaults = &self.config.defaults;
         // Resolve + classify + gate before spawning: a bad attach (or an image to a blind
@@ -2103,10 +2092,12 @@ impl KaiboHandler {
         let session_id = input.session_id.clone();
         let include_report = input.include_report;
         let cast_name = cast.name.clone();
-        let explorer_model = explorer.model.clone();
+        let explorer_model = explorer.as_ref().map(|a| a.model.clone());
         let synth_model = synth.model.clone();
-        let label =
-            format!("cast `{cast_name}` (explorer `{explorer_model}`, synth `{synth_model}`)");
+        let label = match &explorer_model {
+            Some(e) => format!("cast `{cast_name}` (explorer `{e}`, synth `{synth_model}`)"),
+            None => format!("cast `{cast_name}` (synth `{synth_model}`, single-stage)"),
+        };
 
         let job_id = self.jobs.submit(label, progress_log, async move {
             let session = session_id.as_ref().map(|id| (&sessions, id.as_str()));
@@ -2114,7 +2105,7 @@ impl KaiboHandler {
                 &question,
                 context.as_deref(),
                 root,
-                &explorer,
+                explorer.as_ref(),
                 &synth,
                 &cfg,
                 session,
@@ -2127,10 +2118,7 @@ impl KaiboHandler {
                         &out.warnings,
                         cfg.artifacts.as_deref(),
                         &cast_name,
-                        &[
-                            ("explorer", explorer_model.as_str()),
-                            ("synth", synth_model.as_str()),
-                        ],
+                        &consult_models(explorer_model.as_deref(), &synth_model),
                         &out.usage,
                     );
                     Ok(JobResult {
@@ -4823,6 +4811,17 @@ fn render_prompts_resource(config: &Config, cast: Option<&Cast>) -> String {
     }
 
     for phase in Phase::ALL {
+        // A cast runs exactly one of the two `consult` drivers — with `explore′` when it
+        // has an explorer slot, single-stage when it has none — so its own view shows that
+        // one. The base doc shows both.
+        if let Some(c) = cast {
+            let has_explorer = c.slot(ModelRole::Explorer).is_some();
+            match phase {
+                Phase::Consult if !has_explorer => continue,
+                Phase::ConsultSolo if has_explorer => continue,
+                _ => {}
+            }
+        }
         // Attribute the framing by precedence: a cast slot's `preamble` wins over a global
         // `[prompts]` override wins over the built-in — the order `resolved_prompts` layers.
         let slot_set = cast
@@ -8087,8 +8086,9 @@ enabled = false
         // Each cast-taking tool's call-time acceptance, in one place beside the enum rules.
         let gate_accepts = |tool: &str, cast: &Cast| -> bool {
             match tool {
-                "consult" | "consult_submit" => h.require_consult_cast(cast, tool).is_ok(),
-                "oneshot" => h.require_interactive_cast(cast, tool).is_ok(),
+                "consult" | "consult_submit" | "oneshot" => {
+                    h.require_interactive_cast(cast, tool).is_ok()
+                }
                 // `explore` has no lane gate — it runs whichever cast's explorer, so any cast
                 // is accepted (a missing explorer faults later at the arm resolve, not the gate).
                 "explore" => true,
@@ -8129,14 +8129,13 @@ enabled = false
         assert!(checked > 0, "the guard checked nothing");
     }
 
-    /// `consult` and `consult_submit` resolve an explorer arm as well as a synth arm, so a
-    /// synth-only cast cannot staff them; `oneshot` needs only the synth. The enum rule
-    /// for the three tools was shared, so a synth-only cast was offered on `consult` and
-    /// failed at the explorer resolve with a bare "has no explorer slot". Now `consult`
-    /// and `consult_submit` offer only casts with both slots, and naming a synth-only
-    /// cast is refused with the tool it does serve.
+    /// A synth-only interactive cast runs `consult` single-stage: one model doing its own
+    /// reads, with no `explore′` to delegate to. So `consult`, `consult_submit`, and
+    /// `oneshot` all offer it, and its gate accepts it. `explore` still needs an explorer
+    /// slot, so the synth-only cast stays off that tool. This inverts the old refusal,
+    /// which sent a synth-only cast to `oneshot` and lost the shell.
     #[test]
-    fn a_synth_only_cast_is_offered_to_oneshot_but_not_consult() {
+    fn a_synth_only_cast_is_offered_to_consult_single_stage() {
         let h = handler_from_toml(
             r#"
             [backends.gem]
@@ -8167,29 +8166,23 @@ enabled = false
                 })
                 .unwrap_or_default()
         };
-        for tool in ["consult", "consult_submit"] {
+        for tool in ["consult", "consult_submit", "oneshot"] {
             let offered = enum_of(tool);
-            assert!(offered.iter().any(|c| c == "inter"), "{tool}: {offered:?}");
             assert!(
-                !offered.iter().any(|c| c == "solo"),
-                "`{tool}` must not offer the synth-only cast, got {offered:?}"
+                offered.iter().any(|c| c == "solo") && offered.iter().any(|c| c == "inter"),
+                "`{tool}` must offer both casts, got {offered:?}"
             );
         }
-        let offered = enum_of("oneshot");
+        let offered = enum_of("explore");
         assert!(
-            offered.iter().any(|c| c == "solo") && offered.iter().any(|c| c == "inter"),
-            "`oneshot` needs only a synth, got {offered:?}"
+            !offered.iter().any(|c| c == "solo"),
+            "`explore` needs an explorer slot, got {offered:?}"
         );
 
         let solo = h.config.resolve_cast("solo").unwrap();
-        assert!(h.require_interactive_cast(solo, "oneshot").is_ok());
-        let err = h
-            .require_consult_cast(solo, "consult")
-            .expect_err("a synth-only cast must be refused by `consult`");
-        let msg = err.message.to_string();
-        for needle in ["`solo`", "no `explorer` slot", "`consult`", "`oneshot`"] {
-            assert!(msg.contains(needle), "refusal must name {needle}: {msg}");
-        }
+        assert!(h.require_interactive_cast(solo, "consult").is_ok());
+        assert!(h.require_interactive_cast(solo, "consult_submit").is_ok());
+        assert!(h.config.cast_is_interactive("solo"));
     }
 
     /// A cast with no synth slot has no model to answer a text tool: `consult`,
@@ -8464,10 +8457,8 @@ enabled = false
     }
 
     /// And `explore`: a synth-only fixture has no explorer slot anywhere, so the sweep
-    /// tool cannot run. Neither can `consult`, which resolves an explorer arm before its
-    /// synth runs (this test once asserted it survived, on the belief that the driver
-    /// carried its own explorer; `Resolver::arm` has no such fallback, and every such
-    /// call failed at the explorer resolve). `oneshot` runs the synth alone and stays.
+    /// tool cannot run. `consult` runs single-stage on the synth alone, and `oneshot`
+    /// needs only the synth, so both stay.
     #[test]
     fn explore_is_not_advertised_without_an_explorer_slot() {
         let h = hermetic_handler_from_toml(&with_no_builtin_casts(
@@ -8488,18 +8479,13 @@ enabled = false
             !tools.iter().any(|t| t == "explore"),
             "explore must be dropped when no cast carries an explorer slot. Advertised: {tools:?}"
         );
-        for dropped in ["consult", "consult_submit"] {
+        for kept in ["consult", "consult_submit", "oneshot"] {
             assert!(
-                !tools.iter().any(|t| t == dropped),
-                "{dropped} needs an explorer slot too, so it must be dropped. Advertised: \
-                 {tools:?}"
+                tools.iter().any(|t| t == kept),
+                "{kept} needs only the interactive synth (`consult` runs single-stage), so \
+                 it must survive. Advertised: {tools:?}"
             );
         }
-        assert!(
-            tools.iter().any(|t| t == "oneshot"),
-            "oneshot needs only the interactive synth, so it must survive. Advertised: \
-             {tools:?}"
-        );
     }
 
     /// The collect verbs are shared by three producers (`consult_submit`, `batch_submit`,
@@ -10207,6 +10193,37 @@ enabled = false
         assert!(
             text.contains("kaibo://prompts"),
             "per-cast doc must point back to the base doc:\n{text}"
+        );
+    }
+
+    /// A cast runs one of the two `consult` drivers, so its prompts view shows that one:
+    /// the delegating driver for a cast with an explorer, the single-stage driver for a
+    /// synth-only cast. The base doc shows both, because it describes every cast.
+    #[test]
+    fn per_cast_prompts_resource_shows_the_consult_driver_the_cast_runs() {
+        use crate::consult::Phase;
+        let config = Config::from_toml_str(
+            r#"
+            [casts.team]
+            explorer = "anthropic/claude-haiku-4-5"
+            synth    = "anthropic/claude-opus-4-8"
+
+            [casts.solo]
+            synth    = "anthropic/claude-opus-4-8"
+            "#,
+        )
+        .expect("config parses");
+        let heading = |p: Phase| format!("## {}\n", p.label());
+        let team = render_prompts_resource(&config, Some(config.resolve_cast("team").unwrap()));
+        assert!(team.contains(&heading(Phase::Consult)), "{team}");
+        assert!(!team.contains(&heading(Phase::ConsultSolo)), "{team}");
+        let solo = render_prompts_resource(&config, Some(config.resolve_cast("solo").unwrap()));
+        assert!(solo.contains(&heading(Phase::ConsultSolo)), "{solo}");
+        assert!(!solo.contains(&heading(Phase::Consult)), "{solo}");
+        let base = render_prompts_resource(&config, None);
+        assert!(
+            base.contains(&heading(Phase::Consult)) && base.contains(&heading(Phase::ConsultSolo)),
+            "{base}"
         );
     }
 

@@ -213,6 +213,18 @@ built-ins carry `synth` only; none carries a media slot. A user cast that omits 
 valid config, and the tool needing the missing role fails at call time naming the gap
 (`cast "lite" has no synth slot`). Absent means the capability is absent.
 
+**Single-stage `consult`.** A cast with an interactive `synth` and no `explorer` runs
+`consult` as one model: the synth does every read itself through `run_kaish`, and it is
+not offered `explore`. Its preamble is the `consult` driver's with the delegation
+paragraph removed, and a `[prompts] consult` override applies to both. The provenance
+footer names only the synth, and the CLI `--json` envelope sets `models.explorer` to
+`null`. `explore` and `deliberate` still need an `explorer` slot.
+
+```toml
+[casts.flash-solo]
+synth = { backend = "deepseek", id = "deepseek-flash", effort = "xhigh" }
+```
+
 **Slot references.** An unknown backend in a slot is a load error naming the known
 backends. An empty model id is rejected at load, since it would otherwise surface as an
 unexplained provider 404 mid-call.
@@ -655,8 +667,7 @@ Which cast shape staffs which tool:
 
 | tool | needs |
 |---|---|
-| `consult`, `consult_submit` | a cast with an `explorer` slot **and** a `synth` slot that answers **interactively** (no offline lane) |
-| `oneshot` | a cast with a `synth` slot that answers **interactively** (no offline lane) |
+| `consult`, `consult_submit`, `oneshot` | a cast with a `synth` slot that answers **interactively** (no offline lane). Without an `explorer` slot, `consult` runs single-stage. |
 | `explore` | a cast with an `explorer` slot |
 | `batch_submit` | a cast whose synth runs on `lane = "batch"` (or the `batch = true` sugar) |
 | `deliberate` | a cast with an `explorer` **and** an offline synth (`lane = "batch"` or `lane = "direct"`) |
