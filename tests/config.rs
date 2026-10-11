@@ -3279,7 +3279,7 @@ fn a_decision_slot_on_openrouter_loads_and_is_neither_reasoning_nor_media() {
     let role = kaibo::config::ModelRole::Decision;
     assert!(!role.is_reasoning() && !role.is_media());
     // A decision-only cast staffs nothing else.
-    assert!(!c.cast_can_generate("judge") && !c.cast_can_consult("judge"));
+    assert!(!c.cast_can_generate("judge") && cast.slot(kaibo::config::ModelRole::Synth).is_none());
 }
 
 /// Every backend kind without a Decisions route is refused on a `decision` slot, naming
