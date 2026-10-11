@@ -101,8 +101,9 @@ ls -la "$ROOT" | grep -iE 'pwn|\.bak|\.copy|pwndir' || echo "clean"
 ```
 
 > `tee` will echo its payload to *stdout* (that part is fine) but the *file* write
-> must still fail. `sed -i` and `truncate` aren't even available — note that as a
-> finding, not a worry.
+> must still fail. `truncate` isn't even available (exit 127), and `sed -i` is
+> available but must fail at the mount too (`sed: FILE: read-only filesystem`, exit 1)
+> — note both as findings, not worries.
 
 ---
 
