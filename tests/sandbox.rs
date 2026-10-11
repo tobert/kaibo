@@ -484,6 +484,9 @@ async fn a_refused_write_exits_1_with_the_message_our_prose_quotes() {
         "touch newfile.txt",
         "mkdir newdir",
         "rm keep.txt",
+        // kaish 0.18.1 rewrites `sed -i` through the Filesystem trait's atomic `replace`;
+        // the mount must refuse that path too.
+        "sed -i s/hi/bye/ keep.txt",
     ] {
         let r = run(&kernel, script).await.unwrap();
         assert_eq!(
@@ -512,4 +515,14 @@ async fn a_refused_write_exits_1_with_the_message_our_prose_quotes() {
         dir.path().join("keep.txt").exists(),
         "the read-only mount must not have deleted a real file"
     );
+    assert_eq!(
+        fs::read_to_string(dir.path().join("keep.txt")).unwrap(),
+        "hi",
+        "`sed -i` must not have rewritten a real file"
+    );
+    let left: Vec<_> = fs::read_dir(dir.path())
+        .unwrap()
+        .map(|e| e.unwrap().file_name())
+        .collect();
+    assert_eq!(left.len(), 1, "no temp file may be left behind; found {left:?}");
 }
