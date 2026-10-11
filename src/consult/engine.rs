@@ -7404,12 +7404,13 @@ mod tests {
             data_collection: Default::default(),
             wire: None,
         };
-        let mut defaults = crate::config::Defaults::default();
-        defaults.synth_effort = "none".into();
+        let defaults = crate::config::Defaults {
+            synth_effort: "none".into(),
+            ..Default::default()
+        };
         let slot = ModelSlot::bare("anthropic", "claude-opus-5-5");
         let err = Arm::from_slot(&backend, &slot, ModelRole::Synth, &defaults)
-            .err()
-            .expect("none has no wire form on the adaptive tier");
+            .expect_err("none has no wire form on the adaptive tier");
         let msg = err.to_string();
         assert!(msg.contains("claude-opus-5-5") && msg.contains("synth"), "{msg}");
         assert!(msg.contains("`low`"), "{msg}");
