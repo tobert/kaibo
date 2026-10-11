@@ -257,6 +257,9 @@ pub struct ToolGating {
     /// on (`[cas] enabled`), since artifacts must have somewhere to land — see
     /// `live_tools`.
     pub generate: bool,
+    /// The `decide` tool (typed questions answered with probabilities through a cast's
+    /// `decision` slot) — its own gate; it also needs a cast that can staff it.
+    pub decide: bool,
 }
 
 impl Default for ToolGating {
@@ -270,6 +273,7 @@ impl Default for ToolGating {
             batch: true,
             list_models: true,
             generate: true,
+            decide: true,
         }
     }
 }
@@ -292,6 +296,7 @@ impl ToolGating {
             "batch_submit" => self.batch,
             "list_models" => self.list_models,
             "generate" => self.generate,
+            "decide" => self.decide,
             _ => true,
         }
     }
@@ -306,6 +311,7 @@ impl ToolGating {
             && !self.batch
             && !self.list_models
             && !self.generate
+            && !self.decide
     }
 }
 
@@ -677,6 +683,30 @@ pub struct GenerateInputRef {
     pub digest: String,
 }
 
+/// Arguments for [`KaiboHandler::decide`]: the state to judge and the typed questions to
+/// answer about it. No `path`: the model reads only what is sent here.
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct DecideInput {
+    /// What to decide about: a string, or a JSON object or array. The model reads nothing
+    /// else, so include everything the questions need. The provider refuses a state past
+    /// its context limit (about 32k tokens) with `max_tokens_exceeded`; it does not
+    /// truncate.
+    pub state: serde_json::Value,
+
+    /// The questions, as an object from your own question id to
+    /// `{"type": "choice"|"score"|"noul", "instructions": "...", "criteria": ...}`.
+    /// `choice`: `criteria` is an object from label to meaning, 2 to 255 labels; include an
+    /// `other` label. `score`: `criteria` is an array of 2 to 10 level names, lowest first.
+    /// `noul`: no `criteria`; `instructions` holds the yes/no statement. At least one.
+    pub questions: std::collections::BTreeMap<String, crate::decide::Question>,
+
+    /// Which cast (model team) answers; omit for the server's default. The cast needs a
+    /// `decision` slot. `kaibo://config` lists the casts.
+    #[serde(default)]
+    pub cast: Option<String>,
+}
+
 /// Arguments for [`KaiboHandler::write_cas`] — where the file is, and an optional label.
 ///
 /// Exactly one of `path` and `content`. There is no destination of any kind (the address
@@ -897,6 +927,9 @@ pub struct KaiboHandler {
     /// in a factory returning a scripted model via
     /// [`with_media_arms`](Self::with_media_arms).
     media_arms: Arc<dyn crate::media::MediaArmFactory>,
+    /// Replaces the Decisions endpoint a backend kind would use. Always `None` outside
+    /// tests; see [`with_decisions_url`](Self::with_decisions_url).
+    decisions_url: Option<String>,
 }
 
 /// One `CAST_ENUM_RULES` entry: the tools sharing a cast eligibility, the predicate
@@ -971,6 +1004,15 @@ const CAST_ENUM_RULES: &[CastEnumRule] = &[
     // `generate` runs no reasoning slot at all: it needs the cast's media member. The
     // media CAS gate ([cas] enabled) rides separately in `live_tools` — this rule is
     // only the staffing half.
+    // `decide` runs the cast's `decision` slot alone: one request to a Decisions API, no
+    // reasoning phase and no CAS.
+    (
+        &["decide"],
+        Config::cast_can_decide,
+        "a cast with a `decision` slot pointing at a backend with a Decisions route (kind \
+         `openrouter`, model `typesafe/jev-1.13`) — see the decision-slot example in \
+         docs/config.example.toml",
+    ),
     (
         &["generate"],
         Config::cast_can_generate,
@@ -1075,6 +1117,7 @@ fn gating_key_for(name: &str) -> Option<&'static str> {
         "batch_submit" => Some("batch"),
         "list_models" => Some("list_models"),
         "generate" => Some("generate"),
+        "decide" => Some("decide"),
         _ => None,
     }
 }
@@ -1082,7 +1125,7 @@ fn gating_key_for(name: &str) -> Option<&'static str> {
 /// Every `#[tool]` route name kaibo can advertise — the fixed universe [`live_tools`]
 /// filters. `KaiboHandler::new` asserts each really exists on the router, so a renamed
 /// tool method fails the build rather than leaving a gate quietly inert.
-pub(crate) const ALL_TOOL_NAMES: [&str; 15] = [
+pub(crate) const ALL_TOOL_NAMES: [&str; 16] = [
     "consult",
     "consult_submit",
     "explore",
@@ -1091,6 +1134,7 @@ pub(crate) const ALL_TOOL_NAMES: [&str; 15] = [
     "run_kaish",
     "batch_submit",
     "generate",
+    "decide",
     "read_cas",
     "write_cas",
     "job_get",
@@ -1149,6 +1193,9 @@ pub(crate) fn live_tools(config: &Config, usable: &[String]) -> Vec<&'static str
     // ([cas] enabled = false is the operator's explicit choice; the startup log and
     // kaibo://config's [cas] section name it, distinct from the unstaffable warning).
     let generate_live = gating.generate && can_staff("generate") && config.cas.enabled;
+    // `decide` writes nothing (the answers return inline), so unlike `generate` it needs no
+    // CAS: its flag and a cast with a `decision` slot are the whole gate.
+    let decide_live = gating.decide && can_staff("decide");
     // `read_cas` is the retrieval half of the artifact contract, keyed on the SAME
     // liveness the resource it replaces was keyed on: a live media CAS, nothing else. It
     // takes no cast (there is no model in a byte range) and it is deliberately NOT tied to
@@ -1180,6 +1227,9 @@ pub(crate) fn live_tools(config: &Config, usable: &[String]) -> Vec<&'static str
         // Media generation through the cast's image slot; a deferred operation mints a
         // `job-N`, so it is a job producer like the three above.
         (generate_live, "generate"),
+        // Typed questions answered with probabilities. One request, no handle: not a job
+        // producer.
+        (decide_live, "decide"),
         // Client-side retrieval by digest. Operator surface, like the resource it
         // replaces: the inner model team never carries it.
         (read_cas_live, "read_cas"),
@@ -1430,6 +1480,7 @@ impl KaiboHandler {
             // The real network-client builders; tests swap in a scripted double.
             batch_providers: Arc::new(crate::batch::LiveBatchProviders),
             media_arms: Arc::new(crate::media::LiveMediaArms),
+            decisions_url: None,
         })
     }
 
@@ -1543,6 +1594,13 @@ impl KaiboHandler {
     #[cfg(test)]
     pub fn with_media_arms(mut self, arms: Arc<dyn crate::media::MediaArmFactory>) -> Self {
         self.media_arms = arms;
+        self
+    }
+
+    /// Point `decide` at a local listener instead of the provider's endpoint.
+    #[cfg(test)]
+    pub fn with_decisions_url(mut self, url: String) -> Self {
+        self.decisions_url = Some(url);
         self
     }
 
@@ -2721,6 +2779,102 @@ impl KaiboHandler {
 
         let answer = with_provenance(answer, &cast.name, &[("model", &arm.model)], &usage);
         Ok(CallToolResult::success(vec![ContentBlock::text(answer)]))
+    }
+
+    #[tool(
+        description = "Ask a fast decision model typed questions about a state and get \
+            probabilities back instead of text: a quick, cheap check for classification, \
+            routing, or a safety call, and a second opinion from another model family. \
+            `state` is a string or JSON; `questions` maps your own question ids to \
+            `{type, instructions, criteria}`. `choice` (criteria: label to meaning, 2 to 255 \
+            labels, include `other`) answers a label with `probabilities` and `confidence`. \
+            `score` (criteria: 2 to 10 level names, lowest first) answers a number that can \
+            fall between levels. `noul` (no criteria) answers the probability that the \
+            statement in `instructions` is true. The model writes no explanation, so ask \
+            narrow questions. It reads only what you send and has no codebase access. Pick \
+            the team with `cast`. For reasoned answers with citations, use `consult`."
+    )]
+    pub async fn decide(
+        &self,
+        Parameters(input): Parameters<DecideInput>,
+    ) -> Result<CallToolResult, McpError> {
+        let cast = self.resolve_cast(input.cast)?;
+        let Some(slot) = cast.slot(ModelRole::Decision) else {
+            return Err(McpError::invalid_params(
+                format!(
+                    "cast `{}` has no `decision` slot, so it cannot decide. Pass `cast` \
+                     naming one whose `decision` slot points at an `openrouter` backend; \
+                     when `cast` is omitted the default applies, set by `[server] cast` in \
+                     config.toml. kaibo://config lists the configured casts and their slots.",
+                    cast.name,
+                ),
+                None,
+            ));
+        };
+        let backend = self
+            .config
+            .resolve_backend(&slot.backend)
+            .map_err(|e| McpError::internal_error(format!("{e:#}"), None))?;
+        let url = match (&self.decisions_url, backend.kind.decisions_url()) {
+            (Some(url), _) => url.clone(),
+            (None, Some(url)) => url.to_string(),
+            (None, None) => {
+                return Err(McpError::internal_error(
+                    format!(
+                        "backend `{}` (kind `{}`) has no Decisions route; config load \
+                         should have refused this cast",
+                        backend.name,
+                        backend.kind.canonical_name(),
+                    ),
+                    None,
+                ))
+            }
+        };
+        // Validate before resolving the key: the key may come from an operator command.
+        let mut request =
+            crate::decide::DecisionRequest::new(slot.id.clone(), input.state, input.questions)
+                .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
+        // The backend's `data_collection` pin rides this request too, as it does every
+        // OpenRouter completion.
+        if backend.data_collection == crate::config::DataCollection::Deny {
+            request = request.deny_data_collection();
+        }
+        let key = backend.resolve_key().map_err(|e| {
+            McpError::invalid_params(format!("cast `{}` decision slot: {e:#}", cast.name), None)
+        })?;
+        let client = crate::decide::DecisionClient::new(url, key, backend.request_timeout)
+            .map_err(|e| McpError::internal_error(format!("{e:#}"), None))?;
+
+        let span = tracing::info_span!(
+            "decide",
+            cast = %cast.name,
+            model = %slot.id,
+            otel.status_code = tracing::field::Empty,
+        );
+        match client.decide(&request).instrument(span.clone()).await {
+            Ok(resp) => {
+                let body = serde_json::to_string_pretty(&resp.answers)
+                    .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+                Ok(CallToolResult::success(vec![ContentBlock::text(format!(
+                    "{body}\n\n———\nkaibo · cast `{}` · model `{}`{}",
+                    cast.name,
+                    resp.model,
+                    resp.usage
+                        .footer()
+                        .map(|line| format!("\n{line}"))
+                        .unwrap_or_default(),
+                ))]))
+            }
+            Err(e) => {
+                span.record("otel.status_code", "ERROR");
+                Ok(CallToolResult::error(vec![ContentBlock::text(format!(
+                    "decide failed on cast `{}` (model `{}`): {e}. {}",
+                    cast.name,
+                    slot.id,
+                    e.next_step(),
+                ))]))
+            }
+        }
     }
 
     #[tool(
@@ -6052,6 +6206,141 @@ mod tests {
         );
     }
 
+    // --- The decide tool, driven against a local listener ------------------------
+
+    const DECIDE_CAST_TOML: &str = r#"
+        [backends.orx]
+        kind = "openrouter"
+        key_optional = true
+
+        [casts.judge]
+        decision = "orx/typesafe/jev-1.13"
+
+        [casts.talker]
+        synth = "orx/some/model"
+
+        [server]
+        cast = "judge"
+    "#;
+
+    /// Serve one canned HTTP reply; the returned URL is the endpoint to dial.
+    async fn decide_server(status: u16, body: &'static str) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = vec![0u8; 16384];
+            let _ = sock.read(&mut buf).await;
+            let reply = format!(
+                "HTTP/1.1 {status} X\r\ncontent-type: application/json\r\n\
+                 content-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            sock.write_all(reply.as_bytes()).await.unwrap();
+            sock.shutdown().await.ok();
+        });
+        format!("http://{addr}/api/alpha/decisions")
+    }
+
+    fn decide_input(cast: Option<&str>, questions: serde_json::Value) -> DecideInput {
+        serde_json::from_value(serde_json::json!({
+            "state": "git push --force origin main",
+            "questions": questions,
+            "cast": cast,
+        }))
+        .expect("input parses")
+    }
+
+    fn risk_question() -> serde_json::Value {
+        serde_json::json!({"verdict": {"type": "choice", "instructions": "how risky",
+            "criteria": {"safe": "read-only", "risky": "changes something"}}})
+    }
+
+    #[tokio::test]
+    async fn decide_returns_the_answers_and_a_provenance_footer() {
+        let url = decide_server(
+            200,
+            r#"{"model":"typesafe/jev-1.13-20260917","answers":{"verdict":{"type":"choice","choice":"risky","probabilities":{"safe":0.01,"risky":0.99},"confidence":0.99}},"usage":{"input_tokens":120,"output_tokens":30,"cost":0.00001}}"#,
+        )
+        .await;
+        let h = hermetic_handler_from_toml(DECIDE_CAST_TOML).with_decisions_url(url);
+        let out = h
+            .decide(Parameters(decide_input(None, risk_question())))
+            .await
+            .expect("decide succeeds");
+        assert_ne!(out.is_error, Some(true));
+        let text = result_text(out);
+        assert!(text.contains("\"choice\": \"risky\""), "{text}");
+        assert!(text.contains("cast `judge`"), "{text}");
+        assert!(text.contains("typesafe/jev-1.13-20260917"), "{text}");
+        assert!(text.contains("120 in · 30 out · $0.000010"), "{text}");
+    }
+
+    /// A reply with no usage prints no tokens line: a `0 in · 0 out` line would claim a free
+    /// call the provider never reported.
+    #[tokio::test]
+    async fn decide_omits_the_tokens_line_when_usage_is_unreported() {
+        let url = decide_server(
+            200,
+            r#"{"model":"m","answers":{"verdict":{"type":"choice","choice":"safe","probabilities":{"safe":1,"risky":0},"confidence":1}}}"#,
+        )
+        .await;
+        let h = hermetic_handler_from_toml(DECIDE_CAST_TOML).with_decisions_url(url);
+        let text = result_text(
+            h.decide(Parameters(decide_input(None, risk_question())))
+                .await
+                .unwrap(),
+        );
+        assert!(text.contains("model `m`"), "{text}");
+        assert!(!text.contains("tokens"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn decide_on_a_cast_without_a_decision_slot_is_refused_naming_the_slot() {
+        let h = hermetic_handler_from_toml(DECIDE_CAST_TOML);
+        let err = h
+            .decide(Parameters(decide_input(Some("talker"), risk_question())))
+            .await
+            .expect_err("a synth-only cast cannot decide");
+        assert!(err.message.contains("`decision` slot"), "{}", err.message);
+        assert!(err.message.contains("`talker`"), "{}", err.message);
+    }
+
+    /// The listener is never dialed (port 1): the refusal comes before any request.
+    #[tokio::test]
+    async fn decide_refuses_an_invalid_question_before_any_request() {
+        let h = hermetic_handler_from_toml(DECIDE_CAST_TOML)
+            .with_decisions_url("http://127.0.0.1:1/".into());
+        let one_option = serde_json::json!({"v": {"type": "choice", "instructions": "x",
+            "criteria": {"only": "x"}}});
+        let err = h
+            .decide(Parameters(decide_input(None, one_option)))
+            .await
+            .expect_err("one option is refused");
+        assert!(err.message.contains("2 to 255"), "{}", err.message);
+    }
+
+    #[tokio::test]
+    async fn decide_reports_a_provider_failure_as_a_tool_error_with_its_message() {
+        let url = decide_server(
+            400,
+            r#"{"error":{"message":"Model typesafe/jev-1.13 does not exist","code":400}}"#,
+        )
+        .await;
+        let h = hermetic_handler_from_toml(DECIDE_CAST_TOML).with_decisions_url(url);
+        let out = h
+            .decide(Parameters(decide_input(None, risk_question())))
+            .await
+            .expect("a provider failure is a tool result, not a protocol error");
+        assert_eq!(out.is_error, Some(true));
+        let text = result_text(out);
+        assert!(text.contains("HTTP 400"), "{text}");
+        assert!(text.contains("does not exist"), "{text}");
+        assert!(text.contains("change the request, not the timing"), "{text}");
+        assert!(text.contains("cast `judge`"), "{text}");
+    }
+
     // --- The generate lane, driven offline through the media-arm seam -----------
 
     /// A cast that can staff `generate`: a keyless (placeholder-credential) stability
@@ -8073,6 +8362,13 @@ enabled = false
 
             [casts.artist]                                     # image slot → `generate`
             image    = "sd/core"
+
+            [backends.orx]                                     # Decisions backend for `decide`
+            kind = "openrouter"
+            key_optional = true
+
+            [casts.judge]                                      # decision slot → `decide`
+            decision = "orx/typesafe/jev-1.13"
             "#,
         );
         let enum_of = |tool: &str| -> Vec<String> {
@@ -8107,6 +8403,8 @@ enabled = false
                     cast.slot(crate::config::ModelRole::Image).is_some()
                         || cast.slot(crate::config::ModelRole::Audio).is_some()
                 }
+                // `decide` runs the `decision` slot alone; its call-time gate is that slot.
+                "decide" => cast.slot(crate::config::ModelRole::Decision).is_some(),
                 other => panic!("unmapped cast-taking tool `{other}` — add its gate here"),
             }
         };
@@ -8787,6 +9085,7 @@ enabled = false
                 run_kaish: true,
                 list_models: true,
                 generate: false,
+                decide: false,
             };
             KaiboHandler::new(config).expect("handler builds")
         };
@@ -9930,13 +10229,17 @@ enabled = false
     fn every_tool_description_fits_claude_code_budget() {
         let h = KaiboHandler::new(crate::config::Config::builtin()).expect("handler builds");
         let media = hermetic_handler_from_toml(MEDIA_CAST_TOML);
+        let decide = hermetic_handler_from_toml(DECIDE_CAST_TOML);
         let mut tools = h.tool_router.list_all();
         tools.extend(media.tool_router.list_all());
+        tools.extend(decide.tool_router.list_all());
         assert!(!tools.is_empty(), "the guard checked nothing");
-        assert!(
-            tools.iter().any(|t| t.name == "generate"),
-            "`generate` must be among the descriptions checked"
-        );
+        for name in ["generate", "decide"] {
+            assert!(
+                tools.iter().any(|t| t.name == name),
+                "`{name}` must be among the descriptions checked"
+            );
+        }
         for tool in tools {
             let len = tool.description.as_deref().unwrap_or("").chars().count();
             assert!(

@@ -191,8 +191,9 @@ impl Resolver {
                 model = %d.model,
                 tunables = %d.tunables.join(", "),
                 "reasoning tunables on the {} slot do nothing: this slot sends one \
-                 generation request with no reasoning phase, so these knobs are \
-                 dropped before any request is built. Move them to a reasoning slot \
+                 request with no reasoning phase (a generation for `image` and `audio`, a \
+                 decisions request for `decision`), so these knobs are dropped before \
+                 any request is built. Move them to a reasoning slot \
                  (explorer/synth) or remove them. See kaibo://config (inert_tunables).",
                 d.role
             );
@@ -826,6 +827,7 @@ fn synthless_cast_refusal(cast: &Cast, tool: &str) -> String {
         (ModelRole::Explorer, "`explore`"),
         (ModelRole::Image, "`generate`"),
         (ModelRole::Audio, "`generate`"),
+        (ModelRole::Decision, "`decide`"),
     ]
     .into_iter()
     .filter(|(role, _)| cast.slot(*role).is_some())

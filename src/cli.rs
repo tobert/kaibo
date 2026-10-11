@@ -295,6 +295,9 @@ pub struct ServeGates {
     /// Don't advertise the `generate` tool (media generation).
     #[arg(long)]
     pub no_generate: bool,
+    /// Don't advertise the `decide` tool (typed questions answered with probabilities).
+    #[arg(long)]
+    pub no_decide: bool,
 
     /// Let a consult save bulk output as artifacts in kaibo's artifact store, when the
     /// call also asks for it with `save_artifacts` (both keys are required, and the
@@ -317,6 +320,7 @@ impl ServeGates {
             batch: self.no_batch,
             list_models: self.no_list_models,
             generate: self.no_generate,
+            decide: self.no_decide,
         }
     }
 }

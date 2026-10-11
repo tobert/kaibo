@@ -17,10 +17,11 @@ use kaibo::server::{KaiboHandler, ToolGating};
 /// the client's artifact-retrieval verb, live exactly while the media CAS is (see
 /// `read_cas_is_advertised_only_while_the_media_cas_is_on`), so every `--no-<tool>` case
 /// below keeps it.
-const ALL_TOOLS: [&str; 15] = [
+const ALL_TOOLS: [&str; 16] = [
     "batch_submit",
     "consult",
     "consult_submit",
+    "decide",
     "deliberate",
     "explore",
     "generate",
@@ -66,10 +67,15 @@ const FULLY_STAFFED: &str = r#"
     kind = "stability"
     key_optional = true
 
+    [backends.orx]
+    kind = "openrouter"
+    key_optional = true
+
     [casts.inter]
     explorer = "gem/lite"
     synth    = "gem/flash"
     image    = "sd/core"
+    decision = "orx/typesafe/jev-1.13"
 
     [casts.deep]
     explorer = "gem/lite"
@@ -167,7 +173,7 @@ fn each_flag_removes_exactly_its_own_tools() {
     // `job_get`/`job_cancel`/`job_list` belong to neither flag alone — gating one
     // capability leaves them because the other still needs them — so they appear in no
     // row's removed-set and are covered by the "every other tool remains" check below.
-    let cases: [(&[&str], ToolGating); 8] = [
+    let cases: [(&[&str], ToolGating); 9] = [
         (
             // `--no-consult` drops the blocking `consult` and the async `consult_submit`;
             // `job_get`/`job_cancel`/`job_list` stay (batch still uses them).
@@ -224,6 +230,15 @@ fn each_flag_removes_exactly_its_own_tools() {
             &["list_models"],
             ToolGating {
                 list_models: false,
+                ..Default::default()
+            },
+        ),
+        (
+            // `--no-decide` drops only `decide`; it mints no handle, so the collect verbs
+            // are unaffected.
+            &["decide"],
+            ToolGating {
+                decide: false,
                 ..Default::default()
             },
         ),
@@ -343,6 +358,7 @@ fn all_disabled_is_detected() {
         batch: false,
         list_models: false,
         generate: false,
+        decide: false,
     };
     assert!(none_on.all_disabled());
     // Any single tool on means it's a usable server, not the refused state.
@@ -354,6 +370,12 @@ fn all_disabled_is_detected() {
     // The batch capability alone is enough to be a usable server.
     assert!(!ToolGating {
         batch: true,
+        ..none_on
+    }
+    .all_disabled());
+    // decide alone is a usable server too: one request to a Decisions API.
+    assert!(!ToolGating {
+        decide: true,
         ..none_on
     }
     .all_disabled());

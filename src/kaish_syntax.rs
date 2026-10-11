@@ -321,6 +321,7 @@ fn casts_section(config: &Config, usable: &[(String, CastUsability)]) -> String 
                     (ModelRole::Explorer, "`explore`"),
                     (ModelRole::Image, "`generate`"),
                     (ModelRole::Audio, "`generate`"),
+                    (ModelRole::Decision, "`decide`"),
                 ]
                 .into_iter()
                 .filter(|(role, _)| cast.slot(*role).is_some())
@@ -333,6 +334,7 @@ fn casts_section(config: &Config, usable: &[(String, CastUsability)]) -> String 
                 }
                 cast.slot(ModelRole::Image)
                     .or_else(|| cast.slot(ModelRole::Audio))
+                    .or_else(|| cast.slot(ModelRole::Decision))
                     .or_else(|| cast.slot(ModelRole::Explorer))
             });
             let suffix = if tags.is_empty() {

@@ -127,6 +127,7 @@ pub(crate) fn render_config_resource(
         batch: bool,
         list_models: bool,
         generate: bool,
+        decide: bool,
     }
 
     /// Runtime-computed scope state. `follow_worktrees` echoes the knob;
@@ -589,6 +590,7 @@ pub(crate) fn render_config_resource(
         batch,
         list_models,
         generate,
+        decide,
     } = &config.tools;
     let crate::sandbox::SandboxConfig {
         exec_timeout,
@@ -670,6 +672,7 @@ pub(crate) fn render_config_resource(
             batch,
             list_models,
             generate,
+            decide,
         },
         sandbox: SandboxDoc {
             exec_timeout_secs: exec_timeout.as_secs(),
