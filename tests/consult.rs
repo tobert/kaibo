@@ -33,8 +33,8 @@ fn builtin_arm(cast: &str, role: ModelRole) -> Arm {
     arm_from(&Config::builtin(), cast, role)
 }
 
-/// A throwaway explorer arm for the driver-only `view_image` tests. `consult` needs
-/// an explorer arm to assemble its toolset, but these tests never make the driver
+/// A throwaway explorer arm for the driver-only `view_image` tests. These tests pin
+/// the two-stage toolset, so they pass an explorer arm; they never make the driver
 /// delegate a sweep, so it is never invoked — it just has to exist. Shares the
 /// synth's scripted client under a model id the test never scripts.
 fn unused_explorer(client: &ScriptedClient) -> Arm {
@@ -528,7 +528,10 @@ fn the_generic_openai_path_asks_for_reasoning_by_default() {
         p.get("thinking").is_none(),
         "no `thinking` block on this wire — a strict gateway 403s the whole request: {p}"
     );
-    assert!(p.get("reasoning").is_none(), "that shape is OpenRouter's: {p}");
+    assert!(
+        p.get("reasoning").is_none(),
+        "that shape is OpenRouter's: {p}"
+    );
 }
 
 /// The off-switch on the **Responses** wire, checked where the request is really built.
@@ -542,12 +545,14 @@ fn the_generic_openai_path_asks_for_reasoning_by_default() {
 #[test]
 fn thinking_style_off_reaches_the_responses_wire_too() {
     // Reasoning is on for this model by default...
-    let on = hosted_openai_responses_params("gpt-5.6-sol", None, "high", ThinkingStyleOverride::Auto)
-        .expect("a gpt-5 model takes reasoning");
+    let on =
+        hosted_openai_responses_params("gpt-5.6-sol", None, "high", ThinkingStyleOverride::Auto)
+            .expect("a gpt-5 model takes reasoning");
     assert_eq!(on["reasoning"]["effort"], "high");
 
     // ...and `off` must remove it here, not merely in the shape the engine throws away.
-    let off = hosted_openai_responses_params("gpt-5.6-sol", None, "high", ThinkingStyleOverride::Off);
+    let off =
+        hosted_openai_responses_params("gpt-5.6-sol", None, "high", ThinkingStyleOverride::Off);
     assert!(
         off.as_ref().and_then(|v| v.get("reasoning")).is_none(),
         "thinking_style = off must silence the Responses wire, got {off:?}"
@@ -699,7 +704,9 @@ fn builtin_openai_cast_is_cheap_gemma_explorer_strong_gemma_synth() {
 
     // And the built-in `openai` cast resolves to exactly those, on the openai backend.
     let cfg = Config::builtin();
-    let cast = cfg.resolve_cast("openai-local").expect("built-in openai cast");
+    let cast = cfg
+        .resolve_cast("openai-local")
+        .expect("built-in openai cast");
     let e = cast
         .require_slot(ModelRole::Explorer)
         .expect("explorer slot");
@@ -981,7 +988,7 @@ async fn mixed_cast_consult_routes_each_phase_to_its_own_client() {
         "Where is target_marker defined?",
         None,
         dir.path(),
-        &explorer,
+        Some(&explorer),
         &synth,
         &ConsultConfig::default(),
         None,
@@ -1121,7 +1128,7 @@ async fn a_vision_synth_sees_an_image_through_view_image() {
         "What does the diagram show?",
         None,
         &root,
-        &unused_explorer(&synth_client),
+        Some(&unused_explorer(&synth_client)),
         &synth,
         &ConsultConfig::default(),
         None,
@@ -1171,7 +1178,7 @@ async fn a_blind_synth_is_not_offered_view_image() {
         "anything",
         None,
         dir.path(),
-        &unused_explorer(&synth_client),
+        Some(&unused_explorer(&synth_client)),
         &synth,
         &ConsultConfig::default(),
         None,
@@ -1242,7 +1249,7 @@ async fn an_openai_vlm_sees_an_image_on_the_user_turn_channel() {
         "What does the diagram show?",
         None,
         &root,
-        &unused_explorer(&synth_client),
+        Some(&unused_explorer(&synth_client)),
         &synth,
         &ConsultConfig::default(),
         None,
@@ -1308,7 +1315,7 @@ async fn an_openai_vlm_co_tool_call_view_image_and_run_kaish_resumes_cleanly() {
         "What does the diagram show?",
         None,
         &root,
-        &unused_explorer(&synth_client),
+        Some(&unused_explorer(&synth_client)),
         &synth,
         &ConsultConfig::default(),
         None,
@@ -1387,7 +1394,7 @@ async fn recomposed_consult_runs_against_local_gemma() {
         "How does kaibo stop the explorer from deleting real files? Name the mechanism and the file.",
         None,
         root,
-        &builtin_arm("openai-local", ModelRole::Explorer),
+        Some(&builtin_arm("openai-local", ModelRole::Explorer)),
         &builtin_arm("openai-local", ModelRole::Synth),
         &cfg,
         None,
@@ -1449,7 +1456,7 @@ async fn two_phase_consult_via_deepseek() {
         "How does kaibo stop the explorer from deleting real files? Name the mechanism and the file.",
         None,
         env!("CARGO_MANIFEST_DIR"),
-        &builtin_arm("deepseek", ModelRole::Explorer),
+        Some(&builtin_arm("deepseek", ModelRole::Explorer)),
         &builtin_arm("deepseek", ModelRole::Synth),
         &ConsultConfig::default(),
         None,
@@ -1475,7 +1482,7 @@ async fn two_phase_consult_via_gemini() {
         "How does kaibo stop the explorer from deleting real files? Name the mechanism and the file.",
         None,
         env!("CARGO_MANIFEST_DIR"),
-        &builtin_arm("gemini", ModelRole::Explorer),
+        Some(&builtin_arm("gemini", ModelRole::Explorer)),
         &builtin_arm("gemini", ModelRole::Synth),
         &ConsultConfig::default(),
         None,
@@ -1506,7 +1513,7 @@ async fn two_phase_consult_answers_from_the_real_tree() {
         "How does kaibo stop the explorer from deleting real files? Name the mechanism and the file.",
         None,
         root,
-        &builtin_arm("anthropic", ModelRole::Explorer),
+        Some(&builtin_arm("anthropic", ModelRole::Explorer)),
         &builtin_arm("anthropic", ModelRole::Synth),
         &cfg,
         None,
@@ -1563,7 +1570,7 @@ async fn openrouter_consult_round_trips() {
         "How does kaibo stop the explorer from deleting real files? Name the mechanism and the file.",
         None,
         env!("CARGO_MANIFEST_DIR"),
-        &explorer,
+        Some(&explorer),
         &synth,
         &ConsultConfig::default(),
         None,
@@ -1617,11 +1624,7 @@ async fn openrouter_reasoning_accounting_live() {
     // The built-in cast's explorer alias — the slot the doctrine most needs to
     // hold on, since the explorer runs the most turns.
     let model = "~google/gemini-flash-latest";
-    let shape = ModelShape::resolve(
-        ProviderKind::OpenRouter,
-        model,
-        ThinkingStyleOverride::Auto,
-    );
+    let shape = ModelShape::resolve(ProviderKind::OpenRouter, model, ThinkingStyleOverride::Auto);
 
     // Default posture: effort = high ⇒ the gateway bills reasoning tokens. The
     // no-collection routing pin rides along exactly as every live arm sends it —
@@ -1686,7 +1689,7 @@ async fn adaptive_only_anthropic_model_round_trips() {
         "How does kaibo stop the explorer from deleting real files? Name the mechanism and the file.",
         None,
         env!("CARGO_MANIFEST_DIR"),
-        &explorer,
+        Some(&explorer),
         &synth,
         &ConsultConfig::default(),
         None,

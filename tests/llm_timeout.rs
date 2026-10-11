@@ -50,7 +50,9 @@ async fn oneshot_aborts_when_the_provider_never_responds() {
     backend.key_optional = true;
     backend.request_timeout = Duration::from_secs(2);
 
-    let cast = cfg.resolve_cast("openai-local").expect("built-in openai cast");
+    let cast = cfg
+        .resolve_cast("openai-local")
+        .expect("built-in openai cast");
     let slot = cast
         .require_slot(ModelRole::Synth)
         .expect("openai cast has a synth slot");
@@ -107,7 +109,9 @@ async fn call_deadline_bounds_a_call_even_with_a_generous_request_timeout() {
     // run for minutes. The point is that it is NOT the only brake anymore.
     backend.request_timeout = Duration::from_secs(300);
 
-    let cast = cfg.resolve_cast("openai-local").expect("built-in openai cast");
+    let cast = cfg
+        .resolve_cast("openai-local")
+        .expect("built-in openai cast");
     let slot = cast
         .require_slot(ModelRole::Synth)
         .expect("openai cast has a synth slot");

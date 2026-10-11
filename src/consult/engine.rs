@@ -2496,12 +2496,14 @@ pub async fn oneshot(
     .await
 }
 
-/// Build the recomposed `consult` toolset: `{run_kaish, explore′}`. Factored out so
-/// the wiring (both tools present, explore′ pointed at the explorer arm) is
-/// unit-testable without a live model. `reports` collects each `explore′` sweep.
+/// Build the recomposed `consult` toolset: `{run_kaish, explore′}`, or `{run_kaish}`
+/// alone when the cast has no explorer (single-stage: the synth does all its own reads).
+/// Factored out so the wiring (explore′ present exactly when an explorer arm is, pointed
+/// at that arm) is unit-testable without a live model. `reports` collects each `explore′`
+/// sweep.
 #[allow(clippy::too_many_arguments)] // the sinks and flags are each a distinct wiring input
 fn consult_tools(
-    explorer: &Arm,
+    explorer: Option<&Arm>,
     root: &Path,
     cfg: &ConsultConfig,
     reports: Arc<Mutex<Vec<String>>>,
@@ -2511,67 +2513,67 @@ fn consult_tools(
     // run_kaish for precise reads by the consult model itself — carries the sink so
     // the driver's own reads show up as progress alongside the delegated sweeps'.
     let worker = KaishWorker::spawn_with(root, cfg.explore.sandbox.clone())?;
-    // explore′ for delegated breadth: the same explore unit, wrapped as a tool,
-    // pointed at the explorer arm — its own client, model, and request shape,
-    // which may live on a different backend than the driver's. Bounded by
-    // explorer_max_turns per sweep; no cap on how many times consult may delegate
-    // (Amy's call — watch real behavior). Its system prompt is the explorer
-    // override-or-default + house rules, built once here rather than per sweep —
-    // plus the caller's attachment directive: a sweep is a fresh agent that saw
-    // neither the driver prompt nor the inlined bytes, so without this a driver
-    // that delegates early sends a sweep blind to the very files the caller
-    // flagged as central. The directive orders whole `cat -n` reads (the explorer
-    // chooses when, not whether), keeping citation-exact line numbers for free.
-    let mut explorer_preamble_owned = resolve_phase_preamble(
-        // The nested sweep always reports to the consult driver — this loop IS the
-        // synthesis agent, so the reader is fixed here rather than plumbed in.
-        Phase::Explorer(ReportReader::SynthesisAgent),
-        &cfg.explore.phase.prompts,
-        cfg.explore.phase.orientation.as_deref(),
-        cfg.explore.phase.house_rules.as_deref(),
-    );
-    if let Some(directive) = super::prompts::explorer_attachment_directive(&cfg.attachments) {
-        explorer_preamble_owned.push_str(&directive);
-    }
-    let explorer_preamble: Arc<str> = Arc::from(explorer_preamble_owned);
-    // Who a delegated sweep's `attach` calls route to: the DRIVER (this loop runs on
-    // the synth arm), named so the explorer knows who reads its report, gated on the
-    // synth's own vision cap (the same cap `view_image` below rides).
-    let consumer = SweepConsumer {
-        kind: SweepConsumerKind::ConsultDriver,
-        label: Arc::from(format!("the synthesis agent (`{}`)", synth.model)),
-        vision: synth.caps.vision,
-    };
-    // The caller's own `consult` attachments already reach the driver another way
-    // (inlined, or a read-WHOLE directive) — seed the sink so a sweep's `attach`
-    // doesn't re-route what's already in front of the driver.
-    // Resolved exactly as `attach_one` resolves an explorer's path — canonicalized, not
-    // merely joined. A plain join misses the dedupe for any caller path carrying a `./`,
-    // a `..`, or a symlink, and the reader then receives the same bytes twice.
-    let already_delivered: HashSet<PathBuf> = crate::sweep_attach::delivered_seed(
-        root,
-        cfg.attachments.iter().map(|a| Path::new(a.path())),
-    );
-    let explore = RunExplore::new(
-        explorer.clone(),
-        cfg.explore.explorer_max_turns,
-        root,
-        cfg.explore.sandbox.clone(),
-        reports,
-        explore_usage,
+    let mut tools: Vec<DynamicTool> = vec![traced(RunKaish::with_progress(
+        worker.clone(),
         cfg.explore.phase.progress.clone(),
-        explorer_preamble,
-        consumer,
-        cfg.explore.max_attachments,
-        Arc::new(already_delivered),
-    );
-    let mut tools: Vec<DynamicTool> = vec![
-        traced(RunKaish::with_progress(
-            worker.clone(),
+    ))];
+    if let Some(explorer) = explorer {
+        // explore′ for delegated breadth: the same explore unit, wrapped as a tool,
+        // pointed at the explorer arm — its own client, model, and request shape,
+        // which may live on a different backend than the driver's. Bounded by
+        // explorer_max_turns per sweep; no cap on how many times consult may delegate
+        // (Amy's call — watch real behavior). Its system prompt is the explorer
+        // override-or-default + house rules, built once here rather than per sweep —
+        // plus the caller's attachment directive: a sweep is a fresh agent that saw
+        // neither the driver prompt nor the inlined bytes, so without this a driver
+        // that delegates early sends a sweep blind to the very files the caller
+        // flagged as central. The directive orders whole `cat -n` reads (the explorer
+        // chooses when, not whether), keeping citation-exact line numbers for free.
+        let mut explorer_preamble_owned = resolve_phase_preamble(
+            // The nested sweep always reports to the consult driver — this loop IS the
+            // synthesis agent, so the reader is fixed here rather than plumbed in.
+            Phase::Explorer(ReportReader::SynthesisAgent),
+            &cfg.explore.phase.prompts,
+            cfg.explore.phase.orientation.as_deref(),
+            cfg.explore.phase.house_rules.as_deref(),
+        );
+        if let Some(directive) = super::prompts::explorer_attachment_directive(&cfg.attachments) {
+            explorer_preamble_owned.push_str(&directive);
+        }
+        let explorer_preamble: Arc<str> = Arc::from(explorer_preamble_owned);
+        // Who a delegated sweep's `attach` calls route to: the DRIVER (this loop runs on
+        // the synth arm), named so the explorer knows who reads its report, gated on the
+        // synth's own vision cap (the same cap `view_image` below rides).
+        let consumer = SweepConsumer {
+            kind: SweepConsumerKind::ConsultDriver,
+            label: Arc::from(format!("the synthesis agent (`{}`)", synth.model)),
+            vision: synth.caps.vision,
+        };
+        // The caller's own `consult` attachments already reach the driver another way
+        // (inlined, or a read-WHOLE directive) — seed the sink so a sweep's `attach`
+        // doesn't re-route what's already in front of the driver.
+        // Resolved exactly as `attach_one` resolves an explorer's path — canonicalized, not
+        // merely joined. A plain join misses the dedupe for any caller path carrying a `./`,
+        // a `..`, or a symlink, and the reader then receives the same bytes twice.
+        let already_delivered: HashSet<PathBuf> = crate::sweep_attach::delivered_seed(
+            root,
+            cfg.attachments.iter().map(|a| Path::new(a.path())),
+        );
+        let explore = RunExplore::new(
+            explorer.clone(),
+            cfg.explore.explorer_max_turns,
+            root,
+            cfg.explore.sandbox.clone(),
+            reports,
+            explore_usage,
             cfg.explore.phase.progress.clone(),
-        )),
-        traced(explore),
-    ];
+            explorer_preamble,
+            consumer,
+            cfg.explore.max_attachments,
+            Arc::new(already_delivered),
+        );
+        tools.push(traced(explore));
+    }
     // The driver loop runs on the *synth* arm, so view_image rides the synth's
     // vision cap (the delegated explore′ sub-agent gets its own view_image keyed to
     // the explorer arm's caps, inside `explore`). Shares the driver's kernel.
@@ -2698,7 +2700,7 @@ pub async fn deliberate_direct(
     with_call_deadline(deadline, "deliberate", synth.complete(system, prompt)).await
 }
 
-/// Run a `consult` over two resolved arms.
+/// Run a `consult` over its resolved arms.
 ///
 /// One loop, two tools — no rigid explorer→synth hand-off. The synthesis agent
 /// decides when to delegate a sweep to the cheap `explore′` vs. read a span
@@ -2706,10 +2708,14 @@ pub async fn deliberate_direct(
 /// so a mixed cast routes each phase to its own backend through the same loop.
 /// `ConsultOutput.report` aggregates whatever the `explore′` sweeps returned
 /// (empty if the model read everything itself).
+///
+/// `explorer: None` is single-stage: a synth-only cast's synth reads everything itself
+/// over `run_kaish`, under the [`Phase::ConsultSolo`] preamble, which never mentions a
+/// teammate it cannot reach.
 pub(crate) async fn consult_with(
     user_prompt: &str,
     root: &Path,
-    explorer: &Arm,
+    explorer: Option<&Arm>,
     synth: &Arm,
     cfg: &ConsultConfig,
 ) -> Result<ConsultOutput> {
@@ -2724,7 +2730,11 @@ pub(crate) async fn consult_with(
         "consult",
         synth.run(
             &resolve_phase_preamble(
-                Phase::Consult,
+                if explorer.is_some() {
+                    Phase::Consult
+                } else {
+                    Phase::ConsultSolo
+                },
                 &cfg.explore.phase.prompts,
                 cfg.explore.phase.orientation.as_deref(),
                 cfg.explore.phase.house_rules.as_deref(),
@@ -2773,7 +2783,7 @@ pub(crate) async fn consult_with(
 /// backend ([`Sessions`]) is in-memory or durable; this glue doesn't care which.
 pub type Session<'a> = (&'a Sessions, &'a str);
 
-/// One sessioned (or stateless) consult turn over two resolved arms.
+/// One sessioned (or stateless) consult turn over its resolved arms.
 ///
 /// This is the whole multi-turn glue, driven offline by scripted arms in tests
 /// (the public [`consult`] is a thin named wrapper): read the session's prior
@@ -2787,7 +2797,7 @@ pub(crate) async fn consult_session_turn(
     question: &str,
     context: Option<&str>,
     root: &Path,
-    explorer: &Arm,
+    explorer: Option<&Arm>,
     synth: &Arm,
     cfg: &ConsultConfig,
 ) -> Result<ConsultOutput> {
@@ -2835,7 +2845,8 @@ pub(crate) async fn consult_session_turn(
     Ok(out)
 }
 
-/// Run a consult against `root` over the resolved `explorer` and `synth` arms.
+/// Run a consult against `root` over the resolved `explorer` and `synth` arms. A
+/// synth-only cast passes `explorer: None` and runs single-stage.
 ///
 /// The server resolves a cast's slots into the arms ([`Arm::from_slot`] — keys,
 /// endpoints, request shapes); `cfg` carries the per-call loop bounds. `session`
@@ -2846,7 +2857,7 @@ pub async fn consult(
     question: &str,
     context: Option<&str>,
     root: impl Into<PathBuf>,
-    explorer: &Arm,
+    explorer: Option<&Arm>,
     synth: &Arm,
     cfg: &ConsultConfig,
     session: Option<Session<'_>>,
@@ -2996,7 +3007,7 @@ mod tests {
         consult_with(
             "q",
             dir.path(),
-            &arm(&client, EXPLORER),
+            Some(&arm(&client, EXPLORER)),
             &arm(&client, SYNTH),
             &cfg,
         )
@@ -3026,7 +3037,7 @@ mod tests {
         consult_with(
             "q",
             dir.path(),
-            &arm(&bare, EXPLORER),
+            Some(&arm(&bare, EXPLORER)),
             &arm(&bare, SYNTH),
             &cfg2,
         )
@@ -3084,7 +3095,7 @@ mod tests {
         consult_with(
             "where does the cast live?",
             dir.path(),
-            &arm(&client, EXPLORER),
+            Some(&arm(&client, EXPLORER)),
             &arm(&client, SYNTH),
             &cfg,
         )
@@ -3145,7 +3156,7 @@ mod tests {
         consult_with(
             "q",
             dir.path(),
-            &arm(&client, EXPLORER),
+            Some(&arm(&client, EXPLORER)),
             &arm(&client, SYNTH),
             &cfg,
         )
@@ -3959,7 +3970,7 @@ mod tests {
         let out = consult_with(
             "Where is target_marker defined?",
             dir.path(),
-            &arm(&client, EXPLORER),
+            Some(&arm(&client, EXPLORER)),
             &arm(&client, SYNTH),
             &cfg,
         )
@@ -4010,6 +4021,65 @@ mod tests {
         );
     }
 
+    /// Single-stage: a cast with no explorer runs `consult` as one model doing its own
+    /// reads. The driver is offered `run_kaish` and never `explore`, its preamble says
+    /// nothing about a team or a sweep, and the loop still reaches a real kaish read and
+    /// an answer. If the explore′ tool leaked back in, or the preamble still promised a
+    /// teammate the model cannot reach, this fails.
+    #[tokio::test]
+    async fn a_consult_without_an_explorer_reads_for_itself() {
+        const SYNTH: &str = "solo-synth";
+
+        let client = ScriptedClient::builder()
+            .on_model(SYNTH, |req| {
+                assert!(
+                    has_tool(req, "run_kaish"),
+                    "solo driver must have run_kaish"
+                );
+                assert!(
+                    !has_tool(req, "explore"),
+                    "solo driver must not be offered explore′"
+                );
+                if !transcript_text(req).contains("target_marker() {}") {
+                    Ok(tool_call_response(
+                        "t-read",
+                        "run_kaish",
+                        json!({ "script": "cat -n src/foo.rs" }),
+                    ))
+                } else {
+                    Ok(text_response("ANSWER: src/foo.rs:1 defines target_marker."))
+                }
+            })
+            .build();
+
+        let dir = project_with_marker();
+        let cfg = ConsultConfig::default();
+        let out = consult_with(
+            "Where is target_marker defined?",
+            dir.path(),
+            None,
+            &arm(&client, SYNTH),
+            &cfg,
+        )
+        .await
+        .expect("a solo consult should succeed");
+
+        assert!(out.answer.contains("src/foo.rs:1"), "got {:?}", out.answer);
+        assert!(out.report.is_empty(), "no sweep ran, got {:?}", out.report);
+        let reqs = client.requests_for(SYNTH);
+        let preamble = reqs[0].preamble.as_deref().unwrap_or("");
+        for absent in ["`explore`", "two-model team", "explorer"] {
+            assert!(
+                !preamble.contains(absent),
+                "the solo preamble must not mention {absent}: {preamble}"
+            );
+        }
+        assert!(
+            preamble.contains("You are the synthesis agent"),
+            "the solo driver keeps its role: {preamble}"
+        );
+    }
+
     /// A consult's reported `usage` must be the synth loop's tokens **plus** every
     /// delegated `explore′` sweep's — the nested explorer runs inside the synth's tool
     /// loop, so its tokens never reach the synth's own `PromptResponse.usage` and a
@@ -4048,7 +4118,7 @@ mod tests {
         let out = consult_with(
             "Where is target_marker defined?",
             dir.path(),
-            &arm(&client, EXPLORER),
+            Some(&arm(&client, EXPLORER)),
             &arm(&client, SYNTH),
             &cfg,
         )
@@ -4131,7 +4201,7 @@ mod tests {
         consult_with(
             "Does the change hold up?",
             dir.path(),
-            &arm(&client, EXPLORER),
+            Some(&arm(&client, EXPLORER)),
             &arm(&client, SYNTH),
             &cfg,
         )
@@ -4196,7 +4266,7 @@ mod tests {
         consult_with(
             "q",
             dir.path(),
-            &arm(&client, EXPLORER),
+            Some(&arm(&client, EXPLORER)),
             &arm(&client, SYNTH),
             &cfg,
         )
@@ -4243,7 +4313,7 @@ mod tests {
         consult_with(
             "attach the marker file",
             dir.path(),
-            &arm(&client, EXPLORER),
+            Some(&arm(&client, EXPLORER)),
             &arm(&client, SYNTH),
             &cfg,
         )
@@ -4300,7 +4370,7 @@ mod tests {
         consult_with(
             "attach the marker file",
             dir.path(),
-            &arm(&client, EXPLORER),
+            Some(&arm(&client, EXPLORER)),
             &arm(&client, SYNTH),
             &cfg,
         )
@@ -4346,7 +4416,7 @@ mod tests {
         consult_with(
             "q",
             dir.path(),
-            &arm(&client, EXPLORER),
+            Some(&arm(&client, EXPLORER)),
             &arm(&client, SYNTH),
             &cfg,
         )
@@ -4410,7 +4480,7 @@ mod tests {
         consult_with(
             "attach two files",
             dir.path(),
-            &arm(&client, EXPLORER),
+            Some(&arm(&client, EXPLORER)),
             &arm(&client, SYNTH),
             &cfg,
         )
@@ -4500,7 +4570,7 @@ mod tests {
         consult_with(
             "q",
             dir.path(),
-            &arm(&client, EXPLORER),
+            Some(&arm(&client, EXPLORER)),
             &arm(&client, SYNTH),
             &cfg,
         )
@@ -4557,7 +4627,7 @@ mod tests {
         consult_with(
             "attach the marker file",
             dir.path(),
-            &arm(&client, EXPLORER),
+            Some(&arm(&client, EXPLORER)),
             &arm(&client, SYNTH),
             &cfg,
         )
@@ -4626,7 +4696,7 @@ mod tests {
         consult_with(
             "attach the diagram",
             dir.path(),
-            &arm(&client, EXPLORER),
+            Some(&arm(&client, EXPLORER)),
             &synth,
             &cfg,
         )
@@ -4698,7 +4768,7 @@ mod tests {
         consult_with(
             "attach the diagram",
             dir.path(),
-            &arm(&client, EXPLORER),
+            Some(&arm(&client, EXPLORER)),
             &synth,
             &cfg,
         )
@@ -4774,7 +4844,7 @@ mod tests {
         consult_with(
             "attach the diagram",
             dir.path(),
-            &arm(&client, EXPLORER),
+            Some(&arm(&client, EXPLORER)),
             &arm(&client, SYNTH), // the default arm is blind
             &cfg,
         )
@@ -5197,7 +5267,7 @@ mod tests {
             consult_with(
                 "q",
                 dir.path(),
-                &arm(&client, EXPLORER),
+                Some(&arm(&client, EXPLORER)),
                 &arm(&client, SYNTH),
                 &cfg,
             ),
@@ -5350,7 +5420,7 @@ mod tests {
         consult_with(
             "Where is target_marker?",
             dir.path(),
-            &arm(&client, EXPLORER),
+            Some(&arm(&client, EXPLORER)),
             &arm(&client, SYNTH),
             &cfg,
         )
@@ -5423,7 +5493,7 @@ mod tests {
         consult_with(
             "q",
             dir.path(),
-            &arm(&client, "explorer"),
+            Some(&arm(&client, "explorer")),
             &arm(&client, SYNTH),
             &cfg,
         )
@@ -5476,7 +5546,7 @@ mod tests {
         let out = consult_with(
             "two-part question",
             dir.path(),
-            &arm(&client, EXPLORER),
+            Some(&arm(&client, EXPLORER)),
             &arm(&client, SYNTH),
             &cfg,
         )
@@ -5541,7 +5611,7 @@ mod tests {
         let out = consult_with(
             "a question",
             dir.path(),
-            &arm(&client, EXPLORER),
+            Some(&arm(&client, EXPLORER)),
             &arm(&client, SYNTH),
             &cfg,
         )
@@ -5603,7 +5673,7 @@ mod tests {
         let out = consult_with(
             "A question the model never finishes answering",
             dir.path(),
-            &arm(&client, "explorer-unused"),
+            Some(&arm(&client, "explorer-unused")),
             &arm(&client, SYNTH),
             &cfg,
         )
@@ -5693,7 +5763,7 @@ mod tests {
         let out = consult_with(
             "review this branch",
             dir.path(),
-            &arm(&client, "cheap-explorer"),
+            Some(&arm(&client, "cheap-explorer")),
             &arm(&client, SYNTH),
             &ConsultConfig::default(),
         )
@@ -5780,7 +5850,7 @@ mod tests {
         let err = consult_with(
             "review this branch",
             dir.path(),
-            &arm(&client, "explorer-unused"),
+            Some(&arm(&client, "explorer-unused")),
             &arm(&client, SYNTH),
             &ConsultConfig::default(),
         )
@@ -5839,7 +5909,7 @@ mod tests {
         let err = consult_with(
             "review this branch",
             dir.path(),
-            &arm(&client, "cheap-explorer"),
+            Some(&arm(&client, "cheap-explorer")),
             &arm(&client, SYNTH),
             &ConsultConfig::default(),
         )
@@ -5923,7 +5993,7 @@ mod tests {
         let out = consult_with(
             "review src/foo.rs",
             dir.path(),
-            &arm(&client, "explorer-unused"),
+            Some(&arm(&client, "explorer-unused")),
             &arm(&client, SYNTH),
             &ConsultConfig::default(),
         )
@@ -5992,7 +6062,7 @@ mod tests {
         consult_with(
             "review src/foo.rs",
             dir.path(),
-            &arm(client, "cheap-explorer"),
+            Some(&arm(client, "cheap-explorer")),
             &arm_with(client, synth, params),
             &cfg,
         )
@@ -6103,7 +6173,7 @@ mod tests {
         let err = consult_with(
             "review src/foo.rs",
             dir.path(),
-            &arm(&client, "cheap-explorer"),
+            Some(&arm(&client, "cheap-explorer")),
             &arm_with(&client, SYNTH, params),
             &ConsultConfig::default(),
         )
@@ -6182,7 +6252,7 @@ mod tests {
         let err = consult_with(
             "classify these cases",
             dir.path(),
-            &arm(&client, "explorer-unused"),
+            Some(&arm(&client, "explorer-unused")),
             &arm(&client, SYNTH),
             &ConsultConfig::default(),
         )
@@ -6233,7 +6303,7 @@ mod tests {
         let err = consult_with(
             "q",
             dir.path(),
-            &arm(&client, "explorer-unused"),
+            Some(&arm(&client, "explorer-unused")),
             &arm(&client, SYNTH),
             &ConsultConfig::default(),
         )
@@ -6282,7 +6352,7 @@ mod tests {
         let err = consult_with(
             "a question the model never finishes answering",
             dir.path(),
-            &arm(&client, "explorer-unused"),
+            Some(&arm(&client, "explorer-unused")),
             &arm(&client, SYNTH),
             &cfg,
         )
@@ -6712,11 +6782,11 @@ mod tests {
         consult_with(
             "q",
             dir.path(),
-            &arm_with(
+            Some(&arm_with(
                 &client,
                 EXPLORER,
                 thinking_params(ProviderKind::Anthropic, EXPLORER, 4096),
-            ),
+            )),
             &arm_with(
                 &client,
                 SYNTH,
@@ -6856,7 +6926,7 @@ mod tests {
             consult_with(
                 "q",
                 dir.path(),
-                &arm_with(&cl, EXPLORER, Some(expected.clone())),
+                Some(&arm_with(&cl, EXPLORER, Some(expected.clone()))),
                 &arm_with(&cl, SYNTH, Some(expected.clone())),
                 &ConsultConfig::default(),
             )
@@ -6884,7 +6954,7 @@ mod tests {
             consult_with(
                 "q",
                 dir.path(),
-                &arm(&cl, EXPLORER),
+                Some(&arm(&cl, EXPLORER)),
                 &arm(&cl, SYNTH),
                 &ConsultConfig::default(),
             )
@@ -6933,11 +7003,11 @@ mod tests {
         consult_with(
             "q",
             dir.path(),
-            &arm_with(
+            Some(&arm_with(
                 &client,
                 EXPLORER,
                 thinking_params(ProviderKind::Gemini, EXPLORER, 4096),
-            ),
+            )),
             &arm_with(
                 &client,
                 SYNTH,
@@ -7031,7 +7101,7 @@ mod tests {
             },
         );
 
-        let out = consult_with("q", dir.path(), &explorer_arm, &synth_arm, &cfg)
+        let out = consult_with("q", dir.path(), Some(&explorer_arm), &synth_arm, &cfg)
             .await
             .expect("mixed-cast consult should succeed");
 
@@ -7886,7 +7956,7 @@ mod tests {
         let out = consult_with(
             "q",
             dir.path(),
-            &arm(&client, EXPLORER),
+            Some(&arm(&client, EXPLORER)),
             &arm(&client, SYNTH),
             &cfg,
         )
@@ -7935,7 +8005,7 @@ mod tests {
             "Q1 what is kaish",
             None,
             dir.path(),
-            &arm(&client, "explorer"),
+            Some(&arm(&client, "explorer")),
             &arm(&client, SYNTH),
             &cfg,
         )
@@ -7954,7 +8024,7 @@ mod tests {
             "Q2 who calls it",
             None,
             dir.path(),
-            &arm(&client, "explorer"),
+            Some(&arm(&client, "explorer")),
             &arm(&client, SYNTH),
             &cfg,
         )
@@ -8001,7 +8071,7 @@ mod tests {
                 q,
                 None,
                 dir.path(),
-                &arm(&client, "explorer"),
+                Some(&arm(&client, "explorer")),
                 &arm(&client, SYNTH),
                 &cfg,
             )
@@ -8047,7 +8117,7 @@ mod tests {
             "Q that fails",
             None,
             dir.path(),
-            &arm(&client, "explorer"),
+            Some(&arm(&client, "explorer")),
             &arm(&client, SYNTH),
             &cfg,
         )
@@ -8081,7 +8151,7 @@ mod tests {
             "Q that answers",
             None,
             dir.path(),
-            &arm(&client, "explorer"),
+            Some(&arm(&client, "explorer")),
             &arm(&client, SYNTH),
             &cfg,
         )
@@ -8122,7 +8192,7 @@ mod tests {
             "lone question",
             None,
             dir.path(),
-            &arm(&client, "explorer"),
+            Some(&arm(&client, "explorer")),
             &arm(&client, SYNTH),
             &cfg,
         )
@@ -8152,7 +8222,7 @@ mod tests {
 
         let synth = arm(&client, "synth-model"); // not vision-capable
         let tools = consult_tools(
-            &arm(&client, "explorer-model"),
+            Some(&arm(&client, "explorer-model")),
             dir.path(),
             &cfg,
             reports,
@@ -8174,6 +8244,19 @@ mod tests {
             !names.iter().any(|n| n == "view_image"),
             "a blind synth must not get view_image, got {names:?}"
         );
+
+        // No explorer arm → the same toolset minus explore′.
+        let tools = consult_tools(
+            None,
+            dir.path(),
+            &cfg,
+            Arc::new(Mutex::new(Vec::new())),
+            Arc::new(Mutex::new(Usage::new())),
+            &synth,
+        )
+        .expect("building the solo consult toolset should succeed");
+        let names: Vec<String> = tools.iter().map(|t| t.name().to_string()).collect();
+        assert_eq!(names, ["run_kaish"], "solo toolset is run_kaish alone");
     }
 
     /// When the synth arm is vision-capable, the consult driver's toolset gains
@@ -8188,7 +8271,7 @@ mod tests {
 
         let synth = vision_arm(&client, "synth-model"); // synth IS vision-capable
         let tools = consult_tools(
-            &arm(&client, "explorer-model"),
+            Some(&arm(&client, "explorer-model")),
             dir.path(),
             &cfg,
             reports,
@@ -8220,7 +8303,7 @@ mod tests {
         let usage_sink = Arc::new(Mutex::new(Usage::new()));
         let blind_synth = arm(&client, "synth-model");
         let blind = consult_tools(
-            &explorer,
+            Some(&explorer),
             dir.path(),
             &cfg,
             reports.clone(),
@@ -8238,7 +8321,7 @@ mod tests {
 
         let seeing_synth = vision_arm(&client, "synth-model");
         let seeing = consult_tools(
-            &explorer,
+            Some(&explorer),
             dir.path(),
             &cfg,
             reports,
@@ -8287,7 +8370,7 @@ mod tests {
         let synth = arm(&client, "synth-model");
         let names = |cfg: &ConsultConfig| -> Vec<String> {
             consult_tools(
-                &explorer,
+                Some(&explorer),
                 dir.path(),
                 cfg,
                 Arc::new(Mutex::new(Vec::new())),
@@ -8348,7 +8431,7 @@ mod tests {
         let explorer = arm(&client, "explorer-model");
         let names = |cfg: &ConsultConfig, synth: &Arm| -> Vec<String> {
             consult_tools(
-                &explorer,
+                Some(&explorer),
                 dir.path(),
                 cfg,
                 Arc::new(Mutex::new(Vec::new())),
@@ -8423,7 +8506,7 @@ mod tests {
         let out = consult_with(
             "q",
             dir.path(),
-            &arm(&client, EXPLORER),
+            Some(&arm(&client, EXPLORER)),
             &arm(&client, SYNTH),
             &cfg,
         )
@@ -8467,7 +8550,7 @@ mod tests {
         let err = consult_with(
             "make a corpus",
             dir.path(),
-            &arm(&client, "cheap-explorer"),
+            Some(&arm(&client, "cheap-explorer")),
             &arm(&client, SYNTH),
             &cfg,
         )
@@ -8522,7 +8605,7 @@ mod tests {
             "make an inventory",
             None,
             dir.path(),
-            &arm(&client, "cheap-explorer"),
+            Some(&arm(&client, "cheap-explorer")),
             &arm(&client, SYNTH),
             &cfg,
         )
@@ -8572,7 +8655,7 @@ mod tests {
         let out = consult_with(
             "generate a fuzz corpus",
             dir.path(),
-            &arm(&client, "cheap-explorer"),
+            Some(&arm(&client, "cheap-explorer")),
             &arm(&client, SYNTH),
             &cfg,
         )

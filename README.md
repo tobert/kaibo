@@ -51,7 +51,8 @@ the investigation, and it decides how to work. It reads spans through the read-o
 itself, and it can hand a broad survey to the **explorer** — a cheaper, faster model that
 searches the repo and reports back what it found. Delegating is a tool call, and it's the
 synth's call whether to make one. Then the synth checks what matters, fills the gaps, and
-writes the answer.
+writes the answer. A cast with no explorer runs single-stage: the synth does every read
+itself.
 
 So the chain runs: you → your agent → kaibo's synth → kaibo's explorer. If your agent
 spawned a subagent to do the work, that's one more link, and the inside is the same. Every

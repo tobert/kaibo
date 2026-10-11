@@ -27,6 +27,7 @@ record. Each later release appends a new section at the top.
 - Gemini text-to-speech on an `audio` slot, with `voice`, two-voice `speakers`, and `language_code` fields; raw PCM is stored as WAVE.
 - Stable Audio 2, 2.5 and 3 on a Stability `audio` slot, with `audio-to-audio` and `inpaint` ops that take an audio input.
 - The artifact store holds `mp3` and `wav`; `write_cas` and `kaibo cas write` accept them, and `inputs` takes them.
+- `consult` runs single-stage on a cast with no `explorer`: the synth does every read itself, with no `explore` tool.
 
 ### Changed
 - kaish 0.18: `grep` and `sed` read GNU basic regex, so `grep -rn 'fn consult(' src` runs; use `-E` for `|` alternation.
@@ -54,7 +55,6 @@ record. Each later release appends a new section at the top.
 - The MCP instructions put `## Scope` first and cap the cast roster at 8 lines and the allowed trees at 4, so Claude Code's 2048-character cut no longer hides Scope.
 - The instructions' cast roster always lists the default cast, tagged `direct` or `no usable key` when that applies, and counts every cast it leaves out.
 - `consult`, `consult_submit`, and `oneshot` no longer offer a cast with no `synth` slot, such as an image-only cast; naming one is refused with the tool that cast serves.
-- `consult` and `consult_submit` no longer offer a synth-only cast, which they could never run; `oneshot` still does.
 - Startup warns when the default cast (`[server] cast`) cannot run `consult`, since every call without `cast` would be refused.
 - An empty answer at the output limit says whether reasoning filled `max_tokens` and names the `effort` and `max_tokens` keys on the slot that ran.
 - A failed `oneshot` closes its trace spans with error status, so it no longer reads as a success.
