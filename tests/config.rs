@@ -3254,3 +3254,77 @@ fn a_reasoning_slot_cannot_point_at_a_bfl_backend() {
         );
     }
 }
+
+/// A `decision` slot on an `openrouter` backend loads, and is neither a reasoning nor a
+/// media role: the two predicates that gate reasoning knobs and media routes both say no.
+#[test]
+fn a_decision_slot_on_openrouter_loads_and_is_neither_reasoning_nor_media() {
+    let c = Config::from_toml_str(
+        r#"
+        [backends.orx]
+        kind = "openrouter"
+        key_optional = true
+
+        [casts.judge]
+        decision = "orx/typesafe/jev-1.13"
+        "#,
+    )
+    .unwrap();
+    let cast = c.resolve_cast("judge").unwrap();
+    let slot = cast
+        .slot(kaibo::config::ModelRole::Decision)
+        .expect("decision slot resolves");
+    assert_eq!((slot.backend.as_str(), slot.id.as_str()), ("orx", "typesafe/jev-1.13"));
+    assert!(c.cast_can_decide("judge"));
+    let role = kaibo::config::ModelRole::Decision;
+    assert!(!role.is_reasoning() && !role.is_media());
+    // A decision-only cast staffs nothing else.
+    assert!(!c.cast_can_generate("judge") && cast.slot(kaibo::config::ModelRole::Synth).is_none());
+}
+
+/// Every backend kind without a Decisions route is refused on a `decision` slot, naming
+/// the slot, the kind, and the fix — the media kinds and the other completion wires alike.
+#[test]
+fn a_decision_slot_on_a_kind_without_a_decisions_route_is_refused() {
+    for (kind, extra) in [
+        ("gemini", "key_optional = true"),
+        ("deepseek", "key_optional = true"),
+        ("openai", "base_url = \"http://localhost:1/v1\""),
+        ("stability", "key_optional = true"),
+    ] {
+        let toml = format!(
+            r#"
+            [backends.b]
+            kind = "{kind}"
+            {extra}
+
+            [casts.broken]
+            decision = "b/some-model"
+            "#
+        );
+        let err = Config::from_toml_str(&toml)
+            .expect_err("a decision slot on a kind with no Decisions route must be refused");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("decision slot") && msg.contains(kind) && msg.contains("openrouter"),
+            "the error names the slot, the kind, and the fix, got: {msg}"
+        );
+    }
+}
+
+/// A misspelled role is still a load error now that `decision` joined the list.
+#[test]
+fn a_misspelled_decision_role_is_a_load_error() {
+    let err = Config::from_toml_str(
+        r#"
+        [backends.orx]
+        kind = "openrouter"
+        key_optional = true
+
+        [casts.judge]
+        decisions = "orx/typesafe/jev-1.13"
+        "#,
+    )
+    .expect_err("`decisions` is not a role");
+    assert!(format!("{err:#}").contains("decisions"), "{err:#}");
+}

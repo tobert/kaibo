@@ -370,6 +370,23 @@ pub fn with_raw(mut resp: CompletionResponse, raw: Value) -> CompletionResponse 
     resp
 }
 
+/// Stamp a scripted response as **cut off at the output limit**, the way a real
+/// OpenAI-shaped provider (DeepSeek, OpenRouter) delivers it: rig's *normalized*
+/// `FinishReason::Length`, which rig-agent acts on, and the provider's own `"length"` in
+/// the raw payload, which [`Watched`](crate::completion_watch::Watched) reads.
+///
+/// [`with_raw`] sets only the raw half. That was enough before rig 0.42, which never
+/// read the reason; since 0.42 the agent loop raises an error on a truncated turn that
+/// delivered no answer (`rig-agent` `run/mod.rs`, the `truncating_finish_reason` check).
+/// A double carrying only the raw half never reaches that branch, so a loop-path test
+/// that means "truncated" uses this helper.
+pub fn truncated(resp: CompletionResponse) -> CompletionResponse {
+    with_raw(
+        resp.with_finish_reason(rig_core::completion::FinishReason::Length),
+        serde_json::json!({"choices": [{"index": 0, "finish_reason": "length"}]}),
+    )
+}
+
 /// A [`Usage`] a scripted provider "reports" for one completion, `input`/`output`
 /// tokens (with `total` filled to match, the way a real provider does). Lets a test
 /// prove kaibo threads and sums the token counts rig hands back — rig aggregates

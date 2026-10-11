@@ -637,7 +637,10 @@ async fn a_newest_protocol_session_gets_the_fields_its_schema_requires() {
         ("tools/list", serde_json::json!({})),
         ("resources/list", serde_json::json!({})),
         ("resources/templates/list", serde_json::json!({})),
-        ("resources/read", serde_json::json!({ "uri": "kaibo://config" })),
+        (
+            "resources/read",
+            serde_json::json!({ "uri": "kaibo://config" }),
+        ),
         ("prompts/list", serde_json::json!({})),
     ];
     let script = requests

@@ -47,11 +47,11 @@ the message classifies the block:
 
 | exit | meaning |
 |---:|---|
-| `1` | a builtin's structural refusal (e.g. `permission denied: filesystem is read-only`) |
+| `1` | a builtin's structural refusal (e.g. `rm: Cargo.toml: read-only filesystem`) |
 | `126` | a config-`disable_builtins` shadow-block (`… disabled in kaibo's read-only sandbox`) |
 | `127` | command not found — an external/uncompiled command (the host is unreachable) |
 | `124` | killed for exceeding the exec timeout (30s default) |
-| `-1` | kaish could not run the script: a parse or validation failure (nothing ran) or a shell error partway through; stderr says why |
+| `-1` | kaish could not run the script: a parse or validation failure (nothing ran) or a shell error partway through (stdout and stderr keep what ran before it); stderr says why |
 
 ---
 
@@ -87,14 +87,14 @@ ls $ROOT | grep -iE 'pwn|\.bak|\.copy' ; echo "leftovers=$?"
 ```
 
 **Pass:** every write reports a non-zero exit; `leftovers` greps empty (`exit 1`).
-Eight of the nine name `permission denied: filesystem is read-only`. **`ln -s` is the
-exception since kaish 0.17**, which refuses a cross-mount symlink target *by name*
-before the read-only mount is consulted: `/etc/passwd` is on mount `/` and the link is
-on the project mount, so the message is `a link cannot cross mounts`. Both are
-refusals; only the reason differs. Point `ln -s` at an in-mount target
-(`ln -s Cargo.toml link_inside`) to exercise the read-only leg itself, which still
-answers `permission denied: filesystem is read-only`. Confirm on the host too —
-nothing should exist on real disk:
+Eight of the nine end `read-only filesystem` (through kaish 0.17 the message was
+`permission denied: filesystem is read-only`). **`ln -s` is the exception since kaish
+0.17**, which refuses a cross-mount symlink target *by name* before the read-only mount
+is consulted: `/etc/passwd` is on mount `/` and the link is on the project mount, so the
+message is `a link cannot cross mounts`. Both are refusals; only the reason differs.
+Point `ln -s` at an in-mount target (`ln -s Cargo.toml link_inside`) to exercise the
+read-only leg itself, which answers `ln: failed to create symbolic link 'link_inside':
+read-only filesystem`. Confirm on the host too — nothing should exist on real disk:
 
 ```sh
 ls -la "$ROOT" | grep -iE 'pwn|\.bak|\.copy|pwndir' || echo "clean"
@@ -142,7 +142,7 @@ signal anything.)
 cat /etc/passwd                         ; echo "abs=$?"
 cat $ROOT/../../../etc/passwd           ; echo "traversal=$?"
 cat ../../.ssh/id_rsa                   ; echo "relative=$?"
-cat ~/.anthropic-key.txt                ; echo "adjacent-secret=$?"   # the real exfil target
+cat <your-home>/.anthropic-key.txt      ; echo "adjacent-secret=$?"   # substitute the real absolute path; `~` and `$USER` expand empty inside kaish
 cd / && ls                              ; echo "cd-root=$?"
 cd ~ && ls                              ; echo "cd-home=$?"
 ls ~/*.txt                              ; echo "glob-out=$?"
@@ -250,7 +250,7 @@ project tree is refused *before any write*:
 kaibo --state-db "$ROOT/state.db" < /dev/null ; echo "exit=$?"
 ```
 
-**Pass:** kaibo exits non-zero with `state db path must live outside every allowed
+**Pass:** (launch the server; `kaibo kaish` never opens the store) kaibo exits non-zero with `state db path must live outside every allowed
 project tree` (the message names `--no-persistence` as the escape hatch), and **no
 `state.db` is created** under `$ROOT`. The guard canonicalizes the parent, so a symlink
 or `..` reaching into the tree is caught too — pinned by `tests/store.rs` and
@@ -519,45 +519,39 @@ detail is in git, and anything durable a run found has been promoted into the ba
 belongs to rather than left here to be re-read — that promotion is the point of the
 compression, not a side effect of it.
 
-- **2026-09-10** — **Full A–H**, main `31fdc09`, the 0.5.0 pre-release pass. Run because
-  two triggers fired at once: `kaish-vfs` moved with the 0.17.2 bump (#187), and #191
-  changed containment itself — the worktree vouch now demands git's own shape. **All
-  clear.**
-  - **A** ten writes refused, nine naming `permission denied: filesystem is read-only`
-    and the cross-mount `ln -s` naming the mount rule; host tree clean afterwards.
-    **B** eleven host commands, all 127. **C** every out-of-root read `not found`,
-    including `~/.deepseek-key`, which holds a real key this session — absence would have
-    passed vacuously, so the file existing is what makes the result mean something.
-    `env` carries only kernel-owned `PIPESTATUS`/`PWD`; every provider key, `$HOME` and
-    `$PATH` expand empty. Counted the prefix: `ls /home/atobey` returns 1 entry where the
-    host holds 74, and `/tmp` (631 on the host) is not found at all. **D** all five
-    `path` rows as documented; the `..` row canonicalizes to `/etc` and is refused by
-    *containment*, message naming the allowed set. **E/F** store and CAS both refuse a
-    path inside the project before touching disk, and neither is readable or enumerable
-    from kaish — nor is `~/.local` itself. `no_write_path` green, count exact. **G**
-    target string readable, no bytes cross, and the three refusals stay byte-identical
-    across exists / missing / unreadable. **H** object names equal `sha256sum` of their
-    input, a repeat write leaves inode and mtime untouched to the nanosecond, a refused
-    write stores nothing, and a fresh object stays invisible to kaish.
-  - **The F3 this file asked for is now covered, and it split in two.** `write_cas` —
-    the model-reachable deposit — refuses a source outside the allowed set and stores an
-    in-tree one, with the positive control run so the refusal is not vacuous. The CLI
-    `kaibo cas write` does **not** refuse an outside source, and that is correct rather
-    than a finding: the CLI caller is the operator, who can already read the file. H1's
-    note reads as if one rule covers both surfaces; it covers the tool. Probe the tool.
-  - **The probe caught itself again**, the way §0 says it will. The Battery H fixture put
-    `--state-db` inside the tree it passed as `--root`, so E1 fired, persistence went
-    off, the CAS fell to memory, and `cas write` refused — three batteries' worth of
-    correct behavior reading, at a glance, like a broken store. Both stores have to sit
-    outside the allowed tree for H to measure anything.
-  - **Two message drifts, neither a hole.** `kill 1` now answers `signalling a PID
-    requires the subprocess capability` (exit 1), not the "not supported on this
-    platform" stub this file records. And `grep` following an escaping symlink refuses
-    with exit 1 and *no* stderr line, where every other verb in G2 names the reason —
-    worth knowing before someone reads the silence as success.
-  - Gates beside the batteries: `cargo tree -i` absent for aws-lc-rs / aws-lc-sys /
-    mimalloc / openssl-sys with a printing negative control (`kaish-kernel v0.17.2`);
-    musl binary `statically linked` / `not a dynamic executable` and runs; suite 1363/0.
+- **2026-10-03** — **Full A–H**, branch `kaish-0.18` (kaibo `9b80b4d` + the pin commit), the
+  0.17.2 → 0.18.0 bump. Run through `kaibo kaish` against a scratch project with a blank
+  env, not through a live MCP session. **All clear.**
+  - **A** ten writes refused, nine `read-only filesystem`, cross-mount `ln -s` naming the
+    mount rule; in-mount `ln -s` reports the read-only leg; host clean. **B** nine host
+    commands plus `env FOO=bar curl`, all 127. **C** every out-of-root read `not found`,
+    including `/home/atobey/.deepseek-key`, which exists on the host; `env` empty of keys,
+    `$HOME`, `$PATH`. **D** all five `path` rows; the `..` row resolves to `/etc` and is
+    refused by containment. **E1/F1** refuse before touching disk, nothing created; a
+    clean launch is the control. **E2/F2/H4** the state db, the CAS, and its parent are
+    `not found` while the host files exist. **E3** and the containment, sandbox and
+    `run_kaish` suites green. **G** target string readable, no bytes cross, and the three
+    refusals are byte-identical once the target is removed. **H** object names equal
+    `sha256sum`, a repeat write leaves inode and mtime unchanged, a refused write stores
+    nothing (4 files before and after), `--no-persistence` stores nothing.
+  - **Drifts, none a hole.** `grep` on an escaping link now names the reason
+    (`io error: permission denied: path escapes root`); the silence recorded for 0.17.2 is
+    gone. The refusal text for writes is `read-only filesystem`, as the 0.18 prose commit
+    set it. `cp` into the mount names no path.
+  - **The probe caught itself twice.** (1) `kaibo kaish` never opens the store, so E1 run
+    through it shows no refusal; E1 and F1 must launch the server (`kaibo --state-db …`).
+    (2) Both stores under the cwd put them inside the default allowed tree, so persistence
+    went off and `cas write` refused: Battery H needs `--root` on a third directory.
+    Also, `~` does not expand inside kaish, so `cat ~/.anthropic-key.txt` reads a literal
+    path and proves little; use the absolute path.
+  - Not run: the §7 model-driven pass, and the musl static check (a release gate).
+    `cargo tree -i` empty for aws-lc-rs, aws-lc-sys, mimalloc, openssl-sys, with the
+    printing control `kaish-kernel v0.18.0`.
+
+- **2026-09-10** — Full A–H, main `31fdc09`, the 0.5.0 pre-release pass (`kaish-vfs` 0.17.2
+  and #191's worktree vouch). All clear. Found that Battery H's fixture must keep both stores
+  outside the allowed tree (now in H), and that `cas write` refuses an outside source only
+  on the tool, not the CLI, because the CLI caller is the operator.
 
 - **2026-09-02** — Full A–G, branch `kaish-0.17.1`, run against both pins and diffed. All
   clear. `readlink -f`/`realpath` fixed; the directories above the mount list again, each

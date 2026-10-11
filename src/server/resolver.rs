@@ -191,8 +191,9 @@ impl Resolver {
                 model = %d.model,
                 tunables = %d.tunables.join(", "),
                 "reasoning tunables on the {} slot do nothing: this slot sends one \
-                 generation request with no reasoning phase, so these knobs are \
-                 dropped before any request is built. Move them to a reasoning slot \
+                 request with no reasoning phase (a generation for `image` and `audio`, a \
+                 decisions request for `decision`), so these knobs are dropped before \
+                 any request is built. Move them to a reasoning slot \
                  (explorer/synth) or remove them. See kaibo://config (inert_tunables).",
                 d.role
             );
@@ -395,29 +396,6 @@ impl Resolver {
         }
     }
 
-    /// Refuse `consult`/`consult_submit` on a cast that cannot staff both of its phases:
-    /// the interactive-synth checks of [`require_interactive_cast`](Self::require_interactive_cast),
-    /// then an explorer slot, which `consult` resolves before it runs. Without this a
-    /// synth-only cast failed at the explorer resolve with a bare "has no explorer slot".
-    pub(crate) fn require_consult_cast(&self, cast: &Cast, tool: &str) -> Result<(), McpError> {
-        self.require_interactive_cast(cast, tool)?;
-        if cast.slot(ModelRole::Explorer).is_none() {
-            return Err(McpError::invalid_params(
-                format!(
-                    "cast `{name}` has no `explorer` slot, so `{tool}` has no model to \
-                     survey the code before the synth answers. Use `{name}` with \
-                     `oneshot`, which runs the synth alone on the context you pass. For \
-                     `{tool}`, pick a cast with both an `explorer` and a `synth` slot; \
-                     `kaibo://config` (on the command line, `kaibo config`) lists every \
-                     cast with its slots.",
-                    name = cast.name,
-                ),
-                None,
-            ));
-        }
-        Ok(())
-    }
-
     /// Refuse `batch_submit` (`kaibo batch submit`) on a cast whose synth isn't on the
     /// `batch` lane specifically — the other half of the lane split. A batch cast must
     /// positively declare `lane = "batch"` on its synth slot, so an ordinary interactive
@@ -481,10 +459,12 @@ impl Resolver {
             None => cast.slot(role).map(|s| s.backend.clone()).ok_or_else(|| {
                 McpError::invalid_params(
                     format!(
-                        "cast {:?} has no {} slot to override — pass the matching \
-                         backend override arg to target one",
-                        cast.name,
-                        role.key()
+                        "cast `{name}` has no `{role}` slot for this model override to replace. \
+                         Pass `{role}_backend` (CLI: `--{role}-backend`) with it to add \
+                         the slot on that backend, or pick a cast that carries the \
+                         `{role}` slot.",
+                        name = cast.name,
+                        role = role.key()
                     ),
                     None,
                 )
@@ -535,6 +515,20 @@ impl Resolver {
         // the first thing an operator needs from a shaping refusal.
         Arm::from_slot(backend, slot, role, &self.config.defaults)
             .map_err(|e| McpError::internal_error(format!("cast {:?}: {e:#}", cast.name), None))
+    }
+
+    /// [`arm`](Self::arm) for a slot the cast may leave out: `None` when `cast` has no
+    /// `role` slot, so the caller runs without that phase. `consult` resolves its explorer
+    /// this way, and a synth-only cast runs single-stage.
+    pub(crate) fn optional_arm(
+        &self,
+        cast: &Cast,
+        role: ModelRole,
+    ) -> Result<Option<Arm>, McpError> {
+        match cast.slot(role) {
+            Some(_) => self.arm(cast, role).map(Some),
+            None => Ok(None),
+        }
     }
 
     /// Assemble the operator's house rules for this call against the resolved `root`:
@@ -826,6 +820,7 @@ fn synthless_cast_refusal(cast: &Cast, tool: &str) -> String {
         (ModelRole::Explorer, "`explore`"),
         (ModelRole::Image, "`generate`"),
         (ModelRole::Audio, "`generate`"),
+        (ModelRole::Decision, "`decide`"),
     ]
     .into_iter()
     .filter(|(role, _)| cast.slot(*role).is_some())

@@ -30,6 +30,7 @@ pub mod consult;
 pub mod context;
 pub mod credentials;
 pub mod dashscope;
+pub mod decide;
 pub mod discover;
 pub mod explorer;
 pub mod gemini_media;

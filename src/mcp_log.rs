@@ -43,18 +43,18 @@
 //! The convention is safe to assert here because [`KAIBO_TARGET`] filtering means
 //! rig/reqwest's *severity*-sense `warn!`s never reach this bridge — only kaibo's own.
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::Arc;
 
-use rmcp::RoleServer;
 use rmcp::model::{LoggingLevel, LoggingMessageNotificationParam};
 use rmcp::service::Peer;
+use rmcp::RoleServer;
 use serde_json::{Map, Value};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use tracing::field::{Field, Visit};
 use tracing::{Event, Level, Subscriber};
-use tracing_subscriber::Layer;
 use tracing_subscriber::layer::Context;
+use tracing_subscriber::Layer;
 
 /// Only events under this target tree are mirrored to MCP — kaibo's own logs, never
 /// the chatter from `rig`/`reqwest`/`rmcp` a broad `RUST_LOG` would otherwise pull
@@ -250,24 +250,23 @@ impl NotificationBuffer {
     ) -> Vec<LogRecord> {
         // Drain, stream, sample into the sliding tail, and report whether anything crossed
         // the wake bar. Shared by the main loop and the final post-deadline sweep.
-        let mut absorb = |drained: Vec<LogRecord>,
-                          tail: &mut std::collections::VecDeque<LogRecord>|
-         -> bool {
-            let mut woke = false;
-            for rec in drained {
-                on_drained(&rec);
-                if rank(rec.level) >= wake_floor {
-                    woke = true;
-                }
-                if rank(rec.level) >= sample_floor {
-                    tail.push_back(rec);
-                    while tail.len() > limit {
-                        tail.pop_front();
+        let mut absorb =
+            |drained: Vec<LogRecord>, tail: &mut std::collections::VecDeque<LogRecord>| -> bool {
+                let mut woke = false;
+                for rec in drained {
+                    on_drained(&rec);
+                    if rank(rec.level) >= wake_floor {
+                        woke = true;
+                    }
+                    if rank(rec.level) >= sample_floor {
+                        tail.push_back(rec);
+                        while tail.len() > limit {
+                            tail.pop_front();
+                        }
                     }
                 }
-            }
-            woke
-        };
+                woke
+            };
 
         let deadline = tokio::time::Instant::now() + timeout;
         let mut tail: std::collections::VecDeque<LogRecord> = std::collections::VecDeque::new();
@@ -525,7 +524,7 @@ mod tests {
         let returned = buf
             .wait_drain_with(
                 std::time::Duration::from_secs(5),
-                rank(LoggingLevel::Info),    // drain down to Info (to stream)
+                rank(LoggingLevel::Info), // drain down to Info (to stream)
                 rank(LoggingLevel::Warning), // sample only the Warn-bar records
                 rank(LoggingLevel::Warning), // wake on the Warn-bar records
                 20,

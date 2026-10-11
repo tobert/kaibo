@@ -66,12 +66,14 @@ impl MediaOutput {
         }
     }
 
-    /// The output a media role produces, or `None` for a reasoning role.
+    /// The output a media role produces, or `None` for a reasoning role or the decision role.
     pub fn of_role(role: crate::config::ModelRole) -> Option<Self> {
         match role {
             crate::config::ModelRole::Image => Some(MediaOutput::Image),
             crate::config::ModelRole::Audio => Some(MediaOutput::Audio),
-            crate::config::ModelRole::Explorer | crate::config::ModelRole::Synth => None,
+            crate::config::ModelRole::Explorer
+            | crate::config::ModelRole::Synth
+            | crate::config::ModelRole::Decision => None,
         }
     }
 

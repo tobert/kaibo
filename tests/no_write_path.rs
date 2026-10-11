@@ -101,12 +101,7 @@ const BLESSED: &[Blessed] = &[
         marker: "media-cas-write: blessed by the media CAS invariant amendment (AGENTS.md)",
         // One object write touches three seams; the `create_new` open hits two needles on
         // one physical line.
-        needles: &[
-            "create_dir_all(",
-            "OpenOptions::",
-            ".write(",
-            ".write_all(",
-        ],
+        needles: &["create_dir_all(", "OpenOptions::", ".write(", ".write_all("],
     },
     Blessed {
         file: "cli.rs",
@@ -173,9 +168,9 @@ fn strip_line_comment(line: &str) -> &str {
 /// the line's own raw text (comment included) shows that blessing's marker, and the needle
 /// is one the blessing actually excuses.
 fn is_blessed_needle(basename: &str, raw_line: &str, needle: &str) -> bool {
-    BLESSED.iter().any(|b| {
-        basename == b.file && raw_line.contains(b.marker) && b.needles.contains(&needle)
-    })
+    BLESSED
+        .iter()
+        .any(|b| basename == b.file && raw_line.contains(b.marker) && b.needles.contains(&needle))
 }
 
 /// Does this line carry a blessing marker at all? Used for the tree-wide count, which
@@ -254,7 +249,12 @@ fn blessed_marker_count_matches_exactly() {
     rs_files(&src, &mut files);
     let total: usize = files
         .iter()
-        .map(|f| blessed_count(&basename(f), &std::fs::read_to_string(f).expect("read source")))
+        .map(|f| {
+            blessed_count(
+                &basename(f),
+                &std::fs::read_to_string(f).expect("read source"),
+            )
+        })
         .sum();
     assert_eq!(
         total, EXPECTED_BLESSED_LINES,
@@ -316,7 +316,10 @@ fn teeth_other_write_in_store_fails() {
 /// The blessed stdout write in `cli.rs` is exempt on its own marked line.
 #[test]
 fn teeth_cli_stdout_bytes_line_is_exempt() {
-    let src = format!("            out.write_all(&bytes[start..end]) // {}\n", BLESSED[2].marker);
+    let src = format!(
+        "            out.write_all(&bytes[start..end]) // {}\n",
+        BLESSED[2].marker
+    );
     assert!(
         scan_source("cli.rs", &src).is_empty(),
         "the marked stdout write in cli.rs must be exempt"
@@ -333,7 +336,10 @@ fn teeth_cli_writes_without_the_marker_fail() {
         "an unmarked fs::write in cli.rs must fail — a --out flag is a new capability, \
          not a variation on serving stdout"
     );
-    let marked = format!("    std::fs::write(out_path, &bytes) // {}\n", BLESSED[2].marker);
+    let marked = format!(
+        "    std::fs::write(out_path, &bytes) // {}\n",
+        BLESSED[2].marker
+    );
     assert!(
         !scan_source("cli.rs", &marked).is_empty(),
         "cli.rs's marker blesses the stdout needle only — it must not launder an \

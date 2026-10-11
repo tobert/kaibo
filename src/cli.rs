@@ -46,8 +46,8 @@ use crate::consult::{
 use crate::progress::TerminalSink;
 use crate::sandbox::KaishWorker;
 use crate::server::{
-    batch_within_window, configure_prompt_text_cli, consultation_failure_text, now_epoch_secs,
-    render_config_resource, with_provenance, Resolver, BATCH_RECENCY_WINDOW_SECS,
+    batch_within_window, configure_prompt_text_cli, consult_models, consultation_failure_text,
+    now_epoch_secs, render_config_resource, with_provenance, Resolver, BATCH_RECENCY_WINDOW_SECS,
     CONFIG_EXAMPLE_TOML,
 };
 use crate::session::{SessionStore as MemSessionStore, Sessions};
@@ -84,10 +84,10 @@ EXIT CODES
 `kaibo kaish` is the one exception: it exits with kaish's own code instead of
 this table (0 ok, 1 the command failed, 124 timed out, 127 command not found,
 255 on Unix when kaish could not run the script: a parse or validation failure,
-where nothing ran, or a shell error partway through; stderr says why, and
-`--json` reports it as `exit_code` -1).
-A refused write exits 1 and prints `permission denied: filesystem is
-read-only` on stderr.";
+where nothing ran, or a shell error partway through, where stdout and stderr keep
+what ran before it; stderr says why, and `--json` reports it as `exit_code` -1).
+A refused write exits 1, and its stderr line ends `read-only filesystem`, as in
+`rm: src/lib.rs: read-only filesystem`.";
 
 /// kaibo — read-only codebase consultation from a model outside your own
 /// family. Ask a question; a synthesis agent (DeepSeek, Gemini, Anthropic, OpenRouter,
@@ -295,6 +295,9 @@ pub struct ServeGates {
     /// Don't advertise the `generate` tool (media generation).
     #[arg(long)]
     pub no_generate: bool,
+    /// Don't advertise the `decide` tool (typed questions answered with probabilities).
+    #[arg(long)]
+    pub no_decide: bool,
 
     /// Let a consult save bulk output as artifacts in kaibo's artifact store, when the
     /// call also asks for it with `save_artifacts` (both keys are required, and the
@@ -317,6 +320,7 @@ impl ServeGates {
             batch: self.no_batch,
             list_models: self.no_list_models,
             generate: self.no_generate,
+            decide: self.no_decide,
         }
     }
 }
@@ -369,8 +373,8 @@ pub struct ConsultArgs {
 
     /// Also print the explorer's aggregated report. Under --json it is the `report`
     /// field on stdout; otherwise it goes to stderr under a `--- explorer report ---`
-    /// header, so a pipe still captures only the answer. Empty when the consult
-    /// delegated no sweep.
+    /// header, so a pipe still captures only the answer. Empty when no sweep ran: the
+    /// synth read everything itself, or the cast has no explorer.
     #[arg(long)]
     pub include_report: bool,
 
@@ -970,7 +974,7 @@ async fn resolve_and_run(
         .resolve_cast(common.cast.clone())
         .map_err(SetupError::usage)?;
     resolver
-        .require_consult_cast(&cast, "consult")
+        .require_interactive_cast(&cast, "consult")
         .map_err(SetupError::usage)?;
     resolver
         .apply_model_override(
@@ -992,8 +996,9 @@ async fn resolve_and_run(
             "synth_backend",
         )
         .map_err(SetupError::usage)?;
+    // A synth-only cast has no explorer: `consult` runs single-stage.
     let explorer = resolver
-        .arm(&cast, ModelRole::Explorer)
+        .optional_arm(&cast, ModelRole::Explorer)
         .map_err(SetupError::setup)?;
     let synth = resolver
         .arm(&cast, ModelRole::Synth)
@@ -1050,7 +1055,7 @@ async fn resolve_and_run(
         &args.question,
         args.context.as_deref(),
         root,
-        &explorer,
+        explorer.as_ref(),
         &synth,
         &cfg,
         session,
@@ -1058,7 +1063,8 @@ async fn resolve_and_run(
     .await
     {
         Ok(out) => {
-            emit_answer(args, &out, &cast.name, &explorer.model, &synth.model);
+            let explorer_model = explorer.as_ref().map(|a| a.model.as_str());
+            emit_answer(args, &out, &cast.name, explorer_model, &synth.model);
             Ok(EXIT_OK)
         }
         // A provider/model-loop failure is its own exit code — the consultation ran and
@@ -1112,7 +1118,7 @@ fn emit_answer(
     args: &ConsultArgs,
     out: &ConsultOutput,
     cast: &str,
-    explorer_model: &str,
+    explorer_model: Option<&str>,
     synth_model: &str,
 ) {
     if args.json {
@@ -1125,7 +1131,7 @@ fn emit_answer(
     let answer = with_provenance(
         out.answer.clone(),
         cast,
-        &[("explorer", explorer_model), ("synth", synth_model)],
+        &consult_models(explorer_model, synth_model),
         &out.usage,
     );
     println!("{answer}");
@@ -1159,7 +1165,7 @@ fn usage_json(usage: &Usage) -> serde_json::Value {
 fn consult_envelope(
     out: &ConsultOutput,
     cast: &str,
-    explorer_model: &str,
+    explorer_model: Option<&str>,
     synth_model: &str,
     include_report: bool,
 ) -> serde_json::Value {
@@ -1169,6 +1175,7 @@ fn consult_envelope(
         // notices ride the separate `warnings` array below.
         "answer": out.answer,
         "cast": cast,
+        // `explorer` is null when the cast ran single-stage, so the key is always there.
         "models": { "explorer": explorer_model, "synth": synth_model },
         "usage": usage_json(&out.usage),
         // Non-fatal notices about this turn (e.g. a failed session record). Always
@@ -3384,7 +3391,7 @@ mod tests {
     #[test]
     fn consult_envelope_carries_answer_provenance_usage_and_warnings() {
         let out = out_with("the answer", vec![]);
-        let env = consult_envelope(&out, "deepseek", "explorer-m", "synth-m", false);
+        let env = consult_envelope(&out, "deepseek", Some("explorer-m"), "synth-m", false);
         assert_eq!(env["answer"], "the answer");
         assert_eq!(env["cast"], "deepseek");
         assert_eq!(env["models"]["explorer"], "explorer-m");
@@ -3397,8 +3404,13 @@ mod tests {
         // The report is omitted unless requested.
         assert!(env.get("report").is_none(), "report is opt-in");
 
-        let with_report = consult_envelope(&out, "deepseek", "e", "s", true);
+        let with_report = consult_envelope(&out, "deepseek", Some("e"), "s", true);
         assert_eq!(with_report["report"], "the report");
+
+        // Single-stage: the explorer key stays, as null, so a consumer can rely on it.
+        let solo = consult_envelope(&out, "deepseek", None, "s", false);
+        assert_eq!(solo["models"]["explorer"], serde_json::Value::Null);
+        assert_eq!(solo["models"]["synth"], "s");
     }
 
     /// A record-failure warning rides the `warnings` array — NOT the `answer` field, which
@@ -3409,7 +3421,7 @@ mod tests {
             "clean model words",
             vec!["⚠️ Session turn NOT recorded (persistence error: disk full).".to_string()],
         );
-        let env = consult_envelope(&out, "deepseek", "e", "s", false);
+        let env = consult_envelope(&out, "deepseek", Some("e"), "s", false);
         assert_eq!(
             env["answer"], "clean model words",
             "the answer field must be the model's raw words, no injected notices"

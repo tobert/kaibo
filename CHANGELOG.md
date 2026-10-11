@@ -16,6 +16,7 @@ record. Each later release appends a new section at the top.
 ## [Unreleased]
 
 ### Added
+- `decide` asks a fast decision model typed questions (`choice`, `score`, `noul`) about a state and returns probabilities, no text; it runs a cast's new `decision` slot on an `openrouter` backend (`typesafe/jev-1.13`), and `--no-decide` drops it.
 - `job_get` shows each role's model latency on a running job, so a slow backend shows at the first poll.
 - An async model call that reaches `slow_chat_secs` (default 60, `0` off) warns the caller through `job_wait`.
 - A retried model call is timed per attempt, so latency is the provider's time, never kaibo's backoff.
@@ -26,9 +27,12 @@ record. Each later release appends a new section at the top.
 - Gemini text-to-speech on an `audio` slot, with `voice`, two-voice `speakers`, and `language_code` fields; raw PCM is stored as WAVE.
 - Stable Audio 2, 2.5 and 3 on a Stability `audio` slot, with `audio-to-audio` and `inpaint` ops that take an audio input.
 - The artifact store holds `mp3` and `wav`; `write_cas` and `kaibo cas write` accept them, and `inputs` takes them.
+- `consult` runs single-stage on a cast with no `explorer`: the synth does every read itself, with no `explore` tool.
 
 ### Changed
 - The consult and explore shells start every call at the project root, so a `cd` lasts only until its script ends; variables still carry over.
+- kaish 0.18: `grep` and `sed` read GNU basic regex, so `grep -rn 'fn consult(' src` runs; use `-E` for `|` alternation.
+- kaish 0.18: a write to the read-only mount reports `read-only filesystem`, and usage errors exit 2.
 - The configuration reference and template are less than half their former length.
 - A failed consultation tells the calling agent to ask the user whether to retry, use another cast, or continue without it.
 - rig 0.42: OpenRouter's output budget is now sent by rig as `max_tokens`, replacing kaibo's `max_completion_tokens` workaround.
@@ -39,9 +43,12 @@ record. Each later release appends a new section at the top.
 - The `gemini-images` backend kind is now `gemini-media`; the old name still loads.
 
 ### Fixed
+- A shell fault partway through a script keeps the stdout and stderr of the statements that ran before it.
 - `list_models` on a Gemini or Stability media backend names the `audio` slot and its model ids, not only `image`.
 - A deferred `generate` whose result cannot be collected names the provider's job id, so a paid result stays reachable.
 - `kaibo generate` refuses `--field prompt=` and `--field model=`, as the MCP tool does, so provenance names what ran.
+- A `consult` or `explore` turn cut off at `max_tokens` while reasoning gets one forced write-up from its evidence, thinking at effort `medium`, instead of discarding the investigation (a rig 0.42 regression).
+- A turn cut off at the output limit is reported as an empty answer with the budget named, not as a provider rejection.
 - A connection failure no longer reads as a provider rejection; the message names the checks to run.
 - `oneshot` and `deliberate`'s direct lane count each retried attempt, and per-call latency excludes kaibo's backoff.
 - Traces export `run_phase`'s `gen_ai.response.finish_reason` and `gen_ai.request.thinking`, which the allowlist dropped.
@@ -49,7 +56,6 @@ record. Each later release appends a new section at the top.
 - The MCP instructions put `## Scope` first and cap the cast roster at 8 lines and the allowed trees at 4, so Claude Code's 2048-character cut no longer hides Scope.
 - The instructions' cast roster always lists the default cast, tagged `direct` or `no usable key` when that applies, and counts every cast it leaves out.
 - `consult`, `consult_submit`, and `oneshot` no longer offer a cast with no `synth` slot, such as an image-only cast; naming one is refused with the tool that cast serves.
-- `consult` and `consult_submit` no longer offer a synth-only cast, which they could never run; `oneshot` still does.
 - Startup warns when the default cast (`[server] cast`) cannot run `consult`, since every call without `cast` would be refused.
 - An empty answer at the output limit says whether reasoning filled `max_tokens` and names the `effort` and `max_tokens` keys on the slot that ran.
 - A failed `oneshot` closes its trace spans with error status, so it no longer reads as a success.
