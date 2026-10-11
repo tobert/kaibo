@@ -457,6 +457,39 @@ async fn a_gated_tool_is_neither_advertised_nor_callable() {
     server.shutdown().await;
 }
 
+/// Every advertised tool says over MCP that it makes only additive changes
+/// (`destructiveHint: false`), except `job_cancel`, which stops a provider job. No tool
+/// claims `readOnlyHint`: several spend model credits, and hosts such as Codex run a
+/// read-only tool without asking. A tool added without the hint fails here.
+#[tokio::test]
+async fn every_tool_declares_additive_changes_and_none_claims_read_only() {
+    let server = Server::start().await;
+    let tools = server.tools().await;
+    assert!(!tools.is_empty(), "a keyless server advertises tools");
+
+    let mut missing = Vec::new();
+    let mut read_only = Vec::new();
+    for t in &tools {
+        let a = t.annotations.as_ref();
+        if t.name == "job_cancel" {
+            assert_ne!(
+                a.and_then(|a| a.destructive_hint),
+                Some(false),
+                "`job_cancel` stops a provider job and must not call itself additive"
+            );
+        } else if a.and_then(|a| a.destructive_hint) != Some(false) {
+            missing.push(t.name.to_string());
+        }
+        if a.and_then(|a| a.read_only_hint) == Some(true) {
+            read_only.push(t.name.to_string());
+        }
+    }
+    assert!(missing.is_empty(), "no destructiveHint:false on {missing:?}");
+    assert!(read_only.is_empty(), "readOnlyHint:true on {read_only:?}");
+
+    server.shutdown().await;
+}
+
 /// The `alwaysLoad` pin reaches the wire on `consult`, and on nothing else.
 ///
 /// Routing and meta injection are separate steps on the same router

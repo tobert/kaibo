@@ -16,6 +16,8 @@ record. Each later release appends a new section at the top.
 ## [Unreleased]
 
 ### Added
+- `decide` without `cast` uses the one cast that has a `decision` slot; with two or more it refuses and names them.
+- Every tool but `job_cancel` carries `destructiveHint: false` over MCP; none claims `readOnlyHint`, since several spend credits and Codex runs read-only tools without asking.
 - `decide` asks a fast decision model typed questions (`choice`, `score`, `noul`) about a state and returns probabilities, no text; it runs a cast's new `decision` slot on an `openrouter` backend (`typesafe/jev-1.13`), and `--no-decide` drops it.
 - `job_get` shows each role's model latency on a running job, so a slow backend shows at the first poll.
 - An async model call that reaches `slow_chat_secs` (default 60, `0` off) warns the caller through `job_wait`.

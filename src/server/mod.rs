@@ -27,7 +27,7 @@ use rmcp::model::{
     ProgressNotificationParam, ProgressToken, Prompt, PromptArgument, PromptMessage,
     ProtocolVersion, ReadResourceRequestParams, ReadResourceResponse, ReadResourceResult,
     RequestMetaObject, Resource, ResourceContents, ResourceTemplate, ResultType, Role,
-    ServerCapabilities, ServerConfig, SetLevelRequestParams,
+    ServerCapabilities, ServerConfig, SetLevelRequestParams, ToolAnnotations,
 };
 use rmcp::schemars::{self, JsonSchema};
 use rmcp::service::{Peer, RequestContext};
@@ -702,8 +702,9 @@ pub struct DecideInput {
     /// `noul`: no `criteria`; `instructions` holds the yes/no statement. At least one.
     pub questions: std::collections::BTreeMap<String, crate::decide::Question>,
 
-    /// Which cast (model team) answers; omit for the server's default. The cast needs a
-    /// `decision` slot. `kaibo://config` lists the casts.
+    /// Which cast (model team) answers. Omit it when exactly one cast has a `decision`
+    /// slot, and that cast answers; with two or more, name one. `kaibo://config` lists
+    /// the casts.
     #[serde(default)]
     pub cast: Option<String>,
 }
@@ -1411,6 +1412,16 @@ impl KaiboHandler {
         for (tools, _, _) in CAST_ENUM_RULES {
             let casts = eligible.get(tools[0]).expect("every rule seeded the map");
             inject_cast_enum(&mut tool_router, tools, casts);
+        }
+
+        // Say over MCP that every tool but `job_cancel` makes only additive changes. Kaibo
+        // keeps handler-side state (sessions, handles) and the media CAS, which never
+        // overwrites. `readOnlyHint` stays unset: several tools spend model credits, and
+        // hosts such as Codex run a read-only tool without asking.
+        for (name, route) in tool_router.map.iter_mut() {
+            if name.as_ref() != "job_cancel" {
+                route.attr.annotations = Some(ToolAnnotations::new().destructive(false));
+            }
         }
 
         // Pin `consult` resident under Claude Code's tool-schema deferral: a host may
@@ -2780,21 +2791,47 @@ impl KaiboHandler {
             `score` (criteria: 2 to 10 level names, lowest first) answers a number that can \
             fall between levels. `noul` (no criteria) answers the probability that the \
             statement in `instructions` is true. The model writes no explanation, so ask \
-            narrow questions. It reads only what you send and has no codebase access. Pick \
-            the team with `cast`. For reasoned answers with citations, use `consult`."
+            narrow questions. It reads only what you send and has no codebase access. Omit \
+            `cast` when one cast has a decision slot. For reasoned answers with citations, use `consult`."
     )]
     pub async fn decide(
         &self,
         Parameters(input): Parameters<DecideInput>,
     ) -> Result<CallToolResult, McpError> {
-        let cast = self.resolve_cast(input.cast)?;
+        let mut cast = self.resolve_cast(input.cast.clone())?;
+        // An omitted `cast` on a server whose default cannot decide uses the one cast that
+        // can; with two or more, the refusal below names them rather than picking.
+        let deciders: Vec<&String> = self
+            .config
+            .casts
+            .keys()
+            .filter(|name| self.config.cast_can_decide(name))
+            .collect();
+        if input.cast.is_none() && cast.slot(ModelRole::Decision).is_none() {
+            if let [only] = deciders.as_slice() {
+                cast = self.resolve_cast(Some((*only).clone()))?;
+            }
+        }
         let Some(slot) = cast.slot(ModelRole::Decision) else {
+            let named = if deciders.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    " Casts with a `decision` slot: {}.",
+                    deciders
+                        .iter()
+                        .map(|n| format!("`{n}`"))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            };
             return Err(McpError::invalid_params(
                 format!(
                     "cast `{}` has no `decision` slot, so it cannot decide. Pass `cast` \
                      naming one whose `decision` slot points at an `openrouter` backend; \
                      when `cast` is omitted the default applies, set by `[server] cast` in \
-                     config.toml. kaibo://config lists the configured casts and their slots.",
+                     config.toml.{named} kaibo://config lists the configured casts and \
+                     their slots.",
                     cast.name,
                 ),
                 None,
@@ -6307,6 +6344,55 @@ mod tests {
             .expect_err("a synth-only cast cannot decide");
         assert!(err.message.contains("`decision` slot"), "{}", err.message);
         assert!(err.message.contains("`talker`"), "{}", err.message);
+    }
+
+    /// A server whose default cast cannot decide, with exactly one cast that can.
+    const DECIDE_ONE_CAST_TOML: &str = r#"
+        [backends.orx]
+        kind = "openrouter"
+        key_optional = true
+
+        [casts.judge]
+        decision = "orx/typesafe/jev-1.13"
+
+        [casts.talker]
+        synth = "orx/some/model"
+
+        [server]
+        cast = "talker"
+    "#;
+
+    /// Omitting `cast` on `decide` uses the one cast that has a decision slot, so a first
+    /// call from an agent that never read the config does not fail.
+    #[tokio::test]
+    async fn decide_without_a_cast_uses_the_only_cast_with_a_decision_slot() {
+        let url = decide_server(
+            200,
+            r#"{"model":"m","answers":{"verdict":{"type":"choice","choice":"safe","probabilities":{"safe":1,"risky":0},"confidence":1}}}"#,
+        )
+        .await;
+        let h = hermetic_handler_from_toml(DECIDE_ONE_CAST_TOML).with_decisions_url(url);
+        let text = result_text(
+            h.decide(Parameters(decide_input(None, risk_question())))
+                .await
+                .expect("the one decision cast answers"),
+        );
+        assert!(text.contains("cast `judge`"), "{text}");
+    }
+
+    /// Two casts could decide, so kaibo does not pick one: the refusal names both.
+    #[tokio::test]
+    async fn decide_without_a_cast_refuses_when_two_casts_could_decide() {
+        let toml = format!(
+            "{DECIDE_ONE_CAST_TOML}\n[casts.judge2]\ndecision = \"orx/typesafe/jev-1.13\"\n"
+        );
+        let h = hermetic_handler_from_toml(&toml);
+        let err = h
+            .decide(Parameters(decide_input(None, risk_question())))
+            .await
+            .expect_err("two decision casts are ambiguous");
+        assert!(err.message.contains("`judge`"), "{}", err.message);
+        assert!(err.message.contains("`judge2`"), "{}", err.message);
     }
 
     /// The listener is never dialed (port 1): the refusal comes before any request.
