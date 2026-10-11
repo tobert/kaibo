@@ -11,14 +11,14 @@
 //! 1. The project root is mounted with [`LocalFs::read_only`], so every write,
 //!    delete, `mkdir`, `touch` (its mtime bump now routes through the backend's
 //!    `set_mtime`, which the read-only mount rejects), etc. returns
-//!    `PermissionDenied` at the VFS layer — regardless of which builtin issued it.
+//!    `ReadOnlyFilesystem` at the VFS layer — regardless of which builtin issued it.
 //!    This stops `rm`/`mv`/`cp`/`mkdir`/`tee`/`write`/`touch`.
 //! 2. `/` is [`MemoryFs`], so paths *outside* the project resolve to ephemeral
 //!    in-memory scratch that vanishes with the kernel and never touches disk —
 //!    including where `mktemp` lands (it resolves its parent through the VFS, so a
 //!    temp file is created in memory, never on the real `/tmp`).
-//! 3. [`KernelConfig::with_allow_external_commands(false)`] — belt-and-suspenders
-//!    now that `subprocess` is off; refuses any external-command path.
+//! 3. [`KernelConfig::with_allow_unwrapped_commands(false)`] — belt-and-suspenders
+//!    now that `subprocess` is off; refuses PATH lookup, `exec`, `spawn`, and `env CMD`.
 //!
 //! There used to be a fourth lever: a hardcoded `DENYLIST` shadow-blocking `touch`
 //! and `mktemp`, which reached real state directly via `std::fs` and bypassed the
@@ -43,8 +43,8 @@ use kaish_kernel::interpreter::ExecResult;
 use kaish_kernel::tools::{Tool, ToolArgs, ToolCtx, ToolRegistry, ToolSchema};
 use kaish_kernel::vfs::{ByteBudget, Filesystem, LocalFs, MemoryFs, VfsRouter};
 use kaish_kernel::{
-    IgnoreConfig, Kernel, KernelBackend, KernelConfig, LocalBackend, OutputLimitConfig, ReadRange,
-    RECOMMENDED_STACK_SIZE,
+    IgnoreConfig, Kernel, KernelBackend, KernelConfig, KernelError, LocalBackend,
+    OutputLimitConfig, ReadRange, RECOMMENDED_STACK_SIZE,
 };
 
 /// Wraps a real builtin, preserving its identity and schema but refusing to run.
@@ -65,8 +65,8 @@ impl Tool for Blocked {
     async fn execute(&self, _args: ToolArgs, _ctx: &mut dyn ToolCtx) -> ExecResult {
         // Exit **126** = a builtin an operator disabled in config. NOT the read-only
         // refusal: the mount refuses a write structurally, with the VFS's own exit 1
-        // and `permission denied: filesystem is read-only`. Conflating the two is the
-        // error six published strings carried for two months; keep them apart here.
+        // and `read-only filesystem`. Conflating the two is the error six published
+        // strings carried for two months; keep them apart here.
         // The kernel's other non-zero codes a caller may see: 124 = killed for
         // exceeding [`KAISH_EXEC_TIMEOUT`], 130 = cancelled, 127 = command not
         // found, -1 = kaish could not run the script (parse, validation, or an
@@ -283,7 +283,7 @@ fn build_readonly_kernel_and_vfs(
     // orientation repo-map, which enumerates through this same kernel.
     let config = KernelConfig::agent()
         .with_cwd(root)
-        .with_allow_external_commands(false)
+        .with_allow_unwrapped_commands(false)
         .with_request_timeout(sandbox.exec_timeout)
         .with_output_limit(output_limit)
         .with_ignore_config(sandbox.ignore.clone());
@@ -329,12 +329,11 @@ pub fn builtin_names() -> Result<Vec<String>> {
 /// Run one kaish script in the sandbox and hand back the raw kernel result.
 ///
 /// A non-zero `code` (or non-empty `err`) is a normal in-band outcome the
-/// explorer should see — we only `Err` on a kernel-level failure.
-pub async fn run(kernel: &Kernel, script: &str) -> Result<ExecResult> {
-    kernel
-        .execute(script)
-        .await
-        .context("kaish kernel execution failed")
+/// explorer should see. This returns `Err` only when kaish could not run the
+/// script: a parse or validation rejection, or a fault partway through. The error
+/// stays typed so [`KaishOutput::from_error`] can keep the output a fault carries.
+pub async fn run(kernel: &Kernel, script: &str) -> std::result::Result<ExecResult, KernelError> {
+    kernel.execute(script).await
 }
 
 /// A plain, `Send` snapshot of one execution — what crosses the worker boundary.
@@ -389,6 +388,35 @@ impl KaishOutput {
             stdout: r.text_out().into_owned(),
             stderr: r.err.clone(),
         }
+    }
+
+    /// Flatten a script kaish could not run into the `-1` snapshot.
+    ///
+    /// Every [`KernelError`] is `-1`, with the reason on stderr after the
+    /// `kaish kernel execution failed:` prefix the worker has always written. A
+    /// rejection (parse or validation) ran nothing, so it carries no output. A fault
+    /// partway through ([`KernelError::Execution`], kaish 0.18) carries what ran
+    /// before it: the stdout and stderr of the earlier statements, and the part of
+    /// the faulting statement that ran. That output goes through
+    /// [`Self::from_result`], binary guard included, so `echo left; x=$((1/0))`
+    /// shows `left` instead of an empty stdout beside the error. The reason comes
+    /// last on stderr, after anything the script wrote there itself.
+    pub fn from_error(e: &KernelError) -> Self {
+        let reason = format!("kaish kernel execution failed: {e:#}");
+        let mut out = match e {
+            KernelError::Execution { output, .. } => Self::from_result(output),
+            _ => Self {
+                code: -1,
+                stdout: String::new(),
+                stderr: String::new(),
+            },
+        };
+        out.code = -1;
+        if !out.stderr.is_empty() && !out.stderr.ends_with('\n') {
+            out.stderr.push('\n');
+        }
+        out.stderr.push_str(&reason);
+        out
     }
 }
 
@@ -490,11 +518,7 @@ impl KaishWorker {
                             Job::Run { script, reply } => {
                                 let out = match run(&kernel, &script).await {
                                     Ok(r) => KaishOutput::from_result(&r),
-                                    Err(e) => KaishOutput {
-                                        code: -1,
-                                        stdout: String::new(),
-                                        stderr: format!("{e:#}"),
-                                    },
+                                    Err(e) => KaishOutput::from_error(&e),
                                 };
                                 // Receiver gone (caller cancelled) is fine — drop it.
                                 let _ = reply.send(out);

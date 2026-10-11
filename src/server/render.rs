@@ -520,8 +520,22 @@ pub(crate) fn append_warnings(mut answer: String, warnings: &[String]) -> String
     answer
 }
 
+/// The provenance roles for a `consult`: explorer then synth, or the synth alone when
+/// the cast ran single-stage with no explorer. Shared by both MCP lanes and the CLI so
+/// the footer names exactly the models that ran.
+pub(crate) fn consult_models<'a>(
+    explorer: Option<&'a str>,
+    synth: &'a str,
+) -> Vec<(&'static str, &'a str)> {
+    explorer
+        .map(|e| ("explorer", e))
+        .into_iter()
+        .chain([("synth", synth)])
+        .collect()
+}
+
 /// Append a provenance footer naming the cast and model(s) that produced `answer`.
-/// `roles` labels each model: one for `oneshot`, explorer+synth for `consult`.
+/// `roles` labels each model: one for `oneshot`, [`consult_models`] for `consult`.
 pub(crate) fn with_provenance(
     answer: String,
     cast: &str,

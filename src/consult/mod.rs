@@ -4,7 +4,8 @@
 //! a bounded tool loop. Every tool on the surface is that loop wearing different
 //! clothes:
 //!
-//! - [`consult`] — the synthesis agent · `{run_kaish, explore′}` · optional context → a
+//! - [`consult`] — the synthesis agent · `{run_kaish, explore′}` (or `{run_kaish}` alone
+//!   on a cast with no explorer — single-stage) · optional context → a
 //!   cited answer. No rigid explorer→synth hand-off: the synthesis agent decides when
 //!   to delegate a broad sweep to the cheap [`RunExplore`] sub-agent vs. read a span
 //!   directly. The `explore′` sweep ([`report_preamble`]) is internal to this loop.
@@ -39,8 +40,8 @@ pub use engine::{
 pub(crate) use engine::{failure_class, run_phase, run_phase_logged};
 pub use prompts::{
     batch_preamble, batch_system_prompt, consult_preamble, consult_user_prompt,
-    deliberation_prompt, oneshot_preamble, report_preamble, resolve_phase_preamble, ReportReader,
-    sweep_evidence_block, ConsultAttachment, Phase, PromptOverrides,
+    deliberation_prompt, oneshot_preamble, report_preamble, resolve_phase_preamble,
+    sweep_evidence_block, ConsultAttachment, Phase, PromptOverrides, ReportReader,
 };
 pub use shaping::{
     accepted_efforts, effort_rank, effort_sinks, hosted_openai_accepts_reasoning,

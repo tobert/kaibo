@@ -191,7 +191,7 @@ synth    = "claude/claude-sonnet-5-5"       # the model that answers
 # explorer = { backend = "openai-local", id = "Gemma-4-E4B-it", preamble = "..." }
 ```
 
-**Roles.** `explorer`, `synth`, `image`, and `audio`. A misspelled role, or a
+**Roles.** `explorer`, `synth`, `image`, `audio`, and `decision`. A misspelled role, or a
 misspelled per-slot key, is a load error rather than a silent no-op. `image` and
 `audio` are the media members: each points at a media-kind backend that produces its
 output, and staffs the `generate` tool — `media = "image"` (the default) runs the
@@ -208,10 +208,30 @@ generation request, not a reasoning loop, so the reasoning tunables (`effort`,
 `thinking_budget`, `temperature`, ...) written on it are inert — `kaibo://config`
 flags them under `inert_tunables`.
 
+`decision` points at a backend of kind `openrouter` and staffs the `decide` tool: one request
+to OpenRouter's Decisions API (`POST /api/alpha/decisions`) with typed questions about a
+state, answered with probabilities and no text. The model id is the provider's, for
+example `typesafe/jev-1.13` or `~typesafe/jev-latest`. A decision slot on any other kind
+is a load error. Like a media slot it runs no reasoning loop, so reasoning tunables
+written on it are inert.
+
 A cast may omit a role. The interactive built-ins carry explorer + synth; the batch
 built-ins carry `synth` only; none carries a media slot. A user cast that omits a role is
 valid config, and the tool needing the missing role fails at call time naming the gap
 (`cast "lite" has no synth slot`). Absent means the capability is absent.
+
+**Single-stage `consult`.** A cast with an interactive `synth` and no `explorer` runs
+`consult` as one model: the synth does every read itself through `run_kaish`, and it is
+not offered `explore`. Its preamble is the `consult` driver's, with the delegation
+paragraph replaced by one on searching with `grep -rn`; a `[prompts] consult` override
+applies to both. The provenance
+footer names only the synth, and the CLI `--json` envelope sets `models.explorer` to
+`null`. `explore` and `deliberate` still need an `explorer` slot.
+
+```toml
+[casts.flash-solo]
+synth = { backend = "deepseek", id = "deepseek-flash", effort = "xhigh" }
+```
 
 **Slot references.** An unknown backend in a slot is a load error naming the known
 backends. An empty model id is rejected at load, since it would otherwise surface as an
@@ -642,7 +662,7 @@ The rename map ships as load errors, never silent reinterpretation:
 A tool clears **two** gates to be advertised: the `[server.tools]` flag (equivalently
 `--no-<tool>` or `KAIBO_NO_<TOOL>`), and a configured cast that can **staff** it.
 
-The eight flags are *capability* switches, not one per MCP tool. `consult` gates both
+The nine flags are *capability* switches, not one per MCP tool. `consult` gates both
 `consult` and `consult_submit`; `batch` gates `batch_submit`; the `job_*` verbs have no
 flag of their own and follow whichever handle producers are live. `generate` clears a
 third gate as well: the media CAS must be on (`[cas] enabled`), because an
@@ -655,17 +675,17 @@ Which cast shape staffs which tool:
 
 | tool | needs |
 |---|---|
-| `consult`, `consult_submit` | a cast with an `explorer` slot **and** a `synth` slot that answers **interactively** (no offline lane) |
-| `oneshot` | a cast with a `synth` slot that answers **interactively** (no offline lane) |
+| `consult`, `consult_submit`, `oneshot` | a cast with a `synth` slot that answers **interactively** (no offline lane). Without an `explorer` slot, `consult` runs single-stage. |
 | `explore` | a cast with an `explorer` slot |
 | `batch_submit` | a cast whose synth runs on `lane = "batch"` (or the `batch = true` sugar) |
 | `deliberate` | a cast with an `explorer` **and** an offline synth (`lane = "batch"` or `lane = "direct"`) |
 | `generate` | a cast with an `image` slot (kind `stability`, `openai-images`, `gemini-media`, `dashscope`, or `bfl`) or an `audio` slot (kind `gemini-media` or `stability`) — plus `[cas]` on |
+| `decide` | a cast with a `decision` slot (kind `openrouter`) |
 | `job_get`, `job_cancel`, `job_list`, `job_wait` | at least one live handle *producer*; they follow whatever survives above |
 | `run_kaish`, `list_models` | no cast at all; advertised whenever their flag is on |
 
 No built-in cast has a media slot or pairs an explorer with an offline synth, so
-`generate` and `deliberate` need a configured cast before they appear.
+`generate`, `deliberate`, and `decide` need a configured cast before they appear.
 
 ### Finding out why a tool is missing
 

@@ -24,6 +24,7 @@ run_kaish = true
 batch = true                       # batch_submit; requires batch synth
 list_models = true
 generate = true                     # requires image or audio slot + CAS
+decide = true                       # requires decision slot
 # job_* tools follow enabled producers; read_cas/write_cas follow cas.enabled.
 
 [defaults]
@@ -246,6 +247,10 @@ synth = { backend = "gemma", id = "Big-Local-70B-GGUF", lane = "direct" }
 # api_key_env = "BFL_API_KEY"
 # [casts.flux-artist]
 # image = "bfl/flux-2-pro"
+
+# Typed questions answered with probabilities need a decision slot on an openrouter backend.
+# [casts.judge]
+# decision = "openrouter/typesafe/jev-1.13"   # the `decide` tool; ~typesafe/jev-latest tracks the newest
 
 # House rules: project files read if present; user files required when a phase runs.
 # [context]

@@ -136,3 +136,59 @@ async fn worker_denies_writes_to_real_files() {
     assert!(!r.ok(), "rm must be denied through the worker too");
     assert!(victim.exists(), "the real file must survive");
 }
+
+/// A shell fault partway through a script keeps what ran before it. kaish reports the
+/// fault as `KernelError::Execution { error, output }`, and `output` holds the stdout
+/// and stderr of every statement that ran first. The worker passes that output through
+/// with the `-1` code, so the model sees `left` instead of an empty stdout beside an
+/// error. Teeth: dropping `output` (the pre-0.18 worker built an empty `stdout` for
+/// every `Err`) leaves `stdout` empty and fails the `left` assertion, while the code and
+/// the fault's cause are asserted too, so a fix that turns the fault into a success
+/// cannot pass either.
+#[tokio::test]
+async fn worker_keeps_the_output_that_ran_before_a_fault() {
+    let dir = tempdir().unwrap();
+    let worker = KaishWorker::spawn(dir.path()).unwrap();
+
+    let r = worker
+        .run("echo left; echo warned >&2; x=$((1/0)); echo never")
+        .await
+        .unwrap();
+
+    assert_eq!(
+        r.code, -1,
+        "a shell fault partway through exits -1, got {r:?}"
+    );
+    assert!(
+        r.stdout.contains("left"),
+        "stdout must keep what ran before the fault, got {r:?}"
+    );
+    assert!(
+        !r.stdout.contains("never"),
+        "nothing after the fault may run, got {r:?}"
+    );
+    assert!(
+        r.stderr.contains("warned"),
+        "stderr must keep what ran before the fault, got {r:?}"
+    );
+    assert!(
+        r.stderr.contains("divides by zero"),
+        "stderr must still name the fault, got {r:?}"
+    );
+    // Kept once each, in order: the script's own stderr, then the reason. A fault
+    // carried in both `output.err` and the error's message would name it twice, and a
+    // flattening that copied stdout into stderr would put `left` there.
+    assert_eq!(
+        r.stderr.matches("divides by zero").count(),
+        1,
+        "the fault must be named once, got {r:?}"
+    );
+    assert!(
+        !r.stderr.contains("left"),
+        "stdout must not be duplicated into stderr, got {r:?}"
+    );
+    assert!(
+        r.stderr.find("warned") < r.stderr.find("divides by zero"),
+        "the script's own stderr comes before the reason, got {r:?}"
+    );
+}

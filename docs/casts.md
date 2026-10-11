@@ -94,7 +94,9 @@ Rules, in the loud-over-silent house style:
 - **A cast may omit roles.** Built-ins always carry explorer+synth; a user
   cast that omits one is valid config — the tool that needs the missing role
   fails loudly *at call time*, naming the gap ("cast `lite` has no synth
-  slot"). Absent = capability absent.
+  slot"). Absent = capability absent. The one exception is `consult`, which
+  runs single-stage on a synth-only cast: the synth reads everything itself
+  and is not offered `explore`.
 - **`[profiles]` is deleted, not deprecated.** A config that still says
   `[profiles.x]` gets a load error pointing at this doc. Amy is the only
   user; git history is the record.

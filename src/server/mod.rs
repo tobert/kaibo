@@ -84,8 +84,8 @@ use render::{
     wait_level_floor, wait_level_label,
 };
 pub(crate) use render::{
-    batch_within_window, consultation_failure_text, now_epoch_secs, with_provenance,
-    BATCH_RECENCY_WINDOW_SECS,
+    batch_within_window, consult_models, consultation_failure_text, now_epoch_secs,
+    with_provenance, BATCH_RECENCY_WINDOW_SECS,
 };
 
 /// kaibo's resource URI namespace. Everything kaish-related hangs off `kaibo://kaish/`.
@@ -257,6 +257,9 @@ pub struct ToolGating {
     /// on (`[cas] enabled`), since artifacts must have somewhere to land — see
     /// `live_tools`.
     pub generate: bool,
+    /// The `decide` tool (typed questions answered with probabilities through a cast's
+    /// `decision` slot) — its own gate; it also needs a cast that can staff it.
+    pub decide: bool,
 }
 
 impl Default for ToolGating {
@@ -270,6 +273,7 @@ impl Default for ToolGating {
             batch: true,
             list_models: true,
             generate: true,
+            decide: true,
         }
     }
 }
@@ -292,6 +296,7 @@ impl ToolGating {
             "batch_submit" => self.batch,
             "list_models" => self.list_models,
             "generate" => self.generate,
+            "decide" => self.decide,
             _ => true,
         }
     }
@@ -306,6 +311,7 @@ impl ToolGating {
             && !self.batch
             && !self.list_models
             && !self.generate
+            && !self.decide
     }
 }
 
@@ -365,7 +371,8 @@ pub struct ConsultInput {
 
     /// Attach the explorer's aggregated report as `structured_content` alongside the
     /// answer, for debugging the hand-off. Off by default (it can be large; an empty
-    /// report means the consult delegated no sweep).
+    /// report means no sweep ran: the synth read everything itself, or the cast has no
+    /// explorer).
     #[serde(default)]
     pub include_report: bool,
 
@@ -677,6 +684,30 @@ pub struct GenerateInputRef {
     pub digest: String,
 }
 
+/// Arguments for [`KaiboHandler::decide`]: the state to judge and the typed questions to
+/// answer about it. No `path`: the model reads only what is sent here.
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct DecideInput {
+    /// What to decide about: a string, or a JSON object or array. The model reads nothing
+    /// else, so include everything the questions need. The provider refuses a state past
+    /// its context limit (about 32k tokens) with `max_tokens_exceeded`; it does not
+    /// truncate.
+    pub state: serde_json::Value,
+
+    /// The questions, as an object from your own question id to
+    /// `{"type": "choice"|"score"|"noul", "instructions": "...", "criteria": ...}`.
+    /// `choice`: `criteria` is an object from label to meaning, 2 to 255 labels; include an
+    /// `other` label. `score`: `criteria` is an array of 2 to 10 level names, lowest first.
+    /// `noul`: no `criteria`; `instructions` holds the yes/no statement. At least one.
+    pub questions: std::collections::BTreeMap<String, crate::decide::Question>,
+
+    /// Which cast (model team) answers; omit for the server's default. The cast needs a
+    /// `decision` slot. `kaibo://config` lists the casts.
+    #[serde(default)]
+    pub cast: Option<String>,
+}
+
 /// Arguments for [`KaiboHandler::write_cas`] — where the file is, and an optional label.
 ///
 /// Exactly one of `path` and `content`. There is no destination of any kind (the address
@@ -897,6 +928,9 @@ pub struct KaiboHandler {
     /// in a factory returning a scripted model via
     /// [`with_media_arms`](Self::with_media_arms).
     media_arms: Arc<dyn crate::media::MediaArmFactory>,
+    /// Replaces the Decisions endpoint a backend kind would use. Always `None` outside
+    /// tests; see [`with_decisions_url`](Self::with_decisions_url).
+    decisions_url: Option<String>,
 }
 
 /// One `CAST_ENUM_RULES` entry: the tools sharing a cast eligibility, the predicate
@@ -935,15 +969,10 @@ type CastEnumRule = (
 /// budget-limited display (it caps the line count and always lists the default, usable or
 /// not) — a presentation choice distinct from tool eligibility.
 const CAST_ENUM_RULES: &[CastEnumRule] = &[
+    // `consult` runs single-stage on a synth-only cast (the synth reads for itself) and
+    // `oneshot` runs the synth alone, so all three need only an interactive synth.
     (
-        &["consult", "consult_submit"],
-        Config::cast_can_consult,
-        "a cast with an `explorer` slot and a `synth` slot that answers interactively (a \
-         synth with no offline `lane`)",
-    ),
-    // `oneshot` runs the synth alone, so a synth-only cast staffs it.
-    (
-        &["oneshot"],
+        &["consult", "consult_submit", "oneshot"],
         Config::cast_is_interactive,
         "a cast with a `synth` slot that answers interactively (a synth with no offline \
          `lane`)",
@@ -971,6 +1000,15 @@ const CAST_ENUM_RULES: &[CastEnumRule] = &[
     // `generate` runs no reasoning slot at all: it needs the cast's media member. The
     // media CAS gate ([cas] enabled) rides separately in `live_tools` — this rule is
     // only the staffing half.
+    // `decide` runs the cast's `decision` slot alone: one request to a Decisions API, no
+    // reasoning phase and no CAS.
+    (
+        &["decide"],
+        Config::cast_can_decide,
+        "a cast with a `decision` slot pointing at a backend with a Decisions route (kind \
+         `openrouter`, model `typesafe/jev-1.13`) — see the decision-slot example in \
+         docs/config.example.toml",
+    ),
     (
         &["generate"],
         Config::cast_can_generate,
@@ -1027,15 +1065,14 @@ fn default_cast_consult_warning(
     eligible: &std::collections::HashMap<&'static str, Vec<String>>,
 ) -> Option<String> {
     let cast = config.resolve_cast(&config.default_cast).ok()?;
-    if config.cast_can_consult(&cast.name) {
+    if config.cast_is_interactive(&cast.name) {
         return None;
     }
-    let why = if cast.slot(ModelRole::Synth).is_none() {
-        "it has no `synth` slot".to_string()
-    } else if let Some(lane) = cast.synth_lane() {
-        format!("its synth runs on the offline `{}` lane", lane.as_str())
-    } else {
-        "it has no `explorer` slot".to_string()
+    let why = match cast.synth_lane() {
+        Some(lane) if cast.slot(ModelRole::Synth).is_some() => {
+            format!("its synth runs on the offline `{}` lane", lane.as_str())
+        }
+        _ => "it has no `synth` slot".to_string(),
     };
     let example = eligible
         .get("consult")
@@ -1045,8 +1082,7 @@ fn default_cast_consult_warning(
     Some(format!(
         "default cast `{name}` cannot staff `consult`: {why}. Every `consult` or \
          `consult_submit` call that omits `cast` will be refused. Set `[server] cast` in \
-         config.toml to a cast with an `explorer` slot and an interactive `synth` \
-         slot{example} (`kaibo example-config` shows the shape).",
+         config.toml to a cast with an interactive `synth` slot{example} (`kaibo example-config` shows the shape).",
         name = cast.name,
     ))
 }
@@ -1075,6 +1111,7 @@ fn gating_key_for(name: &str) -> Option<&'static str> {
         "batch_submit" => Some("batch"),
         "list_models" => Some("list_models"),
         "generate" => Some("generate"),
+        "decide" => Some("decide"),
         _ => None,
     }
 }
@@ -1082,7 +1119,7 @@ fn gating_key_for(name: &str) -> Option<&'static str> {
 /// Every `#[tool]` route name kaibo can advertise — the fixed universe [`live_tools`]
 /// filters. `KaiboHandler::new` asserts each really exists on the router, so a renamed
 /// tool method fails the build rather than leaving a gate quietly inert.
-pub(crate) const ALL_TOOL_NAMES: [&str; 15] = [
+pub(crate) const ALL_TOOL_NAMES: [&str; 16] = [
     "consult",
     "consult_submit",
     "explore",
@@ -1091,6 +1128,7 @@ pub(crate) const ALL_TOOL_NAMES: [&str; 15] = [
     "run_kaish",
     "batch_submit",
     "generate",
+    "decide",
     "read_cas",
     "write_cas",
     "job_get",
@@ -1149,6 +1187,9 @@ pub(crate) fn live_tools(config: &Config, usable: &[String]) -> Vec<&'static str
     // ([cas] enabled = false is the operator's explicit choice; the startup log and
     // kaibo://config's [cas] section name it, distinct from the unstaffable warning).
     let generate_live = gating.generate && can_staff("generate") && config.cas.enabled;
+    // `decide` writes nothing (the answers return inline), so unlike `generate` it needs no
+    // CAS: its flag and a cast with a `decision` slot are the whole gate.
+    let decide_live = gating.decide && can_staff("decide");
     // `read_cas` is the retrieval half of the artifact contract, keyed on the SAME
     // liveness the resource it replaces was keyed on: a live media CAS, nothing else. It
     // takes no cast (there is no model in a byte range) and it is deliberately NOT tied to
@@ -1180,6 +1221,9 @@ pub(crate) fn live_tools(config: &Config, usable: &[String]) -> Vec<&'static str
         // Media generation through the cast's image slot; a deferred operation mints a
         // `job-N`, so it is a job producer like the three above.
         (generate_live, "generate"),
+        // Typed questions answered with probabilities. One request, no handle: not a job
+        // producer.
+        (decide_live, "decide"),
         // Client-side retrieval by digest. Operator surface, like the resource it
         // replaces: the inner model team never carries it.
         (read_cas_live, "read_cas"),
@@ -1430,6 +1474,7 @@ impl KaiboHandler {
             // The real network-client builders; tests swap in a scripted double.
             batch_providers: Arc::new(crate::batch::LiveBatchProviders),
             media_arms: Arc::new(crate::media::LiveMediaArms),
+            decisions_url: None,
         })
     }
 
@@ -1543,6 +1588,13 @@ impl KaiboHandler {
     #[cfg(test)]
     pub fn with_media_arms(mut self, arms: Arc<dyn crate::media::MediaArmFactory>) -> Self {
         self.media_arms = arms;
+        self
+    }
+
+    /// Point `decide` at a local listener instead of the provider's endpoint.
+    #[cfg(test)]
+    pub fn with_decisions_url(mut self, url: String) -> Self {
+        self.decisions_url = Some(url);
         self
     }
 
@@ -1678,11 +1730,6 @@ impl KaiboHandler {
     /// Shim over [`Resolver::require_interactive_cast`].
     fn require_interactive_cast(&self, cast: &Cast, tool: &str) -> Result<(), McpError> {
         self.resolver.require_interactive_cast(cast, tool)
-    }
-
-    /// Shim over [`Resolver::require_consult_cast`].
-    fn require_consult_cast(&self, cast: &Cast, tool: &str) -> Result<(), McpError> {
-        self.resolver.require_consult_cast(cast, tool)
     }
 
     /// Shim over [`Resolver::require_batch_cast`] — the resolution glue lives on the
@@ -1863,7 +1910,7 @@ impl KaiboHandler {
             answer with `file:line` citations. A synthesis agent (DeepSeek, Gemini, \
             Anthropic, OpenRouter, or local — pick with `cast`) drives a READ-ONLY shell over \
             the project: it reads the real, current source, delegates broad sweeps to a fast \
-            explorer, and answers with evidence, never modifying anything. Describe your \
+            explorer when its cast has one, and answers with evidence, never modifying anything. Describe your \
             intent in prose; kaibo locates the code itself, so you don't paste files or \
             diffs. `attach` puts specific files in front of it; `session_id` threads a \
             multi-turn consultation. For a toolless opinion use `oneshot`; to run in the \
@@ -1879,7 +1926,7 @@ impl KaiboHandler {
         // Resolve the cast, layer per-call model overrides onto the clone, then
         // resolve each phase's slot into its own arm (client + request shape).
         let mut cast = self.resolve_cast(input.cast)?;
-        self.require_consult_cast(&cast, "consult")?;
+        self.require_interactive_cast(&cast, "consult")?;
         self.apply_model_override(
             &mut cast,
             ModelRole::Explorer,
@@ -1896,7 +1943,8 @@ impl KaiboHandler {
             "synth_model",
             "synth_backend",
         )?;
-        let explorer = self.arm(&cast, ModelRole::Explorer)?;
+        // A synth-only cast has no explorer: `consult` runs single-stage.
+        let explorer = self.resolver.optional_arm(&cast, ModelRole::Explorer)?;
         let synth = self.arm(&cast, ModelRole::Synth)?;
         // Progress rides the whole investigation: sweeps and direct reads emit beats
         // onto the wire when the client supplied a token, else a no-op sink.
@@ -1956,7 +2004,7 @@ impl KaiboHandler {
         let span = tracing::info_span!(
             "consult",
             cast = %cast.name,
-            explorer_model = %explorer.model,
+            explorer_model = explorer.as_ref().map_or("none", |a| a.model.as_str()),
             synth_model = %synth.model,
             session = session.is_some(),
         );
@@ -1965,7 +2013,7 @@ impl KaiboHandler {
             &input.question,
             input.context.as_deref(),
             root,
-            &explorer,
+            explorer.as_ref(),
             &synth,
             &cfg,
             session,
@@ -2000,7 +2048,7 @@ impl KaiboHandler {
             &out.warnings,
             cfg.artifacts.as_deref(),
             &cast.name,
-            &[("explorer", &explorer.model), ("synth", &synth.model)],
+            &consult_models(explorer.as_ref().map(|a| a.model.as_str()), &synth.model),
             &out.usage,
         );
         Ok(consult_result(answer, out.report, input.include_report))
@@ -2023,7 +2071,7 @@ impl KaiboHandler {
         // refusable work (bad cast, bad path, missing key) happens *here*, synchronously,
         // so a bad submit is a clean error, not a job that fails on poll.
         let mut cast = self.resolve_cast(input.cast)?;
-        self.require_consult_cast(&cast, "consult_submit")?;
+        self.require_interactive_cast(&cast, "consult_submit")?;
         self.apply_model_override(
             &mut cast,
             ModelRole::Explorer,
@@ -2040,7 +2088,7 @@ impl KaiboHandler {
             "synth_model",
             "synth_backend",
         )?;
-        let explorer = self.arm(&cast, ModelRole::Explorer)?;
+        let explorer = self.resolver.optional_arm(&cast, ModelRole::Explorer)?;
         let synth = self.arm(&cast, ModelRole::Synth)?;
         let defaults = &self.config.defaults;
         // Resolve + classify + gate before spawning: a bad attach (or an image to a blind
@@ -2103,10 +2151,12 @@ impl KaiboHandler {
         let session_id = input.session_id.clone();
         let include_report = input.include_report;
         let cast_name = cast.name.clone();
-        let explorer_model = explorer.model.clone();
+        let explorer_model = explorer.as_ref().map(|a| a.model.clone());
         let synth_model = synth.model.clone();
-        let label =
-            format!("cast `{cast_name}` (explorer `{explorer_model}`, synth `{synth_model}`)");
+        let label = match &explorer_model {
+            Some(e) => format!("cast `{cast_name}` (explorer `{e}`, synth `{synth_model}`)"),
+            None => format!("cast `{cast_name}` (synth `{synth_model}`, single-stage)"),
+        };
 
         let job_id = self.jobs.submit(label, progress_log, async move {
             let session = session_id.as_ref().map(|id| (&sessions, id.as_str()));
@@ -2114,7 +2164,7 @@ impl KaiboHandler {
                 &question,
                 context.as_deref(),
                 root,
-                &explorer,
+                explorer.as_ref(),
                 &synth,
                 &cfg,
                 session,
@@ -2127,10 +2177,7 @@ impl KaiboHandler {
                         &out.warnings,
                         cfg.artifacts.as_deref(),
                         &cast_name,
-                        &[
-                            ("explorer", explorer_model.as_str()),
-                            ("synth", synth_model.as_str()),
-                        ],
+                        &consult_models(explorer_model.as_deref(), &synth_model),
                         &out.usage,
                     );
                     Ok(JobResult {
@@ -2724,16 +2771,114 @@ impl KaiboHandler {
     }
 
     #[tool(
+        description = "Ask a fast decision model typed questions about a state and get \
+            probabilities back instead of text: a quick, cheap check for classification, \
+            routing, or a safety call, and a second opinion from another model family. \
+            `state` is a string or JSON; `questions` maps your own question ids to \
+            `{type, instructions, criteria}`. `choice` (criteria: label to meaning, 2 to 255 \
+            labels, include `other`) answers a label with `probabilities` and `confidence`. \
+            `score` (criteria: 2 to 10 level names, lowest first) answers a number that can \
+            fall between levels. `noul` (no criteria) answers the probability that the \
+            statement in `instructions` is true. The model writes no explanation, so ask \
+            narrow questions. It reads only what you send and has no codebase access. Pick \
+            the team with `cast`. For reasoned answers with citations, use `consult`."
+    )]
+    pub async fn decide(
+        &self,
+        Parameters(input): Parameters<DecideInput>,
+    ) -> Result<CallToolResult, McpError> {
+        let cast = self.resolve_cast(input.cast)?;
+        let Some(slot) = cast.slot(ModelRole::Decision) else {
+            return Err(McpError::invalid_params(
+                format!(
+                    "cast `{}` has no `decision` slot, so it cannot decide. Pass `cast` \
+                     naming one whose `decision` slot points at an `openrouter` backend; \
+                     when `cast` is omitted the default applies, set by `[server] cast` in \
+                     config.toml. kaibo://config lists the configured casts and their slots.",
+                    cast.name,
+                ),
+                None,
+            ));
+        };
+        let backend = self
+            .config
+            .resolve_backend(&slot.backend)
+            .map_err(|e| McpError::internal_error(format!("{e:#}"), None))?;
+        let url = match (&self.decisions_url, backend.kind.decisions_url()) {
+            (Some(url), _) => url.clone(),
+            (None, Some(url)) => url.to_string(),
+            (None, None) => {
+                return Err(McpError::internal_error(
+                    format!(
+                        "backend `{}` (kind `{}`) has no Decisions route; config load \
+                         should have refused this cast",
+                        backend.name,
+                        backend.kind.canonical_name(),
+                    ),
+                    None,
+                ))
+            }
+        };
+        // Validate before resolving the key: the key may come from an operator command.
+        let mut request =
+            crate::decide::DecisionRequest::new(slot.id.clone(), input.state, input.questions)
+                .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
+        // The backend's `data_collection` pin rides this request too, as it does every
+        // OpenRouter completion.
+        if backend.data_collection == crate::config::DataCollection::Deny {
+            request = request.deny_data_collection();
+        }
+        let key = backend.resolve_key().map_err(|e| {
+            McpError::invalid_params(format!("cast `{}` decision slot: {e:#}", cast.name), None)
+        })?;
+        let client = crate::decide::DecisionClient::new(url, key, backend.request_timeout)
+            .map_err(|e| McpError::internal_error(format!("{e:#}"), None))?;
+
+        let span = tracing::info_span!(
+            "decide",
+            cast = %cast.name,
+            model = %slot.id,
+            otel.status_code = tracing::field::Empty,
+        );
+        match client.decide(&request).instrument(span.clone()).await {
+            Ok(resp) => {
+                let body = serde_json::to_string_pretty(&resp.answers)
+                    .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+                Ok(CallToolResult::success(vec![ContentBlock::text(format!(
+                    "{body}\n\n———\nkaibo · cast `{}` · model `{}`{}",
+                    cast.name,
+                    resp.model,
+                    resp.usage
+                        .footer()
+                        .map(|line| format!("\n{line}"))
+                        .unwrap_or_default(),
+                ))]))
+            }
+            Err(e) => {
+                span.record("otel.status_code", "ERROR");
+                Ok(CallToolResult::error(vec![ContentBlock::text(format!(
+                    "decide failed on cast `{}` (model `{}`): {e}. {}",
+                    cast.name,
+                    slot.id,
+                    e.next_step(),
+                ))]))
+            }
+        }
+    }
+
+    #[tool(
         description = "Run a kaish (sh-like) script against the READ-ONLY project; \
             returns exit code + stdout + stderr. Read generously with line numbers — \
             `cat -n FILE` for a whole file, `grep -rn PATTERN` to locate across \
             files — and compose builtins with pipes (grep/jq/awk/find/...). Writes are \
-            refused (exit 1, stderr `permission denied: filesystem is read-only`) and \
-            external commands are unreachable (exit 127); 124 = timed out; -1 = kaish \
-            could not run the script (a parse or validation failure, where nothing ran, \
-            or a shell error partway through; stderr says why). A \
-            grep PATTERN is a regex: search literal text with \
-            `grep -rnF 'fn consult(' src`. Each call starts fresh at the project root. \
+            refused (exit 1, stderr ending `read-only filesystem`) and external commands \
+            are unreachable (exit 127); 124 = timed out; -1 = kaish could not run the \
+            script (a parse or validation failure, where nothing ran, or a shell error \
+            partway through, where stdout and stderr keep what ran before it; stderr says \
+            why). \
+            `grep` reads GNU BRE, as GNU grep does: `grep -rn 'fn consult(' src` finds \
+            the text `fn consult(`, and for alternation use `-E`: \
+            `grep -rnE 'consult|explore' src`. Each call starts fresh at the project root. \
             See `kaibo://kaish/*` (or `help` in the script) for idioms and the bash \
             habits that don't carry over."
     )]
@@ -4722,13 +4867,18 @@ A few habits from `bash` that *won't* carry over here — reach for the kaish fo
 - Adjacent tokens don't paste together — quote to join: `\"$dir/file.txt\"`, not
   `$dir/file.txt`.
 - This shell is **read-only**: a write or a redirect that would create a file is refused
-  with exit `1` and the message `permission denied: filesystem is read-only`; an external
-  command is unreachable and exits `127`. That's the boundary working, not a bug — read
-  freely, and don't try to mutate. Refusals and ordinary failures share exit `1`, so read
-  the stderr line when you need to tell them apart.
-- A `grep` PATTERN is a regex, and a script that fails to parse or validate exits `-1`
-  before anything runs; stderr says why. An unbalanced `(` is the common case, so search
-  literal text with `-F`: `grep -rnF 'fn consult(' src`.
+  with exit `1` and a message ending `read-only filesystem`, as in
+  `rm: src/lib.rs: read-only filesystem` (`cp` names no path, and `ln -s` across mounts
+  ends `a link cannot cross mounts`); an external command is unreachable and exits
+  `127`. That's the boundary working, not a bug — read freely, and don't try to mutate.
+  Refusals and ordinary failures share exit `1`, so read the stderr line when you need to
+  tell them apart.
+- `grep` reads GNU BRE, as GNU grep does: `grep -rn 'fn consult(' src` finds the text
+  `fn consult(`, and for alternation use `-E`: `grep -rnE 'consult|explore' src`. `\\d`
+  is a literal `d` in both, so write `[0-9]`; `-F` makes every character literal.
+- A script that fails to parse or validate exits `-1` before anything runs, and stderr
+  says why. A fault partway through also exits `-1`; stdout and stderr keep what ran
+  before it, and the reason comes last on stderr.
 
 Learn more without spending a turn: the `kaibo://kaish/*` resources (syntax, builtins,
 vfs, scatter, …) and `kaibo://kaish/sandbox`, or run `help` / `help syntax` /
@@ -4823,6 +4973,19 @@ fn render_prompts_resource(config: &Config, cast: Option<&Cast>) -> String {
     }
 
     for phase in Phase::ALL {
+        // A cast with an interactive synth runs exactly one of the two `consult` drivers
+        // — with `explore′` when it has an explorer slot, single-stage when it has none —
+        // so its own view shows that one. A cast with no interactive synth runs neither.
+        // The base doc shows both.
+        if let Some(c) = cast {
+            let interactive = c.slot(ModelRole::Synth).is_some() && c.synth_lane().is_none();
+            let has_explorer = c.slot(ModelRole::Explorer).is_some();
+            match phase {
+                Phase::Consult if !interactive || !has_explorer => continue,
+                Phase::ConsultSolo if !interactive || has_explorer => continue,
+                _ => {}
+            }
+        }
         // Attribute the framing by precedence: a cast slot's `preamble` wins over a global
         // `[prompts]` override wins over the built-in — the order `resolved_prompts` layers.
         let slot_set = cast
@@ -6043,6 +6206,141 @@ mod tests {
             msg.contains("media CAS") && msg.contains("enabled = false"),
             "the error names the store and an escape hatch, got: {msg}"
         );
+    }
+
+    // --- The decide tool, driven against a local listener ------------------------
+
+    const DECIDE_CAST_TOML: &str = r#"
+        [backends.orx]
+        kind = "openrouter"
+        key_optional = true
+
+        [casts.judge]
+        decision = "orx/typesafe/jev-1.13"
+
+        [casts.talker]
+        synth = "orx/some/model"
+
+        [server]
+        cast = "judge"
+    "#;
+
+    /// Serve one canned HTTP reply; the returned URL is the endpoint to dial.
+    async fn decide_server(status: u16, body: &'static str) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = vec![0u8; 16384];
+            let _ = sock.read(&mut buf).await;
+            let reply = format!(
+                "HTTP/1.1 {status} X\r\ncontent-type: application/json\r\n\
+                 content-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            sock.write_all(reply.as_bytes()).await.unwrap();
+            sock.shutdown().await.ok();
+        });
+        format!("http://{addr}/api/alpha/decisions")
+    }
+
+    fn decide_input(cast: Option<&str>, questions: serde_json::Value) -> DecideInput {
+        serde_json::from_value(serde_json::json!({
+            "state": "git push --force origin main",
+            "questions": questions,
+            "cast": cast,
+        }))
+        .expect("input parses")
+    }
+
+    fn risk_question() -> serde_json::Value {
+        serde_json::json!({"verdict": {"type": "choice", "instructions": "how risky",
+            "criteria": {"safe": "read-only", "risky": "changes something"}}})
+    }
+
+    #[tokio::test]
+    async fn decide_returns_the_answers_and_a_provenance_footer() {
+        let url = decide_server(
+            200,
+            r#"{"model":"typesafe/jev-1.13-20260917","answers":{"verdict":{"type":"choice","choice":"risky","probabilities":{"safe":0.01,"risky":0.99},"confidence":0.99}},"usage":{"input_tokens":120,"output_tokens":30,"cost":0.00001}}"#,
+        )
+        .await;
+        let h = hermetic_handler_from_toml(DECIDE_CAST_TOML).with_decisions_url(url);
+        let out = h
+            .decide(Parameters(decide_input(None, risk_question())))
+            .await
+            .expect("decide succeeds");
+        assert_ne!(out.is_error, Some(true));
+        let text = result_text(out);
+        assert!(text.contains("\"choice\": \"risky\""), "{text}");
+        assert!(text.contains("cast `judge`"), "{text}");
+        assert!(text.contains("typesafe/jev-1.13-20260917"), "{text}");
+        assert!(text.contains("120 in · 30 out · $0.000010"), "{text}");
+    }
+
+    /// A reply with no usage prints no tokens line: a `0 in · 0 out` line would claim a free
+    /// call the provider never reported.
+    #[tokio::test]
+    async fn decide_omits_the_tokens_line_when_usage_is_unreported() {
+        let url = decide_server(
+            200,
+            r#"{"model":"m","answers":{"verdict":{"type":"choice","choice":"safe","probabilities":{"safe":1,"risky":0},"confidence":1}}}"#,
+        )
+        .await;
+        let h = hermetic_handler_from_toml(DECIDE_CAST_TOML).with_decisions_url(url);
+        let text = result_text(
+            h.decide(Parameters(decide_input(None, risk_question())))
+                .await
+                .unwrap(),
+        );
+        assert!(text.contains("model `m`"), "{text}");
+        assert!(!text.contains("tokens"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn decide_on_a_cast_without_a_decision_slot_is_refused_naming_the_slot() {
+        let h = hermetic_handler_from_toml(DECIDE_CAST_TOML);
+        let err = h
+            .decide(Parameters(decide_input(Some("talker"), risk_question())))
+            .await
+            .expect_err("a synth-only cast cannot decide");
+        assert!(err.message.contains("`decision` slot"), "{}", err.message);
+        assert!(err.message.contains("`talker`"), "{}", err.message);
+    }
+
+    /// The listener is never dialed (port 1): the refusal comes before any request.
+    #[tokio::test]
+    async fn decide_refuses_an_invalid_question_before_any_request() {
+        let h = hermetic_handler_from_toml(DECIDE_CAST_TOML)
+            .with_decisions_url("http://127.0.0.1:1/".into());
+        let one_option = serde_json::json!({"v": {"type": "choice", "instructions": "x",
+            "criteria": {"only": "x"}}});
+        let err = h
+            .decide(Parameters(decide_input(None, one_option)))
+            .await
+            .expect_err("one option is refused");
+        assert!(err.message.contains("2 to 255"), "{}", err.message);
+    }
+
+    #[tokio::test]
+    async fn decide_reports_a_provider_failure_as_a_tool_error_with_its_message() {
+        let url = decide_server(
+            400,
+            r#"{"error":{"message":"Model typesafe/jev-1.13 does not exist","code":400}}"#,
+        )
+        .await;
+        let h = hermetic_handler_from_toml(DECIDE_CAST_TOML).with_decisions_url(url);
+        let out = h
+            .decide(Parameters(decide_input(None, risk_question())))
+            .await
+            .expect("a provider failure is a tool result, not a protocol error");
+        assert_eq!(out.is_error, Some(true));
+        let text = result_text(out);
+        assert!(text.contains("HTTP 400"), "{text}");
+        assert!(text.contains("does not exist"), "{text}");
+        assert!(text.contains("change the request, not the timing"), "{text}");
+        assert!(text.contains("cast `judge`"), "{text}");
     }
 
     // --- The generate lane, driven offline through the media-arm seam -----------
@@ -8066,6 +8364,13 @@ enabled = false
 
             [casts.artist]                                     # image slot → `generate`
             image    = "sd/core"
+
+            [backends.orx]                                     # Decisions backend for `decide`
+            kind = "openrouter"
+            key_optional = true
+
+            [casts.judge]                                      # decision slot → `decide`
+            decision = "orx/typesafe/jev-1.13"
             "#,
         );
         let enum_of = |tool: &str| -> Vec<String> {
@@ -8087,8 +8392,9 @@ enabled = false
         // Each cast-taking tool's call-time acceptance, in one place beside the enum rules.
         let gate_accepts = |tool: &str, cast: &Cast| -> bool {
             match tool {
-                "consult" | "consult_submit" => h.require_consult_cast(cast, tool).is_ok(),
-                "oneshot" => h.require_interactive_cast(cast, tool).is_ok(),
+                "consult" | "consult_submit" | "oneshot" => {
+                    h.require_interactive_cast(cast, tool).is_ok()
+                }
                 // `explore` has no lane gate — it runs whichever cast's explorer, so any cast
                 // is accepted (a missing explorer faults later at the arm resolve, not the gate).
                 "explore" => true,
@@ -8100,6 +8406,8 @@ enabled = false
                     cast.slot(crate::config::ModelRole::Image).is_some()
                         || cast.slot(crate::config::ModelRole::Audio).is_some()
                 }
+                // `decide` runs the `decision` slot alone; its call-time gate is that slot.
+                "decide" => cast.slot(crate::config::ModelRole::Decision).is_some(),
                 other => panic!("unmapped cast-taking tool `{other}` — add its gate here"),
             }
         };
@@ -8129,14 +8437,13 @@ enabled = false
         assert!(checked > 0, "the guard checked nothing");
     }
 
-    /// `consult` and `consult_submit` resolve an explorer arm as well as a synth arm, so a
-    /// synth-only cast cannot staff them; `oneshot` needs only the synth. The enum rule
-    /// for the three tools was shared, so a synth-only cast was offered on `consult` and
-    /// failed at the explorer resolve with a bare "has no explorer slot". Now `consult`
-    /// and `consult_submit` offer only casts with both slots, and naming a synth-only
-    /// cast is refused with the tool it does serve.
+    /// A synth-only interactive cast runs `consult` single-stage: one model doing its own
+    /// reads, with no `explore′` to delegate to. So `consult`, `consult_submit`, and
+    /// `oneshot` all offer it, and its gate accepts it. `explore` still needs an explorer
+    /// slot, so the synth-only cast stays off that tool. This inverts the old refusal,
+    /// which sent a synth-only cast to `oneshot` and lost the shell.
     #[test]
-    fn a_synth_only_cast_is_offered_to_oneshot_but_not_consult() {
+    fn a_synth_only_cast_is_offered_to_consult_single_stage() {
         let h = handler_from_toml(
             r#"
             [backends.gem]
@@ -8167,29 +8474,54 @@ enabled = false
                 })
                 .unwrap_or_default()
         };
-        for tool in ["consult", "consult_submit"] {
+        for tool in ["consult", "consult_submit", "oneshot"] {
             let offered = enum_of(tool);
-            assert!(offered.iter().any(|c| c == "inter"), "{tool}: {offered:?}");
             assert!(
-                !offered.iter().any(|c| c == "solo"),
-                "`{tool}` must not offer the synth-only cast, got {offered:?}"
+                offered.iter().any(|c| c == "solo") && offered.iter().any(|c| c == "inter"),
+                "`{tool}` must offer both casts, got {offered:?}"
             );
         }
-        let offered = enum_of("oneshot");
+        let offered = enum_of("explore");
         assert!(
-            offered.iter().any(|c| c == "solo") && offered.iter().any(|c| c == "inter"),
-            "`oneshot` needs only a synth, got {offered:?}"
+            !offered.iter().any(|c| c == "solo"),
+            "`explore` needs an explorer slot, got {offered:?}"
         );
 
         let solo = h.config.resolve_cast("solo").unwrap();
-        assert!(h.require_interactive_cast(solo, "oneshot").is_ok());
+        assert!(h.require_interactive_cast(solo, "consult").is_ok());
+        assert!(h.require_interactive_cast(solo, "consult_submit").is_ok());
+        assert!(h.config.cast_is_interactive("solo"));
+
+        // An explorer model override with no backend has no slot to replace on a
+        // synth-only cast; the refusal names the arg that adds one.
+        let mut cast = solo.clone();
         let err = h
-            .require_consult_cast(solo, "consult")
-            .expect_err("a synth-only cast must be refused by `consult`");
+            .resolver
+            .apply_model_override(
+                &mut cast,
+                ModelRole::Explorer,
+                Some("lite"),
+                None,
+                "explorer_model",
+                "explorer_backend",
+            )
+            .expect_err("no explorer slot and no backend");
         let msg = err.message.to_string();
-        for needle in ["`solo`", "no `explorer` slot", "`consult`", "`oneshot`"] {
+        for needle in ["`solo`", "`explorer_backend`", "`--explorer-backend`"] {
             assert!(msg.contains(needle), "refusal must name {needle}: {msg}");
         }
+        // With the backend it becomes two-stage.
+        h.resolver
+            .apply_model_override(
+                &mut cast,
+                ModelRole::Explorer,
+                Some("lite"),
+                Some("gem"),
+                "explorer_model",
+                "explorer_backend",
+            )
+            .expect("a backend adds the slot");
+        assert!(cast.slot(ModelRole::Explorer).is_some());
     }
 
     /// A cast with no synth slot has no model to answer a text tool: `consult`,
@@ -8259,7 +8591,13 @@ enabled = false
             .require_interactive_cast(artist, "oneshot")
             .expect_err("an image-only cast must be refused by `oneshot`");
         let msg = err.message.to_string();
-        for needle in ["`artist`", "no `synth` slot", "`oneshot`", "`image`", "`generate`"] {
+        for needle in [
+            "`artist`",
+            "no `synth` slot",
+            "`oneshot`",
+            "`image`",
+            "`generate`",
+        ] {
             assert!(msg.contains(needle), "refusal must name {needle}: {msg}");
         }
         let scout = h.config.resolve_cast("scout").unwrap();
@@ -8267,7 +8605,13 @@ enabled = false
             .require_interactive_cast(scout, "consult")
             .expect_err("an explorer-only cast must be refused by `consult`");
         let msg = err.message.to_string();
-        for needle in ["`scout`", "no `synth` slot", "`consult`", "`explorer`", "`explore`"] {
+        for needle in [
+            "`scout`",
+            "no `synth` slot",
+            "`consult`",
+            "`explorer`",
+            "`explore`",
+        ] {
             assert!(msg.contains(needle), "refusal must name {needle}: {msg}");
         }
     }
@@ -8433,17 +8777,27 @@ enabled = false
                 .find(|m| m.contains("default cast"))
         };
         let msg = warned("artist").expect("an image-only default must warn at startup");
-        for needle in ["`artist`", "`consult`", "`[server] cast`", "no `synth` slot"] {
-            assert!(msg.contains(needle), "the warning must name {needle}: {msg}");
+        for needle in [
+            "`artist`",
+            "`consult`",
+            "`[server] cast`",
+            "no `synth` slot",
+        ] {
+            assert!(
+                msg.contains(needle),
+                "the warning must name {needle}: {msg}"
+            );
         }
-        assert_eq!(warned("inter"), None, "a default that staffs consult must not warn");
+        assert_eq!(
+            warned("inter"),
+            None,
+            "a default that staffs consult must not warn"
+        );
     }
 
     /// And `explore`: a synth-only fixture has no explorer slot anywhere, so the sweep
-    /// tool cannot run. Neither can `consult`, which resolves an explorer arm before its
-    /// synth runs (this test once asserted it survived, on the belief that the driver
-    /// carried its own explorer; `Resolver::arm` has no such fallback, and every such
-    /// call failed at the explorer resolve). `oneshot` runs the synth alone and stays.
+    /// tool cannot run. `consult` runs single-stage on the synth alone, and `oneshot`
+    /// needs only the synth, so both stay.
     #[test]
     fn explore_is_not_advertised_without_an_explorer_slot() {
         let h = hermetic_handler_from_toml(&with_no_builtin_casts(
@@ -8464,18 +8818,13 @@ enabled = false
             !tools.iter().any(|t| t == "explore"),
             "explore must be dropped when no cast carries an explorer slot. Advertised: {tools:?}"
         );
-        for dropped in ["consult", "consult_submit"] {
+        for kept in ["consult", "consult_submit", "oneshot"] {
             assert!(
-                !tools.iter().any(|t| t == dropped),
-                "{dropped} needs an explorer slot too, so it must be dropped. Advertised: \
-                 {tools:?}"
+                tools.iter().any(|t| t == kept),
+                "{kept} needs only the interactive synth (`consult` runs single-stage), so \
+                 it must survive. Advertised: {tools:?}"
             );
         }
-        assert!(
-            tools.iter().any(|t| t == "oneshot"),
-            "oneshot needs only the interactive synth, so it must survive. Advertised: \
-             {tools:?}"
-        );
     }
 
     /// The collect verbs are shared by three producers (`consult_submit`, `batch_submit`,
@@ -8780,6 +9129,7 @@ enabled = false
                 run_kaish: true,
                 list_models: true,
                 generate: false,
+                decide: false,
             };
             KaiboHandler::new(config).expect("handler builds")
         };
@@ -9902,8 +10252,10 @@ enabled = false
             "124",
             "127",
             "`-1` — kaish could not run the script",
+            "grep -rnE",
             "grep -rnF",
-            "permission denied: filesystem is read-only",
+            "`2` — a usage error",
+            "ends `read-only filesystem`",
         ] {
             assert!(text.contains(needle), "sandbox doc must mention {needle:?}");
         }
@@ -9921,13 +10273,17 @@ enabled = false
     fn every_tool_description_fits_claude_code_budget() {
         let h = KaiboHandler::new(crate::config::Config::builtin()).expect("handler builds");
         let media = hermetic_handler_from_toml(MEDIA_CAST_TOML);
+        let decide = hermetic_handler_from_toml(DECIDE_CAST_TOML);
         let mut tools = h.tool_router.list_all();
         tools.extend(media.tool_router.list_all());
+        tools.extend(decide.tool_router.list_all());
         assert!(!tools.is_empty(), "the guard checked nothing");
-        assert!(
-            tools.iter().any(|t| t.name == "generate"),
-            "`generate` must be among the descriptions checked"
-        );
+        for name in ["generate", "decide"] {
+            assert!(
+                tools.iter().any(|t| t.name == name),
+                "`{name}` must be among the descriptions checked"
+            );
+        }
         for tool in tools {
             let len = tool.description.as_deref().unwrap_or("").chars().count();
             assert!(
@@ -9943,27 +10299,69 @@ enabled = false
     /// a shell error partway through also returns -1 (`sandbox.rs`, the worker's `Run`
     /// arm), so the text does not claim "nothing ran" for every -1. It was 4.1% of
     /// 11,195 calls and no
-    /// kaibo text named it. The description also carries the example that avoids the
-    /// most common cause, a literal `(` in a grep pattern.
+    /// kaibo text named it. The most common cause was a literal `(` in a grep pattern;
+    /// kaish 0.18's GNU BRE default made that pattern run, so the description now
+    /// carries the BRE example and the `-E` form alternation needs instead.
     #[test]
     fn run_kaish_description_names_the_parse_failure_code() {
         let h = KaiboHandler::new(crate::config::Config::builtin()).expect("handler builds");
-        let tool = h.tool_router.get("run_kaish").expect("run_kaish advertised");
+        let tool = h
+            .tool_router
+            .get("run_kaish")
+            .expect("run_kaish advertised");
         let d = tool.description.as_deref().unwrap_or("");
         for needle in [
             "-1 = kaish could not run the script",
             "a parse or validation failure, where nothing ran, or a shell error partway \
-             through",
-            "grep -rnF 'fn consult(' src",
+             through, where stdout and stderr keep what ran before it",
+            "`grep` reads GNU BRE",
+            "`grep -rn 'fn consult(' src`",
+            "`grep -rnE 'consult|explore' src`",
+            "ending `read-only filesystem`",
         ] {
-            assert!(d.contains(needle), "run_kaish description must name {needle:?}: {d}");
+            assert!(
+                d.contains(needle),
+                "run_kaish description must name {needle:?}: {d}"
+            );
         }
     }
 
-    /// The code the text documents is the code the shell returns. A grep pattern with an
-    /// unbalanced `(` fails kaish's validation before anything runs, and `run_kaish`
-    /// reports `exit: -1` with the reason on stderr; the fixed-string form of the same
-    /// search runs and finds the line. A kaish bump that changes either answer fails here.
+    /// The grep examples in the two server texts that teach the shell, the `run_kaish`
+    /// description and `kaibo://tools`, read as GNU BRE: no bare `|`, `+`, `?`, or `{`
+    /// without `-E`, and no `\d`. The same scan guards the addendum and the sandbox doc
+    /// in `kaish_syntax.rs`; a kaish idiom is never in one file.
+    #[test]
+    fn server_grep_examples_read_as_gnu_bre() {
+        let h = KaiboHandler::new(crate::config::Config::builtin()).expect("handler builds");
+        let tool = h
+            .tool_router
+            .get("run_kaish")
+            .expect("run_kaish advertised");
+        let description = tool.description.as_deref().unwrap_or("").to_string();
+        let mut seen = 0;
+        for (label, text) in [
+            ("run_kaish", description.as_str()),
+            ("kaibo://tools", TOOLS_DOC),
+        ] {
+            let (examined, misread) = crate::kaish_syntax::grep_examples_misread_as_ere(text);
+            seen += examined;
+            assert!(
+                misread.is_empty(),
+                "{label}: these grep examples mean something else under GNU BRE: {misread:#?}"
+            );
+        }
+        assert!(
+            seen >= 4,
+            "the scan must examine the grep examples it guards, saw {seen}"
+        );
+    }
+
+    /// The code the text documents is the code the shell returns. An `-E` pattern with
+    /// an unbalanced `(` fails kaish's validation before anything runs, and `run_kaish`
+    /// reports `exit: -1` with the reason on stderr. The same text without `-E` is GNU
+    /// BRE, where `(` is literal, so it runs and finds the line; so does `-F`. A kaish
+    /// bump that changes any answer fails here. Until kaish 0.18 the BRE line was the
+    /// failing one: grep defaulted to ERE and the bare `(` failed validation.
     #[tokio::test]
     async fn a_script_that_fails_validation_exits_minus_one() {
         let dir = tempfile::tempdir().unwrap();
@@ -9983,15 +10381,85 @@ enabled = false
                 out.content[0].as_text().expect("text body").text.clone()
             }
         };
-        let text = run(r#"grep -rn "fn consult(" ."#).await;
+        let text = run(r#"grep -rnE "fn consult(" ."#).await;
         assert!(
             text.starts_with("exit: -1\n") && text.contains("--- stderr ---"),
-            "an unbalanced `(` must fail validation with exit -1 and a reason: {text}"
+            "an unbalanced `(` under -E must fail validation with exit -1 and a reason: {text}"
+        );
+        // The sandbox doc says stderr names the fix, `\(`; pin the fix it names.
+        assert!(
+            text.contains("write `\\(` to match a literal `(`"),
+            "the -1 reason must name the escape the sandbox doc quotes: {text}"
+        );
+        let text = run("grep -rn 'fn consult(' .").await;
+        assert!(
+            text.starts_with("exit: 0\n") && text.contains("pub fn consult("),
+            "the BRE search must run and find the line, as the prose says: {text}"
         );
         let text = run("grep -rnF 'fn consult(' .").await;
         assert!(
             text.starts_with("exit: 0\n") && text.contains("pub fn consult("),
             "the fixed-string search must run and find the line: {text}"
+        );
+    }
+
+    /// The prose says to use `-E` for alternation, that `\d` is a literal `d`, and that
+    /// grep exits 2 for a file it cannot read. Bind each to the shell: without `-E` the
+    /// `|` is text, so `consult|explore` finds nothing and exits 1, which a model would
+    /// read as "no such code"; with `-E` it alternates and finds the line. A kaish bump
+    /// that returns grep to an ERE default makes the first search match and fails here.
+    #[tokio::test]
+    async fn grep_alternation_takes_dash_e_as_the_prose_says() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("lib.rs"), "pub fn consult(q: &str) {}\n").unwrap();
+        std::fs::write(dir.path().join("notes.txt"), "count 12345\nword only\n").unwrap();
+        let mut config = crate::config::Config::builtin();
+        config.root = Some(dir.path().to_path_buf());
+        config.infer_cwd = false;
+        let h = KaiboHandler::new(config).expect("handler builds");
+        let run = |script: &str| {
+            let script = script.to_string();
+            let h = &h;
+            async move {
+                let out = h
+                    .run_kaish(Parameters(RunKaishInput { script, path: None }))
+                    .await
+                    .expect("the tool call itself succeeds");
+                out.content[0].as_text().expect("text body").text.clone()
+            }
+        };
+        let text = run("grep -rn 'consult|explore' .").await;
+        assert!(
+            text.starts_with("exit: 1\n") && !text.contains("pub fn consult("),
+            "without -E, `|` is text and nothing matches: {text}"
+        );
+        let text = run("grep -rnE 'consult|explore' .").await;
+        assert!(
+            text.starts_with("exit: 0\n") && text.contains("pub fn consult("),
+            "with -E, `|` alternates and finds the line: {text}"
+        );
+        // GNU BRE's own alternation, which kaish's help teaches, still works.
+        let text = run("grep -rn 'consult\\|explore' .").await;
+        assert!(
+            text.starts_with("exit: 0\n") && text.contains("pub fn consult("),
+            "in BRE, `\\|` alternates: {text}"
+        );
+        // `\d` is a literal `d`: it finds the line with a `d` and no digit, and misses
+        // the line with digits and no `d`. `[0-9]` is the form the prose teaches.
+        let text = run("grep -n '\\d' notes.txt").await;
+        assert!(
+            text.starts_with("exit: 0\n") && text.contains("word only") && !text.contains("12345"),
+            "`\\d` must match a literal d, not a digit: {text}"
+        );
+        let text = run("grep -n '[0-9]' notes.txt").await;
+        assert!(
+            text.starts_with("exit: 0\n") && text.contains("12345") && !text.contains("word only"),
+            "`[0-9]` must match the digits: {text}"
+        );
+        let text = run("grep -n x missing.txt").await;
+        assert!(
+            text.starts_with("exit: 2\n"),
+            "grep must exit 2 for a file it cannot read, so 1 stays \"no line matched\": {text}"
         );
     }
 
@@ -10019,19 +10487,20 @@ enabled = false
         );
         let text = read_text(TOOLS_URI, &[]);
         for needle in [
-            "attach",                                     // the attachment guidance moved here
-            "inlined",             // the consult-vs-oneshot attach distinction
-            "whole file",          // the toolless-model whole-files steer
-            "verbatim",            // the model-id override semantics
-            "_backend",            // the retarget-the-slot mechanic
-            "job-N",               // the consult handle shape
-            "backend/provider-id", // the batch handle shape
-            "fire-and-forget",     // the async-workflow framing
-            "read-only",           // the kaish shell boundary
-            "permission denied: filesystem is read-only", // how a refusal names itself
-            "worktree",            // attach/path reaches a followed git worktree
-            "Reviewing a change",  // prefer whole files over a diff for review
-            "view_image",          // consult opens an attached image with view_image
+            "attach",                        // the attachment guidance moved here
+            "inlined",                       // the consult-vs-oneshot attach distinction
+            "whole file",                    // the toolless-model whole-files steer
+            "verbatim",                      // the model-id override semantics
+            "_backend",                      // the retarget-the-slot mechanic
+            "job-N",                         // the consult handle shape
+            "backend/provider-id",           // the batch handle shape
+            "fire-and-forget",               // the async-workflow framing
+            "read-only",                     // the kaish shell boundary
+            "ending `read-only filesystem`", // how a refusal names itself
+            "grep -rnE",                     // alternation takes -E under GNU BRE
+            "worktree",                      // attach/path reaches a followed git worktree
+            "Reviewing a change",            // prefer whole files over a diff for review
+            "view_image",                    // consult opens an attached image with view_image
         ] {
             assert!(
                 text.contains(needle),
@@ -10177,6 +10646,46 @@ enabled = false
         assert!(
             text.contains("kaibo://prompts"),
             "per-cast doc must point back to the base doc:\n{text}"
+        );
+    }
+
+    /// A cast runs one of the two `consult` drivers, so its prompts view shows that one:
+    /// the delegating driver for a cast with an explorer, the single-stage driver for a
+    /// synth-only cast. The base doc shows both, because it describes every cast.
+    #[test]
+    fn per_cast_prompts_resource_shows_the_consult_driver_the_cast_runs() {
+        use crate::consult::Phase;
+        let config = Config::from_toml_str(
+            r#"
+            [casts.team]
+            explorer = "anthropic/claude-haiku-4-5"
+            synth    = "anthropic/claude-opus-4-8"
+
+            [casts.solo]
+            synth    = "anthropic/claude-opus-4-8"
+
+            [casts.offline]
+            explorer = "anthropic/claude-haiku-4-5"
+            synth    = { backend = "anthropic", id = "claude-opus-4-8", lane = "batch" }
+            "#,
+        )
+        .expect("config parses");
+        let heading = |p: Phase| format!("## {}\n", p.label());
+        // An offline synth runs no `consult` driver at all.
+        let offline =
+            render_prompts_resource(&config, Some(config.resolve_cast("offline").unwrap()));
+        assert!(!offline.contains(&heading(Phase::Consult)), "{offline}");
+        assert!(!offline.contains(&heading(Phase::ConsultSolo)), "{offline}");
+        let team = render_prompts_resource(&config, Some(config.resolve_cast("team").unwrap()));
+        assert!(team.contains(&heading(Phase::Consult)), "{team}");
+        assert!(!team.contains(&heading(Phase::ConsultSolo)), "{team}");
+        let solo = render_prompts_resource(&config, Some(config.resolve_cast("solo").unwrap()));
+        assert!(solo.contains(&heading(Phase::ConsultSolo)), "{solo}");
+        assert!(!solo.contains(&heading(Phase::Consult)), "{solo}");
+        let base = render_prompts_resource(&config, None);
+        assert!(
+            base.contains(&heading(Phase::Consult)) && base.contains(&heading(Phase::ConsultSolo)),
+            "{base}"
         );
     }
 
@@ -10711,7 +11220,7 @@ enabled = false
             .override_model(&mut cast, ModelRole::Synth, "bare-id", None)
             .unwrap_err();
         let msg = err.to_string();
-        assert!(msg.contains("has no synth slot"), "got: {msg}");
+        assert!(msg.contains("has no `synth` slot"), "got: {msg}");
         assert!(
             msg.contains("backend"),
             "names the escape hatch, got: {msg}"

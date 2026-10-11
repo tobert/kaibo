@@ -49,7 +49,10 @@ async fn reads_work_through_the_front_door() {
     let text = run_tool(&handler, dir.path(), "cat hello.txt").await;
 
     assert!(text.contains("exit: 0"), "cat should succeed, got: {text}");
-    assert!(text.contains("kai the crab"), "should echo file contents, got: {text}");
+    assert!(
+        text.contains("kai the crab"),
+        "should echo file contents, got: {text}"
+    );
 }
 
 #[tokio::test]
@@ -61,7 +64,10 @@ async fn rm_is_refused_and_the_file_survives() {
     let handler = handler_for(dir.path());
     let text = run_tool(&handler, dir.path(), "rm important.txt").await;
 
-    assert!(!text.contains("exit: 0"), "rm must not succeed, got: {text}");
+    assert!(
+        !text.contains("exit: 0"),
+        "rm must not succeed, got: {text}"
+    );
     assert!(victim.exists(), "the real file must survive a refused rm");
 }
 
@@ -88,7 +94,10 @@ async fn touch_on_existing_file_is_refused_by_the_mount() {
     let handler = handler_for(dir.path());
     let text = run_tool(&handler, dir.path(), "touch real.txt").await;
 
-    assert!(!text.contains("exit: 0"), "touch must be refused, got: {text}");
+    assert!(
+        !text.contains("exit: 0"),
+        "touch must be refused, got: {text}"
+    );
     assert!(
         text.contains("read-only"),
         "the read-only mount should reject the mtime bump, got: {text}"
@@ -104,7 +113,10 @@ async fn git_is_blocked_and_inits_no_repo() {
     let handler = handler_for(dir.path());
     let text = run_tool(&handler, dir.path(), "git init").await;
 
-    assert!(!text.contains("exit: 0"), "git must be refused, got: {text}");
+    assert!(
+        !text.contains("exit: 0"),
+        "git must be refused, got: {text}"
+    );
     assert!(
         !dir.path().join(".git").exists(),
         "git must not create a real .git directory"
@@ -118,5 +130,8 @@ async fn external_commands_are_refused() {
     let handler = handler_for(dir.path());
     let text = run_tool(&handler, dir.path(), "/bin/sh -c 'echo escaped'").await;
 
-    assert!(!text.contains("escaped"), "external command must not run, got: {text}");
+    assert!(
+        !text.contains("escaped"),
+        "external command must not run, got: {text}"
+    );
 }

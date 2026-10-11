@@ -51,7 +51,8 @@ the investigation, and it decides how to work. It reads spans through the read-o
 itself, and it can hand a broad survey to the **explorer** — a cheaper, faster model that
 searches the repo and reports back what it found. Delegating is a tool call, and it's the
 synth's call whether to make one. Then the synth checks what matters, fills the gaps, and
-writes the answer.
+writes the answer. A cast with no explorer runs single-stage: the synth does every read
+itself.
 
 So the chain runs: you → your agent → kaibo's synth → kaibo's explorer. If your agent
 spawned a subagent to do the work, that's one more link, and the inside is the same. Every
@@ -335,9 +336,9 @@ failed, `124` timed out, `127` command not found, and on Unix `255` when kaish
 could not run the script, which `--json` reports as `exit_code` -1) instead,
 since a script
 branches on *that* to know what the sandboxed command did. A refused write is an
-ordinary failure: it exits `1` and prints `permission denied: filesystem is
-read-only`, so branch on the message when you need to tell a refusal from a
-mistake. The same table is in `kaibo --help`.
+ordinary failure: it exits `1` and its stderr line ends `read-only filesystem`
+(`rm: src/lib.rs: read-only filesystem`), so branch on the message when you need to
+tell a refusal from a mistake. The same table is in `kaibo --help`.
 
 The shared flags (`--root`, `--allow-path`, `--cast`, `--config`, house-rules
 files, …) work before or after the subcommand and are documented in `kaibo
@@ -536,7 +537,7 @@ config has three concepts for configuring models:
   file. `openrouter` is a keyed gateway with a fixed endpoint — one key reaching every
   major model family, reasoning on by default via its unified `effort` param.
 - **role** — a *job* a model does: `explorer` (fast surveys), `synth` (the voice that
-  answers), and `image` and `audio` (the media members behind `generate`). A reasoning slot that
+  answers), `image` and `audio` (the media members behind `generate`), and `decision` (typed questions answered with probabilities, behind `decide`). A reasoning slot that
   reads images carries a `vision` pin (see [`docs/casts.md`](docs/casts.md)).
 - **cast** — a *composition*: a named team assigning models to roles. The `cast` call
   argument selects the ensemble; the calling agent sees these names in its tool listing,
