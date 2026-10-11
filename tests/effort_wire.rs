@@ -130,7 +130,7 @@ impl Path {
 
     fn model(&self) -> &'static str {
         match self {
-            Path::AnthropicAdaptive => "claude-sonnet-4-6",
+            Path::AnthropicAdaptive => "claude-sonnet-5-5",
             Path::AnthropicBudget => "claude-haiku-4-5",
             Path::Gemini => "gemini-3.5-flash",
             Path::DeepSeek => "deepseek-flash",

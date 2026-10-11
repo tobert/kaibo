@@ -2578,7 +2578,7 @@ fn builtin_casts() -> BTreeMap<String, Cast> {
     );
     // anthropic-batch synths Claude Opus — the Anthropic analogue of Gemini Pro, the big
     // model whose batch latency is free. Anthropic has no `-latest` alias convention, so
-    // the id is pinned (`claude-opus-4-8`); when it's retired, bump it here or pin a
+    // the id is pinned (`claude-opus-5-5`); when it's retired, bump it here or pin a
     // current Opus in config.toml.
     let anthropic_batch = "anthropic-batch".to_string();
     m.insert(
@@ -2589,7 +2589,7 @@ fn builtin_casts() -> BTreeMap<String, Cast> {
                 ModelRole::Synth,
                 ModelSlot {
                     lane: Some(Lane::Batch),
-                    ..ModelSlot::bare("anthropic", "claude-opus-4-8")
+                    ..ModelSlot::bare("anthropic", "claude-opus-5-5")
                 },
             )]),
         },
@@ -2609,7 +2609,7 @@ pub fn default_models(kind: ProviderKind) -> (&'static str, &'static str) {
         return ("", "");
     };
     match wire {
-        credentials::WireKind::Anthropic => ("claude-haiku-4-5", "claude-sonnet-4-6"),
+        credentials::WireKind::Anthropic => ("claude-haiku-4-5", "claude-sonnet-5-5"),
         // kaibo is flash-only on DeepSeek: `deepseek-flash` for both roles, and no
         // other DeepSeek id is recommended or special-cased. The undated id is the
         // rot-resistant one — it tracks each new flash generation. The dated

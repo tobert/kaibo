@@ -184,10 +184,10 @@ A role table. Each slot takes one of two forms:
 ```toml
 [casts.chimera]
 explorer = "deepseek/deepseek-flash"        # reads the tree and cites
-synth    = "claude/claude-sonnet-4-6"       # the model that answers
+synth    = "claude/claude-sonnet-5-5"       # the model that answers
 
 # table form: id + capability pins + per-slot tunables
-# synth = { backend = "claude", id = "claude-opus-4-8", effort = "max" }
+# synth = { backend = "claude", id = "claude-opus-5-5", effort = "max" }
 # explorer = { backend = "openai-local", id = "Gemma-4-E4B-it", preamble = "..." }
 ```
 
@@ -349,7 +349,7 @@ that can use it. Measured 2026-08-01:
 | DeepSeek | accepts all seven (`none` … `max`), strictly validated, and runs three: `minimal`/`low` → low, `medium`/`high`/`xhigh` → high, `max` → max. The built-in `deepseek` cast's synth pins `max`. `none` emits the structural `thinking:{"type":"disabled"}` — asking for zero effort while thinking stays enabled bills reasoning tokens anyway (probed: 160–253). |
 | OpenRouter | all seven on everything; the gateway normalizes each onto the upstream's native knob, so a rung can reach a model that refuses it on that vendor's direct API. `none` emits the gateway's structural disable. |
 | OpenAI (hosted) | **per model**, at both ends: `gpt-5.6` → `max`, `gpt-5.2` → `xhigh`, `gpt-5.1` → `high`; `gpt-5`'s bottom rung is `minimal` where 5.1+ use `none`. |
-| Anthropic | the adaptive tier takes an effort; the budget tier (Haiku 4.5 and older) expresses depth as `budget_tokens` and has no effort field at all. **Which rungs the adaptive tier takes is still unmeasured.** |
+| Anthropic | the adaptive tier takes an effort; the budget tier (Haiku 4.5 and older) expresses depth as `budget_tokens` and has no effort field at all. **Which rungs the adaptive tier takes is still unmeasured**, and `none` is refused at arm construction: the adaptive tier has no off-switch to send. |
 
 Every row above except the Anthropic one was measured against the live endpoint, and each
 is re-checkable: `tests/consult.rs` carries an `#[ignore]`d probe per provider that fails
@@ -377,7 +377,7 @@ or through `KAIBO_*_EFFORT`, kaibo warns at startup and reports `effort` under
 `inert_tunables` in `kaibo://config`. An inherited built-in effort stays quiet.
 
 **`thinking_style`.** Forces the thinking shape instead of the built-in classifier.
-`auto` picks adaptive for Opus 4.6+, Sonnet 4.6, and Fable 5, and enabled-budget for
+`auto` picks adaptive for Opus 4.6+, Sonnet 4.6+, and Fable 5, and enabled-budget for
 older models plus Haiku 4.5. Set `adaptive` or `budget` when a new or misclassified
 Anthropic model ships; those two are no-ops for other kinds. An unknown value is a load
 error.
@@ -471,13 +471,13 @@ not OpenAI Platform's own but should still take the Responses shape; see
 
 | cast | explorer | synth | synth lane |
 |---|---|---|---|
-| `anthropic` | `anthropic/claude-haiku-4-5` | `anthropic/claude-sonnet-4-6` | |
+| `anthropic` | `anthropic/claude-haiku-4-5` | `anthropic/claude-sonnet-5-5` | |
 | `deepseek` | `deepseek/deepseek-flash` | `deepseek/deepseek-flash` | |
 | `gemini` | `gemini/gemini-flash-lite-latest` | `gemini/gemini-3.5-flash` | |
 | `openrouter` | `openrouter/qwen/qwen3.6-flash` | `openrouter/qwen/qwen3.7-max` | |
 | `openai-local` | `openai-local/Gemma-4-E4B-it-GGUF` | `openai-local/Gemma-4-26B-A4B-it-GGUF` | |
 | `gemini-batch` | — | `gemini/gemini-pro-latest` | `batch` |
-| `anthropic-batch` | — | `anthropic/claude-opus-4-8` | `batch` |
+| `anthropic-batch` | — | `anthropic/claude-opus-5-5` | `batch` |
 
 The built-in OpenRouter explorer has `vision = true`; its synth is text-only.
 Use the live model catalog when changing model IDs or capabilities.
@@ -1023,7 +1023,7 @@ result with `kaibo://prompts`.
 ```toml
 [casts.custom]
 explorer = { backend = "openai-local", id = "Gemma-4-E4B-it", preamble = "You are a careful reader. Cite exact numbered lines." }
-synth = "anthropic/claude-sonnet-4-6"
+synth = "anthropic/claude-sonnet-5-5"
 ```
 
 Precedence: `slot.preamble` > `[prompts].<phase>` > built-in. A synth slot's preamble

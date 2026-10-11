@@ -30,6 +30,7 @@ record. Each later release appends a new section at the top.
 - `consult` runs single-stage on a cast with no `explorer`: the synth does every read itself, with no `explore` tool.
 
 ### Changed
+- The built-in `anthropic` cast's synth is `claude-sonnet-5-5` and `anthropic-batch` synths `claude-opus-5-5`; Opus 5.5, Sonnet 5.5, and Fable 5.x take adaptive thinking.
 - The consult and explore shells start every call at the project root, so a `cd` lasts only until its script ends; variables still carry over.
 - kaish 0.18: `grep` and `sed` read GNU basic regex, so `grep -rn 'fn consult(' src` runs; use `-E` for `|` alternation.
 - kaish 0.18: a write to the read-only mount reports `read-only filesystem`, and usage errors exit 2.
@@ -43,6 +44,8 @@ record. Each later release appends a new section at the top.
 - The `gemini-images` backend kind is now `gemini-media`; the old name still loads.
 
 ### Fixed
+- `effort = "none"` on an adaptive Anthropic model (Opus 4.6+, Sonnet 4.6+, Fable 5.x) is refused when the arm or batch client is built, naming the slot and suggesting a rung such as `low`; it used to send `output_config.effort: "none"` and 400 mid-call.
+- Opus 5.5 and Sonnet 5.5 are classified as adaptive-thinking models; they were sent the budget shape and rejected.
 - A shell fault partway through a script keeps the stdout and stderr of the statements that ran before it.
 - `list_models` on a Gemini or Stability media backend names the `audio` slot and its model ids, not only `image`.
 - A deferred `generate` whose result cannot be collected names the provider's job id, so a paid result stays reachable.

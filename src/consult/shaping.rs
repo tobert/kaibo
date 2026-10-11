@@ -115,16 +115,25 @@ pub fn lower_effort(params: Option<&Value>, to: &str) -> Option<(Value, String)>
 /// Which Anthropic models want **adaptive** thinking (`{type:"adaptive"}` plus an
 /// `output_config.effort`) instead of the legacy `{type:"enabled", budget_tokens}`.
 ///
-/// **Empirical — confirm by probe**: Opus 4.7/4.8 and Fable 5 *reject* enabled/budget
-/// and sampling outright (400); Opus 4.6 / Sonnet 4.6 take adaptive too — it's the
+/// **Empirical — confirm by probe**: Opus 4.7/4.8, Opus 5.5, Sonnet 5.5, and Fable 5.x
+/// *reject* enabled/budget and sampling outright (400), and Opus 5.5 / Sonnet 5.5 also
+/// reject `thinking:{type:"disabled"}`; Opus 4.6 / Sonnet 4.6 take adaptive too — it's the
 /// recommended shape, `budget_tokens` is deprecated there. Everything older, and Haiku
 /// 4.5, stays on enabled/budget. Matched by `contains` so a vendor-prefixed id still
 /// resolves. Add ids as they ship; a slot (or `[defaults]`) can force a tier via
 /// `thinking_style`.
 fn is_anthropic_adaptive(model: &str) -> bool {
-    ["opus-4-6", "opus-4-7", "opus-4-8", "sonnet-4-6", "fable-5"]
-        .iter()
-        .any(|tier| model.contains(tier))
+    [
+        "opus-4-6",
+        "opus-4-7",
+        "opus-4-8",
+        "opus-5",
+        "sonnet-4-6",
+        "sonnet-5",
+        "fable-5",
+    ]
+    .iter()
+    .any(|tier| model.contains(tier))
 }
 
 /// What one (provider, model) can perceive — and *how* an image reaches it. Capability
@@ -425,6 +434,26 @@ impl ModelShape {
                 | ThinkingStyle::OpenRouterEffort
                 | ThinkingStyle::EffortOnly
         )
+    }
+
+    /// Refuse an effort this shape cannot put on the wire. Today that is the reasoning
+    /// off-switch ([`EFFORT_OFF`]) on Anthropic's adaptive tier: Opus 5.5 and Sonnet 5.5
+    /// reject `thinking:{type:"disabled"}`, and `none` is not an `output_config.effort`
+    /// rung, so there is nothing truthful to send. Sending it anyway is a provider 400
+    /// mid-call; dropping it would quietly bill reasoning the operator switched off.
+    /// The error names the fixes. Every other style answers `none` by shape.
+    pub fn check_effort(&self, effort: &str) -> std::result::Result<(), String> {
+        if self.thinking == ThinkingStyle::AnthropicAdaptive && is_effort_off(effort) {
+            return Err(
+                "effort \"none\" (reasoning off) has no wire form on this Anthropic model: \
+                 the adaptive tier cannot disable thinking and \"none\" is not an effort \
+                 rung. Reasoning cannot be turned off on this model; set the \
+                 slot's `effort` (or `[defaults]`) to a rung such as `low` for the \
+                 shallowest reasoning"
+                    .to_string(),
+            );
+        }
+        Ok(())
     }
 
     /// Does this shape actually send sampling (`temperature`/`top_p`)? Kaibo runs
@@ -886,6 +915,36 @@ mod tests {
         ThinkingStyle::EffortOnly,
         ThinkingStyle::None,
     ];
+
+    /// `effort = "none"` means reasoning off. Anthropic's adaptive tier has no off
+    /// switch kaibo can send (Opus 5.5 and Sonnet 5.5 400 `thinking:{type:"disabled"}`,
+    /// and `output_config.effort: "none"` is not a rung), so the shape must refuse it
+    /// with the fix named instead of putting a 400 on the wire. Every other style has
+    /// an answer for it.
+    #[test]
+    fn effort_off_is_refused_where_the_wire_has_no_off_switch() {
+        let adaptive = ModelShape::resolve(
+            ProviderKind::Anthropic,
+            "claude-sonnet-5-5",
+            ThinkingStyleOverride::Auto,
+        );
+        let err = adaptive
+            .check_effort("none")
+            .expect_err("adaptive Anthropic has no off-switch");
+        assert!(err.contains("`low`"), "names the fix: {err}");
+        assert!(adaptive.check_effort(" NONE ").is_err(), "spelling-insensitive");
+        assert!(adaptive.check_effort("high").is_ok());
+        for style in ALL_STYLES {
+            if style == ThinkingStyle::AnthropicAdaptive {
+                continue;
+            }
+            let (kind, model, ovr) = representative(style);
+            assert!(
+                ModelShape::resolve(kind, model, ovr).check_effort("none").is_ok(),
+                "{style:?} answers none by shape"
+            );
+        }
+    }
 
     /// Every blob kaibo can build for one effort: one per [`ThinkingStyle`], plus the
     /// hosted OpenAI Responses blob, which replaces the [`ModelShape`] blob at the call
