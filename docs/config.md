@@ -215,6 +215,14 @@ example `typesafe/jev-1.13` or `~typesafe/jev-latest`. A decision slot on any ot
 is a load error. Like a media slot it runs no reasoning loop, so reasoning tunables
 written on it are inert.
 
+Jev (`typesafe/jev-*`) is a fast classifier: it answers `choice`, `score`, and `noul`
+questions with probabilities and writes no text. A call costs a fraction of a cent. The
+state may hold about 32k tokens; a larger state is refused with `max_tokens_exceeded`.
+Put the slot in its own cast, as in `[casts.judge]` of `docs/config.example.toml`, and name
+it on every call (`cast = "judge"`): the default cast has no decision slot, and `decide`
+refuses it. The example's `openrouter/` prefix is the backend's name, so use yours if it
+differs.
+
 A cast may omit a role. The interactive built-ins carry explorer + synth; the batch
 built-ins carry `synth` only; none carries a media slot. A user cast that omits a role is
 valid config, and the tool needing the missing role fails at call time naming the gap
@@ -686,6 +694,18 @@ Which cast shape staffs which tool:
 
 No built-in cast has a media slot or pairs an explorer with an offline synth, so
 `generate`, `deliberate`, and `decide` need a configured cast before they appear.
+
+**Which key staffs which tool.**
+
+| key | tools it staffs | config needed |
+|---|---|---|
+| DeepSeek, Anthropic, Gemini, or OpenRouter, or a local endpoint | `consult`, `explore`, `oneshot` | none beyond the key source |
+| Anthropic or Gemini | also `batch_submit` | none: the `anthropic-batch` and `gemini-batch` casts |
+| Anthropic or Gemini, plus any explorer | also `deliberate` | a cast pairing an explorer with a batch synth |
+| OpenRouter | also `decide` | a cast with a `decision` slot |
+| Stability, Gemini, Black Forest Labs, OpenAI, or DashScope | `generate` | a media backend, an `image` or `audio` slot, and `[cas]` on |
+
+OpenRouter does not staff `generate`. `kaibo configure` walks through these.
 
 ### Finding out why a tool is missing
 
