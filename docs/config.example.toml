@@ -248,9 +248,11 @@ synth = { backend = "gemma", id = "Big-Local-70B-GGUF", lane = "direct" }
 # [casts.flux-artist]
 # image = "bfl/flux-2-pro"
 
-# Typed questions answered with probabilities need a decision slot on an openrouter backend.
+# `decide`: a fast classifier (Jev) answers typed questions with probabilities, no text.
+# The slot needs an openrouter backend (the prefix below is that backend's name). Give it
+# its own cast and pass cast = "judge" on each call: the default cast has no decision slot.
 # [casts.judge]
-# decision = "openrouter/typesafe/jev-1.13"   # the `decide` tool; ~typesafe/jev-latest tracks the newest
+# decision = "openrouter/typesafe/jev-1.13"   # ~typesafe/jev-latest tracks the newest
 
 # House rules: project files read if present; user files required when a phase runs.
 # [context]
