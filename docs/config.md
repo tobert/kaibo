@@ -215,6 +215,14 @@ example `typesafe/jev-1.13` or `~typesafe/jev-latest`. A decision slot on any ot
 is a load error. Like a media slot it runs no reasoning loop, so reasoning tunables
 written on it are inert.
 
+Jev (`typesafe/jev-1.13`, or the `~typesafe/jev-latest` alias) is a fast classifier: it
+answers `choice`, `score`, and `noul` questions with probabilities and writes no text. A call
+costs under a cent (the 2026-10-06 probe: $0.000017). The provider refuses a state past its
+context limit with `max_tokens_exceeded` and does not truncate. Give the slot its own cast, as
+`[casts.judge]` in `docs/config.example.toml` does, and name it on every call
+(`cast = "judge"`): the default cast has no decision slot, and `decide` refuses it. The
+example's `openrouter/` prefix is the backend's name, so use yours if it differs.
+
 A cast may omit a role. The interactive built-ins carry explorer + synth; the batch
 built-ins carry `synth` only; none carries a media slot. A user cast that omits a role is
 valid config, and the tool needing the missing role fails at call time naming the gap
@@ -686,6 +694,20 @@ Which cast shape staffs which tool:
 
 No built-in cast has a media slot or pairs an explorer with an offline synth, so
 `generate`, `deliberate`, and `decide` need a configured cast before they appear.
+
+**Which key staffs which tool.**
+
+| key | tools it staffs | config needed |
+|---|---|---|
+| DeepSeek, Anthropic, Gemini, or OpenRouter, or a local endpoint | `consult`, `explore`, `oneshot` | none beyond the key source |
+| a hosted OpenAI Platform key | the same three | a new `openai` backend and cast, as `[backends.gpt]` and `[casts.gpt]` show |
+| Anthropic, Gemini, or a hosted OpenAI Platform key | also `batch_submit` | a cast whose synth has `lane = "batch"`; `anthropic-batch` and `gemini-batch` are built in |
+| any of the above | also `deliberate` | a cast pairing an `explorer` with an offline synth: `lane = "batch"` on the three keys above, or `lane = "direct"` on any backend |
+| OpenRouter | also `decide` | a cast with a `decision` slot |
+| a key for a `stability`, `gemini-media`, `bfl`, `openai-images`, or `dashscope` backend | `generate` | an `image` slot, or an `audio` slot on `stability` and `gemini-media` only; `[cas]` on |
+
+OpenRouter does not staff `generate`. `kaibo configure` covers `consult`, `decide`, and
+`generate`; the batch and `deliberate` casts are in `docs/config.example.toml`.
 
 ### Finding out why a tool is missing
 

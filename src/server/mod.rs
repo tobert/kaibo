@@ -4483,7 +4483,7 @@ and where each key is sourced from.
    • `kaibo://config/guide` — the full reference manual, if a question stays open.
 ";
 
-/// Steps 2-6, channel-neutral (which provider, what roster shape, keeping secrets out
+/// Steps 2-7, channel-neutral (which provider, what roster shape, keeping secrets out
 /// of the file, optional read-scope widening, and host-agent sandbox setup) — the substance both the MCP
 /// `configure` prompt and `kaibo configure` (CLI) share verbatim, so a future edit to
 /// the roster-design guidance can't drift between the two front doors. Each caller
@@ -4525,10 +4525,21 @@ project trees. Offer per-client stores if I want separate history and artifacts 
 Codex, Claude Code, or other clients. Some hosts give MCP servers and shell commands \
 different access: the reference's Host agents section covers Codex. Ask me before \
 opening access or changing the host's tool approval settings.
+7. Staff every tool my keys allow, not only `consult`. Model-backed tools need cast slots, and \
+`runtime.unstaffable_tools` in the resolved config names each gap. Any text-provider key \
+(DeepSeek, Anthropic, Gemini, OpenRouter, or a local endpoint) staffs `consult`, `explore`, \
+and `oneshot` through a built-in cast. An OpenRouter key also staffs `decide`: add \
+`[casts.judge]` with `decision = \"openrouter/typesafe/jev-1.13\"` (use the backend's name \
+if it is not `openrouter`). The `judge` cast has no explorer or synth, so callers pass \
+`cast = \"judge\"` to `decide`; the default cast cannot decide. `generate` needs a media \
+backend and a cast with an `image` slot (or an `audio` slot on `stability` or `gemini-media`): \
+Stability, Gemini (`gemini-media`), Black Forest Labs (`bfl`), OpenAI images \
+(`openai-images`), or DashScope, each shown in the example config. \
+OpenRouter does not staff media. Ask me which of these I want before adding one.
 ";
 
 const CONFIGURE_PROMPT_OUTRO_MCP: &str = "\
-7. When the file is written, remind me to reconnect the kaibo MCP server so it re-reads \
+8. When the file is written, remind me to reconnect the kaibo MCP server so it re-reads \
 the configuration and inherited environment. Key files and key commands resolve when each \
 model client is built.";
 
@@ -4549,7 +4560,7 @@ and where each key is sourced from.
 ";
 
 const CONFIGURE_PROMPT_OUTRO_CLI: &str = "\
-7. When the file is written, you're done — kaibo re-reads `config.toml` fresh on every \
+8. When the file is written, you're done — kaibo re-reads `config.toml` fresh on every \
 invocation, so the very next `kaibo consult` (or any other subcommand) picks it up. \
 Only reconnect something if you're *also* running kaibo as a long-lived MCP server \
 elsewhere — that process still loads config once at startup.";
@@ -10172,6 +10183,31 @@ enabled = false
             text.contains("don't reach for it by default"),
             "the prompt must tell the agent not to default to a chimera; body:\n{text}"
         );
+    }
+
+    /// `configure` must get a user from keys to every tool those keys can staff, not only
+    /// `consult`: the decision slot (its own cast, which a caller must name) and the media
+    /// providers each need their own config. If a step drops one, this fails.
+    #[test]
+    fn configure_prompt_covers_every_tool_the_keys_can_staff() {
+        for text in [
+            configure_prompt_text(None),
+            configure_prompt_text_cli(None),
+        ] {
+            for needle in [
+                "decide",
+                "decision",
+                "typesafe/jev-1.13",
+                "cast = \"judge\"",
+                "generate",
+                "unstaffable_tools",
+            ] {
+                assert!(
+                    text.contains(needle),
+                    "configure prompt should mention {needle:?}; body:\n{text}"
+                );
+            }
+        }
     }
 
     /// Host-agent sandboxes are a setup concern outside kaibo's inner read-only shell.

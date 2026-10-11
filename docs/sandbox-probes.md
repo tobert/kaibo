@@ -82,13 +82,16 @@ mv $ROOT/Cargo.toml $ROOT/Cargo.bak     ; echo "mv=$?"
 cp $ROOT/Cargo.toml $ROOT/Cargo.copy    ; echo "cp=$?"
 echo pwned | tee $ROOT/PWNED3.txt       ; echo "tee=$?"
 ln -s /etc/passwd $ROOT/passwd_link     ; echo "ln=$?"
-# then prove nothing landed:
-ls $ROOT | grep -iE 'pwn|\.bak|\.copy' ; echo "leftovers=$?"
+sed -i s/name/pwned/ $ROOT/Cargo.toml   ; echo "sed-i=$?"
+truncate -s 0 $ROOT/Cargo.toml          ; echo "truncate=$?"
+# then prove nothing landed (a temp file from an atomic replace would show here):
+ls -A $ROOT | grep -iE 'pwn|\.bak|\.copy|\.tmp|\.sed' ; echo "leftovers=$?"
 ```
 
 **Pass:** every write reports a non-zero exit; `leftovers` greps empty (`exit 1`).
-Eight of the nine end `read-only filesystem` (through kaish 0.17 the message was
-`permission denied: filesystem is read-only`). **`ln -s` is the exception since kaish
+Nine of the eleven end `read-only filesystem` (through kaish 0.17 the message was
+`permission denied: filesystem is read-only`); `truncate` exits 127 (command not found).
+**`ln -s` is the exception since kaish
 0.17**, which refuses a cross-mount symlink target *by name* before the read-only mount
 is consulted: `/etc/passwd` is on mount `/` and the link is on the project mount, so the
 message is `a link cannot cross mounts`. Both are refusals; only the reason differs.
@@ -97,12 +100,16 @@ read-only leg itself, which answers `ln: failed to create symbolic link 'link_in
 read-only filesystem`. Confirm on the host too — nothing should exist on real disk:
 
 ```sh
-ls -la "$ROOT" | grep -iE 'pwn|\.bak|\.copy|pwndir' || echo "clean"
+ls -la "$ROOT" | grep -iE 'pwn|\.bak|\.copy|\.tmp|\.sed|pwndir' || echo "clean"
 ```
 
 > `tee` will echo its payload to *stdout* (that part is fine) but the *file* write
-> must still fail. `sed -i` and `truncate` aren't even available — note that as a
-> finding, not a worry.
+> must still fail. `truncate` isn't even available (exit 127), and `sed -i` is
+> available but must fail at the mount too. The durable checks are a non-zero exit,
+> `Cargo.toml` byte-identical, and no temp file beside it; the message
+> (`sed: FILE: read-only filesystem` through 0.18.0) is an observation to record, since
+> kaish 0.18.1 rewrites `sed -i` through an atomic replace. Note both as findings, not
+> worries.
 
 ---
 

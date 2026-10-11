@@ -18,6 +18,7 @@ record. Each later release appends a new section at the top.
 ### Added
 - `decide` without `cast` uses the one cast that has a `decision` slot; with two or more it refuses and names them.
 - Every tool but `job_cancel` carries `destructiveHint: false` over MCP; none claims `readOnlyHint`, since several spend credits and Codex runs read-only tools without asking.
+- `kaibo configure` covers `decide` and `generate`: it says which key staffs which tool, and the guide has a key-to-tool table.
 - `decide` asks a fast decision model typed questions (`choice`, `score`, `noul`) about a state and returns probabilities, no text; it runs a cast's new `decision` slot on an `openrouter` backend (`typesafe/jev-1.13`), and `--no-decide` drops it.
 - `job_get` shows each role's model latency on a running job, so a slow backend shows at the first poll.
 - An async model call that reaches `slow_chat_secs` (default 60, `0` off) warns the caller through `job_wait`.
@@ -36,6 +37,7 @@ record. Each later release appends a new section at the top.
 - The consult and explore shells start every call at the project root, so a `cd` lasts only until its script ends; variables still carry over.
 - kaish 0.18: `grep` and `sed` read GNU basic regex, so `grep -rn 'fn consult(' src` runs; use `-E` for `|` alternation.
 - kaish 0.18: a write to the read-only mount reports `read-only filesystem`, and usage errors exit 2.
+- kaish 0.18.1: `sed -i` replaces files atomically; on the read-only project mount it still ends `read-only filesystem`.
 - The configuration reference and template are less than half their former length.
 - A failed consultation tells the calling agent to ask the user whether to retry, use another cast, or continue without it.
 - rig 0.42: OpenRouter's output budget is now sent by rig as `max_tokens`, replacing kaibo's `max_completion_tokens` workaround.
