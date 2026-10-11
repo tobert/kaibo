@@ -35,6 +35,7 @@ record. Each later release appends a new section at the top.
 - The consult and explore shells start every call at the project root, so a `cd` lasts only until its script ends; variables still carry over.
 - kaish 0.18: `grep` and `sed` read GNU basic regex, so `grep -rn 'fn consult(' src` runs; use `-E` for `|` alternation.
 - kaish 0.18: a write to the read-only mount reports `read-only filesystem`, and usage errors exit 2.
+- kaish 0.18.1: `sed -i` replaces files atomically; on the read-only project mount it still ends `read-only filesystem`.
 - The configuration reference and template are less than half their former length.
 - A failed consultation tells the calling agent to ask the user whether to retry, use another cast, or continue without it.
 - rig 0.42: OpenRouter's output budget is now sent by rig as `max_tokens`, replacing kaibo's `max_completion_tokens` workaround.
