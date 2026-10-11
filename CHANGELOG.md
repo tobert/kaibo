@@ -30,6 +30,7 @@ record. Each later release appends a new section at the top.
 - `consult` runs single-stage on a cast with no `explorer`: the synth does every read itself, with no `explore` tool.
 
 ### Changed
+- The consult and explore shells start every call at the project root, so a `cd` lasts only until its script ends; variables still carry over.
 - kaish 0.18: `grep` and `sed` read GNU basic regex, so `grep -rn 'fn consult(' src` runs; use `-E` for `|` alternation.
 - kaish 0.18: a write to the read-only mount reports `read-only filesystem`, and usage errors exit 2.
 - The configuration reference and template are less than half their former length.
