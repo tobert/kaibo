@@ -77,11 +77,9 @@ async fn oversized_output_is_capped_or_marked() {
         "a truncated read must carry a marker so the caller knows it's partial, got tail: {:?}",
         &out[out.len().saturating_sub(120)..]
     );
-    // KNOWN IMPERFECTION (tracked in kaish's issues.md): under the `localfs`
-    // feature the cap spills the full output to a real host file in the XDG
-    // runtime dir and remaps the exit code to 3. kaibo's invariant (never modify
-    // the *project*) holds — the project mount is read-only — but the ideal is
-    // in-memory head+tail truncation with no host write and the real code preserved.
+    // kaibo forces the in-memory limiter, so the cap writes no host file; the
+    // sandbox tests prove that. A truncated stream carries a marker, and its exit
+    // code can be 0 or 3.
 }
 
 /// Config-driven `[sandbox].disable_builtins` actually shadow-blocks a builtin that

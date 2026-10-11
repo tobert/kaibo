@@ -450,8 +450,9 @@ async fn oversize_output_never_spills_to_the_host() {
 /// Six published strings — the preamble addendum, the `kaibo://kaish/sandbox`
 /// resource, `kaibo --help`, the `kaibo kaish` failure message, the MCP `run_kaish`
 /// tool description, and `kaibo://tools` — tell a reader that a refused write exits
-/// `1` and identifies itself with `permission denied: filesystem is read-only`. That
-/// sentence is how a model tells a refusal from its own mistake, since both exit 1.
+/// `1` and that its stderr line ends `read-only filesystem`, as in
+/// `rm: src/lib.rs: read-only filesystem`. That phrase is how a model tells a refusal
+/// from its own mistake, since both exit 1.
 ///
 /// **kaibo does not own that string — kaish-kernel does.** Every other test here
 /// asserts the loose `contains("read-only")`, and the tests beside the prose assert
@@ -462,9 +463,16 @@ async fn oversize_output_never_spills_to_the_host() {
 ///
 /// It pins the code too: `1`, not 126. The prose said 126 for two months because
 /// nothing tied the claim to behavior.
+///
+/// This test caught the first rewording. kaish 0.17 said `permission denied:
+/// filesystem is read-only`; kaish 0.18 reports a write to a read-only mount as
+/// `ErrorKind::ReadOnlyFilesystem`, whose message is `<builtin>: <path>: read-only
+/// filesystem`. The prose quotes the phrase as the line's ending and shows the `rm`
+/// line as its example, so both are pinned: every case must END with the phrase, and
+/// the `rm` case must have exactly the example's shape.
 #[tokio::test(flavor = "current_thread")]
 async fn a_refused_write_exits_1_with_the_message_our_prose_quotes() {
-    const QUOTED: &str = "permission denied: filesystem is read-only";
+    const QUOTED: &str = "read-only filesystem";
 
     let dir = tempdir().unwrap();
     fs::write(dir.path().join("keep.txt"), "hi").unwrap();
@@ -485,12 +493,21 @@ async fn a_refused_write_exits_1_with_the_message_our_prose_quotes() {
              refused write is an ordinary failure, not 126. Got {r:?}"
         );
         assert!(
-            r.err.contains(QUOTED),
-            "`{script}` must refuse with the exact sentence kaibo quotes to models, \
-             {QUOTED:?}. If kaish reworded this, six published strings are now wrong — \
-             fix them together with this test. Got {r:?}"
+            r.err.trim_end().ends_with(QUOTED),
+            "`{script}` must refuse with a line ending in the exact phrase kaibo quotes \
+             to models, {QUOTED:?}. If kaish reworded this, six published strings are now \
+             wrong — fix them together with this test. Got {r:?}"
         );
     }
+
+    // The example the prose shows, `rm: src/lib.rs: read-only filesystem`, in the
+    // shape kaish writes it: the builtin, the path as given, then the phrase.
+    let r = run(&kernel, "rm keep.txt").await.unwrap();
+    assert_eq!(
+        r.err.trim_end(),
+        "rm: keep.txt: read-only filesystem",
+        "the `rm` refusal must have the shape of the example kaibo's prose shows"
+    );
 
     assert!(
         dir.path().join("keep.txt").exists(),

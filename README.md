@@ -335,9 +335,9 @@ failed, `124` timed out, `127` command not found, and on Unix `255` when kaish
 could not run the script, which `--json` reports as `exit_code` -1) instead,
 since a script
 branches on *that* to know what the sandboxed command did. A refused write is an
-ordinary failure: it exits `1` and prints `permission denied: filesystem is
-read-only`, so branch on the message when you need to tell a refusal from a
-mistake. The same table is in `kaibo --help`.
+ordinary failure: it exits `1` and its stderr line ends `read-only filesystem`
+(`rm: src/lib.rs: read-only filesystem`), so branch on the message when you need to
+tell a refusal from a mistake. The same table is in `kaibo --help`.
 
 The shared flags (`--root`, `--allow-path`, `--cast`, `--config`, house-rules
 files, …) work before or after the subcommand and are documented in `kaibo
