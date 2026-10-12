@@ -127,11 +127,13 @@ line (different kinds, even) is fit per-arm by construction.
 
 ## Choosing an explorer
 
-The explorer's job is cheap bulk reading, so it is the slot where the cheapest
-tier looks tempting — two considerations before pinning one:
+The explorer reads broadly and reports what it found, with citations. Flash is
+the floor: every built-in explorer is a flash-tier model or stronger, none pins a
+lite model, and we recommend the same for your own casts. Two considerations
+before pinning one:
 
 - **Confabulation risk is why we usually want smarter models.** Under a
-  restricted toolset a small or flash-tier model may confabulate — calling a
+  restricted toolset a less capable model may confabulate — calling a
   tool that is not in its set, for example — and a survey re-run without
   corrective feedback tends to repeat the confabulation. Thinking depth is not
   the lever here: kaibo already enables thinking at high effort by default on

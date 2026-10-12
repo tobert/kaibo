@@ -570,10 +570,10 @@ merges over them by name. The built-ins are:
 
 | cast | explorer | synth |
 |---|---|---|
-| `anthropic` *(default)* | `claude-haiku-4-5` | `claude-sonnet-5-5` |
+| `anthropic` *(default)* | `claude-haiku-5-5` | `claude-sonnet-5-5` |
 | `deepseek` | `deepseek-flash` | `deepseek-flash` |
-| `gemini` | `gemini-flash-lite-latest` | `gemini-3.5-flash` |
-| `openrouter` | `qwen/qwen3.6-flash` | `qwen/qwen3.7-max` |
+| `gemini` | `gemini-flash-latest` | `gemini-flash-latest` |
+| `openrouter` | `qwen/qwen3.8-flash` | `qwen/qwen3.7-max` |
 | `openai-local` | local Gemma (small) | local Gemma (large) |
 | `anthropic-batch` | — | `claude-opus-5-5` (batch lane) |
 | `gemini-batch` | — | `gemini-pro-latest` (batch lane) |

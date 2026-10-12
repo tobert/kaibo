@@ -197,7 +197,7 @@ explorer = "anthropic/claude-sonnet-5-5"
 synth = { backend = "anthropic", id = "claude-fable-5", lane = "batch" }
 
 [casts.gemini-deliberate]
-explorer = "gemini/gemini-flash-lite-latest"
+explorer = "gemini/gemini-flash-latest"
 synth = { backend = "gemini", id = "gemini-pro-latest", lane = "batch" }
 
 # Direct is one long completion, with no provider batch API.

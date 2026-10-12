@@ -353,11 +353,11 @@ that can use it. Measured 2026-08-01:
 
 | provider | rungs |
 |---|---|
-| Gemini | `minimal` `low` `medium` `high` — Google's own schema rejects `none`/`xhigh`/`max`. `minimal` is the off-switch, itself model-dependent (`gemini-3.5-flash` takes it, `gemini-pro-latest` refuses it). |
+| Gemini | `minimal` `low` `medium` `high` — Google's own schema rejects `none`/`xhigh`/`max`. `minimal` is the off-switch, itself model-dependent: `gemini-3.5-flash` takes it; `gemini-pro-latest` and `gemini-flash-latest` (serving `gemini-3.8-flash`, probed 2026-10-12) refuse it. |
 | DeepSeek | accepts all seven (`none` … `max`), strictly validated, and runs three: `minimal`/`low` → low, `medium`/`high`/`xhigh` → high, `max` → max. The built-in `deepseek` cast's synth pins `max`. `none` emits the structural `thinking:{"type":"disabled"}` — asking for zero effort while thinking stays enabled bills reasoning tokens anyway (probed: 160–253). |
 | OpenRouter | all seven on everything; the gateway normalizes each onto the upstream's native knob, so a rung can reach a model that refuses it on that vendor's direct API. `none` emits the gateway's structural disable. |
 | OpenAI (hosted) | **per model**, at both ends: `gpt-5.6` → `max`, `gpt-5.2` → `xhigh`, `gpt-5.1` → `high`; `gpt-5`'s bottom rung is `minimal` where 5.1+ use `none`. |
-| Anthropic | the adaptive tier takes an effort; the budget tier (Haiku 4.5 and older) expresses depth as `budget_tokens` and has no effort field at all. **Which rungs the adaptive tier takes is still unmeasured**, and `none` is refused at arm construction: the adaptive tier has no off-switch to send. |
+| Anthropic | the adaptive tier takes an effort; the budget tier (Haiku 4.5 and older) expresses depth as `budget_tokens` and has no effort field at all. Haiku 5.5 took `high` and `max` (probed 2026-10-12); **the other adaptive rungs are still unmeasured**, and `none` is refused at arm construction: the adaptive tier has no off-switch to send. |
 
 Every row above except the Anthropic one was measured against the live endpoint, and each
 is re-checkable: `tests/consult.rs` carries an `#[ignore]`d probe per provider that fails
@@ -385,8 +385,8 @@ or through `KAIBO_*_EFFORT`, kaibo warns at startup and reports `effort` under
 `inert_tunables` in `kaibo://config`. An inherited built-in effort stays quiet.
 
 **`thinking_style`.** Forces the thinking shape instead of the built-in classifier.
-`auto` picks adaptive for Opus 4.6+, Sonnet 4.6+, and Fable 5, and enabled-budget for
-older models plus Haiku 4.5. Set `adaptive` or `budget` when a new or misclassified
+`auto` picks adaptive for Opus 4.6+, Sonnet 4.6+, Haiku 5.5, and Fable 5, and
+enabled-budget for older models plus Haiku 4.5. Set `adaptive` or `budget` when a new or misclassified
 Anthropic model ships; those two are no-ops for other kinds. An unknown value is a load
 error.
 
@@ -479,15 +479,18 @@ not OpenAI Platform's own but should still take the Responses shape; see
 
 | cast | explorer | synth | synth lane |
 |---|---|---|---|
-| `anthropic` | `anthropic/claude-haiku-4-5` | `anthropic/claude-sonnet-5-5` | |
+| `anthropic` | `anthropic/claude-haiku-5-5` | `anthropic/claude-sonnet-5-5` | |
 | `deepseek` | `deepseek/deepseek-flash` | `deepseek/deepseek-flash` | |
-| `gemini` | `gemini/gemini-flash-lite-latest` | `gemini/gemini-3.5-flash` | |
-| `openrouter` | `openrouter/qwen/qwen3.6-flash` | `openrouter/qwen/qwen3.7-max` | |
+| `gemini` | `gemini/gemini-flash-latest` | `gemini/gemini-flash-latest` | |
+| `openrouter` | `openrouter/qwen/qwen3.8-flash` | `openrouter/qwen/qwen3.7-max` | |
 | `openai-local` | `openai-local/Gemma-4-E4B-it-GGUF` | `openai-local/Gemma-4-26B-A4B-it-GGUF` | |
 | `gemini-batch` | — | `gemini/gemini-pro-latest` | `batch` |
 | `anthropic-batch` | — | `anthropic/claude-opus-5-5` | `batch` |
 
 The built-in OpenRouter explorer has `vision = true`; its synth is text-only.
+Four built-in synths pin `max_tokens` above the 16384 floor, because reasoning bills into
+the same budget as the answer: `deepseek` 131072, `gemini` 65536 (its model's output
+ceiling), `openrouter` 65536, and `anthropic` 32768.
 Use the live model catalog when changing model IDs or capabilities.
 
 **Merging.** The TOML merges over this registry by name. Set one field on a built-in to

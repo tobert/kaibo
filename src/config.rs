@@ -2503,8 +2503,8 @@ fn builtin_casts() -> BTreeMap<String, Cast> {
         // OpenRouter's vision classifier defaults false (the gateway fronts blind and
         // sighted models alike — it's a property of the pinned model, not the wire), so
         // a multimodal default id must opt its slot in. The Qwen default splits by role:
-        // explorer `qwen/qwen3.6-flash` advertises `image` in `architecture.input_modalities`
-        // (verified 2026-07-15) so it pins vision on, while synth `qwen/qwen3.7-max` is
+        // explorer `qwen/qwen3.8-flash` advertises `image` in `architecture.input_modalities`
+        // (verified 2026-10-12) so it pins vision on, while synth `qwen/qwen3.7-max` is
         // text-only — its slot leaves `vision: None`, letting the classifier's `false`
         // stand. Every other built-in kind is classified correctly by default, needing no pin.
         let slot = |id, vision| ModelSlot {
@@ -2518,12 +2518,17 @@ fn builtin_casts() -> BTreeMap<String, Cast> {
         // 2× the [defaults] floor. DeepSeek: the synth reasons at `max` (below), and
         // DeepSeek's API reference makes 128K the default `max_tokens` at that effort
         // (ceiling 393216, probed 2026-09-23); at 32768, dense reviews ended with
-        // `finish_reason = length` and no answer. The other built-ins are unmeasured
-        // and stay on the floor; the pin table lives with
+        // `finish_reason = length` and no answer. Gemini and OpenRouter: both synths
+        // reason at the `high` default, and the 16384 floor is the budget that starved
+        // DeepSeek. Each gets 65536, inside its model's catalog output ceiling (read
+        // 2026-10-12): `gemini-flash-latest` caps output at 65536, so the pin is that
+        // ceiling; `qwen/qwen3.7-max` caps at 131072, so the pin is half of it. Local
+        // Gemma stays on the floor. The pin table lives with
         // `builtin_synth_max_tokens_pins_are_deliberate`.
         let synth_max_tokens = match kind {
             ProviderKind::Anthropic => Some(32_768),
             ProviderKind::DeepSeek => Some(131_072),
+            ProviderKind::Gemini | ProviderKind::OpenRouter => Some(65_536),
             _ => None,
         };
         // DeepSeek serves three reasoning rungs (`low`, `high`, `max`) and maps every
@@ -2609,14 +2614,20 @@ pub fn default_models(kind: ProviderKind) -> (&'static str, &'static str) {
         return ("", "");
     };
     match wire {
-        credentials::WireKind::Anthropic => ("claude-haiku-4-5", "claude-sonnet-5-5"),
+        // Haiku 5.5 is on the adaptive thinking tier, like the Sonnet 5.5 synth
+        // (probed 2026-10-12; see `is_anthropic_adaptive`).
+        credentials::WireKind::Anthropic => ("claude-haiku-5-5", "claude-sonnet-5-5"),
         // kaibo is flash-only on DeepSeek: `deepseek-flash` for both roles, and no
         // other DeepSeek id is recommended or special-cased. The undated id is the
         // rot-resistant one — it tracks each new flash generation. The dated
         // `deepseek-v4-flash` was retired under us, and the built-in dialed it until
         // 2026-09-10.
         credentials::WireKind::DeepSeek => ("deepseek-flash", "deepseek-flash"),
-        credentials::WireKind::Gemini => ("gemini-flash-lite-latest", "gemini-3.5-flash"),
+        // Flash is the floor (2026-10-10): no built-in pins a lite model. Both roles use
+        // the `gemini-flash-latest` alias, which tracks each new flash generation
+        // (it served `gemini-3.8-flash` on 2026-10-12) the way `gemini-pro-latest` does
+        // for gemini-batch. Catalog: 1048576 input, 65536 output, thinking.
+        credentials::WireKind::Gemini => ("gemini-flash-latest", "gemini-flash-latest"),
         // OpenRouter's job here is a family we *can't* reach directly (we key
         // DeepSeek, Gemini, and Anthropic on their own backends), so the gateway
         // default is Qwen — a distinct lineage for a genuine cross-family read.
@@ -2624,11 +2635,14 @@ pub fn default_models(kind: ProviderKind) -> (&'static str, &'static str) {
         // google / moonshotai / openai / x-ai get those), so we pin the *undated*
         // family ids, which are the most rot-resistant Qwen ids available — each
         // tracks the newest point-release until the next `.x` bump. Explorer is the
-        // cheap multimodal flash; synth is the flagship reasoner `qwen3.7-max`,
-        // which is text-only (hence the synth slot takes no vision pin below). If
+        // multimodal flash that surveys (text, image, video in; 1M context; reasoning);
+        // synth is the flagship reasoner `qwen3.7-max`, which is text-only (hence the
+        // synth slot takes no vision pin below). The synth stays on 3.7 because no
+        // undated `qwen/qwen3.8-max` id exists yet: the 3.8 max tier ships only as the
+        // dated `qwen3.8-max-0902` and `qwen3.8-max-prime` (catalog, 2026-10-12). If
         // you'd rather keep vision on the synth, swap in the multimodal plus tier
         // `qwen/qwen3.7-plus` (weaker reasoner, ~4.5× cheaper) and pin its vision on.
-        credentials::WireKind::OpenRouter => ("qwen/qwen3.6-flash", "qwen/qwen3.7-max"),
+        credentials::WireKind::OpenRouter => ("qwen/qwen3.8-flash", "qwen/qwen3.7-max"),
         credentials::WireKind::Openai => ("Gemma-4-E4B-it-GGUF", "Gemma-4-26B-A4B-it-GGUF"),
     }
 }
@@ -4229,6 +4243,40 @@ mod tests {
         assert!(!b.key_optional);
     }
 
+    /// Every built-in (explorer, synth) id, written out literally. The other built-in
+    /// tests compare a cast against `default_models`, so a changed default passes them
+    /// unseen; this one fails, and the change has to be made here on purpose. Flash is
+    /// the floor (2026-10-10): no built-in pins a lite model.
+    #[test]
+    fn builtin_default_model_ids_are_pinned() {
+        for (kind, expected) in [
+            (
+                ProviderKind::Anthropic,
+                ("claude-haiku-5-5", "claude-sonnet-5-5"),
+            ),
+            (ProviderKind::DeepSeek, ("deepseek-flash", "deepseek-flash")),
+            (
+                ProviderKind::Gemini,
+                ("gemini-flash-latest", "gemini-flash-latest"),
+            ),
+            (
+                ProviderKind::OpenRouter,
+                ("qwen/qwen3.8-flash", "qwen/qwen3.7-max"),
+            ),
+            (
+                ProviderKind::Openai,
+                ("Gemma-4-E4B-it-GGUF", "Gemma-4-26B-A4B-it-GGUF"),
+            ),
+        ] {
+            let (explorer, synth) = default_models(kind);
+            assert_eq!((explorer, synth), expected, "{kind:?} built-in ids");
+            assert!(
+                !explorer.contains("lite") && !synth.contains("lite"),
+                "{kind:?}: flash is the floor, no lite model in a built-in"
+            );
+        }
+    }
+
     /// Built-in synth `max_tokens` pins are deliberate — a future edit moves this
     /// test, not just the cast table. Measured 2026-08-02 at the 16384 default
     /// (whole-file attach, exhaustive-review ask): deepseek-v4-pro used 10.6K of
@@ -4238,7 +4286,11 @@ mod tests {
     /// `max_tokens` at that effort (64K for other thinking efforts; ceiling 393216,
     /// confirmed by a live probe 2026-09-23). At the old 32768 pin, dense reviews
     /// stopped with `finish_reason = length` and no answer, so the pin is DeepSeek's
-    /// own `max` default. The unmeasured casts stay on the `[defaults]` floor (16384)
+    /// own `max` default. The gemini and openrouter synths reason at the `high` default
+    /// on models whose catalog output ceilings sit well above the floor
+    /// (`gemini-flash-latest` 65536, `qwen/qwen3.7-max` 131072, both read 2026-10-12),
+    /// so each gets 65536: the Gemini ceiling itself, and half the Qwen ceiling. The
+    /// casts left (local Gemma, the batch lane) stay on the `[defaults]` floor (16384)
     /// rather than guessing a ceiling.
     #[test]
     fn builtin_synth_max_tokens_pins_are_deliberate() {
@@ -4246,8 +4298,8 @@ mod tests {
         for (name, expected) in [
             ("deepseek", Some(131_072)),
             ("anthropic", Some(32_768)),
-            ("gemini", None),
-            ("openrouter", None),
+            ("gemini", Some(65_536)),
+            ("openrouter", Some(65_536)),
             ("openai-local", None),
             ("gemini-batch", None),
             ("anthropic-batch", None),
@@ -4362,7 +4414,7 @@ mod tests {
     fn builtin_openrouter_cast_and_backend() {
         let cfg = Config::builtin();
         let (explorer, synth) = default_models(ProviderKind::OpenRouter);
-        assert_eq!(explorer, "qwen/qwen3.6-flash");
+        assert_eq!(explorer, "qwen/qwen3.8-flash");
         assert_eq!(synth, "qwen/qwen3.7-max");
 
         let cast = cfg.resolve_cast("openrouter").unwrap();

@@ -146,8 +146,9 @@ fn every_gemini_id_takes_thinking_level_not_budget() {
     for id in [
         "gemini-3-pro-preview",     // dash 3-line
         "gemini-3.1-pro-preview",   // dotted 3.x preview
-        "gemini-3.5-flash",         // built-in gemini synth default
-        "gemini-flash-lite-latest", // built-in explorer default (a -latest alias)
+        "gemini-3.5-flash",         // dotted 3.x flash
+        "gemini-flash-latest",      // built-in gemini cast, both roles (a -latest alias)
+        "gemini-flash-lite-latest", // a lite -latest alias an operator may configure
         "gemini-pro-latest",        // built-in gemini-batch synth (a -latest alias)
     ] {
         let g = thinking_params(ProviderKind::Gemini, id, THINKING_BUDGET).expect("toggle");
@@ -314,8 +315,9 @@ fn anthropic_thinking_suppresses_sampling_or_the_api_400s() {
 
 #[test]
 fn anthropic_newest_models_get_adaptive_thinking() {
-    // Opus 4.7/4.8 and Fable 5 *require* adaptive: enabled/budget AND temperature/top_p
-    // all 400. Each gets `{thinking:{type:adaptive}, output_config:{effort}}` and no
+    // Opus 4.7/4.8, Fable 5, and Haiku 5.5 *require* adaptive: enabled/budget AND
+    // temperature/top_p all 400 (Haiku 5.5 probed 2026-10-12: `enabled` 400 "is not
+    // supported for this model", `temperature = 0.5` 400, adaptive 200). Each gets `{thinking:{type:adaptive}, output_config:{effort}}` and no
     // sampling. (Mirrors the live "fix anthropic" goal — these would 400 on the old shape.)
     for model in [
         "claude-opus-4-8",
@@ -324,6 +326,7 @@ fn anthropic_newest_models_get_adaptive_thinking() {
         "claude-fable-5-1",
         "claude-opus-5-5",
         "claude-sonnet-5-5",
+        "claude-haiku-5-5",
     ] {
         let a = request_params(
             ProviderKind::Anthropic,
@@ -369,6 +372,7 @@ fn anthropic_classifier_boundary() {
         "claude-fable-5-1",
         "claude-opus-5-5",
         "claude-sonnet-5-5",
+        "claude-haiku-5-5",
     ] {
         assert_eq!(
             thinking_type(model),
@@ -637,7 +641,12 @@ fn model_caps_classify_per_kind_and_honor_the_override() {
     // Every current Anthropic and Gemini completion id is multimodal-in.
     assert!(ModelCaps::resolve(ProviderKind::Anthropic, "claude-sonnet-4-6", None).vision);
     assert!(ModelCaps::resolve(ProviderKind::Anthropic, "claude-haiku-4-5", None).vision);
+    // The built-in anthropic explorer; `GET /v1/models/claude-haiku-5-5` reports
+    // `image_input.supported = true` (2026-10-12).
+    assert!(ModelCaps::resolve(ProviderKind::Anthropic, "claude-haiku-5-5", None).vision);
     assert!(ModelCaps::resolve(ProviderKind::Gemini, "gemini-3.5-flash", None).vision);
+    // The built-in gemini cast's id for both roles.
+    assert!(ModelCaps::resolve(ProviderKind::Gemini, "gemini-flash-latest", None).vision);
     // DeepSeek is per model: `deepseek-flash` (V4.1 Flash, 2026-09-10) reads images on
     // chat completions (live probe 2026-09-21: a 32x32 red PNG answered "Red", 224
     // prompt tokens). Any other id stays blind, so an image to it is refused before
