@@ -64,11 +64,13 @@ pub struct DiscoveredModel {
     /// `created_at` (RFC3339, parsed via [`rfc3339_to_epoch`]) — `None` if absent or
     /// unparseable; the original value still rides in `raw` either way.
     pub created: Option<i64>,
-    /// Anthropic `max_input_tokens`, Gemini `inputTokenLimit`.
+    /// Anthropic `max_input_tokens`, Gemini `inputTokenLimit`, OpenRouter
+    /// `context_length`, DeepSeek `context_window`.
     pub context_window: Option<u64>,
     /// The model's advertised max *completion* tokens — OpenRouter
-    /// `top_provider.max_completion_tokens`, Gemini `outputTokenLimit`. `None` where
-    /// the provider's list endpoint doesn't report one (Anthropic, plain OpenAI wire).
+    /// `top_provider.max_completion_tokens`, DeepSeek `max_output_tokens`, Gemini
+    /// `outputTokenLimit`. `None` where the provider's list endpoint doesn't report one
+    /// (Anthropic, plain OpenAI wire).
     /// Surfaced so a configure-time caller can size a synth slot's `max_tokens` from
     /// it: reasoning bills into the same completion budget as the answer, so a budget
     /// set below the ceiling starves answers.
@@ -324,9 +326,10 @@ pub fn parse_openai_models(v: &Value) -> Vec<DiscoveredModel> {
                 .to_string(),
             display_name: None,
             created: item.get("created").and_then(Value::as_i64),
-            // OpenRouter carries the model's context at the top level, with the
-            // serving provider's figure under `top_provider` as the fallback; the
-            // other OpenAI-wire endpoints carry neither.
+            // OpenRouter carries the model's context at the top level as
+            // `context_length`, with the serving provider's figure under
+            // `top_provider` as the fallback. DeepSeek names it `context_window`.
+            // Plain OpenAI carries none of these.
             context_window: item
                 .get("context_length")
                 .and_then(Value::as_u64)
@@ -334,13 +337,15 @@ pub fn parse_openai_models(v: &Value) -> Vec<DiscoveredModel> {
                     item.get("top_provider")
                         .and_then(|tp| tp.get("context_length"))
                         .and_then(Value::as_u64)
-                }),
-            // OpenRouter nests the completion ceiling under `top_provider`; the
-            // other OpenAI-wire endpoints simply don't carry the field.
+                })
+                .or_else(|| item.get("context_window").and_then(Value::as_u64)),
+            // OpenRouter nests the completion ceiling under `top_provider`; DeepSeek
+            // puts `max_output_tokens` at the top level. Plain OpenAI carries neither.
             output_ceiling: item
                 .get("top_provider")
                 .and_then(|tp| tp.get("max_completion_tokens"))
-                .and_then(Value::as_u64),
+                .and_then(Value::as_u64)
+                .or_else(|| item.get("max_output_tokens").and_then(Value::as_u64)),
             pricing: parse_openai_pricing(item),
             reasoning: parse_reasoning_support(item),
             raw: item.clone(),
@@ -991,6 +996,42 @@ mod tests {
             models[0].raw["top_provider"]["max_completion_tokens"],
             16_384
         );
+    }
+
+    /// DeepSeek's `/models` names its limits at the top level, as `context_window` and
+    /// `max_output_tokens` (live entry captured 2026-10-12), not in OpenRouter's
+    /// `context_length`/`top_provider` shape — so both normalized fields came back
+    /// `None` for every DeepSeek model.
+    #[test]
+    fn parse_openai_shape_normalizes_deepseek_limits() {
+        let body = serde_json::json!({
+            "object": "list",
+            "data": [
+                {
+                    "id": "deepseek-flash",
+                    "object": "model",
+                    "owned_by": "deepseek",
+                    "name": "DeepSeek-V4.1-Flash",
+                    "context_window": 1_048_576,
+                    "max_output_tokens": 393_216,
+                    "input_modalities": ["text", "image"],
+                    "output_modalities": ["text"],
+                    "effort": {"supported_levels": ["low", "high", "max"], "default_level": "high"},
+                    "api_capabilities": {"anthropic_messages": {"system_prompt_update": "in-history"}},
+                },
+                {"id": "deepseek-bare", "object": "model", "owned_by": "deepseek"},
+                {"id": "deepseek-odd", "context_window": "big", "max_output_tokens": -1},
+            ]
+        });
+        let models = parse_openai_models(&body);
+        assert_eq!(models[0].context_window, Some(1_048_576));
+        assert_eq!(models[0].output_ceiling, Some(393_216));
+        assert_eq!(models[0].raw, body["data"][0], ".raw stays verbatim");
+        // Absent or wrong-typed limits degrade to None, never a guess.
+        for m in &models[1..] {
+            assert_eq!(m.context_window, None, "{}", m.id);
+            assert_eq!(m.output_ceiling, None, "{}", m.id);
+        }
     }
 
     #[test]

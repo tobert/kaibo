@@ -656,7 +656,7 @@ impl std::str::FromStr for DataCollection {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OpenaiWire {
     /// rig's Responses client. Needed behind an OpenAI-compatible gateway/proxy
-    /// that implements `/v1/responses` — current GPT-5.x reasoning models reject
+    /// that implements `/v1/responses` — current GPT reasoning models (5 and later) reject
     /// Chat Completions' `max_tokens` outright (`unsupported_parameter`).
     Responses,
     /// The OpenAI-compatible Chat Completions client — the default shape for a

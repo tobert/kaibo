@@ -183,9 +183,10 @@ The mount's own prefix *directories* (`/home`, `/home/<user>`, …) are the one 
 and they list — see the note below — but each level names only the next component
 toward the mount, so it can't be walked to a sibling.
 
-> **`cd / && ls` returns `dev`, `home`, `v`, and that is not a finding.** It is
+> **`cd / && ls` returns `dev`, `home`, `tmp`, `v`, and that is not a finding.** It is
 > synthetic VFS scaffolding, not host content: `/dev/{null,random,urandom,zero}` are
-> virtual devices, `/v` is kaish's own builtin toolbox plus ephemeral blob/job scratch,
+> virtual devices, `/tmp` is the empty scratch directory kaibo creates in the `/`
+> MemoryFs, `/v` is kaish's own builtin toolbox plus ephemeral blob/job scratch,
 > and `/home` is the synthesized head of the path down to the mount. Only the exact
 > `--root`-resolved absolute path mounts real content.
 > Confirm it the way the 2026-07-29 run did: read `$ROOT/Cargo.toml` through the mount
@@ -198,7 +199,10 @@ toward the mount, so it can't be walked to a sibling.
 > component, down to the project. Each level lists **only the component leading to the
 > mount** — the host's real siblings, files, and bytes stay absent — so a model walking
 > up recovers the root path string the caller already handed it and nothing else. Check
-> it by counting: `ls /tmp` returns one entry where the host `/tmp` holds thousands.
+> it by counting: `ls` on the directory one level above the mount returns one entry where
+> the host directory holds many. Count below `/tmp`, not at it: the scratch starts with
+> an empty `/tmp` of its own, and a directory that exists in scratch lists only its own
+> contents, so `ls /tmp` returns no entries even when the project lives under `/tmp`.
 >
 > **And check the oracle, the way G3 does for links:** `stat` and `realpath` on a real
 > host file beside the chain, and on a path that was never created, must refuse

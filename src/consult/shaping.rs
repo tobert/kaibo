@@ -642,7 +642,8 @@ pub fn request_params(
 /// `/chat/completions`, so they stay on [`ThinkingStyle::None`]. A backend whose
 /// resolved base URL is OpenAI Platform gets this first-party Responses shape.
 /// Reasoning and sampling are independent model-family capabilities: current GPT
-/// reasoning models (`gpt-5*`, including `gpt-5.6-sol`) take `reasoning.effort`
+/// reasoning models (GPT 5 and later, such as `gpt-5.6-sol` and `gpt-6-luna`; see
+/// [`hosted_openai_accepts_reasoning`]) take `reasoning.effort`
 /// and reject custom `temperature`; older GPT chat families (`gpt-4*`,
 /// `gpt-3.5*`, `chatgpt-*`) take sampling and reject `reasoning.effort`.
 ///
@@ -668,7 +669,7 @@ pub fn hosted_openai_responses_params(
     // build on [`ModelShape`], it REPLACES that blob at the call site, so the early
     // return in `ModelShape::resolve` never reaches the Responses wire. Without this
     // check an operator who switched reasoning off still got `reasoning:{effort}` on
-    // every gpt-5 slot — silently, because the setting looked honored everywhere else.
+    // every GPT 5+ slot — silently, because the setting looked honored everywhere else.
     if hosted_openai_accepts_reasoning(model) && style != ThinkingStyleOverride::Off {
         obj.insert("reasoning".into(), json!({ "effort": effort }));
     }
@@ -694,15 +695,32 @@ pub fn hosted_openai_accepts_sampling(model: &str) -> bool {
     m.starts_with("gpt-4") || m.starts_with("gpt-3.5") || m.starts_with("chatgpt-")
 }
 
+/// GPT 5 and every later generation take `reasoning.effort`: `gpt-5`, `gpt-5.6-sol`,
+/// `gpt-6-luna`, `gpt-6.1-sol`, and a `gpt-7` that ships tomorrow. The rule reads the
+/// major version out of the id instead of matching a prefix list, because a prefix
+/// list went stale the day `gpt-6-*` shipped and silently dropped effort from those
+/// slots. Ids without a `gpt-<digits>` head (`gpt-image-1`, `gpt-oss-120b`, `o3`)
+/// answer `false`.
 pub fn hosted_openai_accepts_reasoning(model: &str) -> bool {
-    model.trim().to_ascii_lowercase().starts_with("gpt-5")
+    gpt_major_version(model).is_some_and(|major| major >= 5)
+}
+
+/// The generation number in a `gpt-<major>[.<minor>][-<variant>]` id, case- and
+/// whitespace-insensitive: `gpt-6.1-sol` → 6, `gpt-4o` → 4, `gpt-image-1` → `None`.
+fn gpt_major_version(model: &str) -> Option<u32> {
+    let m = model.trim().to_ascii_lowercase();
+    let rest = m.strip_prefix("gpt-")?;
+    let end = rest
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(rest.len());
+    rest[..end].parse().ok()
 }
 
 /// Does this (backend, slot) actually put the per-role `effort` on the wire? The one
 /// answer both the wire path and the `kaibo://config` render read, so an operator's
 /// "is my `effort` doing anything?" is settled in exactly one place. `responses_wire`
 /// is the backend's resolved interactive wire ([`Backend::uses_responses_wire`]),
-/// which is what splits a hosted GPT-5 slot (reasoning) from the same `openai` kind
+/// which is what splits a hosted GPT 5+ slot (reasoning) from the same `openai` kind
 /// pointed at a local llama.cpp server (no reasoning knob at all).
 pub fn effort_sinks(
     kind: ProviderKind,
@@ -1254,6 +1272,71 @@ mod tests {
             .is_none(),
             "unknown hosted models get no guessed provider-specific params"
         );
+    }
+
+    /// The reasoning family is "GPT 5 and every later generation", read from the major
+    /// version in the id — not a list of prefixes, which went stale the day `gpt-6-*`
+    /// shipped and left those slots with no `reasoning.effort` at all. Sampling stays with
+    /// the older chat families only.
+    #[test]
+    fn hosted_openai_reasoning_covers_gpt_5_and_later_generations() {
+        for model in [
+            "gpt-5",
+            "gpt-5.6-sol",
+            "gpt-6-luna",
+            "gpt-6-sol",
+            "gpt-6.1-sol",
+            "gpt-6-astra",
+            "GPT-6-Luna",
+            " gpt-7 ",
+            "gpt-12-nova",
+        ] {
+            assert!(
+                hosted_openai_accepts_reasoning(model),
+                "{model:?} takes reasoning.effort"
+            );
+            assert!(
+                effort_sinks(
+                    ProviderKind::Openai,
+                    model,
+                    ThinkingStyleOverride::Auto,
+                    true
+                ),
+                "{model:?} sinks effort on the Responses wire"
+            );
+            assert!(
+                !hosted_openai_accepts_sampling(model),
+                "{model:?} rejects custom temperature"
+            );
+            assert_eq!(
+                hosted_openai_responses_params(
+                    model,
+                    Some(0.9),
+                    "medium",
+                    ThinkingStyleOverride::Auto
+                ),
+                Some(json!({ "reasoning": { "effort": "medium" } })),
+                "{model:?}: effort on the wire, no sampling"
+            );
+        }
+        for model in [
+            "gpt-4o",
+            "gpt-4.1-mini",
+            "gpt-4.5-preview",
+            "gpt-3.5-turbo",
+            "chatgpt-4o-latest",
+            "gpt-image-1",
+            "gpt-oss-120b",
+            "gpt-",
+            "gpt",
+            "o3",
+            "",
+        ] {
+            assert!(
+                !hosted_openai_accepts_reasoning(model),
+                "{model:?} takes no reasoning.effort"
+            );
+        }
     }
 
     /// Kaibo's prompts carry source code, and one OpenRouter slug routes across

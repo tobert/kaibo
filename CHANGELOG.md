@@ -46,6 +46,7 @@ record. Each later release appends a new section at the top.
 - rmcp 3.4: `initialize` asking for MCP `2026-07-28` now gets `2025-11-25`; a `2026-07-28` client enters with `server/discover`.
 - The `oneshot` preamble says thinking comes before the reply and shares its output budget.
 - The `gemini-images` backend kind is now `gemini-media`; the old name still loads.
+- The shell's in-memory scratch starts with an empty `/tmp`, so `echo x > /tmp/x` works without a `mkdir -p /tmp` first.
 
 ### Fixed
 - `effort = "none"` on an adaptive Anthropic model (Opus 4.6+, Sonnet 4.6+, Fable 5.x) is refused when the arm or batch client is built, naming the slot and suggesting a rung such as `low`; it used to send `output_config.effort: "none"` and 400 mid-call.
@@ -67,6 +68,8 @@ record. Each later release appends a new section at the top.
 - An empty answer at the output limit says whether reasoning filled `max_tokens` and names the `effort` and `max_tokens` keys on the slot that ran.
 - A failed `oneshot` closes its trace spans with error status, so it no longer reads as a success.
 - `run_kaish` and the shell guidance document exit `-1` (kaish could not run the script; `255` from `kaibo kaish` on Unix) and teach `grep -rnF` for literal text.
+- GPT 6 and later (`gpt-6-luna`, `gpt-6.1-sol`) get `reasoning.effort` on OpenAI's Responses wire, interactive and batch; only `gpt-5*` ids did.
+- `list_models` reports DeepSeek's `context_window` and `max_output_tokens` as the context window and output ceiling.
 
 ## [0.5.0] — 2026-09-10
 

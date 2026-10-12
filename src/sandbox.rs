@@ -16,7 +16,8 @@
 //! 2. `/` is [`MemoryFs`], so paths *outside* the project resolve to ephemeral
 //!    in-memory scratch that vanishes with the kernel and never touches disk —
 //!    including where `mktemp` lands (it resolves its parent through the VFS, so a
-//!    temp file is created in memory, never on the real `/tmp`).
+//!    temp file is created in memory, never on the real `/tmp`). The scratch starts
+//!    with an empty `/tmp` directory (see [`seed_scratch_tmp`]).
 //! 3. [`KernelConfig::with_allow_unwrapped_commands(false)`] — belt-and-suspenders
 //!    now that `subprocess` is off; refuses PATH lookup, `exec`, `spawn`, and `env CMD`.
 //!
@@ -248,7 +249,9 @@ fn build_readonly_kernel_and_vfs(
         sandbox.scratch_limit_bytes,
         "kaibo-scratch",
     ));
-    vfs.mount("/", MemoryFs::with_budget(scratch_budget));
+    let scratch = MemoryFs::with_budget(scratch_budget);
+    seed_scratch_tmp(&scratch)?;
+    vfs.mount("/", scratch);
     // The project itself: real files, read-only.
     vfs.mount(&mount_point, LocalFs::read_only(&root));
 
@@ -301,6 +304,38 @@ fn build_readonly_kernel_and_vfs(
     )
     .context("failed to build read-only kaish kernel")?;
     Ok((kernel, project_vfs))
+}
+
+/// Create `/tmp` inside the scratch `MemoryFs`, before it is mounted.
+///
+/// kaish 0.18 stopped creating a redirect target's missing parent, so a fresh kernel
+/// refused `echo x > /tmp/x` (exit 1) until the model ran `mkdir -p /tmp` — the most
+/// common scratch path, failing on first use. The directory is made on the
+/// `MemoryFs` value itself rather than through the router, so it lands in scratch by
+/// construction even when the project root is itself `/tmp` or under it.
+///
+/// `mkdir` is async only because `MemoryFs` guards its map with a tokio `RwLock`.
+/// Nothing else holds this filesystem yet, so the lock is uncontended and the future
+/// is ready on its first poll; `unconstrained` keeps tokio's cooperative budget from
+/// turning that into `Pending` when this runs inside a busy task. A `Pending` here
+/// would mean that reasoning broke, so it fails the kernel build loudly instead of
+/// handing out a scratch with no `/tmp`.
+fn seed_scratch_tmp(scratch: &MemoryFs) -> Result<()> {
+    use std::future::Future;
+    use std::task::{Context as TaskContext, Poll, Waker};
+
+    let mkdir = tokio::task::unconstrained(scratch.mkdir(std::path::Path::new("/tmp")));
+    let mut mkdir = std::pin::pin!(mkdir);
+    match mkdir
+        .as_mut()
+        .poll(&mut TaskContext::from_waker(Waker::noop()))
+    {
+        Poll::Ready(result) => result.context("failed to create /tmp in the scratch filesystem"),
+        Poll::Pending => anyhow::bail!(
+            "creating /tmp in the scratch filesystem did not complete on its first poll; \
+             the fresh MemoryFs lock was unexpectedly contended"
+        ),
+    }
 }
 
 /// The schemas of every builtin kaibo's kernel registers, sorted by name.
