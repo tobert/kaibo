@@ -383,6 +383,9 @@ off for stays off instead of being lifted to `high` and billing thinking on ever
 have no effort field. If you explicitly set effort on such a slot, in `[defaults]`,
 or through `KAIBO_*_EFFORT`, kaibo warns at startup and reports `effort` under
 `inert_tunables` in `kaibo://config`. An inherited built-in effort stays quiet.
+Anthropic's adaptive tier, which includes the built-in `anthropic` explorer and synth,
+is the opposite case: `none` gets no startup warning, and the call that builds that
+model fails with an error that names `low` as the fix.
 
 **`thinking_style`.** Forces the thinking shape instead of the built-in classifier.
 `auto` picks adaptive for Opus 4.6+, Sonnet 4.6+, Haiku 5.5, and Fable 5, and

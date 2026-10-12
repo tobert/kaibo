@@ -2486,9 +2486,9 @@ fn builtin_backends(defaults: &Defaults) -> BTreeMap<String, Backend> {
     m
 }
 
-/// The five built-in casts: same-named single-backend compositions carrying
-/// today's default models, so a missing config file and `cast = "anthropic"`
-/// reproduce kaibo's historical behavior byte-for-byte.
+/// The built-in casts: five same-named single-backend compositions carrying
+/// today's default models, so a missing config file and `cast = "anthropic"` work
+/// with no setup beyond a key, plus the two synth-only batch casts.
 fn builtin_casts() -> BTreeMap<String, Cast> {
     let mut m = BTreeMap::new();
     for kind in [
@@ -4270,11 +4270,22 @@ mod tests {
         ] {
             let (explorer, synth) = default_models(kind);
             assert_eq!((explorer, synth), expected, "{kind:?} built-in ids");
-            assert!(
-                !explorer.contains("lite") && !synth.contains("lite"),
-                "{kind:?}: flash is the floor, no lite model in a built-in"
-            );
         }
+        // Every slot of every built-in cast, the batch casts included.
+        let cfg = Config::builtin();
+        let mut slots = 0;
+        for (name, cast) in &cfg.casts {
+            for slot in cast.slots.values() {
+                slots += 1;
+                assert!(
+                    !slot.id.contains("lite"),
+                    "{name}: flash is the floor, but a slot pins {:?}",
+                    slot.id
+                );
+            }
+        }
+        // 5 interactive casts × 2 roles + 2 synth-only batch casts.
+        assert_eq!(slots, 12, "the lite check saw every built-in slot");
     }
 
     /// Built-in synth `max_tokens` pins are deliberate — a future edit moves this
