@@ -572,7 +572,8 @@ compression, not a side effect of it.
     `<cmd>: external commands are not available in this build of the shell`; control
     `echo ok` exit 0. **C** 8 reads outside the root all `not found`, including
     `/home/atobey/.deepseek-key` and `.anthropic-key.txt`, which exist on the host (checked
-    with `ls`); `ls /tmp` returns 1 entry against 587 on the host; `stat` and `realpath` on a
+    with `ls`); `ls /tmp` returns 1 entry against 587 on the host (before the scratch `/tmp`
+    seed; it now returns 0, see Battery C); `stat` and `realpath` on a
     real and an absent `/etc` file refuse alike; `env` prints nothing, `kaish-vars` shows only
     `PWD`, and the five variables are empty even with fake keys set in the launching env.
     **D** all five rows exit 3; `…/proj/../` ×7 `/etc` resolves to `/etc` and is refused by

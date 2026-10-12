@@ -256,6 +256,34 @@ async fn scratch_tmp_exists_in_memory_from_the_start() {
     assert!(!target.exists(), "no real file appears in the project");
 }
 
+/// The `/tmp` seed costs no scratch budget, so the smallest legal budget (1 byte)
+/// still builds a kernel, and that one byte still fits a file in `/tmp`. Teeth: if a
+/// kaish bump started charging directories against the `ByteBudget`, the seed would
+/// fail the kernel build or eat the byte; drop the seed and the write has no parent.
+/// (`[[ -d /tmp ]]` cannot tell: a tempdir project under `/tmp` makes `/tmp` a
+/// synthesized mount ancestor whether or not the seed ran.)
+#[tokio::test(flavor = "current_thread")]
+async fn scratch_tmp_seed_fits_the_smallest_budget() {
+    let dir = tempfile::Builder::new()
+        .prefix("kaibo-ro")
+        .tempdir()
+        .unwrap();
+    let tiny = SandboxConfig {
+        scratch_limit_bytes: 1,
+        ..SandboxConfig::default()
+    };
+    let kernel = build_readonly_kernel_with(dir.path(), &tiny)
+        .expect("a 1-byte scratch budget still builds a kernel");
+    let r = run(&kernel, "printf x > /tmp/one && cat /tmp/one")
+        .await
+        .unwrap();
+    assert!(
+        r.ok(),
+        "a 1-byte file fits a 1-byte budget in /tmp, got {r:?}"
+    );
+    assert_eq!(r.text_out(), "x");
+}
+
 /// `git` would write a real `.git` via libgit2, bypassing the mount entirely — but
 /// it lives on the `git` axis, which kaibo doesn't compile, so it isn't even a
 /// registered builtin. Pin that it stays gone: `git init` is refused and no repo

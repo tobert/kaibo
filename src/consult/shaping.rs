@@ -699,8 +699,11 @@ pub fn hosted_openai_accepts_sampling(model: &str) -> bool {
 /// `gpt-6-luna`, `gpt-6.1-sol`, and a `gpt-7` that ships tomorrow. The rule reads the
 /// major version out of the id instead of matching a prefix list, because a prefix
 /// list went stale the day `gpt-6-*` shipped and silently dropped effort from those
-/// slots. Ids without a `gpt-<digits>` head (`gpt-image-1`, `gpt-oss-120b`, `o3`)
-/// answer `false`.
+/// slots. Ids without a `gpt-<digits>` head answer `false` and get no effort field:
+/// `gpt-image-1`, but also reasoning models kaibo has not probed on this wire, such as
+/// the o-series (`o3`) and `gpt-oss-120b`. That is a known gap, not a claim that they
+/// cannot reason; their slots run at the provider's default effort and
+/// `kaibo://config` reports the `effort` as inert.
 pub fn hosted_openai_accepts_reasoning(model: &str) -> bool {
     gpt_major_version(model).is_some_and(|major| major >= 5)
 }

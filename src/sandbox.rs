@@ -332,8 +332,11 @@ fn seed_scratch_tmp(scratch: &MemoryFs) -> Result<()> {
     {
         Poll::Ready(result) => result.context("failed to create /tmp in the scratch filesystem"),
         Poll::Pending => anyhow::bail!(
-            "creating /tmp in the scratch filesystem did not complete on its first poll; \
-             the fresh MemoryFs lock was unexpectedly contended"
+            "kaibo could not create /tmp in the shell's scratch filesystem: \
+             MemoryFs::mkdir did not finish on its first poll, so the kaish-kernel \
+             in this build now waits inside mkdir (a held lock or a new await point). \
+             No kernel was built. This is a kaibo build defect; use a kaibo build \
+             whose `tests/sandbox.rs` passes"
         ),
     }
 }
