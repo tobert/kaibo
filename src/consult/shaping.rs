@@ -123,21 +123,43 @@ pub fn lower_effort(params: Option<&Value>, to: &str) -> Option<(Value, String)>
 /// not supported for this model"), `temperature = 0.5` under adaptive 400, `disabled` at
 /// `high` 200 (kaibo still refuses `none` across the whole adaptive tier, see
 /// [`ModelShape::check_effort`]). Everything older, and Haiku 4.5, stays on
-/// enabled/budget. Matched by `contains` so a vendor-prefixed id still resolves. Add ids
-/// as they ship; a slot (or `[defaults]`) can force a tier via `thinking_style`.
+/// enabled/budget.
+///
+/// **The past is the closed list.** Legacy is a finished set — Claude 2.x / instant /
+/// 3.x (`claude-<digit>…` naming) and the `<tier>-4-<minor>` releases below 4.6 (a
+/// dated 4.0 id like `claude-sonnet-4-20250514` reads as minor 0) — so it is what we
+/// enumerate. Any other Claude id, including one released after this build, takes
+/// adaptive: the newest known shape, and the one a new release is likely to want.
+/// Until 2026-10-13 this was an allowlist of adaptive tiers, so every new family fell
+/// to budget and 400'd on its first call. A non-Claude id (a gateway fronting another
+/// family on the Messages wire) keeps budget, which those gateways accept. The `claude-`
+/// anchor is searched anywhere, so a vendor-prefixed id still resolves; a slot (or
+/// `[defaults]`) can force a tier via `thinking_style`.
 fn is_anthropic_adaptive(model: &str) -> bool {
-    [
-        "opus-4-6",
-        "opus-4-7",
-        "opus-4-8",
-        "opus-5",
-        "sonnet-4-6",
-        "sonnet-5",
-        "haiku-5",
-        "fable-5",
-    ]
-    .iter()
-    .any(|tier| model.contains(tier))
+    let m = model.to_ascii_lowercase();
+    let Some(at) = m.rfind("claude-") else {
+        return false;
+    };
+    let mut parts = m[at + "claude-".len()..].split(['-', '.']);
+    let Some(first) = parts.next() else {
+        return false;
+    };
+    // `claude-3-5-sonnet`, `claude-2.1`, `claude-instant-1.2`: the pre-4 naming.
+    if first == "instant" || first.starts_with(|c: char| c.is_ascii_digit()) {
+        return false;
+    }
+    // `<tier>-<major>[-<minor>][-<date>]`. A missing or non-numeric major is an alias
+    // such as `claude-sonnet-latest`, which tracks the newest release.
+    let Some(major) = parts.next().and_then(|p| p.parse::<u32>().ok()) else {
+        return true;
+    };
+    // An 8-digit date is not a minor version: `claude-opus-4-20250514` is 4.0.
+    let minor = parts
+        .next()
+        .filter(|p| p.len() <= 2)
+        .and_then(|p| p.parse::<u32>().ok())
+        .unwrap_or(0);
+    (major, minor) >= (4, 6)
 }
 
 /// What one (provider, model) can perceive — and *how* an image reaches it. Capability

@@ -169,7 +169,7 @@ fn media_listing_refusal(backend: &Backend, media: crate::credentials::MediaKind
             crate::stability::AudioModel::ALL.map(|m| m.id()).join(", ")
         )),
         MediaKind::GeminiMedia => {
-            Some("a Gemini speech model, e.g. gemini-3.8-flash-tts".to_string())
+            Some("a Gemini speech model, one whose id ends in `-tts`".to_string())
         }
         MediaKind::OpenAiImages | MediaKind::DashScope | MediaKind::Bfl => None,
     };
@@ -773,11 +773,16 @@ mod tests {
         let err = refusal(ProviderKind::Bfl);
         let ops = crate::bfl::op_names().join(", ");
         assert!(err.contains(&ops), "expected {ops}: {err}");
-        // Gemini has no id allowlist; pin the example the template and guide use.
+        // Gemini has no id allowlist and no undated speech alias, so the refusal names
+        // the id shape and the backend that lists the current ones.
         let err = refusal(ProviderKind::GeminiMedia);
         assert!(
-            err.contains("gemini-3.8-flash-tts"),
+            err.contains("ends in `-tts`"),
             "no Gemini speech model: {err}"
+        );
+        assert!(
+            err.contains("`kind = \"gemini\"`"),
+            "no catalog route: {err}"
         );
     }
 

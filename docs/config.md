@@ -184,10 +184,10 @@ A role table. Each slot takes one of two forms:
 ```toml
 [casts.chimera]
 explorer = "deepseek/deepseek-flash"        # reads the tree and cites
-synth    = "claude/claude-sonnet-5-5"       # the model that answers
+synth    = "gemini/gemini-pro-latest"       # the model that answers
 
 # table form: id + capability pins + per-slot tunables
-# synth = { backend = "claude", id = "claude-opus-5-5", effort = "max" }
+# synth = { backend = "claude", id = "<current Opus id>", effort = "max" }
 # explorer = { backend = "openai-local", id = "Gemma-4-E4B-it", preamble = "..." }
 ```
 
@@ -200,8 +200,8 @@ audio route (`openai-images`, `dashscope`, `bfl`) is a load error. A media slot'
 model id means what that kind says it means — for `stability` it picks the route
 (image: `core`, `ultra`, or an SD3.5 variant; audio: `stable-audio-2.5`,
 `stable-audio-2`, or `stable-audio-3`); for `gemini-media` it is the model in the
-request path (audio: `gemini-3.8-flash-tts`, ...); for `openai-images` it is the `model` field
-(`gpt-image-1` hosted, or whatever a local sd-server loaded); for `dashscope` it is
+request path (a Gemini image or TTS model); for `openai-images` it is the `model` field
+(a `gpt-image` model hosted, or whatever a local sd-server loaded); for `dashscope` it is
 the `model` field too (`wan2.6-t2i`); for `bfl` it names one of five operations
 (`flux-2-pro`, ...) and doubles as `generate`'s default `op`. It sends one
 generation request, not a reasoning loop, so the reasoning tunables (`effort`,
@@ -211,11 +211,11 @@ flags them under `inert_tunables`.
 `decision` points at a backend of kind `openrouter` and staffs the `decide` tool: one request
 to OpenRouter's Decisions API (`POST /api/alpha/decisions`) with typed questions about a
 state, answered with probabilities and no text. The model id is the provider's, for
-example `typesafe/jev-1.13` or `~typesafe/jev-latest`. A decision slot on any other kind
+example `~typesafe/jev-latest`, which tracks the newest Jev. A decision slot on any other kind
 is a load error. Like a media slot it runs no reasoning loop, so reasoning tunables
 written on it are inert.
 
-Jev (`typesafe/jev-1.13`, or the `~typesafe/jev-latest` alias) is a fast classifier: it
+Jev (`~typesafe/jev-latest`) is a fast classifier: it
 answers `choice`, `score`, and `noul` questions with probabilities and writes no text. A call
 costs under a cent (the 2026-10-06 probe: $0.000017). The provider refuses a state past its
 context limit with `max_tokens_exceeded` and does not truncate. Give the slot its own cast, as
@@ -389,9 +389,11 @@ is the opposite case: `none` gets no startup warning, and the call that builds t
 model fails with an error that names `low` as the fix.
 
 **`thinking_style`.** Forces the thinking shape instead of the built-in classifier.
-`auto` picks adaptive for Opus 4.6+, Sonnet 4.6+, Haiku 5.5, and Fable 5, and
-enabled-budget for older models plus Haiku 4.5. Set `adaptive` or `budget` when a new or misclassified
-Anthropic model ships; those two are no-ops for other kinds. An unknown value is a load
+`auto` picks enabled-budget for the Claude releases before 4.6 (Claude 3.x and older, and
+4.0 through 4.5, which includes Haiku 4.5) and adaptive for every other Claude id, including
+releases newer than your kaibo build. A non-Claude id on an anthropic-kind backend (a
+gateway fronting another family) gets enabled-budget. Set `adaptive` or `budget` when a
+model rejects the shape `auto` picked; those two are no-ops for other kinds. An unknown value is a load
 error.
 
 `off` is different: it applies to **every** provider and sends no reasoning parameter at
@@ -483,13 +485,16 @@ not OpenAI Platform's own but should still take the Responses shape; see
 
 | cast | explorer | synth | synth lane |
 |---|---|---|---|
-| `anthropic` | `anthropic/claude-haiku-5-5` | `anthropic/claude-sonnet-5-5` | |
+| `anthropic` | a Haiku | a Sonnet | |
 | `deepseek` | `deepseek/deepseek-flash` | `deepseek/deepseek-flash` | |
 | `gemini` | `gemini/gemini-flash-latest` | `gemini/gemini-flash-latest` | |
-| `openrouter` | `openrouter/qwen/qwen3.8-flash` | `openrouter/qwen/qwen3.7-max` | |
-| `openai-local` | `openai-local/Gemma-4-E4B-it-GGUF` | `openai-local/Gemma-4-26B-A4B-it-GGUF` | |
+| `openrouter` | a Qwen flash | a Qwen max | |
+| `openai-local` | a small Gemma | a larger Gemma | |
 | `gemini-batch` | — | `gemini/gemini-pro-latest` | `batch` |
-| `anthropic-batch` | — | `anthropic/claude-opus-5-5` | `batch` |
+| `anthropic-batch` | — | an Opus | `batch` |
+
+Where a provider serves no undated alias, the table names the family. The exact ids this
+build dials are in `kaibo://config` (`kaibo config`), and kaibo releases move them.
 
 The built-in OpenRouter explorer has `vision = true`; its synth is text-only.
 Four built-in synths pin `max_tokens` above the 16384 floor, because reasoning bills into
@@ -561,7 +566,7 @@ key_optional = true
 
 [casts.mixed]
 explorer = "llama/qwen2.5-coder-7b"     # surveys stay local and free
-synth    = { backend = "gpt", id = "gpt-5.6-sol", vision = true, effort = "high" }
+synth    = { backend = "gpt", id = "<current sol id>", vision = true, effort = "high" }
 ```
 
 Every cast resolves the same way: each slot becomes an *arm*, with a client on the
@@ -1052,7 +1057,7 @@ result with `kaibo://prompts`.
 ```toml
 [casts.custom]
 explorer = { backend = "openai-local", id = "Gemma-4-E4B-it", preamble = "You are a careful reader. Cite exact numbered lines." }
-synth = "anthropic/claude-sonnet-5-5"
+synth = "deepseek/deepseek-flash"
 ```
 
 Precedence: `slot.preamble` > `[prompts].<phase>` > built-in. A synth slot's preamble

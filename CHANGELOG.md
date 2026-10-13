@@ -33,6 +33,11 @@ record. Each later release appends a new section at the top.
 - `consult` runs single-stage on a cast with no `explorer`: the synth does every read itself, with no `explore` tool.
 
 ### Changed
+- A Claude id newer than this build takes adaptive thinking; only Claude releases before 4.6 keep the budget shape.
+- A rejected model call names the model id and points at `list_models` and the slot's `thinking_style`.
+- The `configure` prompt takes ids from `list_models`, prefers undated aliases, and can move every pinned slot to the newest release.
+- Config examples and the guide name undated aliases or a model family, never a versioned hosted id; `kaibo config` shows the built-in ids.
+- `decide` examples use `~typesafe/jev-latest`.
 - The built-in `gemini` cast runs `gemini-flash-latest` on both roles; no built-in cast pins a lite model.
 - The built-in `anthropic` explorer is `claude-haiku-5-5` on adaptive thinking, so an explorer `effort = "none"` there now fails the call instead of being ignored.
 - The built-in `openrouter` explorer is `qwen/qwen3.8-flash`, still with vision on.

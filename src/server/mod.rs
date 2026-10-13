@@ -1007,7 +1007,7 @@ const CAST_ENUM_RULES: &[CastEnumRule] = &[
         &["decide"],
         Config::cast_can_decide,
         "a cast with a `decision` slot pointing at a backend with a Decisions route (kind \
-         `openrouter`, model `typesafe/jev-1.13`) — see the decision-slot example in \
+         `openrouter`, model `~typesafe/jev-latest`) — see the decision-slot example in \
          docs/config.example.toml",
     ),
     (
@@ -4495,13 +4495,19 @@ missing choices: provider access, local endpoint URLs, model family, and budget.
 A backend being configured does not by itself authorize paid calls.
 3. Choose a family outside the calling agent's own, with explorer and synth both within it. \
 A built-in cast often needs only a key source. Mixing families across roles is an \
-advanced move; don't reach for it by default. Ground model IDs, tool support, and output \
-limits in `list_models` or `kaibo models`, then provider docs where the catalog leaves \
-a gap. For OpenRouter, the public catalog \
+advanced move; don't reach for it by default. Take model IDs, tool support, and output \
+limits from `list_models` or `kaibo models`, not from memory, then provider docs where \
+the catalog leaves a gap. Prefer an undated ID that tracks new releases: \
+`deepseek-flash`, `gemini-flash-latest`, `gemini-pro-latest`, or OpenRouter's \
+`~author/family-latest`, such as `~anthropic/claude-sonnet-latest`. Anthropic and hosted \
+OpenAI serve no such alias; take the newest ID of the family from the listing. A \
+built-in cast already carries a current ID, and kaibo releases move it, so override a \
+built-in slot only when I want a different model. For OpenRouter, the public catalog \
 `GET https://openrouter.ai/api/v1/models?supported_parameters=tools&category=programming` \
 lists tool-capable coding models with live pricing and context length (a consult cast \
-needs `tools` support); prefer `~author/family-latest` aliases such as \
-`~anthropic/claude-sonnet-latest` over a pinned slug. Reasoning uses the completion \
+needs `tools` support). To update models to the newest release, list each configured \
+slot's backend and move each pinned ID to the newest ID of the same family and tier (a \
+flash slot stays flash); leave undated IDs alone. Reasoning uses the completion \
 budget too; choose slot `max_tokens` within the model's output ceiling and my budget. \
 Write only the needed sections to \
 `$XDG_CONFIG_HOME/kaibo/config.toml` (default `~/.config/kaibo/config.toml`).
@@ -4529,7 +4535,7 @@ opening access or changing the host's tool approval settings.
 `runtime.unstaffable_tools` in the resolved config names each gap. Any text-provider key \
 (DeepSeek, Anthropic, Gemini, OpenRouter, or a local endpoint) staffs `consult`, `explore`, \
 and `oneshot` through a built-in cast. An OpenRouter key also staffs `decide`: add \
-`[casts.judge]` with `decision = \"openrouter/typesafe/jev-1.13\"` (use the backend's name \
+`[casts.judge]` with `decision = \"openrouter/~typesafe/jev-latest\"` (use the backend's name \
 if it is not `openrouter`). The `judge` cast has no explorer or synth, so callers pass \
 `cast = \"judge\"` to `decide`; the default cast cannot decide. `generate` needs a media \
 backend and a cast with an `image` slot (or an `audio` slot on `stability` or `gemini-media`): \
@@ -4541,7 +4547,9 @@ OpenRouter does not staff media. Ask me which of these I want before adding one.
 const CONFIGURE_PROMPT_OUTRO_MCP: &str = "\
 8. When the file is written, remind me to reconnect the kaibo MCP server so it re-reads \
 the configuration and inherited environment. Key files and key commands resolve when each \
-model client is built.";
+model client is built. After a model change, read `inert_tunables` in `kaibo://config` and \
+the startup log: a new model can reject a reasoning setting, and that slot's `effort` or \
+`thinking_style` is the fix.";
 
 /// The CLI-flavored opening/step-1: kaibo's own config surfaces read as plain
 /// subcommands, no MCP client needed — the whole reason `kaibo configure` exists is
@@ -4563,7 +4571,9 @@ const CONFIGURE_PROMPT_OUTRO_CLI: &str = "\
 8. When the file is written, you're done — kaibo re-reads `config.toml` fresh on every \
 invocation, so the very next `kaibo consult` (or any other subcommand) picks it up. \
 Only reconnect something if you're *also* running kaibo as a long-lived MCP server \
-elsewhere — that process still loads config once at startup.";
+elsewhere — that process still loads config once at startup. After a model change, read \
+`inert_tunables` in `kaibo config`: a new model can reject a reasoning setting, and that \
+slot's `effort` or `thinking_style` is the fix.";
 
 /// The prompts kaibo advertises (`list_prompts`). Currently just `configure`.
 fn kaibo_prompts() -> Vec<Prompt> {
@@ -10197,7 +10207,7 @@ enabled = false
             for needle in [
                 "decide",
                 "decision",
-                "typesafe/jev-1.13",
+                "~typesafe/jev-latest",
                 "cast = \"judge\"",
                 "generate",
                 "unstaffable_tools",
@@ -10992,13 +11002,63 @@ enabled = false
         }
     }
 
-    /// The guide names the models every built-in cast dials, so a default that drifts
-    /// leaves the document promising an operator a model kaibo will not ask for. That is
-    /// how `deepseek-v4-flash` outlived DeepSeek retiring it: the registry and four
-    /// documents each carried the id and nothing tied them together. Now the registry is
-    /// the source and the guide has to keep up.
+    /// A hosted model id that carries a version number. Each provider retires these on
+    /// its own schedule, so text that names one goes stale without any change here.
+    /// Undated aliases (`deepseek-flash`, `gemini-flash-latest`,
+    /// `~anthropic/claude-sonnet-latest`) do not match. Local endpoint ids are the
+    /// operator's own and are not checked.
+    fn versioned_hosted_ids(text: &str) -> Vec<String> {
+        let re = regex::Regex::new(
+            r"(?i)\b(claude-(opus|sonnet|haiku|fable)-\d|gemini-\d|gpt-(image-)?\d|deepseek-v\d|jev-\d|qwen/qwen\d|glm-\d|kimi-k?\d)[\w.-]*",
+        )
+        .unwrap();
+        re.find_iter(text).map(|m| m.as_str().to_string()).collect()
+    }
+
+    /// The config text a person or agent copies from names no versioned hosted id, so a
+    /// model release cannot make it stale. That is how `deepseek-v4-flash` outlived
+    /// DeepSeek retiring it: the registry and four documents each carried the id. The
+    /// built-in ids live in the registry and reach readers through `kaibo://config`;
+    /// examples use an undated alias where the provider serves one, and otherwise name the
+    /// family and send the reader to `list_models`.
     #[test]
-    fn the_guide_names_the_models_every_built_in_cast_dials() {
+    fn published_config_text_names_no_versioned_hosted_model() {
+        let fence = regex::Regex::new(r"(?s)```[a-z]*\n(.*?)```").unwrap();
+        let guide_blocks: String = fence
+            .captures_iter(CONFIG_GUIDE_MD)
+            .map(|c| c[1].to_string())
+            .collect();
+        let mut texts = vec![
+            ("docs/config.example.toml", CONFIG_EXAMPLE_TOML.to_string()),
+            ("docs/config.md code blocks", guide_blocks),
+            ("configure prompt (MCP)", configure_prompt_text(None)),
+            ("configure prompt (CLI)", configure_prompt_text_cli(None)),
+        ];
+        for (tools, _, why) in CAST_ENUM_RULES {
+            texts.push((tools[0], why.to_string()));
+        }
+        for tool in KaiboHandler::tool_router().list_all() {
+            let description = tool.description.unwrap_or_default().to_string();
+            texts.push(("tool description", description));
+        }
+        let found: Vec<String> = texts
+            .iter()
+            .flat_map(|(where_, text)| {
+                versioned_hosted_ids(text)
+                    .into_iter()
+                    .map(move |id| format!("{where_}: {id}"))
+            })
+            .collect();
+        assert!(
+            found.is_empty(),
+            "versioned hosted ids in published text: {found:#?}"
+        );
+    }
+
+    /// The guide sends readers to `kaibo://config` for the ids the built-in casts dial
+    /// instead of copying them, so a bump to a pinned default changes one place.
+    #[test]
+    fn the_guide_leaves_versioned_built_in_ids_to_the_resolved_config() {
         use crate::credentials::ProviderKind;
         for kind in [
             ProviderKind::Anthropic,
@@ -11007,16 +11067,18 @@ enabled = false
             ProviderKind::OpenRouter,
             ProviderKind::Openai,
         ] {
-            let backend = kind.builtin_name();
             let (explorer, synth) = crate::config::default_models(kind);
-            for id in [explorer, synth] {
+            for id in versioned_hosted_ids(explorer)
+                .into_iter()
+                .chain(versioned_hosted_ids(synth))
+            {
                 assert!(
-                    CONFIG_GUIDE_MD.contains(&format!("`{backend}/{id}`")),
-                    "docs/config.md never names `{backend}/{id}`, which the built-in \
-                     `{backend}` cast dials — the guide and the registry have drifted"
+                    !CONFIG_GUIDE_MD.contains(&id),
+                    "docs/config.md copies the built-in id `{id}`; point at kaibo://config"
                 );
             }
         }
+        assert!(CONFIG_GUIDE_MD.contains("`kaibo config`"));
     }
 
     // --- kaibo://config resource tests ---------------------------------------

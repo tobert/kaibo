@@ -1502,10 +1502,7 @@ fn the_shipped_example_config_parses() {
     let e = chimera.require_slot(ModelRole::Explorer).unwrap();
     let s = chimera.require_slot(ModelRole::Synth).unwrap();
     assert_eq!(e.backend, "deepseek", "explorer sweeps on deepseek");
-    assert_eq!(
-        s.backend, "anthropic",
-        "synth answers on anthropic (claude/… refs canonicalize)"
-    );
+    assert_eq!(s.backend, "gemini", "synth answers on gemini");
     assert_ne!(
         e.backend, s.backend,
         "the example demonstrates a cross-backend cast"

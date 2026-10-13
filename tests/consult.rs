@@ -137,6 +137,58 @@ fn thinking_is_enabled_for_kinds_with_a_request_toggle() {
 }
 
 #[test]
+fn anthropic_tier_closes_over_the_past_and_stays_open_to_new_releases() {
+    // The legacy enabled/budget shape belongs to a finished set of Claude releases (3.x,
+    // 2.x, instant, and 4.0 through 4.5). Every newer Claude id takes adaptive, including
+    // ids that do not exist yet: the adaptive tier 400s on `budget_tokens`, so a new
+    // release routed to budget fails its first call until an operator sets
+    // `thinking_style`.
+    for id in [
+        "claude-haiku-4-5",
+        "claude-sonnet-4-5",
+        "claude-opus-4-5-20251101",
+        "claude-opus-4-1",
+        "claude-sonnet-4-0",
+        "claude-sonnet-4-20250514",
+        "claude-3-7-sonnet-latest",
+        "claude-3-5-haiku-20241022",
+        "claude-3-opus-20240229",
+        "claude-2.1",
+        "claude-instant-1.2",
+        "us.anthropic.claude-sonnet-4-5-20250929-v1:0",
+    ] {
+        let p = thinking_params(ProviderKind::Anthropic, id, THINKING_BUDGET).expect("toggle");
+        assert_eq!(
+            p["thinking"]["type"], "enabled",
+            "{id} is a legacy budget id"
+        );
+    }
+    for id in [
+        "claude-sonnet-4-6",
+        "claude-opus-4-8",
+        "claude-sonnet-5-5",
+        "claude-haiku-5-5",
+        "claude-fable-5-1",
+        // Not released when this was written; each must not need a kaibo release.
+        "claude-sonnet-6",
+        "claude-haiku-6-0",
+        "claude-opus-7-1-20271201",
+        "claude-fable-6",
+        "claude-sonnet-latest",
+        "anthropic/claude-opus-6",
+    ] {
+        let p = thinking_params(ProviderKind::Anthropic, id, THINKING_BUDGET).expect("toggle");
+        assert_eq!(p["thinking"]["type"], "adaptive", "{id} is adaptive");
+    }
+    // A non-Claude model behind an Anthropic-compatible gateway keeps the budget shape:
+    // those gateways accept `budget_tokens` (Alibaba's ignores it) and may refuse
+    // `adaptive`, so the open default is for Claude ids only.
+    let p =
+        thinking_params(ProviderKind::Anthropic, "qwen3.8-max", THINKING_BUDGET).expect("toggle");
+    assert_eq!(p["thinking"]["type"], "enabled");
+}
+
+#[test]
 fn every_gemini_id_takes_thinking_level_not_budget() {
     // kaibo targets the Gemini 3-line and newer, whose whole family uses `thinkingLevel`
     // (mutually exclusive with the retired 2.5-era budget); rig's typed ThinkingConfig
