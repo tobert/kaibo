@@ -211,6 +211,79 @@ async fn mktemp_lands_in_memory_not_real_disk() {
     );
 }
 
+/// A fresh kernel has a scratch `/tmp`. kaish 0.18 stopped creating a redirect
+/// target's missing parent, so without a seeded `/tmp` in the `/` `MemoryFs` the
+/// first `echo x > /tmp/x` exits 1 until the model runs `mkdir -p /tmp`. Teeth: drop
+/// the seed in `build_readonly_kernel_and_vfs` and the redirect fails. The second half
+/// pins where it lands: the file is readable through the shell and absent from the
+/// host's `/tmp`, and the project mount still refuses the same redirect.
+#[tokio::test(flavor = "current_thread")]
+async fn scratch_tmp_exists_in_memory_from_the_start() {
+    let dir = tempfile::Builder::new()
+        .prefix("kaibo-ro")
+        .tempdir()
+        .unwrap();
+    let kernel = build_readonly_kernel(dir.path()).unwrap();
+
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let name = format!("kaibo-scratch-{}-{nanos}", std::process::id());
+    let host = std::path::Path::new("/tmp").join(&name);
+    assert!(!host.exists(), "probe name collided on the host: {host:?}");
+
+    let script = format!("echo hi > /tmp/{name} && cat /tmp/{name}");
+    let r = run(&kernel, &script).await.unwrap();
+    assert!(
+        r.ok(),
+        "a redirect into scratch /tmp must work in a fresh kernel, got {r:?}"
+    );
+    assert_eq!(r.text_out().trim(), "hi", "scratch /tmp reads back: {r:?}");
+    assert!(
+        !host.exists(),
+        "scratch /tmp must live in MemoryFs, but {host:?} exists on the host"
+    );
+
+    let target = dir.path().join("newfile.txt");
+    let r = run(&kernel, &format!("echo pwned > {}", target.display()))
+        .await
+        .unwrap();
+    assert!(
+        !r.ok() && r.err.contains("read-only"),
+        "the project mount stays read-only beside scratch /tmp, got {r:?}"
+    );
+    assert!(!target.exists(), "no real file appears in the project");
+}
+
+/// The `/tmp` seed costs no scratch budget, so the smallest legal budget (1 byte)
+/// still builds a kernel, and that one byte still fits a file in `/tmp`. Teeth: if a
+/// kaish bump started charging directories against the `ByteBudget`, the seed would
+/// fail the kernel build or eat the byte; drop the seed and the write has no parent.
+/// (`[[ -d /tmp ]]` cannot tell: a tempdir project under `/tmp` makes `/tmp` a
+/// synthesized mount ancestor whether or not the seed ran.)
+#[tokio::test(flavor = "current_thread")]
+async fn scratch_tmp_seed_fits_the_smallest_budget() {
+    let dir = tempfile::Builder::new()
+        .prefix("kaibo-ro")
+        .tempdir()
+        .unwrap();
+    let tiny = SandboxConfig {
+        scratch_limit_bytes: 1,
+        ..SandboxConfig::default()
+    };
+    let kernel = build_readonly_kernel_with(dir.path(), &tiny)
+        .expect("a 1-byte scratch budget still builds a kernel");
+    let r = run(&kernel, "printf x > /tmp/one && cat /tmp/one")
+        .await
+        .unwrap();
+    assert!(
+        r.ok(),
+        "a 1-byte file fits a 1-byte budget in /tmp, got {r:?}"
+    );
+    assert_eq!(r.text_out(), "x");
+}
+
 /// `git` would write a real `.git` via libgit2, bypassing the mount entirely — but
 /// it lives on the `git` axis, which kaibo doesn't compile, so it isn't even a
 /// registered builtin. Pin that it stays gone: `git init` is refused and no repo

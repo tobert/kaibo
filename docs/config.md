@@ -83,7 +83,7 @@ Chat Completions. Hosted GPT and local Gemma both work without this knob.
 
 Set it when the heuristic cannot see the truth: an OpenAI-compatible gateway that
 implements the Responses API at `/v1/responses` but does not sit at Platform's URL.
-Current GPT-5.x reasoning models require Responses — they reject Chat Completions'
+Current GPT reasoning models (5 and later) require Responses — they reject Chat Completions'
 `max_tokens` with `unsupported_parameter` — so `wire = "responses"` is what makes them
 usable behind such a gateway. `wire = "chat"` is the symmetric opt-out, including on
 Platform's own endpoint.
@@ -336,10 +336,11 @@ whenever thinking is on**, which is every Anthropic slot by default — the Mess
 | gemini | `thinkingLevel` |
 | openrouter | `{"reasoning":{"effort":…}}` |
 | openai (Chat Completions) | `reasoning_effort` |
-| openai (Responses) | `reasoning.effort`, for `gpt-5*` model ids only |
+| openai (Responses) | `reasoning.effort`, for GPT 5 and later (`gpt-5*`, `gpt-6*`, …) only |
 
 OpenAI-compatible Chat Completions requests carry the bare `reasoning_effort` field.
-Responses requests use `reasoning.effort` when the model id starts with `gpt-5`; any
+Responses requests use `reasoning.effort` when the model id is `gpt-<N>…` with `N` of 5
+or more (`gpt-5.6-sol`, `gpt-6-luna`, `gpt-6.1-sol`); any
 other id on the Responses wire gets no effort field, and `kaibo://config` marks it inert. Budget-tier Anthropic uses
 `thinking_budget` instead. A server that rejects the field needs
 `thinking_style = "off"`; kaibo preserves its error for diagnosis.

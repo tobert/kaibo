@@ -3834,6 +3834,20 @@ mod tests {
         );
     }
 
+    /// The batch lane reads the same model classifier as the interactive arm, so a GPT
+    /// generation after 5 gets its effort here too, not only on the interactive wire.
+    #[test]
+    fn openai_shaping_carries_effort_for_later_gpt_generations() {
+        for model in ["gpt-6-luna", "gpt-6.1-sol", "gpt-7"] {
+            let (_, params) = openai_batch_shaping(model, &tunables("xhigh", 100));
+            assert_eq!(
+                params.as_ref().map(|p| &p["reasoning"]["effort"]),
+                Some(&json!("xhigh")),
+                "{model} takes reasoning.effort on the batch lane: {params:?}"
+            );
+        }
+    }
+
     /// The model-aware half: an older chat family takes no `reasoning` block at all, so
     /// batch sends none rather than a 400-bait guess.
     #[test]
