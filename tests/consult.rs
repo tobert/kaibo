@@ -156,6 +156,12 @@ fn anthropic_tier_closes_over_the_past_and_stays_open_to_new_releases() {
         "claude-2.1",
         "claude-instant-1.2",
         "us.anthropic.claude-sonnet-4-5-20250929-v1:0",
+        // Vertex dates with `@`: a date glued to the major must not hide a 4.0.
+        "claude-sonnet-4@20250514",
+        "claude-opus-4-1@20250805",
+        // Bedrock's Claude 2 spelling.
+        "anthropic.claude-v2",
+        "anthropic.claude-v2:1",
     ] {
         let p = thinking_params(ProviderKind::Anthropic, id, THINKING_BUDGET).expect("toggle");
         assert_eq!(
@@ -176,6 +182,10 @@ fn anthropic_tier_closes_over_the_past_and_stays_open_to_new_releases() {
         "claude-fable-6",
         "claude-sonnet-latest",
         "anthropic/claude-opus-6",
+        // A date or variant glued to the minor must not read as a 4.0.
+        "claude-opus-4-7@20260101",
+        "claude-sonnet-4-6:thinking",
+        "CLAUDE-OPUS-4-8",
     ] {
         let p = thinking_params(ProviderKind::Anthropic, id, THINKING_BUDGET).expect("toggle");
         assert_eq!(p["thinking"]["type"], "adaptive", "{id} is adaptive");

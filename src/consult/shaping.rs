@@ -126,9 +126,10 @@ pub fn lower_effort(params: Option<&Value>, to: &str) -> Option<(Value, String)>
 /// enabled/budget.
 ///
 /// **The past is the closed list.** Legacy is a finished set — Claude 2.x / instant /
-/// 3.x (`claude-<digit>…` naming) and the `<tier>-4-<minor>` releases below 4.6 (a
-/// dated 4.0 id like `claude-sonnet-4-20250514` reads as minor 0) — so it is what we
-/// enumerate. Any other Claude id, including one released after this build, takes
+/// 3.x (`claude-<digit>…` naming, and Bedrock's `claude-v2`) and the `<tier>-4-<minor>`
+/// releases below 4.6 (a dated 4.0 id like `claude-sonnet-4-20250514` reads as minor 0)
+/// — so it is what we enumerate. Ids split on `-`, `.`, `@`, and `:`, so a Vertex date
+/// (`claude-opus-4-1@20250805`) or a variant suffix (`:thinking`) stays its own part. Any other Claude id, including one released after this build, takes
 /// adaptive: the newest known shape, and the one a new release is likely to want.
 /// Until 2026-10-13 this was an allowlist of adaptive tiers, so every new family fell
 /// to budget and 400'd on its first call. A non-Claude id (a gateway fronting another
@@ -140,12 +141,18 @@ fn is_anthropic_adaptive(model: &str) -> bool {
     let Some(at) = m.rfind("claude-") else {
         return false;
     };
-    let mut parts = m[at + "claude-".len()..].split(['-', '.']);
+    let mut parts = m[at + "claude-".len()..].split(['-', '.', '@', ':']);
     let Some(first) = parts.next() else {
         return false;
     };
-    // `claude-3-5-sonnet`, `claude-2.1`, `claude-instant-1.2`: the pre-4 naming.
-    if first == "instant" || first.starts_with(|c: char| c.is_ascii_digit()) {
+    // `claude-3-5-sonnet`, `claude-2.1`, `claude-instant-1.2`, `claude-v2`: the pre-4
+    // naming.
+    let pre_4 = first == "instant"
+        || first.starts_with(|c: char| c.is_ascii_digit())
+        || (first.len() > 1
+            && first.starts_with('v')
+            && first[1..].bytes().all(|b| b.is_ascii_digit()));
+    if pre_4 {
         return false;
     }
     // `<tier>-<major>[-<minor>][-<date>]`. A missing or non-numeric major is an alias

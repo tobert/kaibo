@@ -1,7 +1,7 @@
 # Backends, roles, casts — splitting the profile
 
-Status: **implemented** (2026-06-11; `src/config.rs`, `src/consult.rs`,
-`src/server.rs`). This doc was the contract for the rewrite and now stands as
+Status: **implemented** (2026-06-11; `src/config.rs`, `src/consult/`,
+`src/server/mod.rs`). This doc was the contract for the rewrite and now stands as
 its design record, updated where the implementation deliberately diverged.
 `docs/config.md` is the configuration reference for the shipped surface.
 

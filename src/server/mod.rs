@@ -11006,7 +11006,9 @@ enabled = false
     /// its own schedule, so text that names one goes stale without any change here.
     /// Undated aliases (`deepseek-flash`, `gemini-flash-latest`,
     /// `~anthropic/claude-sonnet-latest`) do not match. Local endpoint ids are the
-    /// operator's own and are not checked.
+    /// operator's own and are not checked. Media vendors' route names (Stability's
+    /// `stable-audio-2.5`, BFL's `flux-2-pro`) are a fixed list kaibo wires, not a
+    /// catalog id, and are not checked either; `gpt-image` ids are.
     fn versioned_hosted_ids(text: &str) -> Vec<String> {
         let re = regex::Regex::new(
             r"(?i)\b(claude-(opus|sonnet|haiku|fable)-\d|gemini-\d|gpt-(image-)?\d|deepseek-v\d|jev-\d|qwen/qwen\d|glm-\d|kimi-k?\d)[\w.-]*",
@@ -11057,27 +11059,26 @@ enabled = false
 
     /// The guide sends readers to `kaibo://config` for the ids the built-in casts dial
     /// instead of copying them, so a bump to a pinned default changes one place.
+    /// Every slot of every built-in cast, the batch casts included, so a pin outside
+    /// `default_models` (the `anthropic-batch` synth) is covered too.
     #[test]
     fn the_guide_leaves_versioned_built_in_ids_to_the_resolved_config() {
-        use crate::credentials::ProviderKind;
-        for kind in [
-            ProviderKind::Anthropic,
-            ProviderKind::DeepSeek,
-            ProviderKind::Gemini,
-            ProviderKind::OpenRouter,
-            ProviderKind::Openai,
-        ] {
-            let (explorer, synth) = crate::config::default_models(kind);
-            for id in versioned_hosted_ids(explorer)
-                .into_iter()
-                .chain(versioned_hosted_ids(synth))
-            {
-                assert!(
-                    !CONFIG_GUIDE_MD.contains(&id),
-                    "docs/config.md copies the built-in id `{id}`; point at kaibo://config"
-                );
+        let builtin = Config::builtin();
+        let mut checked = 0;
+        for cast in builtin.casts.values() {
+            for slot in cast.slots.values() {
+                checked += 1;
+                for id in versioned_hosted_ids(&slot.id) {
+                    assert!(
+                        !CONFIG_GUIDE_MD.contains(&id),
+                        "docs/config.md copies the built-in id `{id}` (cast `{}`); point \
+                         at kaibo://config",
+                        cast.name
+                    );
+                }
             }
         }
+        assert!(checked >= 12, "walked only {checked} built-in slots");
         assert!(CONFIG_GUIDE_MD.contains("`kaibo config`"));
     }
 

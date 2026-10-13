@@ -149,8 +149,8 @@ fn media_listing_refusal(backend: &Backend, media: crate::credentials::MediaKind
             "the documented generate routes: core, ultra, or an sd3.5 variant".into()
         }
         MediaKind::OpenAiImages => {
-            "the endpoint's own model names, e.g. gpt-image-1 hosted or whatever a local \
-             sd-server has loaded"
+            "the endpoint's own model names: a `gpt-image` model hosted, or whatever a \
+             local sd-server has loaded"
                 .into()
         }
         MediaKind::GeminiMedia => {
