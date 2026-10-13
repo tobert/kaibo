@@ -419,10 +419,10 @@ fn per_slot_tunables_override_defaults_others_inherit() {
     assert_eq!(et.max_tokens, 20000);
     assert_eq!(et.thinking_budget, 9000);
 
-    // A built-in slot with no pin inherits the file-set defaults too (gemini's
+    // A built-in slot with no pin inherits the file-set defaults too (openai-local's
     // synth carries no built-in max_tokens pin).
     let g = c
-        .resolve_cast("gemini")
+        .resolve_cast("openai-local")
         .unwrap()
         .require_slot(ModelRole::Synth)
         .unwrap()
@@ -786,13 +786,20 @@ fn an_inverted_thinking_budget_is_rejected_at_the_resolved_slot() {
     assert!(msg.contains("max_tokens (1000)"), "got: {msg}");
 
     // The inversion can also arrive purely through [defaults]: a global max_tokens below
-    // the default 8192 budget breaks the built-in budget-tier Anthropic slot (Haiku
-    // explorer) at resolution time.
-    let err = Config::from_toml_str("[defaults]\nmax_tokens = 4096\n").unwrap_err();
+    // the default 8192 budget breaks a budget-tier slot that inherits both values, at
+    // resolution time.
+    let err = Config::from_toml_str(
+        "[defaults]\nmax_tokens = 4096\n[casts.x]\nexplorer = \"anthropic/claude-haiku-4-5\"\n",
+    )
+    .unwrap_err();
     assert!(
         format!("{err:#}").contains("thinking_budget"),
         "got: {err:#}"
     );
+    // No built-in slot is on the budget tier (the anthropic explorer is Haiku 5.5, on the
+    // adaptive tier), so the same [defaults] alone loads.
+    Config::from_toml_str("[defaults]\nmax_tokens = 4096\n")
+        .expect("no built-in slot sends a budget, so a low [defaults] max_tokens loads");
 
     // The same inverted pair is accepted where the model sends no budget: the generic
     // openai path (no thinking toggle), Gemini (takes a `thinkingLevel`), and Anthropic's
@@ -1087,17 +1094,17 @@ fn env_overrides_file_defaults_and_flows_into_slot_tunables() {
     let path = dir.path().join("config.toml");
     std::fs::write(&path, "[defaults]\nmax_tokens = 11111\n").unwrap();
 
-    // Both values sit above the 8192 thinking budget, so the built-in anthropic
-    // slots stay valid; the point under test is env-over-file precedence.
+    // Both values sit above the 8192 thinking budget; the point under test is
+    // env-over-file precedence.
     let env: HashMap<&str, &str> = [("KAIBO_MAX_TOKENS", "22222")].into_iter().collect();
     let c = Config::load_with(None, Some(path), |k| env.get(k).map(|s| s.to_string())).unwrap();
     assert_eq!(c.defaults.max_tokens, 22222);
-    // And the env'd default flows into a slot that inherits it — gemini's synth,
-    // which carries no built-in max_tokens pin (the anthropic and deepseek synths
-    // do, and a slot pin wins over [defaults] from any layer; see
+    // And the env'd default flows into a slot that inherits it — openai-local's synth,
+    // which carries no built-in max_tokens pin (the anthropic, deepseek, gemini, and
+    // openrouter synths do, and a slot pin wins over [defaults] from any layer; see
     // `builtin_synth_max_tokens_pins_are_deliberate` in src/config.rs).
     let t = c
-        .resolve_cast("gemini")
+        .resolve_cast("openai-local")
         .unwrap()
         .require_slot(ModelRole::Synth)
         .unwrap()

@@ -33,6 +33,10 @@ record. Each later release appends a new section at the top.
 - `consult` runs single-stage on a cast with no `explorer`: the synth does every read itself, with no `explore` tool.
 
 ### Changed
+- The built-in `gemini` cast runs `gemini-flash-latest` on both roles; no built-in cast pins a lite model.
+- The built-in `anthropic` explorer is `claude-haiku-5-5` on adaptive thinking, so an explorer `effort = "none"` there now fails the call instead of being ignored.
+- The built-in `openrouter` explorer is `qwen/qwen3.8-flash`, still with vision on.
+- The built-in `gemini` and `openrouter` synths pin `max_tokens = 65536`, so reasoning no longer starves the answer at 16384.
 - The built-in `anthropic` cast's synth is `claude-sonnet-5-5` and `anthropic-batch` synths `claude-opus-5-5`; Opus 5.5, Sonnet 5.5, and Fable 5.x take adaptive thinking.
 - The consult and explore shells start every call at the project root, so a `cd` lasts only until its script ends; variables still carry over.
 - kaish 0.18: `grep` and `sed` read GNU basic regex, so `grep -rn 'fn consult(' src` runs; use `-E` for `|` alternation.

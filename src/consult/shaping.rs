@@ -115,13 +115,16 @@ pub fn lower_effort(params: Option<&Value>, to: &str) -> Option<(Value, String)>
 /// Which Anthropic models want **adaptive** thinking (`{type:"adaptive"}` plus an
 /// `output_config.effort`) instead of the legacy `{type:"enabled", budget_tokens}`.
 ///
-/// **Empirical — confirm by probe**: Opus 4.7/4.8, Opus 5.5, Sonnet 5.5, and Fable 5.x
-/// *reject* enabled/budget and sampling outright (400), and Opus 5.5 / Sonnet 5.5 also
-/// reject `thinking:{type:"disabled"}`; Opus 4.6 / Sonnet 4.6 take adaptive too — it's the
-/// recommended shape, `budget_tokens` is deprecated there. Everything older, and Haiku
-/// 4.5, stays on enabled/budget. Matched by `contains` so a vendor-prefixed id still
-/// resolves. Add ids as they ship; a slot (or `[defaults]`) can force a tier via
-/// `thinking_style`.
+/// **Empirical — confirm by probe**: Opus 4.7/4.8, Opus 5.5, Sonnet 5.5, Haiku 5.5, and
+/// Fable 5.x *reject* enabled/budget and sampling outright (400), and Opus 5.5 / Sonnet 5.5
+/// also reject `thinking:{type:"disabled"}`; Opus 4.6 / Sonnet 4.6 take adaptive too — it's
+/// the recommended shape, `budget_tokens` is deprecated there. Haiku 5.5, probed
+/// 2026-10-12: adaptive + `effort` `high`/`max` 200, `enabled` + `budget_tokens` 400 ("is
+/// not supported for this model"), `temperature = 0.5` under adaptive 400, `disabled` at
+/// `high` 200 (kaibo still refuses `none` across the whole adaptive tier, see
+/// [`ModelShape::check_effort`]). Everything older, and Haiku 4.5, stays on
+/// enabled/budget. Matched by `contains` so a vendor-prefixed id still resolves. Add ids
+/// as they ship; a slot (or `[defaults]`) can force a tier via `thinking_style`.
 fn is_anthropic_adaptive(model: &str) -> bool {
     [
         "opus-4-6",
@@ -130,6 +133,7 @@ fn is_anthropic_adaptive(model: &str) -> bool {
         "opus-5",
         "sonnet-4-6",
         "sonnet-5",
+        "haiku-5",
         "fable-5",
     ]
     .iter()
@@ -232,7 +236,7 @@ fn is_vision_capable(wire: WireKind, model: &str) -> bool {
         // OpenRouter fronts every model — vision-capable and text-only alike — so the
         // capability is a property of the pinned *model*, not the gateway. Opt in per
         // slot (`vision = true`), like the generic OpenAI kind. The built-in openrouter
-        // cast splits by role: its explorer default (multimodal `qwen3.6-flash`) pins
+        // cast splits by role: its explorer default (multimodal `qwen3.8-flash`) pins
         // vision on, while its synth default (text-only `qwen3.7-max`) leaves the slot
         // `None` and lets this false stand.
         WireKind::OpenRouter => false,
@@ -1050,10 +1054,10 @@ mod tests {
 
     /// Every Gemini slot kaibo actually ships routes the per-role effort as
     /// `thinkingLevel` — including the ones a nominal `gemini-3-…` substring test would
-    /// miss: the `-latest` aliases the built-in casts pin
-    /// (`gemini-flash-lite-latest`/`gemini-pro-latest`/`gemini-flash-latest`, no
-    /// `gemini-3` substring at all) and the concrete 3.x previews with a *dot* after the
-    /// 3 (`gemini-3.1-pro-preview`, `gemini-3.5-flash`). Google's thinking doc lists
+    /// miss: the `-latest` aliases the built-in casts pin (`gemini-flash-latest`,
+    /// `gemini-pro-latest`, no `gemini-3` substring at all), the lite alias an operator
+    /// may still configure, and the concrete 3.x ids with a *dot* after the 3
+    /// (`gemini-3.1-pro-preview`, `gemini-3.5-flash`). Google's thinking doc lists
     /// `thinkingLevel` across the whole 3-line, so it's the native depth knob and the
     /// sink the effort lever rides. The classifier must reach all of them; a shape that
     /// dropped effort into a fixed `thinkingBudget` would silently ignore a slot's
@@ -1064,10 +1068,10 @@ mod tests {
         // The literal ids kaibo classifies from (config.rs `default_models` + the
         // built-in `gemini-batch` cast), plus the concrete 3.x previews they resolve to.
         let ids = [
-            "gemini-flash-lite-latest", // built-in Gemini explorer default
-            "gemini-3.5-flash",         // built-in gemini synth default
+            "gemini-flash-latest",      // built-in gemini cast, both roles
             "gemini-pro-latest",        // built-in gemini-batch synth
-            "gemini-flash-latest",      // a -latest alias with no version in the id
+            "gemini-flash-lite-latest", // a lite alias an operator may configure
+            "gemini-3.5-flash",         // a dotted 3.x flash id
             "gemini-3.1-pro-preview",   // a dotted 3.x id the old dash test missed
         ];
         for id in ids {
