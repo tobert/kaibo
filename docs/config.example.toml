@@ -145,9 +145,12 @@ api_key_cmd = ["op", "read", "op://Vault/Kaibo/Deepseek-key"]
 
 # Cast examples. Usually start with a built-in family; mix backends when useful.
 # String slots split at the first slash. Table slots accept per-model tunables.
+# Prefer an undated id that tracks new releases (`deepseek-flash`, `gemini-pro-latest`,
+# OpenRouter's `~author/family-latest`). Anthropic and hosted OpenAI serve none: replace
+# each `<current … id>` with the newest id that `list_models` (`kaibo models`) shows.
 [casts.chimera]
 explorer = "deepseek/deepseek-flash"
-synth = "claude/claude-sonnet-5-5"
+synth = "gemini/gemini-pro-latest"
 
 [casts.local-only]
 explorer = "gemma/Gemma-4-E4B-it-GGUF"
@@ -161,7 +164,7 @@ synth = { backend = "llama", id = "qwen2.5-vl-32b", vision = true }
 [casts.deep-dive]
 aliases = ["deep"]
 explorer = { backend = "deepseek", id = "deepseek-flash", temperature = 0.0, thinking_budget = 4096, thinking_style = "auto" }
-synth = { backend = "claude", id = "claude-opus-5-5", effort = "max", max_tokens = 32768 }
+synth = { backend = "claude", id = "<current Opus id>", effort = "max", max_tokens = 32768 }
 
 [casts.or-deep]
 explorer = "openrouter/~google/gemini-flash-latest"
@@ -170,31 +173,24 @@ synth = { backend = "openrouter", id = "~anthropic/claude-sonnet-latest", effort
 # Slot preamble > [prompts].phase > built-in; one synth slot can serve several phases.
 [casts.tuned-local]
 explorer = { backend = "gemma", id = "Gemma-4-E4B-it-GGUF", preamble = "You are a careful reader. Cite exact numbered lines." }
-synth = "claude/claude-sonnet-5-5"
+synth = "deepseek/deepseek-flash"
 
 [casts.gpt]
-explorer = { backend = "gpt", id = "gpt-5.6-luna", vision = true, effort = "low" }
-synth = { backend = "gpt", id = "gpt-5.6-sol", vision = true, effort = "high" }
-
-[casts.gpt-balanced]
-explorer = { backend = "gpt", id = "gpt-5.6-luna", vision = true, effort = "low" }
-synth = { backend = "gpt", id = "gpt-5.6-terra", vision = true, effort = "medium" }
+explorer = { backend = "gpt", id = "<current luna id>", vision = true, effort = "low" }
+synth = { backend = "gpt", id = "<current sol id>", vision = true, effort = "high" }
 
 # Batch-only casts need a synth; deliberate needs an interactive explorer beside it.
 [casts.pro-batch]
 batch = true                       # legacy sugar for synth lane="batch"
 synth = "gemini/gemini-pro-latest"
 
-[casts.gpt-batch]
-synth = { backend = "gpt", id = "gpt-5.6-sol", lane = "batch" }
-
 [casts.gpt-deliberate]
-explorer = { backend = "gpt", id = "gpt-5.6-luna", vision = true, effort = "low" }
-synth = { backend = "gpt", id = "gpt-5.6-sol", lane = "batch" }
+explorer = { backend = "gpt", id = "<current luna id>", vision = true, effort = "low" }
+synth = { backend = "gpt", id = "<current sol id>", lane = "batch" }
 
 [casts.fable]
-explorer = "anthropic/claude-sonnet-5-5"
-synth = { backend = "anthropic", id = "claude-fable-5", lane = "batch" }
+explorer = "anthropic/<current Sonnet id>"
+synth = { backend = "anthropic", id = "<current Fable id>", lane = "batch" }
 
 [casts.gemini-deliberate]
 explorer = "gemini/gemini-flash-latest"
@@ -216,7 +212,7 @@ synth = { backend = "gemma", id = "Big-Local-70B-GGUF", lane = "direct" }
 # kind = "openai-images"
 # api_key_env = "OPENAI_API_KEY"
 # [casts.hosted-artist]
-# image = "oai-images/gpt-image-1"
+# image = "oai-images/<current gpt-image id>"
 
 # [backends.sdcpp]
 # kind = "openai-images"
@@ -229,8 +225,8 @@ synth = { backend = "gemma", id = "Big-Local-70B-GGUF", lane = "direct" }
 # kind = "gemini-media"                # was gemini-images; that name still loads
 # api_key_env = "GEMINI_API_KEY"
 # [casts.studio]
-# image = "gemini-media/gemini-3.1-flash-image"
-# audio = "gemini-media/gemini-3.8-flash-tts"   # speech: generate with media = "audio"
+# image = "gemini-media/<current Gemini image id>"
+# audio = "gemini-media/<current Gemini TTS id>"   # speech: generate with media = "audio"
 
 # [casts.foley]
 # audio = "sd/stable-audio-2.5"         # Stability: music and sound effects
@@ -252,7 +248,7 @@ synth = { backend = "gemma", id = "Big-Local-70B-GGUF", lane = "direct" }
 # The slot needs an openrouter backend (the prefix below is that backend's name). Give it
 # its own cast and pass cast = "judge" on each call: the default cast has no decision slot.
 # [casts.judge]
-# decision = "openrouter/typesafe/jev-1.13"   # ~typesafe/jev-latest tracks the newest
+# decision = "openrouter/~typesafe/jev-latest"   # tracks the newest Jev
 
 # House rules: project files read if present; user files required when a phase runs.
 # [context]

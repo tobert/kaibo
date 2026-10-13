@@ -70,8 +70,8 @@ enum FailureKind {
 /// (`CompletionError::ProviderError(text)` carries Anthropic's `overloaded_error` JSON, a
 /// Gemini `RESOURCE_EXHAUSTED`, etc. — not the number `529`), so we match the providers'
 /// transient *vocabulary* rather than a status code. A failure that reached a model wears
-/// one of kaibo's markers (`consult/engine.rs`): `"model loop failed: …"` from the tool
-/// loop, `"model call failed: …"` from a single-shot direct completion (`oneshot`,
+/// one of kaibo's markers (`consult/engine.rs`): `"model loop failed on `<id>`: …"` from
+/// the tool loop, `"model call failed on `<id>`: …"` from a single-shot direct completion (`oneshot`,
 /// `deliberate`'s direct lane), `"model used all …"` from the forced final turn, and
 /// `"returned an empty answer"` from the empty-answer guard (every lane's gate plus the
 /// forced write-up turn's failure wrapper). An error
@@ -261,8 +261,12 @@ pub(crate) fn consultation_failure_text(tool: &str, cast: &str, err: anyhow::Err
         FailureKind::TransientProvider => &transient,
         FailureKind::Provider => {
             "The model or its provider rejected the request; retrying is unlikely to help. \
-             Check the cast and its backend configuration. Ask the user whether to run \
-             this on another cast or continue without the consultation."
+             If the error says the model id is unknown, retired, or not found, run \
+             `list_models` (CLI: `kaibo models`) on this cast's backend, pick a current \
+             id, and set it on the slot in config.toml. If the error rejects a thinking, \
+             reasoning, or effort field, set that slot's `thinking_style` (`adaptive`, \
+             `budget`, or `off`; see kaibo://config/guide). Ask the user whether to change \
+             the config, run this on another cast, or continue without the consultation."
         }
         FailureKind::MalformedGeneration => &malformed,
         FailureKind::EmptyAnswer => {
@@ -660,6 +664,30 @@ mod tests {
                 "{kind:?} must not tell the agent to go on alone: {text}"
             );
         }
+    }
+
+    /// A rejected model is the failure a model release causes: a retired id 404s, and a
+    /// new id can refuse the request shape kaibo sends. The calling agent can fix either
+    /// in config without a kaibo release, so the refusal names the two keys and the tool
+    /// that finds a current id.
+    #[test]
+    fn provider_rejection_names_the_config_fixes_for_a_retired_or_new_model() {
+        let text = consultation_failure_text(
+            "consult",
+            "anthropic",
+            anyhow::anyhow!(
+                "model loop failed on `claude-sonnet-6`: ProviderError: \
+                 {{\"type\":\"not_found_error\",\"message\":\"model: claude-sonnet-6\"}}"
+            ),
+        );
+        assert!(
+            text.contains("`claude-sonnet-6`"),
+            "names the model: {text}"
+        );
+        assert!(text.contains("`list_models`"), "{text}");
+        assert!(text.contains("`kaibo models`"), "{text}");
+        assert!(text.contains("`thinking_style`"), "{text}");
+        assert!(text.contains("`cast = \"anthropic\"`") || text.contains("cast `anthropic`"));
     }
 
     #[test]

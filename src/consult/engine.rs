@@ -1855,7 +1855,7 @@ where
                 history = rest;
                 prompt = next;
             }
-            Err(e) => return Err(anyhow!("model loop failed: {e}")),
+            Err(e) => return Err(anyhow!("model loop failed on `{model_name}`: {e}")),
         }
     }
 }
@@ -2053,7 +2053,7 @@ where
         // "model call failed" keeps this on the provider side of `classify_failure`
         // (`server/render.rs`), where a loop failure lands via "model loop failed" — an
         // overload or rate limit here is still worth a caller retry.
-        let response = response.map_err(|e| anyhow!("model call failed: {e}"))?;
+        let response = response.map_err(|e| anyhow!("model call failed on `{model_name}`: {e}"))?;
         let answer = response
             .choice
             .iter()
@@ -6695,6 +6695,38 @@ mod tests {
             .await
             .expect_err("provider error");
         assert_eq!(failure_class(&err), "phase_failed");
+    }
+
+    /// A provider failure names the model id it was sent to, on both markers: the
+    /// rendered refusal tells the caller to replace that id, and a cast has more than one.
+    #[tokio::test]
+    async fn a_provider_failure_names_the_model_it_was_sent_to() {
+        const MODEL: &str = "claude-sonnet-6";
+        let client = ScriptedClient::builder()
+            .on_model(MODEL, |_req| Err(provider_error("not_found_error")))
+            .build();
+        let err = oneshot("q", &[], &arm(&client, MODEL), &PhaseContext::default())
+            .await
+            .expect_err("single shot");
+        assert!(
+            format!("{err:#}").contains("model call failed on `claude-sonnet-6`"),
+            "{err:#}"
+        );
+
+        let dir = project_with_marker();
+        let err = consult_with(
+            "q",
+            dir.path(),
+            None,
+            &arm(&client, MODEL),
+            &ConsultConfig::default(),
+        )
+        .await
+        .expect_err("tool loop");
+        assert!(
+            format!("{err:#}").contains("model loop failed on `claude-sonnet-6`"),
+            "{err:#}"
+        );
     }
 
     /// The same failure must also read as a failure in traces. Every kaibo span used

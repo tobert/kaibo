@@ -562,20 +562,21 @@ key_optional = true
 # the answer. Two families, not two flavors of one.)
 [casts.mixed]
 explorer = "llama/qwen2.5-coder-7b"       # cheap, local surveys — Qwen family
-synth    = { backend = "gpt", id = "gpt-5.6-sol", vision = true, effort = "high" }
+synth    = { backend = "gpt", id = "<current sol id>", vision = true, effort = "high" }
 ```
 
 Some default casts ship in code so kaibo runs with zero config; your `config.toml`
-merges over them by name. The built-ins are:
+merges over them by name. Where a provider serves no undated alias, the table names
+the family; `kaibo config` shows the exact ids your build dials. The built-ins are:
 
 | cast | explorer | synth |
 |---|---|---|
-| `anthropic` *(default)* | `claude-haiku-5-5` | `claude-sonnet-5-5` |
+| `anthropic` *(default)* | a Haiku | a Sonnet |
 | `deepseek` | `deepseek-flash` | `deepseek-flash` |
 | `gemini` | `gemini-flash-latest` | `gemini-flash-latest` |
-| `openrouter` | `qwen/qwen3.8-flash` | `qwen/qwen3.7-max` |
+| `openrouter` | a Qwen flash | a Qwen max |
 | `openai-local` | local Gemma (small) | local Gemma (large) |
-| `anthropic-batch` | — | `claude-opus-5-5` (batch lane) |
+| `anthropic-batch` | — | an Opus (batch lane) |
 | `gemini-batch` | — | `gemini-pro-latest` (batch lane) |
 
 `openai-local` points at *your* OpenAI-compatible server on localhost (llama.cpp,

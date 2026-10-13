@@ -1,7 +1,7 @@
 # Backends, roles, casts — splitting the profile
 
-Status: **implemented** (2026-06-11; `src/config.rs`, `src/consult.rs`,
-`src/server.rs`). This doc was the contract for the rewrite and now stands as
+Status: **implemented** (2026-06-11; `src/config.rs`, `src/consult/`,
+`src/server/mod.rs`). This doc was the contract for the rewrite and now stands as
 its design record, updated where the implementation deliberately diverged.
 `docs/config.md` is the configuration reference for the shipped surface.
 
@@ -70,14 +70,14 @@ api_key_env = "OPENAI_API_KEY"
 
 [casts.chimera]
 explorer = "deepseek/deepseek-flash"        # reads the tree and cites — DeepSeek family
-synth    = "claude/claude-sonnet-5-5"       # the voice that answers — hosted family
+synth    = "gemini/gemini-pro-latest"       # the voice that answers — Gemini family
 
 [casts.local-only]                          # privacy posture: nothing leaves the box
 explorer = "gemma/Gemma-4-E4B-it-GGUF"
 synth    = "gemma/Gemma-4-26B-A4B-it-GGUF"
 
 # A slot needing capability pins or tunables takes the table form:
-# synth = { backend = "claude", id = "claude-opus-5-5", effort = "max" }
+# synth = { backend = "claude", id = "<current Opus id>", effort = "max" }
 ```
 
 Slot forms: `"backend/model-id"` (the common case; the *first* `/` splits, so
@@ -161,8 +161,8 @@ server.rs: resolve_cast("chimera")
 │    └─ Arm { client: rig(deepseek backend, lazy key), model,
 │             params: ModelShape(DeepSeek, model) + explorer effort/temp,
 │             caps: vision=true }
-└─ synth = "claude/claude-sonnet-5-5"
-     └─ Arm { client: rig(anthropic backend), model, adaptive-thinking params,
+└─ synth = "gemini/gemini-pro-latest"
+     └─ Arm { client: rig(gemini backend), model, thinkingLevel params,
               caps: vision=true → toolset gains view_image }
 
 consult(question, root, arms, cfg, session)
