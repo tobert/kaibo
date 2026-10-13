@@ -28,9 +28,19 @@ fn arm_from(cfg: &Config, cast: &str, role: ModelRole) -> Arm {
     Arm::from_slot(backend, slot, role, &cfg.defaults).unwrap_or_else(|e| panic!("arm: {e}"))
 }
 
-/// A built-in cast's arm by name, for the live tests below.
+/// A built-in cast's arm by name, for the live tests below. Built-in backends declare
+/// no key source, so a keyed cast names the conventional `$HOME` key file of its
+/// same-named backend; the keyless `openai-local` uses the registry as it ships.
 fn builtin_arm(cast: &str, role: ModelRole) -> Arm {
-    arm_from(&Config::builtin(), cast, role)
+    let cfg = match cast.parse::<ProviderKind>() {
+        Ok(kind) if !kind.key_optional() => Config::from_toml_str(&format!(
+            "[backends.{cast}]\napi_key_file = \"~/{}\"\n",
+            kind.key_file_name()
+        ))
+        .unwrap_or_else(|e| panic!("key source for {cast}: {e}")),
+        _ => Config::builtin(),
+    };
+    arm_from(&cfg, cast, role)
 }
 
 /// A throwaway explorer arm for the driver-only `view_image` tests. These tests pin

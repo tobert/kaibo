@@ -15,70 +15,53 @@ record. Each later release appends a new section at the top.
 
 ## [Unreleased]
 
+## [0.6.0] — 2026-10-13
+
 ### Added
-- `decide` without `cast` uses the one cast that has a `decision` slot; with two or more it refuses and names them.
-- Every tool but `job_cancel` carries `destructiveHint: false` over MCP; none claims `readOnlyHint`, since several spend credits and Codex runs read-only tools without asking.
-- `kaibo configure` covers `decide` and `generate`: it says which key staffs which tool, and the guide has a key-to-tool table.
-- `decide` asks a fast decision model typed questions (`choice`, `score`, `noul`) about a state and returns probabilities, no text; it runs a cast's new `decision` slot on an `openrouter` backend (`typesafe/jev-1.13`), and `--no-decide` drops it.
-- `job_get` shows each role's model latency on a running job, so a slow backend shows at the first poll.
-- An async model call that reaches `slow_chat_secs` (default 60, `0` off) warns the caller through `job_wait`.
-- A retried model call is timed per attempt, so latency is the provider's time, never kaibo's backoff.
-- `kaibo config-guide` prints the configuration reference, even when the config is broken.
-- The configuration reference has a host agents section, starting with Codex MCP access, timeouts, and approval.
+- `decide` asks a fast decision model typed questions (`choice`, `score`, `noul`) and returns probabilities; it runs a cast's `decision` slot on an `openrouter` backend.
+- `decide` without `cast` uses the one cast with a `decision` slot, and refuses with their names when there are several.
+- `consult` runs single-stage on a cast with no `explorer`: the synth does every read itself.
+- `generate` makes audio with `media = "audio"` on a cast's `audio` slot: Gemini text-to-speech, and Stable Audio 2, 2.5, and 3.
+- The artifact store holds `mp3` and `wav`, for `write_cas`, `kaibo cas write`, and `inputs`.
 - DeepSeek's `deepseek-flash` reads images: attachments and `view_image` work on the `deepseek` cast.
-- `generate` makes audio: `media = "audio"` runs a cast's new `audio` slot (`kaibo generate --media audio` on the CLI).
-- Gemini text-to-speech on an `audio` slot, with `voice`, two-voice `speakers`, and `language_code` fields; raw PCM is stored as WAVE.
-- Stable Audio 2, 2.5 and 3 on a Stability `audio` slot, with `audio-to-audio` and `inpaint` ops that take an audio input.
-- The artifact store holds `mp3` and `wav`; `write_cas` and `kaibo cas write` accept them, and `inputs` takes them.
-- `consult` runs single-stage on a cast with no `explorer`: the synth does every read itself, with no `explore` tool.
+- `job_get` shows each role's model latency on a running job, and `job_wait` warns when a call passes `slow_chat_secs` (default 60).
+- `kaibo config-guide` prints the configuration reference, even when the config is broken.
+- The configuration reference has a host agents section, starting with Codex.
+- `kaibo configure` says which key staffs which tool, including `decide` and `generate`.
+- Every tool but `job_cancel` declares `destructiveHint: false`; none claims `readOnlyHint`, since several spend credits.
 
 ### Changed
 - A Claude id newer than this build takes adaptive thinking; only Claude releases before 4.6 keep the budget shape.
 - A rejected model call names the model id and points at `list_models` and the slot's `thinking_style`.
 - The `configure` prompt takes ids from `list_models`, prefers undated aliases, and can move every pinned slot to the newest release.
-- Config examples, the configure prompt, and the guide's built-in table use undated aliases or a model family, not versioned hosted ids; `kaibo config` shows the built-in ids.
-- `decide` examples use `~typesafe/jev-latest`.
-- The built-in `gemini` cast runs `gemini-flash-latest` on both roles; no built-in cast pins a lite model.
-- The built-in `anthropic` explorer is `claude-haiku-5-5` on adaptive thinking, so an explorer `effort = "none"` there now fails the call instead of being ignored.
-- The built-in `openrouter` explorer is `qwen/qwen3.8-flash`, still with vision on.
-- The built-in `gemini` and `openrouter` synths pin `max_tokens = 65536`, so reasoning no longer starves the answer at 16384.
-- The built-in `anthropic` cast's synth is `claude-sonnet-5-5` and `anthropic-batch` synths `claude-opus-5-5`; Opus 5.5, Sonnet 5.5, and Fable 5.x take adaptive thinking.
-- The consult and explore shells start every call at the project root, so a `cd` lasts only until its script ends; variables still carry over.
-- kaish 0.18: `grep` and `sed` read GNU basic regex, so `grep -rn 'fn consult(' src` runs; use `-E` for `|` alternation.
-- kaish 0.18: a write to the read-only mount reports `read-only filesystem`, and usage errors exit 2.
-- kaish 0.18.1: `sed -i` replaces files atomically; on the read-only project mount it still ends `read-only filesystem`.
+- Config examples and the guide's built-in table use undated aliases or a model family; `kaibo config` shows the exact built-in ids.
+- Built-in casts hold to flash and up: `gemini` runs `gemini-flash-latest`, the `anthropic` explorer is Haiku 5.5, the `openrouter` explorer is `qwen/qwen3.8-flash`.
+- The built-in `anthropic` synth is Sonnet 5.5 and `anthropic-batch` is Opus 5.5.
+- Built-in synths pin `max_tokens` above 16384 so reasoning cannot starve the answer; the `deepseek` synth reasons at `max`.
+- The consult and explore shells start every call at the project root; variables still carry over.
+- The shell's scratch starts with an empty `/tmp`.
+- kaish 0.18.1: `grep` and `sed` read GNU basic regex (`-E` for `|`), writes to the project report `read-only filesystem`, and `sed -i` is atomic.
+- A failed consultation tells the calling agent to ask the user whether to retry, switch casts, or continue without it.
 - The configuration reference and template are less than half their former length.
-- A failed consultation tells the calling agent to ask the user whether to retry, use another cast, or continue without it.
-- rig 0.42: OpenRouter's output budget is now sent by rig as `max_tokens`, replacing kaibo's `max_completion_tokens` workaround.
-- The built-in `deepseek` cast's synth reasons at `max` with `max_tokens = 131072`, DeepSeek's own default at that effort; the explorer stays at `high`.
-- turso 0.7.2, with every turso crate now pinned exactly; a plain `cargo update` had moved the engine past the pin.
-- rmcp 3.4: `initialize` asking for MCP `2026-07-28` now gets `2025-11-25`; a `2026-07-28` client enters with `server/discover`.
-- The `oneshot` preamble says thinking comes before the reply and shares its output budget.
 - The `gemini-images` backend kind is now `gemini-media`; the old name still loads.
-- The shell's in-memory scratch starts with an empty `/tmp`, so `echo x > /tmp/x` works without a `mkdir -p /tmp` first.
+- rig 0.42, rmcp 3.4, and turso 0.7.2 with every turso crate pinned exactly.
 
 ### Fixed
-- `effort = "none"` on an adaptive Anthropic model (Opus 4.6+, Sonnet 4.6+, Fable 5.x) is refused when the arm or batch client is built, naming the slot and suggesting a rung such as `low`; it used to send `output_config.effort: "none"` and 400 mid-call.
-- Opus 5.5 and Sonnet 5.5 are classified as adaptive-thinking models; they were sent the budget shape and rejected.
-- A shell fault partway through a script keeps the stdout and stderr of the statements that ran before it.
-- `list_models` on a Gemini or Stability media backend names the `audio` slot and its model ids, not only `image`.
-- A deferred `generate` whose result cannot be collected names the provider's job id, so a paid result stays reachable.
-- `kaibo generate` refuses `--field prompt=` and `--field model=`, as the MCP tool does, so provenance names what ran.
-- A `consult` or `explore` turn cut off at `max_tokens` while reasoning gets one forced write-up from its evidence, thinking at effort `medium`, instead of discarding the investigation (a rig 0.42 regression).
-- A turn cut off at the output limit is reported as an empty answer with the budget named, not as a provider rejection.
+- `effort = "none"` on an adaptive Anthropic model is refused when the client is built, suggesting `low`, instead of a 400 mid-call.
+- GPT 6 and later get `reasoning.effort` on OpenAI's Responses wire, interactive and batch.
+- A `consult` or `explore` turn cut off while reasoning gets one forced write-up from its evidence instead of discarding the work.
+- An answer cut off at the output limit is reported as empty with the budget named, not as a provider rejection.
 - A connection failure no longer reads as a provider rejection; the message names the checks to run.
-- `oneshot` and `deliberate`'s direct lane count each retried attempt, and per-call latency excludes kaibo's backoff.
-- Traces export `run_phase`'s `gen_ai.response.finish_reason` and `gen_ai.request.thinking`, which the allowlist dropped.
-- Traces export the model slots, session flag, and job and batch identifiers kaibo's spans declare.
-- The MCP instructions put `## Scope` first and cap the cast roster at 8 lines and the allowed trees at 4, so Claude Code's 2048-character cut no longer hides Scope.
-- The instructions' cast roster always lists the default cast, tagged `direct` or `no usable key` when that applies, and counts every cast it leaves out.
-- `consult`, `consult_submit`, and `oneshot` no longer offer a cast with no `synth` slot, such as an image-only cast; naming one is refused with the tool that cast serves.
-- Startup warns when the default cast (`[server] cast`) cannot run `consult`, since every call without `cast` would be refused.
-- An empty answer at the output limit says whether reasoning filled `max_tokens` and names the `effort` and `max_tokens` keys on the slot that ran.
-- A failed `oneshot` closes its trace spans with error status, so it no longer reads as a success.
-- `run_kaish` and the shell guidance document exit `-1` (kaish could not run the script; `255` from `kaibo kaish` on Unix) and teach `grep -rnF` for literal text.
-- GPT 6 and later (`gpt-6-luna`, `gpt-6.1-sol`) get `reasoning.effort` on OpenAI's Responses wire, interactive and batch; only `gpt-5*` ids did.
-- `list_models` reports DeepSeek's `context_window` and `max_output_tokens` as the context window and output ceiling.
+- A shell fault partway through a script keeps the output of the statements that ran before it.
+- A deferred `generate` whose result cannot be collected names the provider's job id.
+- `kaibo generate` refuses `--field prompt=` and `--field model=`, as the MCP tool does.
+- `consult` and `oneshot` no longer offer a cast with no `synth` slot.
+- Startup warns when the default cast cannot run `consult`.
+- The MCP instructions put `## Scope` first and cap the cast roster, so Claude Code's 2048-character cut no longer hides it.
+- `list_models` reports DeepSeek's context window and output ceiling, and names the `audio` slot on media backends.
+- `run_kaish` documents exit `-1` (`255` from `kaibo kaish`) and teaches `grep -rnF` for literal text.
+- Retried calls count each attempt, and latency excludes kaibo's backoff.
+- Traces export the finish reason, request thinking shape, model slots, and job identifiers, and a failed `oneshot` closes its spans as errors.
 
 ## [0.5.0] — 2026-09-10
 

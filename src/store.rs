@@ -927,6 +927,28 @@ fn validate_local_filesystem(_dir: &Path) -> Result<()> {
 mod tests {
     use super::*;
 
+    /// The one carve-out from fatal open errors rests on this text match, so pin it: the
+    /// message turso 0.7 gives for a file another process holds maps to the lock refusal,
+    /// and an unrelated open failure does not, so it stays fatal.
+    #[test]
+    fn is_lock_error_matches_only_a_lock_message() {
+        let locked = turso::Error::Error(
+            "Locking error: Failed locking file. File is locked by another process".into(),
+        );
+        assert!(is_lock_error(&locked));
+        for other in [
+            turso::Error::Corrupt("database disk image is malformed".into()),
+            turso::Error::NotAdb("file is not a database".into()),
+            turso::Error::Readonly("attempt to write a readonly database".into()),
+            turso::Error::IoError(std::io::ErrorKind::PermissionDenied, "open"),
+        ] {
+            assert!(
+                !is_lock_error(&other),
+                "{other} must stay a fatal open error"
+            );
+        }
+    }
+
     /// The gap this whole fix closes: a `PathInAllowedTree` failure at startup is very
     /// often "kaibo ran unscoped from `~`, so the default allowed tree (launch dir) and
     /// the default XDG state db path collide" — and `--root`/`--allow-path` (narrow the
