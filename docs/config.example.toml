@@ -170,6 +170,16 @@ synth = { backend = "claude", id = "<current Opus id>", effort = "max", max_toke
 explorer = "openrouter/~google/gemini-flash-latest"
 synth = { backend = "openrouter", id = "~anthropic/claude-sonnet-latest", effort = "xhigh" }
 
+# Gemini Argon has a larger output ceiling than 65536 (inspect `output` in `list_models`).
+# Replace `<current Argon id>` on direct Gemini, or use `~google/gemini-pro-latest` on OpenRouter.
+[casts.argon]
+explorer = "gemini/gemini-flash-latest"
+synth = { backend = "gemini", id = "<current Argon id>", max_tokens = 131072 }
+
+[casts.or-argon]
+explorer = "openrouter/~google/gemini-flash-latest"
+synth = { backend = "openrouter", id = "~google/gemini-pro-latest", effort = "xhigh", max_tokens = 131072 }
+
 # Slot preamble > [prompts].phase > built-in; one synth slot can serve several phases.
 [casts.tuned-local]
 explorer = { backend = "gemma", id = "Gemma-4-E4B-it-GGUF", preamble = "You are a careful reader. Cite exact numbered lines." }
@@ -194,7 +204,11 @@ synth = { backend = "anthropic", id = "<current Fable id>", lane = "batch" }
 
 [casts.gemini-deliberate]
 explorer = "gemini/gemini-flash-latest"
-synth = { backend = "gemini", id = "gemini-pro-latest", lane = "batch" }
+synth = { backend = "gemini", id = "gemini-pro-latest", lane = "batch", max_tokens = 131072 }
+
+[casts.or-deliberate]
+explorer = "openrouter/~google/gemini-flash-latest"
+synth = { backend = "openrouter", id = "~google/gemini-pro-latest", lane = "batch", max_tokens = 131072 }
 
 # Direct is one long completion, with no provider batch API.
 [casts.local-direct]

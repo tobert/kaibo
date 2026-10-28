@@ -1339,6 +1339,19 @@ impl GeminiBatch {
             .check_effort(&tunables.effort)
             .map_err(|e| anyhow::anyhow!("model {:?} (backend {:?}, batch): {e}", slot.id, backend.name))?;
         let (max_tokens, params) = batch_shaping(backend.kind, &slot.id, &tunables);
+        let wire = crate::consult::EffortWire::Gemini;
+        if let Err(detail) = crate::consult::preflight_params(wire, params.as_ref()) {
+            return Err(anyhow!(
+                "model {:?} (backend {:?}, batch): effort {:?} is not accepted on the Gemini \
+                 wire — Google's thinkingLevel accepts {}. Set the slot's `effort` (or \
+                 `[defaults]`) to one of those, or `thinking_style = \"off\"` to send no \
+                 thinkingLevel. ({detail})",
+                slot.id,
+                backend.name,
+                batch_effort(&tunables.effort),
+                crate::consult::accepted_efforts(wire).join(" | "),
+            ));
+        }
         Ok(Self {
             http: batch_http_client(backend)?,
             api_key: backend.resolve_key()?,
@@ -2077,6 +2090,409 @@ impl BatchProvider for OpenaiBatch {
     }
 }
 
+// --- OpenRouter batch (`/api/v1/batches`, inline Chat Completions) ---------
+
+/// OpenRouter's fixed API base. Mirrors `discover.rs::OPENROUTER_BASE`.
+const OPENROUTER_API_BASE: &str = "https://openrouter.ai/api/v1";
+
+/// The target inference endpoint declared inside an OpenRouter batch submission.
+const OPENROUTER_BATCH_ENDPOINT: &str = "/v1/chat/completions";
+
+/// OpenRouter's completion window (`"24h"` is the only value the API accepts today).
+const OPENROUTER_COMPLETION_WINDOW: &str = "24h";
+
+/// Normalize an OpenRouter model slug for `POST /api/v1/batches`: the `/models` catalog
+/// advertises batch-eligible models alongside a `:batch` variant (`google/gemini-4-argon:batch`),
+/// while `/api/v1/batches` takes the base model slug (`google/gemini-4-argon`). Stripping
+/// an optional `:batch` suffix lets an operator copy either entry from `list_models`.
+pub fn openrouter_batch_model(model: &str) -> &str {
+    model.strip_suffix(":batch").unwrap_or(model)
+}
+
+/// Build one Chat Completions `content` value for an OpenRouter batch item. With no
+/// attachments it stays a plain string; with attachments it becomes a content-part array
+/// (`text` blocks for wrapped files, `image_url` data URLs for images, then the prompt).
+fn openrouter_chat_content(attachments: &[Attachment], prompt: &str) -> Value {
+    if attachments.is_empty() {
+        return json!(prompt);
+    }
+    let mut parts: Vec<Value> = attachments
+        .iter()
+        .map(|att| match att {
+            Attachment::Text { .. } => json!({
+                "type": "text",
+                "text": att.wrapped_text().expect("text attachment wraps")
+            }),
+            Attachment::Image { mime, data_b64, .. } => json!({
+                "type": "image_url",
+                "image_url": {
+                    "url": format!("data:{mime};base64,{data_b64}")
+                }
+            }),
+        })
+        .collect();
+    parts.push(json!({ "type": "text", "text": prompt }));
+    Value::Array(parts)
+}
+
+/// Build the `POST /api/v1/batches` JSON body for OpenRouter.
+///
+/// OpenRouter's streaming parser requires metadata fields (`completion_window`,
+/// `endpoint`, `model`, `provider`) to appear **before** `requests` in the serialized
+/// JSON object. `serde_json::Map` (backed by `BTreeMap`) serializes keys in
+/// lexicographical order (`"completion_window" < "endpoint" < "model" < "provider" < "requests"`),
+/// so `"requests"` is always emitted last.
+pub fn openrouter_batch_body(
+    model: &str,
+    max_tokens: u64,
+    system: &str,
+    params: &Option<Value>,
+    data_collection: crate::config::DataCollection,
+    attachments: &[Attachment],
+    items: &[BatchItem],
+) -> Value {
+    let requests: Vec<Value> = items
+        .iter()
+        .map(|it| {
+            let mut messages = Vec::new();
+            if !system.is_empty() {
+                messages.push(json!({
+                    "role": "system",
+                    "content": system,
+                }));
+            }
+            messages.push(json!({
+                "role": "user",
+                "content": openrouter_chat_content(attachments, &it.prompt),
+            }));
+            let mut item_body = Map::new();
+            item_body.insert("messages".into(), Value::Array(messages));
+            item_body.insert("max_tokens".into(), json!(max_tokens));
+            if let Some(Value::Object(extra)) = params {
+                for (k, v) in extra {
+                    item_body.insert(k.clone(), v.clone());
+                }
+            }
+            json!({
+                "custom_id": it.custom_id,
+                "body": Value::Object(item_body),
+            })
+        })
+        .collect();
+
+    let mut top = Map::new();
+    top.insert("completion_window".into(), json!(OPENROUTER_COMPLETION_WINDOW));
+    top.insert("endpoint".into(), json!(OPENROUTER_BATCH_ENDPOINT));
+    top.insert("model".into(), json!(openrouter_batch_model(model)));
+    if data_collection == crate::config::DataCollection::Deny {
+        top.insert("provider".into(), json!({ "data_collection": "deny" }));
+    }
+    top.insert("requests".into(), Value::Array(requests));
+    Value::Object(top)
+}
+
+/// Extract the assistant message text from an OpenRouter `/v1/chat/completions` item body.
+fn openrouter_response_text(body: &Value) -> String {
+    let Some(content) = body
+        .get("choices")
+        .and_then(Value::as_array)
+        .and_then(|c| c.first())
+        .and_then(|c| c.get("message"))
+        .and_then(|m| m.get("content"))
+    else {
+        return String::new();
+    };
+    if let Some(s) = content.as_str() {
+        return s.to_string();
+    }
+    content
+        .as_array()
+        .map(|parts| {
+            parts
+                .iter()
+                .filter(|p| p.get("type").and_then(Value::as_str) == Some("text"))
+                .filter_map(|p| p.get("text").and_then(Value::as_str))
+                .collect::<Vec<_>>()
+                .join("")
+        })
+        .unwrap_or_default()
+}
+
+/// Gate an OpenRouter `/v1/chat/completions` item body on its `finish_reason` and inline
+/// `error`. `stop` (or absent) is a clean completion; `length` is output-budget truncation.
+fn openrouter_finish_gate(body: &Value) -> Result<(), String> {
+    if let Some(err) = body.get("error").filter(|e| !e.is_null()) {
+        let detail = err
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or("no detail given");
+        return Err(format!("provider error: {detail}"));
+    }
+    let choice = body
+        .get("choices")
+        .and_then(Value::as_array)
+        .and_then(|c| c.first());
+    if let Some(err) = choice.and_then(|c| c.get("error")).filter(|e| !e.is_null()) {
+        let detail = err
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or("no detail given");
+        return Err(format!("provider error: {detail}"));
+    }
+    match choice
+        .and_then(|c| c.get("finish_reason"))
+        .and_then(Value::as_str)
+    {
+        Some("stop") | None => Ok(()),
+        Some("length") => Err(
+            "finish_reason=length: the response hit its output-token budget before finishing \
+             — common when a big attached-file review spends the budget thinking; re-run with \
+             a higher max_tokens or a narrower prompt"
+                .to_string(),
+        ),
+        Some("content_filter") => Err(
+            "finish_reason=content_filter: the provider halted generation on a content policy"
+                .to_string(),
+        ),
+        Some("error") => {
+            Err("finish_reason=error: the upstream provider aborted generation".to_string())
+        }
+        Some(other) => Err(format!(
+            "finish_reason={other}: the response did not complete normally"
+        )),
+    }
+}
+
+/// Parse one OpenRouter `GET /api/v1/batches/{id}` response into a [`BatchPoll`].
+/// OpenRouter returns `results` inline on the batch object when terminal (`completed`,
+/// `failed`, `expired`, `cancelled`).
+pub fn parse_openrouter_poll(v: &Value, submitted: Option<u64>) -> Result<BatchPoll> {
+    let status = v
+        .get("status")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow!("openrouter batch object has no `status`: {v}"))?;
+    match status {
+        "validating" | "in_progress" | "finalizing" => {
+            let (completed, total) = openai_counts(v);
+            Ok(BatchPoll::Pending { completed, total })
+        }
+        "cancelling" => Ok(BatchPoll::Cancelling),
+        "completed" | "failed" | "expired" | "cancelled" => {
+            let mut answers = Vec::new();
+            if let Some(results) = v.get("results").and_then(Value::as_array) {
+                for item in results {
+                    let custom_id = item
+                        .get("custom_id")
+                        .and_then(Value::as_str)
+                        .ok_or_else(|| anyhow!("openrouter batch result has no `custom_id`: {item}"))?
+                        .to_string();
+                    let request_error = item.get("error").filter(|e| !e.is_null());
+                    let response = item.get("response").filter(|r| !r.is_null());
+                    let text = match (request_error, response) {
+                        (Some(err), _) => {
+                            let detail = err
+                                .get("message")
+                                .and_then(Value::as_str)
+                                .map(str::to_string)
+                                .or_else(|| {
+                                    err.get("error_type")
+                                        .and_then(Value::as_str)
+                                        .map(str::to_string)
+                                })
+                                .unwrap_or_else(|| err.to_string());
+                            Err(format!("provider error: {detail}"))
+                        }
+                        (None, Some(resp)) => {
+                            let code = resp
+                                .get("status_code")
+                                .and_then(Value::as_u64)
+                                .unwrap_or(200);
+                            let body = resp.get("body");
+                            if code != 200 {
+                                let detail = body
+                                    .and_then(|b| b.get("error"))
+                                    .and_then(|e| e.get("message"))
+                                    .and_then(Value::as_str)
+                                    .map(str::to_string)
+                                    .or_else(|| body.map(|b| b.to_string()))
+                                    .unwrap_or_else(|| "no detail given".into());
+                                Err(format!("provider error (HTTP {code}): {detail}"))
+                            } else {
+                                let body = body.ok_or_else(|| {
+                                    anyhow!(
+                                        "succeeded openrouter batch item has no `response.body`: {item}"
+                                    )
+                                })?;
+                                finish_gated_answer(
+                                    openrouter_response_text(body),
+                                    openrouter_finish_gate(body),
+                                )
+                            }
+                        }
+                        (None, None) => Err(
+                            "the provider returned neither a response nor an error for this item"
+                                .to_string(),
+                        ),
+                    };
+                    answers.push(BatchAnswer { custom_id, text });
+                }
+            }
+            if answers.is_empty() {
+                let message = v
+                    .get("error")
+                    .and_then(|e| e.get("message"))
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+                    .or_else(|| openai_batch_error_text(v))
+                    .unwrap_or_else(|| {
+                        "the provider returned no results and no error detail".to_string()
+                    });
+                return Ok(BatchPoll::Failed {
+                    state: status.to_string(),
+                    message,
+                    submitted,
+                });
+            }
+            Ok(BatchPoll::Done(finalize_openai_answers(
+                answers, status, submitted,
+            )))
+        }
+        other => Err(anyhow!("unknown openrouter batch status {other:?}")),
+    }
+}
+
+/// OpenRouter Batch over HTTP (`POST /api/v1/batches`, `GET /api/v1/batches/{id}`).
+/// Requests ride inline in the submission JSON body and results return inline on the
+/// batch object once completed — no file upload required.
+pub struct OpenRouterBatch {
+    http: reqwest::Client,
+    api_key: String,
+    model: String,
+    max_tokens: u64,
+    params: Option<Value>,
+    data_collection: crate::config::DataCollection,
+}
+
+impl OpenRouterBatch {
+    fn require_openrouter(backend: &Backend) -> Result<()> {
+        if backend.kind != ProviderKind::OpenRouter {
+            return Err(anyhow!(
+                "this is the OpenRouter batch provider, but backend {:?} is {:?}. (Batch \
+                 dispatch should never route a non-OpenRouter backend here; see \
+                 `submitter`/`poller`.)",
+                backend.name,
+                backend.kind
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn from_slot(backend: &Backend, slot: &ModelSlot, defaults: &Defaults) -> Result<Self> {
+        Self::require_openrouter(backend)?;
+        let tunables = slot.tunables(ModelRole::Synth, defaults);
+        let (max_tokens, params) = batch_shaping(backend.kind, &slot.id, &tunables);
+        Ok(Self {
+            http: batch_http_client(backend)?,
+            api_key: backend.resolve_key()?,
+            model: slot.id.clone(),
+            max_tokens,
+            params,
+            data_collection: backend.data_collection,
+        })
+    }
+
+    pub fn from_backend(backend: &Backend) -> Result<Self> {
+        Self::require_openrouter(backend)?;
+        Ok(Self {
+            http: batch_http_client(backend)?,
+            api_key: backend.resolve_key()?,
+            model: String::new(),
+            max_tokens: 0,
+            params: None,
+            data_collection: backend.data_collection,
+        })
+    }
+
+    async fn send_json(&self, req: reqwest::RequestBuilder, what: &str) -> Result<Value> {
+        let resp = req
+            .bearer_auth(&self.api_key)
+            .send()
+            .await
+            .map_err(|e| anyhow!("openrouter batch {what} failed: {e}"))?;
+        let status = resp.status();
+        let text = resp
+            .text()
+            .await
+            .map_err(|e| anyhow!("reading openrouter batch {what} body: {e}"))?;
+        if !status.is_success() {
+            return Err(anyhow!("openrouter batch {what} {status}: {text}"));
+        }
+        serde_json::from_str(&text)
+            .with_context(|| format!("parsing openrouter batch {what}: {text}"))
+    }
+}
+
+#[async_trait]
+impl BatchProvider for OpenRouterBatch {
+    async fn submit(
+        &self,
+        system: &str,
+        attachments: &[Attachment],
+        items: &[BatchItem],
+    ) -> Result<String> {
+        if self.model.is_empty() {
+            return Err(anyhow!(
+                "this batch client was built for poll/cancel only (no model) — submit \
+                 needs a synth slot"
+            ));
+        }
+        if items.is_empty() {
+            return Err(anyhow!("a batch needs at least one prompt"));
+        }
+        let _span = batch_request_span(&self.model, self.params.as_ref(), items.len());
+        let body = openrouter_batch_body(
+            &self.model,
+            self.max_tokens,
+            system,
+            &self.params,
+            self.data_collection,
+            attachments,
+            items,
+        );
+        let url = format!("{OPENROUTER_API_BASE}/batches");
+        let v = self
+            .send_json(
+                self.http
+                    .post(&url)
+                    .header("content-type", "application/json")
+                    .body(serde_json::to_vec(&body)?),
+                "submit",
+            )
+            .await?;
+        parse_batch_id(&v)
+    }
+
+    async fn poll(&self, batch_id: &str, submitted: Option<u64>) -> Result<BatchPoll> {
+        let url = format!("{OPENROUTER_API_BASE}/batches/{batch_id}");
+        let v = self.send_json(self.http.get(&url), "status").await?;
+        parse_openrouter_poll(&v, submitted)
+    }
+
+    async fn cancel(&self, batch_id: &str) -> Result<()> {
+        Err(anyhow!(
+            "cannot cancel OpenRouter batch {batch_id:?}: OpenRouter's Batch API does not \
+             support canceling an in-progress batch; poll it with `job_get` (`kaibo batch get`) \
+             until it reaches a terminal state"
+        ))
+    }
+
+    async fn list(&self) -> Result<(Vec<BatchListItem>, bool)> {
+        let url = format!("{OPENROUTER_API_BASE}/batches?limit=100");
+        let v = self.send_json(self.http.get(&url), "list").await?;
+        parse_openai_list(&v)
+    }
+}
+
 // --- Dispatch --------------------------------------------------------------
 
 /// Does this *backend* have a batch lane? The single source of truth — dispatch
@@ -2095,9 +2511,9 @@ pub fn batch_supported(backend: &Backend) -> bool {
         return false;
     };
     match wire {
-        WireKind::Anthropic | WireKind::Gemini => true,
+        WireKind::Anthropic | WireKind::Gemini | WireKind::OpenRouter => true,
         WireKind::Openai => backend.is_hosted_openai(),
-        WireKind::DeepSeek | WireKind::OpenRouter => false,
+        WireKind::DeepSeek => false,
     }
 }
 
@@ -2105,7 +2521,7 @@ pub fn batch_supported(backend: &Backend) -> bool {
 /// lane is per-backend, so a bare "openai" would send a user with a local server in
 /// circles (see [`batch_supported`]).
 pub fn supported_kinds_list() -> String {
-    "anthropic, gemini, openai (hosted OpenAI Platform only — not a local \
+    "anthropic, gemini, openrouter, openai (hosted OpenAI Platform only — not a local \
      OpenAI-compatible server)"
         .to_string()
 }
@@ -2134,6 +2550,9 @@ pub fn submitter(
             backend, slot, defaults,
         )?)),
         ProviderKind::Gemini => Ok(Arc::new(GeminiBatch::from_slot(backend, slot, defaults)?)),
+        ProviderKind::OpenRouter => Ok(Arc::new(OpenRouterBatch::from_slot(
+            backend, slot, defaults,
+        )?)),
         ProviderKind::Openai if backend.is_hosted_openai() => {
             Ok(Arc::new(OpenaiBatch::from_slot(backend, slot, defaults)?))
         }
@@ -2146,6 +2565,7 @@ pub fn poller(backend: &Backend) -> Result<Arc<dyn BatchProvider>> {
     match backend.kind {
         ProviderKind::Anthropic => Ok(Arc::new(AnthropicBatch::from_backend(backend)?)),
         ProviderKind::Gemini => Ok(Arc::new(GeminiBatch::from_backend(backend)?)),
+        ProviderKind::OpenRouter => Ok(Arc::new(OpenRouterBatch::from_backend(backend)?)),
         ProviderKind::Openai if backend.is_hosted_openai() => {
             Ok(Arc::new(OpenaiBatch::from_backend(backend)?))
         }
@@ -3667,21 +4087,49 @@ mod tests {
         assert!(err.to_string().contains("Gemini batch provider"), "{err}");
     }
 
-    /// Dispatch refuses a backend with no batch lane (DeepSeek / OpenRouter / a *local*
+    /// `GeminiBatch::from_slot` runs the same `EffortWire::Gemini` preflight as the
+    /// interactive `Arm::from_slot`: Google's protobuf enum accepts only
+    /// `minimal|low|medium|high`, so `max`, `xhigh`, and `none` are refused before
+    /// any dossier sweep or HTTP submit, naming the valid rungs.
+    #[test]
+    fn gemini_batch_from_slot_preflights_effort_against_gemini_ladder() {
+        let mut b = anthropic_backend();
+        b.name = "gemini".into();
+        b.kind = ProviderKind::Gemini;
+        for bad in ["max", "xhigh", "none"] {
+            let slot = ModelSlot {
+                effort: Some(bad.to_string()),
+                ..ModelSlot::bare(&b.name, "gemini-pro-latest")
+            };
+            let err = GeminiBatch::from_slot(&b, &slot, &Defaults::default())
+                .err()
+                .unwrap_or_else(|| panic!("GeminiBatch must refuse effort={bad:?}"));
+            let msg = err.to_string();
+            assert!(
+                msg.contains(bad) && msg.contains("minimal | low | medium | high"),
+                "refusal for {bad:?} must name the bad rung and the accepted Gemini ladder: {msg}"
+            );
+        }
+    }
+
+    /// Dispatch refuses a backend with no batch lane (DeepSeek / a *local*
     /// openai endpoint) and points at the supported set; `batch_supported` agrees.
     #[test]
     fn dispatch_refuses_unsupported_backends() {
         assert!(batch_supported(&anthropic_backend()));
         assert!(batch_supported(&hosted_openai_backend()));
+        let mut or_backend = anthropic_backend();
+        or_backend.name = "openrouter".into();
+        or_backend.kind = ProviderKind::OpenRouter;
+        or_backend.key_optional = true;
+        assert!(batch_supported(&or_backend));
+        let or_slot = ModelSlot::bare("openrouter", "google/gemini-4-argon");
+        assert!(submitter(&or_backend, &or_slot, &Defaults::default()).is_ok());
+        assert!(poller(&or_backend).is_ok());
         for mut b in [
             {
                 let mut b = anthropic_backend();
                 b.kind = ProviderKind::DeepSeek;
-                b
-            },
-            {
-                let mut b = anthropic_backend();
-                b.kind = ProviderKind::OpenRouter;
                 b
             },
             local_openai_backend(),
@@ -3700,7 +4148,10 @@ mod tests {
             // The refusal names the live supported set, `openai`'s condition included —
             // a bare "openai" would send a local-server user in circles.
             assert!(
-                msg.contains("anthropic") && msg.contains("gemini") && msg.contains("openai"),
+                msg.contains("anthropic")
+                    && msg.contains("gemini")
+                    && msg.contains("openrouter")
+                    && msg.contains("openai"),
                 "refusal names the live supported set: {err}"
             );
             assert!(poller(&b).is_err());
@@ -4460,5 +4911,171 @@ mod tests {
         ));
         provider.cancel(&id).await.unwrap();
         assert_eq!(provider.canceled(), vec!["msgbatch_test".to_string()]);
+    }
+
+    // --- OpenRouter batch ----------------------------------------------------
+
+    /// `openrouter_batch_body` strips an optional `:batch` catalog suffix, propagates
+    /// `data_collection = "deny"`, floors `max_tokens` and `reasoning.effort`, and
+    /// serializes metadata fields (`completion_window`, `endpoint`, `model`, `provider`)
+    /// **before** `requests` so OpenRouter's streaming parser never 400s.
+    #[test]
+    fn openrouter_batch_body_shapes_inline_requests_and_strips_batch_suffix() {
+        let (max_tokens, params) = batch_shaping(
+            ProviderKind::OpenRouter,
+            "google/gemini-4-argon:batch",
+            &tunables("low", 8192),
+        );
+        let items = vec![BatchItem {
+            custom_id: "0".into(),
+            prompt: "Review this module".into(),
+        }];
+        let body = openrouter_batch_body(
+            "google/gemini-4-argon:batch",
+            max_tokens,
+            "You are a synthesis agent.",
+            &params,
+            crate::config::DataCollection::Deny,
+            &[],
+            &items,
+        );
+        assert_eq!(body["endpoint"], "/v1/chat/completions");
+        assert_eq!(body["model"], "google/gemini-4-argon");
+        assert_eq!(body["completion_window"], "24h");
+        assert_eq!(body["provider"]["data_collection"], "deny");
+
+        let req = &body["requests"][0];
+        assert_eq!(req["custom_id"], "0");
+        assert_eq!(req["body"]["max_tokens"], BATCH_MAX_TOKENS_FLOOR);
+        assert_eq!(req["body"]["reasoning"]["effort"], BATCH_EFFORT);
+        assert_eq!(req["body"]["messages"][0]["role"], "system");
+        assert_eq!(req["body"]["messages"][1]["role"], "user");
+        assert_eq!(req["body"]["messages"][1]["content"], "Review this module");
+
+        let serialized = serde_json::to_string(&body).unwrap();
+        let endpoint_pos = serialized.find("\"endpoint\"").unwrap();
+        let model_pos = serialized.find("\"model\"").unwrap();
+        let provider_pos = serialized.find("\"provider\"").unwrap();
+        let requests_pos = serialized.find("\"requests\"").unwrap();
+        assert!(
+            endpoint_pos < requests_pos && model_pos < requests_pos && provider_pos < requests_pos,
+            "metadata fields must precede `requests` in serialized JSON: {serialized}"
+        );
+    }
+
+    /// `parse_openrouter_poll` handles pending progress, completed inline results (sorted
+    /// by `custom_id` index, with `finish_reason=length` flagged as truncation), and
+    /// batch-level failures.
+    #[test]
+    fn openrouter_poll_handles_pending_done_truncation_and_failure() {
+        let pending = json!({
+            "id": "batch_1",
+            "status": "in_progress",
+            "request_counts": { "total": 2, "completed": 1, "failed": 0 }
+        });
+        assert_eq!(
+            parse_openrouter_poll(&pending, Some(2)).unwrap(),
+            BatchPoll::Pending {
+                completed: 1,
+                total: 2
+            }
+        );
+
+        let completed = json!({
+            "id": "batch_1",
+            "status": "completed",
+            "request_counts": { "total": 2, "completed": 2, "failed": 0 },
+            "results": [
+                {
+                    "custom_id": "1",
+                    "response": {
+                        "status_code": 200,
+                        "body": {
+                            "choices": [{
+                                "finish_reason": "length",
+                                "message": { "role": "assistant", "content": "cut off" }
+                            }]
+                        }
+                    }
+                },
+                {
+                    "custom_id": "0",
+                    "response": {
+                        "status_code": 200,
+                        "body": {
+                            "choices": [{
+                                "finish_reason": "stop",
+                                "message": { "role": "assistant", "content": "clean answer" }
+                            }]
+                        }
+                    }
+                }
+            ]
+        });
+        let BatchPoll::Done(answers) = parse_openrouter_poll(&completed, Some(2)).unwrap() else {
+            panic!("expected Done");
+        };
+        assert_eq!(answers.len(), 2);
+        assert_eq!(answers[0].custom_id, "0");
+        assert_eq!(answers[0].text.as_deref(), Ok("clean answer"));
+        assert_eq!(answers[1].custom_id, "1");
+        let partial = answers[1]
+            .text
+            .as_deref()
+            .expect("partial text is preserved under the INCOMPLETE banner");
+        assert!(
+            partial.contains("INCOMPLETE")
+                && partial.contains("finish_reason=length")
+                && partial.ends_with("cut off"),
+            "length with partial content must carry the INCOMPLETE banner and text: {partial}"
+        );
+
+        let empty_length = json!({
+            "id": "batch_len",
+            "status": "completed",
+            "request_counts": { "total": 1, "completed": 1, "failed": 0 },
+            "results": [{
+                "custom_id": "0",
+                "response": {
+                    "status_code": 200,
+                    "body": {
+                        "choices": [{
+                            "finish_reason": "length",
+                            "message": { "role": "assistant", "content": "" }
+                        }]
+                    }
+                }
+            }]
+        });
+        let BatchPoll::Done(empty_answers) =
+            parse_openrouter_poll(&empty_length, Some(1)).unwrap()
+        else {
+            panic!("expected Done");
+        };
+        assert!(
+            empty_answers[0]
+                .text
+                .as_ref()
+                .unwrap_err()
+                .contains("finish_reason=length"),
+            "empty content at length must surface as Err: {:?}",
+            empty_answers[0].text
+        );
+
+        let failed = json!({
+            "id": "batch_2",
+            "status": "failed",
+            "request_counts": { "total": 1, "completed": 0, "failed": 1 },
+            "error": { "message": "model does not support batch" },
+            "results": null
+        });
+        assert_eq!(
+            parse_openrouter_poll(&failed, Some(1)).unwrap(),
+            BatchPoll::Failed {
+                state: "failed".into(),
+                message: "model does not support batch".into(),
+                submitted: Some(1),
+            }
+        );
     }
 }
