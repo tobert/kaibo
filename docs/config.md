@@ -141,8 +141,8 @@ OpenRouter is a keyed gateway rather than a wire protocol of its own. One
 - **`batch` lane (`/api/v1/batches`).** OpenRouter runs inline Chat Completions batches
   on a 24h completion window. If `list_models` shows a `:batch` variant (`org/model:batch`),
   kaibo strips `:batch` automatically before sending the batch request. Cancelling an
-  in-progress OpenRouter batch is unsupported upstream (`job_cancel` drops the local
-  handle and reports the limitation).
+  in-progress OpenRouter batch is unsupported upstream (`job_cancel` refuses and keeps the
+  handle so `job_get` can collect it once terminal).
 - **`data_collection` defaults to `deny`.** One slug routes across competing upstream
   hosts whose data policies differ, and kaibo's prompts carry your source, so
   no-collection routing is pinned on every request. A model whose only hosts collect

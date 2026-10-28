@@ -271,7 +271,7 @@ fn is_vision_capable(wire: WireKind, model: &str) -> bool {
         // default (multimodal `qwen3.8-flash`) pins vision on, while its synth default
         // (text-only `qwen3.7-max`) leaves the slot `None` and lets `false` stand.
         WireKind::OpenRouter => {
-            let slug = model.trim_start_matches('~').to_ascii_lowercase();
+            let slug = model.trim().trim_start_matches('~').to_ascii_lowercase();
             slug.starts_with("google/gemini-")
         }
     }
