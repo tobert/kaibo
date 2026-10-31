@@ -138,8 +138,11 @@ surface rule in the invariants).
   `rustls-no-provider` and we install ring at every client build site (`src/tls.rs`);
   `tests/tls.rs` proves a real client builds, and `cargo tree -i aws-lc-rs` must come
   back empty. The trap: enabling reqwest's `rustls` feature (directly, or via
-  rig-core's default features, or otlp's `reqwest-rustls`) silently re-pulls aws-lc —
-  the Cargo.toml comments mark each of those three off. See **Build & release**.
+  rig-core's default features, rig-reqwest's default features, or otlp's `reqwest-rustls`)
+  silently re-pulls aws-lc (rig-reqwest's also pulls `webpki-root-certs`, the bundled-roots
+  crate) — the Cargo.toml comments mark each of those four off, and `cargo tree -i
+  webpki-root-certs` must come back empty too. rig gets kaibo's own client through
+  `From<reqwest::Client> for ReqwestClient`. See **Build & release**.
 
 ## Working here
 
@@ -162,34 +165,35 @@ surface rule in the invariants).
   stamp the "Last run" line. A release by itself is not the trigger: the `cargo test`
   suites guard every commit, so a release that touched neither the rules nor the VFS
   gives the battery nothing new to find.
-- **Model loops are tested offline.** A scripted `CompletionClient` in
-  `src/test_support.rs` (`#[cfg(test)]`) drives the *real* consult loop with no
+- **Model loops are tested offline.** A scripted `ModelSource` in
+  `src/test_support.rs` (`#[cfg(test)]`) — rig's `MockScript` wire over our own `Transport` — drives the *real* consult loop with no
   network — delegation→report aggregation, session replay, turn-cap recovery. It's
   **content-driven, not consumption-ordered**: a responder branches on the inbound
   `CompletionRequest` (preamble, transcript, `tool_choice`) keyed by model id, the way
-  a real model reads the whole request each call. That's deliberate — rig runs a
-  turn's tool calls with `buffer_unordered`, so a queue-pop mock ("Nth call → Nth
+  a real model reads the whole request each call. That's deliberate — rig can run a
+  turn's tool calls concurrently, so a queue-pop mock ("Nth call → Nth
   step") would race the day a turn emits two tool calls or someone bumps concurrency,
   and the finalize replay (`tool_choice::None` ⇒ answer-now) falls out for free.
   Two primitives — response strategy + a request log — so new cases (multi-sweep,
   model routing, error injection) are new responders, not harness changes. The seams
-  take their client on the `Arm`: tests pass a `ScriptedClient` through `Arm::new`
-  into the generic entry points (`run_phase`, `consult_with`, `consult_session_turn`),
+  take their model on the `Arm`: tests pass a `ScriptedClient` through `Arm::new`
+  into the entry points (`run_phase`, `consult_with`, `consult_session_turn`),
   while the public `consult`/`oneshot` run on arms the server resolves with
-  `Arm::from_slot` — the single live construction point that wraps the real rig client.
-  The scripted model's `Response` is a bare `serde_json::Value`, so a responder can hand
-  back any provider's *raw* payload shape (`with_raw`) — that's what drives
-  `completion_watch` offline.
-- **Seeing what the provider said.** rig's agent hook is medium-neutral (content, usage,
-  no `raw_response`), so `finish_reason` never reaches kaibo through it. `Watched`
-  (`src/completion_watch.rs`) wraps the *model* instead — `traced`'s sibling, a
-  transparent `CompletionModel` — recording each turn into a per-call `CompletionLog`
-  that `run_phase_logged` hands back, tool-loop turns included, and the last turn's
-  reason onto the `run_phase` span. Provider-agnostic by construction: the reason is read
+  `Arm::from_slot` — the single live construction point, where a wire and kaibo's HTTP
+  transport become a type-erased `Llm`. A scripted response's `raw` is a bare
+  `serde_json::Value`, so a responder can hand back any provider's *raw* payload shape
+  (`with_raw`) — that's what drives `completion_watch` offline.
+- **Seeing what the provider said.** rig's final answer carries no provider
+  `finish_reason`. `Watch` (`src/completion_watch.rs`) is an `AgentHook` on every
+  completion dispatch — `traced`'s sibling, transparent — recording each turn into a
+  per-call `CompletionLog` that `run_phase_logged` hands back, tool-loop turns included,
+  and the last turn's reason onto the `run_phase` span. Retries live beside it
+  (`src/completion_retry.rs`): transient 429/5xx in an `HttpClientExt` wrapper, malformed
+  generations in a turn hook. Provider-agnostic by construction: the reason is read
   out of the serialized raw response under the spellings providers ship, so an unknown
   shape degrades to `None` instead of needing a new match arm. The single-shot phases
   (`oneshot`, `deliberate` direct) skip the agent entirely via `Arm::complete` — one
-  request, built with rig's own `CompletionRequestBuilder` so both paths move together on
+  request, built with rig's own `CompletionRequest::new` so both paths move together on
   a rig bump.
 - **The tracker and the devlog live outside this repo.** Open work and the
   shipped-work narrative moved out on 2026-08-13; the repo keeps code, tests, docs, and
