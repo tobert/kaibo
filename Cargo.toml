@@ -39,7 +39,13 @@ anyhow = "1"
 # provider we hand-write: rig already ships openai / xai / azure / huggingface impls of
 # that trait, so an `image` cast slot can reach them for free. Turned off by 986806f
 # when image generation was removed; back on with the media CAS.
-rig-core = { version = "0.42", default-features = false, features = ["reqwest", "derive", "image"] }
+rig-core = { version = "0.46", default-features = false, features = ["derive"] }
+# FOURTH aws-lc route (0.46): rig-core splits transport into `rig-reqwest`, whose own default
+# feature `rustls` enables `reqwest/rustls` (aws-lc) and `webpki-root-certs` (bundled roots).
+# rig-core's default `rustls` feature forwards to it too. Both are off here; we build the
+# `reqwest::Client` ourselves (src/tls.rs) and hand it over via `From<reqwest::Client>`.
+# Verify with `cargo tree -i aws-lc-rs` and `cargo tree -i webpki-root-certs` (both empty).
+rig-reqwest = { version = "0.46", default-features = false }
 # The agent/tool loop, which rig ships as its own crate beside `rig-core`.
 #
 # DO NOT collapse these two onto the `rig` facade crate. It looks tidier and it is a
@@ -54,7 +60,7 @@ rig-core = { version = "0.42", default-features = false, features = ["reqwest", 
 #
 # `rmcp` is off (kaibo wraps kaish as an in-process rig Tool, not over MCP); `image` is
 # forwarded so a tool can return image content.
-rig-agent = { version = "0.42", default-features = false, features = ["derive", "image"] }
+rig-agent = { version = "0.46", default-features = false, features = ["derive"] }
 # We construct the HTTP backend ourselves (a `reqwest::Client` carrying a
 # per-request timeout) and hand it to rig via `.http_client(..)` — rig has no
 # native timeout knob, and its prompt loop is non-streaming, so a wedged provider
@@ -98,10 +104,14 @@ serde_json = "1"
 # use at `0.23` merges it into the reqwest/rmcp group instead of adding a third
 # copy (confirm with `cargo tree -i base64@0.22.1` / `@0.23.1`).
 base64 = "0.23"
-# rig's `HttpClientExt` is typed in `bytes::Bytes`, so `wire_repair`'s transport
-# wrapper needs the type by name. Already in the tree via reqwest/rig-core — zero new
-# crates; named here so the dep is ours, not implicit.
+# rig's `HttpClientExt` is typed in `bytes::Bytes`, so the transport wrapper
+# (`completion_retry`) needs the type by name. Already in the tree via reqwest/rig-core —
+# zero new crates; named here so the dep is ours, not implicit.
 bytes = "1"
+# Header and status types for the transport middleware (`src/completion_retry.rs`, the
+# OpenRouter app-identity stamp in `src/consult/engine.rs`). rig-http speaks `http`; already
+# in the tree, named here so the dep is ours, not implicit.
+http = "1"
 # XDG config.toml: named provider profiles + tunables. `deny_unknown_fields` on the
 # raw structs turns a typo'd key into a startup error rather than a silent no-op.
 # Default features (`std`, `serde`, `parse`, `display`) cover exactly what we use:
@@ -246,10 +256,7 @@ rmcp = { version = "3.4.0", default-features = false, features = [
     "client",
     "transport-child-process",
 ] }
-# `http::StatusCode`, to build a status-bearing `CompletionError` offline
-# (`test_support::status_error`) — the only way to drive
-# `completion_retry::is_transient_transport_failure`'s status branch without a live
-# provider. Already in the tree transitively via rig-core/reqwest; named here so the
-# dep is ours, not implicit. Dev-only: production code reads the status rig hands back
-# through `provider_response_status()` and never names the type itself.
-http = "1"
+# The scripted completion transport (`rig_core::test_utils::MockScript`) the offline consult-loop
+# tests drive. Dev-only; `cargo tree -e normal` stays free of it.
+rig-core = { version = "0.46", default-features = false, features = ["derive", "test-utils"] }
+futures = "0.3"

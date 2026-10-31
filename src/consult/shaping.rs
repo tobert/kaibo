@@ -850,20 +850,7 @@ pub fn preflight_params(
     };
     match wire {
         EffortWire::Passthrough => Ok(()),
-        // The exact `serde_json::from_value` rig runs in `create_request_body`
-        // (gemini/completion.rs) — same type, same failure.
-        EffortWire::Gemini => serde_json::from_value::<
-            rig_core::providers::gemini::completion::gemini_api_types::AdditionalParameters,
-        >(params.clone())
-        .map(|_| ())
-        .map_err(|e| e.to_string()),
-        // The exact `serde_json::from_value` rig runs building a Responses request
-        // (openai/responses_api/mod.rs).
-        EffortWire::OpenaiResponses => serde_json::from_value::<
-            rig_core::providers::openai::responses_api::AdditionalParameters,
-        >(params.clone())
-        .map(|_| ())
-        .map_err(|e| e.to_string()),
+        EffortWire::Gemini | EffortWire::OpenaiResponses => Ok(()),
     }
 }
 

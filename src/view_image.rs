@@ -187,7 +187,7 @@ impl ViewImage {
                 data: DocumentSourceKind::Base64(data),
                 media_type: ImageMediaType::from_mime_type(mime),
                 detail: None,
-                additional_params: None,
+                native: None,
             }),
         ])
         .expect("the note and the image are both present"))

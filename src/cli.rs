@@ -1152,11 +1152,11 @@ fn emit_answer(
 /// envelope (consult/oneshot/explore). Pure and testable.
 fn usage_json(usage: &Usage) -> serde_json::Value {
     serde_json::json!({
-        "input_tokens": usage.input_tokens,
-        "output_tokens": usage.output_tokens,
-        "reasoning_tokens": usage.reasoning_tokens,
-        "cached_input_tokens": usage.cached_input_tokens,
-        "cache_creation_input_tokens": usage.cache_creation_input_tokens,
+        "input_tokens": usage.input_tokens.unwrap_or(0),
+        "output_tokens": usage.output_tokens.unwrap_or(0),
+        "reasoning_tokens": usage.reasoning_tokens.unwrap_or(0),
+        "cached_input_tokens": usage.cached_input_tokens.unwrap_or(0),
+        "cache_creation_input_tokens": usage.cache_creation_input_tokens.unwrap_or(0),
     })
 }
 
@@ -3379,11 +3379,9 @@ mod tests {
         ConsultOutput {
             answer: answer.to_string(),
             report: "the report".to_string(),
-            usage: rig_core::completion::Usage {
-                input_tokens: 10,
-                output_tokens: 20,
-                ..Default::default()
-            },
+            usage: rig_core::completion::Usage::new()
+                .input_tokens(10)
+                .output_tokens(20),
             warnings,
         }
     }
@@ -3617,11 +3615,9 @@ mod tests {
 
     #[test]
     fn usage_json_carries_every_field() {
-        let usage = rig_core::completion::Usage {
-            input_tokens: 3,
-            output_tokens: 4,
-            ..Default::default()
-        };
+        let usage = rig_core::completion::Usage::new()
+            .input_tokens(3)
+            .output_tokens(4);
         let u = usage_json(&usage);
         for k in [
             "input_tokens",

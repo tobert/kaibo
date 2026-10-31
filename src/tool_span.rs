@@ -84,7 +84,7 @@ pub fn traced<T: Tool + 'static>(tool: T) -> DynamicTool {
     let definition = tool_definition(&tool);
     let name = definition.name.clone();
     let tool = Arc::new(tool);
-    DynamicTool::new(
+    DynamicTool::new_with_context(
         definition.name,
         definition.description,
         definition.parameters,

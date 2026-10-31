@@ -292,13 +292,11 @@ fn record_completion_on(
             KeyValue::new("gen_ai.token.type", token_type),
         ]
     };
-    if usage.input_tokens > 0 {
-        inst.token_usage
-            .record(usage.input_tokens, &token_attrs("input"));
+    if let Some(input) = usage.input_tokens.filter(|n| *n > 0) {
+        inst.token_usage.record(input, &token_attrs("input"));
     }
-    if usage.output_tokens > 0 {
-        inst.token_usage
-            .record(usage.output_tokens, &token_attrs("output"));
+    if let Some(output) = usage.output_tokens.filter(|n| *n > 0) {
+        inst.token_usage.record(output, &token_attrs("output"));
     }
 }
 
@@ -520,11 +518,9 @@ mod tests {
         // would be unreadable — a backend could not tell prompt spend from completion
         // spend, which is the split that makes the metric worth having.
         let (provider, exporter, inst) = reader();
-        let usage = rig_core::completion::Usage {
-            input_tokens: 1200,
-            output_tokens: 340,
-            ..Default::default()
-        };
+        let usage = rig_core::completion::Usage::new()
+            .input_tokens(1200)
+            .output_tokens(340);
         record_completion_on(
             &inst,
             CallIdent {

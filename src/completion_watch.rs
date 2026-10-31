@@ -34,13 +34,20 @@
 //! reasoning), so holding it would grow with the transcript for a payload nothing
 //! reads. The extraction is the point; the haystack is not worth keeping.
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
-use rig_core::completion::message::AssistantContent;
-use rig_core::completion::{
-    CompletionError, CompletionModel, CompletionRequest, CompletionResponse, Usage,
+use rig_agent::agent::{
+    AgentHook, DispatchAction, DispatchEvent, HookContext, OutcomeAction, OutcomeEvent,
 };
+use rig_core::completion::message::AssistantContent;
+use rig_core::completion::{CompletionRequest, CompletionResponse, Usage};
+use rig_core::effect::{Answered, EffectId, EffectKind};
+use rig_core::error::{ErrorReport, ProviderError};
+use rig_core::operation::Completion;
+use rig_core::DynModel;
 use serde_json::Value;
 
 use crate::progress::{PhaseEvent, ProgressSink};
@@ -134,7 +141,7 @@ pub fn finish_reason(raw: &Value) -> Option<String> {
 /// is the cheap context that makes it actionable: an empty answer with
 /// `text_chars = 0`, `tool_calls = 0`, and `finish_reason = Some("content_filter")`
 /// is a diagnosis, where any one of the three alone is a guess.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct TurnRecord {
     /// The provider's own word for why generation stopped, verbatim — `"stop"`,
     /// `"max_tokens"`, `"MAX_TOKENS"`, `"content_filter"`, `"tool_use"`, … Never
@@ -185,24 +192,31 @@ impl TurnRecord {
 /// The variant name, never the message. A metric attribute mints a time series per
 /// distinct value, and every one of these variants carries a formatted string holding
 /// a URL, a provider's error body, or a serde path — unbounded cardinality, and content
-/// on the signal built to carry none. Seven variants is the right resolution for "what
-/// kind of thing went wrong", and the message is still in the error the caller gets.
-fn completion_error_type(error: &CompletionError) -> &'static str {
+/// on the signal built to carry none. A handful of classes is the right resolution for
+/// "what kind of thing went wrong", and the message is still in the error the caller gets.
+fn completion_error_type(error: &ProviderError) -> &'static str {
     match error {
-        CompletionError::HttpError(_) => "http_error",
-        CompletionError::JsonError(_) => "json_error",
-        CompletionError::UrlError(_) => "url_error",
-        CompletionError::RequestError(_) => "request_error",
-        CompletionError::ResponseError(_) => "response_error",
-        CompletionError::ProviderError(_) => "provider_error",
-        CompletionError::ProviderResponse(_) => "provider_response_error",
-        // Exhaustive on purpose: rig 0.42 dropped `#[non_exhaustive]` from this enum,
-        // so a variant added upstream fails our build and gets a name here, instead
-        // of landing under a catch-all label nobody chose.
+        ProviderError::Http(_) => "http_error",
+        ProviderError::Json(_) => "json_error",
+        ProviderError::Url(_) => "url_error",
+        ProviderError::Request(_) => "request_error",
+        ProviderError::Response(_) => "response_error",
+        ProviderError::Provider(_) => "provider_error",
+        ProviderError::ProviderResponse(_) => "provider_response_error",
+        // `ProviderError` is `#[non_exhaustive]`: a variant rig adds later lands under
+        // the one label below until someone names it, which keeps the series bounded.
+        _ => "other_error",
     }
 }
 
-/// The per-call slot [`Watched`] records into: every completion of one phase, in
+/// The same class label for an error that came back through rig's effect protocol as an
+/// [`ErrorReport`], which is what an agent hook sees. `ErrorKind::code` is rig's own
+/// stable machine name, one value per kind and never a message.
+fn report_error_type(report: &ErrorReport) -> &'static str {
+    report.kind.code()
+}
+
+/// The per-call slot a [`Watch`] records into: every completion of one phase, in
 /// order. Cheaply cloneable and `Send + Sync`, because the model is cloned into each
 /// agent rig builds (once per loop iteration, again for the forced final turn) and
 /// every clone must land in the *same* log.
@@ -283,61 +297,67 @@ impl CompletionLog {
     }
 }
 
-/// A completion model that records what each response reported, then hands the
-/// response back untouched.
+/// Observes every completion of one phase: times it, counts it, and records what the
+/// response reported, then leaves the answer exactly as the provider gave it.
 ///
-/// Pure passthrough by construction: `completion` awaits the inner model, reads the
-/// response, and returns the very same `Ok`/`Err`. Output, usage, `message_id`,
-/// `raw` payload, and every error are identical to the unwrapped model's — the only
-/// difference is that a [`TurnRecord`] landed in the log.
+/// Two seams feed one recorder. Inside a tool loop the watcher is an [`AgentHook`]: rig's
+/// agent dispatches each completion through its handler table, and the hook sees the
+/// dispatch begin ([`AgentHook::on_dispatch`]) and the answer or failure come back
+/// ([`AgentHook::on_outcome`]) for **every** turn of the loop, the forced final turn
+/// included. A single-shot lane has no agent, so it calls [`Watch::call`], which brackets
+/// one `DynModel` call the same way. Both write through [`Watch::record`].
+///
+/// A hook cannot change what it observes here: `on_outcome` always returns
+/// [`OutcomeAction::Proceed`], so the response and every error reach the loop unchanged.
 #[derive(Clone, Debug)]
-pub struct Watched<M> {
-    inner: M,
+pub struct Watch {
     log: CompletionLog,
     /// Who this arm calls, for the GenAI client metrics. `None` for an arm with no
     /// provider behind it — the offline scripted client — which records nothing; see
     /// [`crate::metrics::PhaseIdentity`].
     ident: Option<MetricIdent>,
     /// Where each call's duration goes as a progress beat, and which cast role to
-    /// label it — `None` for a wrapper nobody watches. Separate from `ident` on
+    /// label it — `None` for a watcher nobody listens to. Separate from `ident` on
     /// purpose: a beat is liveness for the caller, so the offline scripted arm emits
     /// it too, while a metric is a provider fact that arm has no business recording.
     beat: Option<ChatBeat>,
+    /// When each in-flight dispatch began, keyed by rig's effect id. Hook callbacks are
+    /// `&self` and a turn's calls can overlap, so the map is shared and locked.
+    started: Arc<Mutex<HashMap<EffectId, Instant>>>,
 }
 
-/// The progress half of a [`Watched`] wrapper: the sink a call's duration is emitted to
-/// and the role it is labeled with.
+/// The progress half of a [`Watch`]: the sink a call's duration is emitted to and the
+/// role it is labeled with.
 #[derive(Clone, Debug)]
 struct ChatBeat {
     sink: Arc<dyn ProgressSink>,
     agent: &'static str,
 }
 
-/// The owned half of [`crate::metrics::CallIdent`]. Owned because this wrapper is
-/// cloned into every agent rig builds and must outlive the call site that named it.
+/// The owned half of [`crate::metrics::CallIdent`]. Owned because the watcher is cloned
+/// into every agent a phase builds and must outlive the call site that named it.
 #[derive(Clone, Debug)]
 struct MetricIdent {
     provider: crate::credentials::ProviderKind,
     model: String,
 }
 
-impl<M> Watched<M> {
-    /// Wrap `model` so its completions record into `log`, and — when the arm names a
-    /// provider — into the client metrics.
+impl Watch {
+    /// A watcher recording into `log`, and — when the arm names a provider — into the
+    /// client metrics.
     pub fn new(
-        model: M,
         log: CompletionLog,
         ident: Option<crate::metrics::PhaseIdentity>,
         model_name: &str,
     ) -> Self {
         Self {
-            inner: model,
             log,
             ident: ident.map(|i| MetricIdent {
                 provider: i.provider,
                 model: model_name.to_string(),
             }),
             beat: None,
+            started: Arc::default(),
         }
     }
 
@@ -348,31 +368,14 @@ impl<M> Watched<M> {
         self.beat = Some(ChatBeat { sink, agent });
         self
     }
-}
 
-/// Wrap a completion model so every turn records into `log` — the drop-in at an
-/// agent-builder call site, mirroring [`traced`](crate::tool_span::traced) for tools.
-pub fn watched<M: CompletionModel>(
-    model: M,
-    log: CompletionLog,
-    ident: Option<crate::metrics::PhaseIdentity>,
-    model_name: &str,
-) -> Watched<M> {
-    Watched::new(model, log, ident, model_name)
-}
+    /// The log this watcher writes.
+    pub fn log(&self) -> &CompletionLog {
+        &self.log
+    }
 
-impl<M: CompletionModel> CompletionModel for Watched<M> {
-    /// Still a pure passthrough: the response and every error are returned untouched.
-    /// What it now also does is *time* the call, because this is the one place kaibo
-    /// sees a single provider request begin and end — rig's agent hook fires per turn
-    /// of the outer loop, which is a different bracket once a turn retries.
-    async fn completion(
-        &self,
-        request: CompletionRequest,
-    ) -> Result<CompletionResponse, CompletionError> {
-        let started = std::time::Instant::now();
-        let result = self.inner.completion(request).await;
-        let elapsed = started.elapsed();
+    /// One finished call: `result` is the response, or the failure's `error.type`.
+    fn record(&self, elapsed: Duration, result: Result<&CompletionResponse, &'static str>) {
         // Counted before the outcome is inspected, so a failed call is an inference
         // call — which is what the conventions require and what a phase that died at
         // turn 90 has to report to be read honestly.
@@ -385,49 +388,70 @@ impl<M: CompletionModel> CompletionModel for Watched<M> {
                 elapsed,
             });
         }
-
         if let Some(ident) = &self.ident {
             let call = crate::metrics::CallIdent {
                 provider: ident.provider,
                 model: &ident.model,
             };
-            match &result {
+            match result {
                 // A failed call has no usage to report, but its duration is the
                 // number an operator most wants when a provider is degrading.
-                Err(error) => {
-                    crate::metrics::record_completion(
-                        call,
-                        elapsed,
-                        None,
-                        Some(completion_error_type(error)),
-                    );
-                }
+                Err(kind) => crate::metrics::record_completion(call, elapsed, None, Some(kind)),
                 Ok(response) => {
-                    crate::metrics::record_completion(call, elapsed, Some(&response.usage), None);
+                    crate::metrics::record_completion(call, elapsed, Some(&response.usage), None)
                 }
             }
         }
-
-        let response = result?;
-        self.log.push(TurnRecord::observe(&response));
-        Ok(response)
+        if let Ok(response) = result {
+            self.log.push(TurnRecord::observe(response));
+        }
     }
 
-    /// Forwarded verbatim. kaibo drives the non-streaming loop, so nothing here calls
-    /// this today; a streamed response reports its finish reason through rig's own
-    /// stream events rather than a single raw payload, so wrapping it would be a
-    /// different job than this one.
-    async fn stream(
+    /// One completion straight to `model`, bracketed and recorded — the single-shot
+    /// lanes' seam. The response and every error come back untouched.
+    pub async fn call(
         &self,
+        model: &DynModel<Completion>,
         request: CompletionRequest,
-    ) -> Result<rig_core::streaming::StreamingCompletionResponse, CompletionError> {
-        self.inner.stream(request).await
+    ) -> Result<CompletionResponse, ProviderError> {
+        let started = Instant::now();
+        let result = model.call(request).await;
+        let elapsed = started.elapsed();
+        match &result {
+            Ok(response) => self.record(elapsed, Ok(response)),
+            Err(error) => self.record(elapsed, Err(completion_error_type(error))),
+        }
+        result
     }
 
-    /// Forwarded: this is a provider capability, and the wrapper must not change what
-    /// rig believes the model can do.
-    fn capabilities(&self) -> rig_core::completion::ProviderCapabilities {
-        self.inner.capabilities()
+    fn lock_started(&self) -> std::sync::MutexGuard<'_, HashMap<EffectId, Instant>> {
+        self.started.lock().unwrap_or_else(|p| p.into_inner())
+    }
+}
+
+impl AgentHook for Watch {
+    async fn on_dispatch(&self, _ctx: &HookContext, event: DispatchEvent<'_>) -> DispatchAction {
+        if matches!(event.kind, EffectKind::Completion { .. }) {
+            self.lock_started().insert(event.id, Instant::now());
+        }
+        DispatchAction::Proceed
+    }
+
+    async fn on_outcome(&self, _ctx: &HookContext, event: OutcomeEvent<'_>) -> OutcomeAction {
+        if !matches!(event.kind, EffectKind::Completion { .. }) {
+            return OutcomeAction::Proceed;
+        }
+        let elapsed = self
+            .lock_started()
+            .remove(&event.id)
+            .map(|at| at.elapsed())
+            .unwrap_or_default();
+        match event.outcome {
+            Ok(Answered::Completion(response)) => self.record(elapsed, Ok(response)),
+            Ok(_) => {}
+            Err(report) => self.record(elapsed, Err(report_error_type(report))),
+        }
+        OutcomeAction::Proceed
     }
 }
 

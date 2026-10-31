@@ -1,24 +1,19 @@
-//! Stability AI's image and audio generation — kaibo's own facade, with rig's
-//! `image_generation` trait wired as a thin adapter over it.
+//! Stability AI's image and audio generation — kaibo's own facade, reached through the
+//! media seam ([`crate::media`]).
 //!
-//! # Why a facade first, not a direct trait impl
+//! # Why a facade of our own, not a rig model
 //!
-//! rig ships `openai`/`xai`/`azure`/`huggingface` implementations of
-//! [`rig_core::image_generation::ImageGenerationModel`], and that trait's request shape
-//! (`prompt`/`width`/`height`/`additional_params`) is deliberately thin — it fits a
-//! single text-to-image call and nothing else. Stability's v2beta API is bigger than
-//! that: alongside `stable-image/generate/{core,ultra,sd3}`, the synchronous
+//! rig's image-generation request shape (`prompt`/`width`/`height`/`additional_params`)
+//! is deliberately thin — it fits a single text-to-image call and nothing else, and
+//! rig 0.46 no longer has a trait for a provider to implement at all. Stability's v2beta
+//! API is bigger than that: alongside `stable-image/generate/{core,ultra,sd3}`, the synchronous
 //! `edit`/`control`/`upscale` routes wired in [`STABLE_IMAGE_OPS`], and the Stable Audio
 //! routes wired as [`Operation::Audio`], it also ships the deferred half of upscale
 //! (creative) and edit (replace-background-and-relight), and 3D (`stable-fast-3d`) —
 //! and every one of the image-family operations, unlike generate, takes an **input
-//! image** alongside its other fields. Building straight to
-//! rig's shape would mean rewriting this module's core type the day any of those
-//! lands. So the primary abstraction here is [`StabilityRequest`]/[`Operation`] —
-//! provider-native, already carrying its named binary input parts — and
-//! [`StabilityImageModel`]'s [`rig_core::image_generation::ImageGenerationModel`] impl
-//! is a thin translation at the bottom ([`from_rig_request`]) that only text-to-image
-//! ever needs.
+//! image** alongside its other fields. So the abstraction here is
+//! [`StabilityRequest`]/[`Operation`] — provider-native, already carrying its named
+//! binary input parts.
 //!
 //! # Sync vs deferred — declared, not sniffed
 //!
@@ -124,8 +119,8 @@
 //!   [`handle_response`]'s doc for why a `200` with a JSON content-type is refused
 //!   rather than parsed as a second success shape).
 //! - **`aspect_ratio`, not `width`/`height`** — confirmed both by the spec and the live
-//!   call (`aspect_ratio=1:1` is what actually worked). rig's `ImageGenerationRequest`
-//!   only carries width/height, so [`aspect_ratio_for`] bridges the two.
+//!   call (`aspect_ratio=1:1` is what actually worked). [`aspect_ratio_for`] maps a
+//!   width/height pair onto the nearest ratio for a caller that has dimensions.
 //! - Every non-2xx response (`400`/`403`/`422`/`429`/`500`, and the dedicated
 //!   `403 content_moderation` shape) shares one JSON body: `{id, name, errors: [...]}`
 //!   — confirmed live: an empty POST (no body at all) came back `400` with
@@ -180,12 +175,7 @@ use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result as AnyResult};
 use reqwest::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE};
-use rig_core::image_generation::{
-    ImageGenerationError, ImageGenerationModel as RigImageGenerationModel, ImageGenerationRequest,
-    ImageGenerationResponse,
-};
 use serde::Deserialize;
-use serde_json::Value;
 
 use crate::credentials;
 
@@ -248,9 +238,8 @@ pub struct StabilityRequest {
     /// as named multipart file parts by [`StabilityClient::call`].
     pub inputs: Vec<crate::media::MediaInput>,
     /// Stability's own `aspect_ratio` enum value (e.g. `"16:9"`), when this operation
-    /// takes one. The rig adapter ([`from_rig_request`]) derives it from
-    /// `ImageGenerationRequest`'s width/height via [`aspect_ratio_for`]; a caller
-    /// driving this facade directly can just say what they mean.
+    /// takes one. A caller with only a width and height derives it with
+    /// [`aspect_ratio_for`]; one driving this facade directly can just say what it means.
     pub aspect_ratio: Option<String>,
     /// Every other form field (`output_format`, `seed`, `style_preset`,
     /// `negative_prompt`, `cfg_scale`, `strength`, `mode`, an explicit `model` for
@@ -588,7 +577,7 @@ pub enum GenerateRoute {
     Core,
     Ultra,
     /// The SD3.5 variant string (`sd3.5-large`, `sd3.5-large-turbo`, `sd3.5-medium`, ...)
-    /// rides as the `model` form field — see [`from_rig_request`]. Passed through
+    /// rides as the `model` form field. Passed through
     /// verbatim; Stability validates it, so an unrecognized variant still reaches the
     /// provider as a normal `400`, not a client-side guess.
     Sd3 {
@@ -704,11 +693,9 @@ struct StabilityErrorBody {
     errors: Vec<String>,
 }
 
-/// Everything that can go wrong building or interpreting a Stability call. Kept as our
-/// own type — rather than reaching for rig's `ImageGenerationError` directly — so
-/// [`build_form_fields`]/[`from_rig_request`]/[`handle_response`] stay unit-testable
-/// with no rig or reqwest types in the loop; [`StabilityImageModel::image_generation`]
-/// is the one place this becomes a rig error.
+/// Everything that can go wrong building or interpreting a Stability call. Its own type,
+/// so [`build_form_fields`]/[`handle_response`] stay unit-testable with no rig or
+/// reqwest types in the loop.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StabilityError {
     /// The HTTP request itself failed (DNS, connect, TLS, a dropped connection) —
@@ -974,9 +961,7 @@ impl MediaType {
 }
 
 /// One successful artifact: raw bytes plus whatever Stability told us about them.
-/// Kept separate from rig's `ImageGenerationResponse` wrapper so this facade has a
-/// return type of its own — a future direct (non-rig) caller (e.g. the media CAS
-/// wiring) uses this same shape, for every media family, not just images.
+/// This facade's own return type, the same shape for every media family, not just images.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Artifact {
     pub bytes: Vec<u8>,
@@ -1239,69 +1224,6 @@ fn poll_response_with(
 
 // --- The rig adapter ------------------------------------------------------------
 
-/// A JSON [`Value`] form field value, as a form-encodable string — Stability's
-/// multipart fields are all plain text, so only scalars translate; an
-/// array/object/null value means the caller's `additional_params` doesn't shape what
-/// this module can send.
-fn value_to_form_field(v: &Value) -> Option<String> {
-    match v {
-        Value::String(s) => Some(s.clone()),
-        Value::Number(n) => Some(n.to_string()),
-        Value::Bool(b) => Some(b.to_string()),
-        _ => None,
-    }
-}
-
-/// Translate rig's [`ImageGenerationRequest`] into this facade's own
-/// [`StabilityRequest`] + [`Operation`] — the one place rig's thin shape (prompt/width/
-/// height/additional_params) meets Stability's native one. `model_id` is
-/// [`RigImageGenerationModel::make`]'s model string, classified by
-/// [`GenerateRoute::classify`]. `output_format` defaults to `"png"` (Stability's own
-/// default, kept explicit rather than omitted so a caller reading this module's
-/// behavior never has to check Stability's docs to know what they'll get); an
-/// `additional_params` entry of the same name overrides it, same as any other field.
-pub fn from_rig_request(
-    model_id: &str,
-    request: &ImageGenerationRequest,
-) -> Result<(Operation, StabilityRequest), StabilityError> {
-    let route = GenerateRoute::classify(model_id);
-    let mut fields: Vec<(String, String)> = Vec::new();
-    if let GenerateRoute::Sd3 { model } = &route {
-        fields.push(("model".to_string(), model.clone()));
-    }
-    fields.push(("output_format".to_string(), "png".to_string()));
-
-    if let Some(extra) = &request.additional_params {
-        let obj = extra.as_object().ok_or_else(|| {
-            StabilityError::InvalidAdditionalParams(
-                "additional_params must be a JSON object of Stability form fields".to_string(),
-            )
-        })?;
-        for (k, v) in obj {
-            let value = value_to_form_field(v).ok_or_else(|| {
-                StabilityError::InvalidAdditionalParams(format!(
-                    "additional_params.{k} must be a string, number, or bool — got {v}"
-                ))
-            })?;
-            if let Some(existing) = fields.iter_mut().find(|(name, _)| name == k) {
-                existing.1 = value;
-            } else {
-                fields.push((k.clone(), value));
-            }
-        }
-    }
-
-    Ok((
-        Operation::Generate(route),
-        StabilityRequest {
-            prompt: Some(request.prompt.clone()),
-            inputs: Vec::new(),
-            aspect_ratio: Some(aspect_ratio_for(request.width, request.height).to_string()),
-            fields,
-        },
-    ))
-}
-
 // --- The HTTP client -------------------------------------------------------------
 
 /// A Stability API connection: the `reqwest::Client` (ring-installed, per-call
@@ -1477,12 +1399,9 @@ async fn interpret(
     Ok((status, content_type, finish_reason, seed, body.to_vec()))
 }
 
-/// rig's `image_generation` adapter over [`StabilityClient`] — one Stability
-/// `generate` model id (`"core"`/`"ultra"`/an SD3.5 variant), classified into a route
-/// by [`GenerateRoute::classify`]. Implements
-/// [`rig_core::image_generation::ImageGenerationModel`] so a future `image` cast slot
-/// can dispatch across this and rig's built-in openai/xai/azure/huggingface impls
-/// identically — see the module doc.
+/// One Stability model over a [`StabilityClient`] — a `generate` model id
+/// (`"core"`/`"ultra"`/an SD3.5 variant), classified into a route by
+/// [`GenerateRoute::classify`], or a Stable Audio model id.
 #[derive(Clone)]
 pub struct StabilityImageModel {
     client: StabilityClient,
@@ -1492,63 +1411,9 @@ pub struct StabilityImageModel {
     output: crate::media::MediaOutput,
 }
 
-/// Everything rig's [`RigImageGenerationModel::Response`] carries beyond the image
-/// bytes (which ride on rig's own `ImageGenerationResponse::image`): just the seed,
-/// today — see [`Artifact::seed`].
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub struct StabilityImageResponse {
-    pub seed: Option<String>,
-}
-
-impl RigImageGenerationModel for StabilityImageModel {
-    type Response = StabilityImageResponse;
-    type Client = StabilityClient;
-
-    fn make(client: &Self::Client, model: impl Into<String>) -> Self {
-        Self {
-            client: client.clone(),
-            model: model.into(),
-            output: crate::media::MediaOutput::Image,
-        }
-    }
-
-    async fn image_generation(
-        &self,
-        request: ImageGenerationRequest,
-    ) -> Result<ImageGenerationResponse<Self::Response>, ImageGenerationError> {
-        let (op, stability_request) = from_rig_request(&self.model, &request)
-            .map_err(|e| ImageGenerationError::RequestError(Box::new(e)))?;
-        let response = self
-            .client
-            .call(&op, &stability_request)
-            .await
-            .map_err(|e| ImageGenerationError::ProviderError(e.to_string()))?;
-        // `Operation::Generate` always declares `Shape::Sync` (see `Operation::shape`),
-        // so `Deferred` is unreachable here today — but rig's trait is a single
-        // synchronous call with nowhere to hand a job id, so a mismatch must fail
-        // loudly (`StabilityError::UnexpectedlyDeferred`) rather than panic or silently
-        // drop it, in case a future bug ever mis-declares a route's shape.
-        let artifact = match response {
-            StabilityResponse::Complete(artifact) => artifact,
-            StabilityResponse::Deferred(_) => {
-                return Err(ImageGenerationError::ProviderError(
-                    StabilityError::UnexpectedlyDeferred.to_string(),
-                ))
-            }
-        };
-        Ok(ImageGenerationResponse {
-            image: artifact.bytes,
-            response: StabilityImageResponse {
-                seed: artifact.seed,
-            },
-        })
-    }
-}
-
 impl StabilityImageModel {
-    /// Build directly from a client + model id — the non-rig constructor
-    /// [`crate::media::MediaArm::from_slot`] uses. Same shape as
-    /// [`RigImageGenerationModel::make`], available without importing rig's trait.
+    /// Build from a client + model id — the constructor
+    /// [`crate::media::MediaArm::from_slot`] uses.
     pub fn from_parts(
         client: &StabilityClient,
         model: impl Into<String>,
@@ -1609,11 +1474,6 @@ impl StabilityImageModel {
         ))
     }
 
-    /// The request-side translation shared with [`from_rig_request`]: classify the
-    /// model id into a route, seed the sd3 `model` field and the explicit
-    /// `output_format = "png"` default, then let the caller's own fields override —
-    /// last write wins, the same contract [`build_form_fields`] applies again at
-    /// send time.
     /// Resolve one neutral request into the operation it addresses and Stability's own
     /// request shape.
     ///
@@ -2155,92 +2015,6 @@ mod tests {
                 req.fields
             );
         }
-    }
-
-    // --- from_rig_request --------------------------------------------------------
-
-    /// Build a real `ImageGenerationRequest` via rig's own builder — the type is
-    /// `#[non_exhaustive]`, so a struct literal isn't available outside rig's crate.
-    /// Any `ImageGenerationModel` instance can mint the builder; a throwaway
-    /// [`StabilityImageModel`] over a never-dialed client does the job with no network.
-    fn rig_request(
-        width: u32,
-        height: u32,
-        additional_params: Option<Value>,
-    ) -> ImageGenerationRequest {
-        let client = StabilityClient::new("test-key", "http://localhost", Duration::from_secs(1))
-            .expect("client construction is pure config, no network");
-        let model = StabilityImageModel::make(&client, "core");
-        let mut builder = model
-            .image_generation_request()
-            .prompt("lighthouse on a cliff")
-            .width(width)
-            .height(height);
-        if let Some(params) = additional_params {
-            builder = builder.additional_params(params);
-        }
-        builder.build()
-    }
-
-    #[test]
-    fn from_rig_request_core_route_has_no_model_field() {
-        let (op, req) = from_rig_request("core", &rig_request(1024, 1024, None)).unwrap();
-        assert_eq!(op, Operation::Generate(GenerateRoute::Core));
-        assert_eq!(req.aspect_ratio.as_deref(), Some("1:1"));
-        assert!(!req.fields.iter().any(|(k, _)| k == "model"));
-        assert!(req
-            .fields
-            .iter()
-            .any(|(k, v)| k == "output_format" && v == "png"));
-    }
-
-    #[test]
-    fn from_rig_request_sd3_variant_carries_model_field() {
-        let (op, req) =
-            from_rig_request("sd3.5-large-turbo", &rig_request(1024, 1024, None)).unwrap();
-        assert_eq!(
-            op,
-            Operation::Generate(GenerateRoute::Sd3 {
-                model: "sd3.5-large-turbo".to_string()
-            })
-        );
-        assert!(req
-            .fields
-            .iter()
-            .any(|(k, v)| k == "model" && v == "sd3.5-large-turbo"));
-    }
-
-    #[test]
-    fn from_rig_request_additional_params_override_output_format() {
-        let params = serde_json::json!({"output_format": "webp", "seed": 42});
-        let (_, req) = from_rig_request("core", &rig_request(1024, 1024, Some(params))).unwrap();
-        assert!(req
-            .fields
-            .iter()
-            .any(|(k, v)| k == "output_format" && v == "webp"));
-        assert!(req.fields.iter().any(|(k, v)| k == "seed" && v == "42"));
-        // output_format must not appear twice (override, not append).
-        assert_eq!(
-            req.fields
-                .iter()
-                .filter(|(k, _)| k == "output_format")
-                .count(),
-            1
-        );
-    }
-
-    #[test]
-    fn from_rig_request_rejects_non_object_additional_params() {
-        let params = serde_json::json!(["not", "an", "object"]);
-        let err = from_rig_request("core", &rig_request(1024, 1024, Some(params))).unwrap_err();
-        assert!(matches!(err, StabilityError::InvalidAdditionalParams(_)));
-    }
-
-    #[test]
-    fn from_rig_request_rejects_non_scalar_field_value() {
-        let params = serde_json::json!({"style_preset": {"nested": true}});
-        let err = from_rig_request("core", &rig_request(1024, 1024, Some(params))).unwrap_err();
-        assert!(matches!(err, StabilityError::InvalidAdditionalParams(_)));
     }
 
     // --- MediaType --------------------------------------------------------------
