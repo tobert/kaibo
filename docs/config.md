@@ -41,6 +41,7 @@ Connection settings only. Models are never declared here.
 | `api_key_cmd` | argv array | unset — declared by you | command source: stdout, trimmed, is the key (no shell, 30s ceiling, stdin closed) |
 | `key_optional` | bool | `true` for `openai`, else `false` | allows a placeholder token |
 | `data_collection` | `deny` \| `allow` | `deny` | `kind = "openrouter"` only; load error elsewhere |
+| `prompt_cache` | `short` \| `long` \| `off` | `short` | `kind = "anthropic"` or `"openrouter"` only; load error elsewhere |
 | `request_timeout_secs` | integer > 0 | `[defaults]` value (900) | per-single-completion ceiling |
 
 #### `kind` and `base_url`
@@ -149,6 +150,25 @@ OpenRouter is a keyed gateway rather than a wire protocol of its own. One
   (most `:free` variants) fails loudly instead of leaking quietly. `data_collection =
   "allow"` is the explicit opt-in: kaibo then emits no restriction and your OpenRouter
   account settings govern. `kaibo://config` renders the active policy per backend.
+
+#### `prompt_cache`
+
+The prompt-cache retention every interactive request on an `anthropic` or `openrouter`
+backend asks for. The tool loop resends the same prefix each turn (tool definitions, the
+system prompt, then the growing transcript), so a cache marker bills each re-read at the
+cache-read rate instead of the full input price.
+
+- `short` (default): a top-level `cache_control: {type: "ephemeral"}` marker. On
+  Anthropic that is the 5-minute cache.
+- `long`: the same marker with `ttl: "1h"`, Anthropic's 1-hour cache. Cache writes cost
+  more than `short`'s; it pays off when calls to one backend arrive more than 5 minutes
+  apart.
+- `off`: no marker, for a Messages-compatible gateway that rejects the field.
+
+The other kinds cache without a marker or not at all, so they refuse the key. The
+provenance footer shows the effect: `N cached` is tokens read from the cache, and
+`N cache-write` is tokens written to it. `kaibo://config` renders the active value per
+backend.
 
 #### `request_timeout_secs`
 
