@@ -117,6 +117,7 @@ scratch_limit_bytes = 67108864      # in-memory root scratch; a write past it is
 # [backends.openrouter]
 # api_key_env = "OPENROUTER_API_KEY"
 # data_collection = "deny"          # default; allow defers to account routing policy
+# prompt_cache = "short"            # default; also "long" or "off", as on anthropic
 
 # A backend is a named connection; kind is required on new backends.
 # Hosted OpenAI uses Responses by default; other openai endpoints use Chat Completions.
