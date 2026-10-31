@@ -15,6 +15,12 @@ record. Each later release appends a new section at the top.
 
 ## [Unreleased]
 
+## [0.6.1] — 2026-10-31
+
+### Security
+- `rustls-webpki` 0.103.16 fixes RUSTSEC-2026-0382: certificate checks could accept chains through distrusted emSign intermediates.
+- `rustls` 0.23.46, `tokio-rustls` 0.26.6, `rustls-native-certs` 0.8.5, and `rustls-platform-verifier` 0.7.1 bring the rest of the TLS stack to its latest patch releases.
+
 ## [0.6.0] — 2026-10-13
 
 ### Added
