@@ -135,8 +135,8 @@ pub enum Phase {
     Explorer(ReportReader),
     /// The `consult` driver, with an `explore′` sweep to delegate to.
     Consult,
-    /// The `consult` driver on a synth-only cast: one model, no explorer, every read its
-    /// own. Shares the `consult` override key, since an operator tuning the driver means
+    /// The `consult` driver on a solo cast (no explorer slot, or `consult = "solo"`): one
+    /// model, no explorer, every read its own. Shares the `consult` override key, since an operator tuning the driver means
     /// both shapes.
     ConsultSolo,
     /// The thin, toolless `oneshot`.
@@ -211,7 +211,7 @@ impl Phase {
             }
             Phase::Explorer(ReportReader::CallingAgent) => "explorer → calling agent (explore)",
             Phase::Consult => "consult driver",
-            Phase::ConsultSolo => "consult driver, single-stage (synth-only cast)",
+            Phase::ConsultSolo => "consult driver, single-stage (solo cast)",
             Phase::Oneshot => "oneshot",
             Phase::Batch => "batch / deliberate synth (offline)",
         }
@@ -833,7 +833,7 @@ pub fn consult_preamble() -> String {
     )
 }
 
-/// The `consult` driver's system prompt on a synth-only cast: the same driver, with no
+/// The `consult` driver's system prompt on a solo cast: the same driver, with no
 /// explorer on the team. It reads everything through `run_kaish`, so the delegation
 /// paragraph is gone and the role line names no team. Everything after that is shared
 /// with [`consult_preamble`] through [`driver_preamble`], so the two cannot drift.

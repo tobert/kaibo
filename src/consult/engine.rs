@@ -2485,7 +2485,7 @@ pub async fn oneshot(
 }
 
 /// Build the recomposed `consult` toolset: `{run_kaish, explore′}`, or `{run_kaish}`
-/// alone when the cast has no explorer (single-stage: the synth does all its own reads).
+/// alone when the cast runs solo (single-stage: the synth does all its own reads).
 /// Factored out so the wiring (explore′ present exactly when an explorer arm is, pointed
 /// at that arm) is unit-testable without a live model. `reports` collects each `explore′`
 /// sweep.
@@ -2697,7 +2697,7 @@ pub async fn deliberate_direct(
 /// `ConsultOutput.report` aggregates whatever the `explore′` sweeps returned
 /// (empty if the model read everything itself).
 ///
-/// `explorer: None` is single-stage: a synth-only cast's synth reads everything itself
+/// `explorer: None` is single-stage: a solo cast's synth reads everything itself
 /// over `run_kaish`, under the [`Phase::ConsultSolo`] preamble, which never mentions a
 /// teammate it cannot reach.
 pub(crate) async fn consult_with(
@@ -2834,7 +2834,7 @@ pub(crate) async fn consult_session_turn(
 }
 
 /// Run a consult against `root` over the resolved `explorer` and `synth` arms. A
-/// synth-only cast passes `explorer: None` and runs single-stage.
+/// solo cast passes `explorer: None` and runs single-stage.
 ///
 /// The server resolves a cast's slots into the arms ([`Arm::from_slot`] — keys,
 /// endpoints, request shapes); `cfg` carries the per-call loop bounds. `session`

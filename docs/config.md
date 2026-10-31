@@ -252,17 +252,31 @@ built-ins carry `synth` only; none carries a media slot. A user cast that omits 
 valid config, and the tool needing the missing role fails at call time naming the gap
 (`cast "lite" has no synth slot`). Absent means the capability is absent.
 
-**Single-stage `consult`.** A cast with an interactive `synth` and no `explorer` runs
-`consult` as one model: the synth does every read itself through `run_kaish`, and it is
-not offered `explore`. Its preamble is the `consult` driver's, with the delegation
-paragraph replaced by one on searching with `grep -rn`; a `[prompts] consult` override
-applies to both. The provenance
-footer names only the synth, and the CLI `--json` envelope sets `models.explorer` to
-`null`. `explore` and `deliberate` still need an `explorer` slot.
+**Single-stage `consult` (`consult = "solo" | "team"`).** A solo `consult` is one
+model: the synth does every read itself through `run_kaish`, and it is not offered
+`explore`. Its preamble is the `consult` driver's, with the delegation paragraph replaced
+by one on searching with `grep -rn`; a `[prompts] consult` override applies to both. No
+explorer model is resolved or called. The provenance footer names only the synth, and the
+CLI `--json` envelope sets `models.explorer` to `null`.
+
+The cast's `consult` key picks the mode. Without it, a cast with an `explorer` slot runs
+`team` (the synth may delegate surveys to the explorer) and a cast without one runs
+`solo`. `consult = "solo"` on a cast that has an `explorer` slot keeps that slot for
+`explore`, and for `deliberate` when the synth is offline. An `explorer_model` override on
+such a cast is refused, because `consult` would not use it. `consult = "team"` on a cast
+with no `explorer` slot is a load error. The built-in `anthropic` cast sets
+`consult = "solo"`; restate `consult = "team"` on it to get the old behavior back. The key
+survives a re-declaration of the cast's slots. `kaibo://config` shows each cast's
+configured mode under `consult` (a per-call `explorer_model` with `explorer_backend` on a cast that is solo only for lack of an explorer slot adds one and runs team).
 
 ```toml
-[casts.flash-solo]
+[casts.flash-solo]                  # no explorer, so solo by default
 synth = { backend = "deepseek", id = "deepseek-flash", effort = "xhigh" }
+
+[casts.opus-solo]                   # keeps the explorer for `explore`
+explorer = "anthropic/<current Haiku id>"
+synth    = "anthropic/<current Opus id>"
+consult  = "solo"
 ```
 
 **Slot references.** An unknown backend in a slot is a load error naming the known
@@ -516,6 +530,9 @@ not OpenAI Platform's own but should still take the Responses shape; see
 | `gemini-batch` | — | `gemini/gemini-pro-latest` | `batch` |
 | `anthropic-batch` | — | an Opus | `batch` |
 
+The built-in `anthropic` cast also sets `consult = "solo"`: its Sonnet reads the code
+itself and the Haiku serves `explore`. Every other built-in cast keeps the `team` default.
+
 Where a provider serves no undated alias, the table names the family. The exact ids this
 build dials are in `kaibo://config` (`kaibo config`), and kaibo releases move them.
 
@@ -718,7 +735,7 @@ Which cast shape staffs which tool:
 
 | tool | needs |
 |---|---|
-| `consult`, `consult_submit`, `oneshot` | a cast with a `synth` slot that answers **interactively** (no offline lane). Without an `explorer` slot, `consult` runs single-stage. |
+| `consult`, `consult_submit`, `oneshot` | a cast with a `synth` slot that answers **interactively** (no offline lane). A cast runs `consult` single-stage when it has no `explorer` slot or sets `consult = "solo"`. |
 | `explore` | a cast with an `explorer` slot |
 | `batch_submit` | a cast whose synth runs on `lane = "batch"` (or the `batch = true` sugar) |
 | `deliberate` | a cast with an `explorer` **and** an offline synth (`lane = "batch"` or `lane = "direct"`) |

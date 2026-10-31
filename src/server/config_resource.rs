@@ -388,8 +388,20 @@ pub(crate) fn render_config_resource(
         inert_tunables: Vec<&'static str>,
     }
 
-    /// A cast's role table, keyed by role. Only configured roles appear.
-    type CastDoc = BTreeMap<&'static str, SlotDoc>;
+    /// A cast: its role table, keyed by role (only configured roles appear), beside the
+    /// mode `consult` runs in. The slots flatten, so each role stays a top-level key.
+    #[derive(Serialize)]
+    struct CastDoc {
+        #[serde(flatten)]
+        slots: BTreeMap<&'static str, SlotDoc>,
+        /// The configured `consult` mode: `"solo"` (the synth reads the code itself) or
+        /// `"team"` (the synth delegates to the explorer). A cast with no `consult` key
+        /// shows what its slots imply. A per-call explorer override on a cast that is
+        /// solo only for lack of an explorer slot adds one and runs team. Absent on a cast with no
+        /// interactive synth, which runs no `consult` at all.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        consult: Option<&'static str>,
+    }
 
     let backends: BTreeMap<String, BackendDoc> = config
         .backends
@@ -458,7 +470,7 @@ pub(crate) fn render_config_resource(
         .casts
         .iter()
         .map(|(name, cast)| {
-            let slots: CastDoc = cast
+            let slots: BTreeMap<&'static str, SlotDoc> = cast
                 .slots
                 .iter()
                 .map(|(role, slot)| {
@@ -586,7 +598,10 @@ pub(crate) fn render_config_resource(
                     )
                 })
                 .collect();
-            (name.clone(), slots)
+            let runs_consult =
+                cast.slot(crate::config::ModelRole::Synth).is_some() && cast.synth_lane().is_none();
+            let consult = runs_consult.then_some(if cast.consult_solo() { "solo" } else { "team" });
+            (name.clone(), CastDoc { slots, consult })
         })
         .collect();
 

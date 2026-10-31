@@ -95,8 +95,9 @@ Rules, in the loud-over-silent house style:
   cast that omits one is valid config — the tool that needs the missing role
   fails loudly *at call time*, naming the gap ("cast `lite` has no synth
   slot"). Absent = capability absent. The one exception is `consult`, which
-  runs single-stage on a synth-only cast: the synth reads everything itself
-  and is not offered `explore`.
+  runs single-stage on a synth-only cast, or on any cast with `consult = "solo"`
+  (the built-in `anthropic` cast): the synth reads everything itself, is not
+  offered `explore`, and no explorer model is called.
 - **`[profiles]` is deleted, not deprecated.** A config that still says
   `[profiles.x]` gets a load error pointing at this doc. Amy is the only
   user; git history is the record.

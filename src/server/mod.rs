@@ -345,6 +345,7 @@ pub struct ConsultInput {
 
     /// Override the explorer (investigation) model id. See `kaibo://tools` for override
     /// semantics (ids are verbatim; pair with `explorer_backend` to also retarget).
+    /// Refused on a cast with `consult = "solo"`, which runs no explorer.
     #[serde(default)]
     pub explorer_model: Option<String>,
 
@@ -371,8 +372,8 @@ pub struct ConsultInput {
 
     /// Attach the explorer's aggregated report as `structured_content` alongside the
     /// answer, for debugging the hand-off. Off by default (it can be large; an empty
-    /// report means no sweep ran: the synth read everything itself, or the cast has no
-    /// explorer).
+    /// report means no sweep ran: the synth read everything itself, the cast runs
+    /// `consult` solo, or the cast has no explorer).
     #[serde(default)]
     pub include_report: bool,
 
@@ -970,7 +971,7 @@ type CastEnumRule = (
 /// budget-limited display (it caps the line count and always lists the default, usable or
 /// not) — a presentation choice distinct from tool eligibility.
 const CAST_ENUM_RULES: &[CastEnumRule] = &[
-    // `consult` runs single-stage on a synth-only cast (the synth reads for itself) and
+    // `consult` runs single-stage on a solo cast (the synth reads for itself) and
     // `oneshot` runs the synth alone, so all three need only an interactive synth.
     (
         &["consult", "consult_submit", "oneshot"],
@@ -1921,7 +1922,7 @@ impl KaiboHandler {
             answer with `file:line` citations. A synthesis agent (DeepSeek, Gemini, \
             Anthropic, OpenRouter, or local — pick with `cast`) drives a READ-ONLY shell over \
             the project: it reads the real, current source, delegates broad sweeps to a fast \
-            explorer when its cast has one, and answers with evidence, never modifying anything. Describe your \
+            explorer when its cast runs a team, and answers with evidence, never modifying anything. Describe your \
             intent in prose; kaibo locates the code itself, so you don't paste files or \
             diffs. `attach` puts specific files in front of it; `session_id` threads a \
             multi-turn consultation. For a toolless opinion use `oneshot`; to run in the \
@@ -1954,8 +1955,12 @@ impl KaiboHandler {
             "synth_model",
             "synth_backend",
         )?;
-        // A synth-only cast has no explorer: `consult` runs single-stage.
-        let explorer = self.resolver.optional_arm(&cast, ModelRole::Explorer)?;
+        // A solo cast (`consult = "solo"`, or no explorer slot) runs single-stage.
+        let explorer = self.resolver.consult_explorer_arm(
+            &cast,
+            input.explorer_model.as_deref(),
+            "explorer_model",
+        )?;
         let synth = self.arm(&cast, ModelRole::Synth)?;
         // Progress rides the whole investigation: sweeps and direct reads emit beats
         // onto the wire when the client supplied a token, else a no-op sink.
@@ -2099,7 +2104,11 @@ impl KaiboHandler {
             "synth_model",
             "synth_backend",
         )?;
-        let explorer = self.resolver.optional_arm(&cast, ModelRole::Explorer)?;
+        let explorer = self.resolver.consult_explorer_arm(
+            &cast,
+            input.explorer_model.as_deref(),
+            "explorer_model",
+        )?;
         let synth = self.arm(&cast, ModelRole::Synth)?;
         let defaults = &self.config.defaults;
         // Resolve + classify + gate before spawning: a bad attach (or an image to a blind
@@ -4771,7 +4780,8 @@ A model id is sent **verbatim** — an id with a `/` in it (HuggingFace-style
 `org/model-name`) is still one id, not a path. The `*_model` override keeps the slot's
 configured backend; pair it with the matching `*_backend` (`synth_backend`, `backend`, …)
 to retarget the slot to a different connection wholesale — which also lets you fill a role
-the cast doesn't otherwise carry.
+the cast doesn't otherwise carry. A cast set to solo `consult` refuses an explorer
+override on `consult`, since it runs no explorer there.
 
 ## Survey the code, or get an answer: `explore` vs `consult`
 
@@ -5041,15 +5051,15 @@ fn render_prompts_resource(config: &Config, cast: Option<&Cast>) -> String {
 
     for phase in Phase::ALL {
         // A cast with an interactive synth runs exactly one of the two `consult` drivers
-        // — with `explore′` when it has an explorer slot, single-stage when it has none —
+        // — with `explore′` on a team cast, single-stage on a solo cast (`Cast::consult_solo`) —
         // so its own view shows that one. A cast with no interactive synth runs neither.
         // The base doc shows both.
         if let Some(c) = cast {
             let interactive = c.slot(ModelRole::Synth).is_some() && c.synth_lane().is_none();
-            let has_explorer = c.slot(ModelRole::Explorer).is_some();
+            let solo = c.consult_solo();
             match phase {
-                Phase::Consult if !interactive || !has_explorer => continue,
-                Phase::ConsultSolo if !interactive || has_explorer => continue,
+                Phase::Consult if !interactive || solo => continue,
+                Phase::ConsultSolo if !interactive || !solo => continue,
                 _ => {}
             }
         }
@@ -8640,6 +8650,107 @@ enabled = false
         assert!(cast.slot(ModelRole::Explorer).is_some());
     }
 
+    /// `consult = "solo"` on a cast WITH an explorer: `consult` resolves no explorer arm
+    /// (so no explorer model can be called), `explore` still staffs the cast, and a
+    /// `team` cast on the same backend still resolves its explorer. An `explorer_model`
+    /// override on the solo cast is refused, naming the key and the way out.
+    #[test]
+    fn a_solo_cast_with_an_explorer_resolves_no_explorer_for_consult() {
+        let h = handler_from_toml(
+            r#"
+            [backends.gem]
+            kind = "gemini"
+            key_optional = true
+
+            [casts.solo]
+            explorer = "gem/lite"
+            synth    = "gem/flash"
+            consult  = "solo"
+
+            [casts.team]
+            explorer = "gem/lite"
+            synth    = "gem/flash"
+            "#,
+        );
+        let solo = h.config.resolve_cast("solo").unwrap();
+        let none = h
+            .resolver
+            .consult_explorer_arm(solo, None, "explorer_model")
+            .expect("resolves");
+        assert!(none.is_none(), "solo consult must not resolve the explorer");
+        assert!(
+            h.config.cast_can_explore("solo"),
+            "`explore` still staffs it"
+        );
+        assert!(h.resolver.arm(solo, ModelRole::Explorer).is_ok());
+
+        let team = h.config.resolve_cast("team").unwrap();
+        let some = h
+            .resolver
+            .consult_explorer_arm(team, None, "explorer_model")
+            .expect("resolves");
+        assert!(some.is_some(), "team consult resolves its explorer");
+
+        let err = h
+            .resolver
+            .consult_explorer_arm(solo, Some("other"), "explorer_model")
+            .expect_err("override cannot take effect");
+        let msg = err.message.to_string();
+        for needle in [
+            "explorer_model",
+            "consult = \"solo\"",
+            "`explore`",
+            "kaibo://config",
+        ] {
+            assert!(msg.contains(needle), "refusal must name {needle}: {msg}");
+        }
+    }
+
+    /// The per-cast prompts view and `kaibo://config` both show the mode a cast runs.
+    #[test]
+    fn a_solo_cast_with_an_explorer_shows_the_solo_driver_and_mode() {
+        use crate::consult::Phase;
+        let config = Config::from_toml_str(
+            r#"
+            [casts.solo]
+            explorer = "anthropic/claude-haiku-4-5"
+            synth    = "anthropic/claude-opus-4-8"
+            consult  = "solo"
+            "#,
+        )
+        .expect("config parses");
+        let heading = |p: Phase| format!("## {}\n", p.label());
+        let text = render_prompts_resource(&config, Some(config.resolve_cast("solo").unwrap()));
+        assert!(text.contains(&heading(Phase::ConsultSolo)), "{text}");
+        assert!(!text.contains(&heading(Phase::Consult)), "{text}");
+
+        let body = render_config_resource(
+            &config,
+            &[],
+            None,
+            false,
+            vec![],
+            false,
+            crate::config::CasMode::Memory,
+            None,
+        );
+        let doc: toml::Value = toml::from_str(&body).expect("valid TOML");
+        let mode = |c: &str| {
+            doc["casts"][c]
+                .get("consult")
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+        };
+        assert_eq!(mode("solo").as_deref(), Some("solo"));
+        assert_eq!(mode("anthropic").as_deref(), Some("solo"));
+        assert_eq!(mode("deepseek").as_deref(), Some("team"));
+        assert_eq!(
+            mode("anthropic-batch"),
+            None,
+            "no interactive synth, no consult"
+        );
+    }
+
     /// A cast with no synth slot has no model to answer a text tool: `consult`,
     /// `consult_submit`, and `oneshot` all end on the synth. An image-only cast
     /// (`generate`'s kind) and an explorer-only cast used to pass the interactive
@@ -10207,10 +10318,7 @@ enabled = false
     /// providers each need their own config. If a step drops one, this fails.
     #[test]
     fn configure_prompt_covers_every_tool_the_keys_can_staff() {
-        for text in [
-            configure_prompt_text(None),
-            configure_prompt_text_cli(None),
-        ] {
+        for text in [configure_prompt_text(None), configure_prompt_text_cli(None)] {
             for needle in [
                 "decide",
                 "decision",

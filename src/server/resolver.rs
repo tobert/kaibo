@@ -31,7 +31,7 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use rmcp::ErrorData as McpError;
 
-use crate::config::{Cast, Config, Lane, ModelRole, ModelSlot};
+use crate::config::{Cast, Config, ConsultMode, Lane, ModelRole, ModelSlot};
 use crate::consult::{Arm, PromptOverrides};
 
 /// The resolution state shared by the MCP handler and the CLI: the resolved
@@ -433,6 +433,8 @@ impl Resolver {
     /// `org/model`) is still one id, never parsed for a backend. Retargeting is the
     /// explicit `backend` arg's job: when set, it resolves (aliases included) and the
     /// slot is replaced wholesale, which also works on a role the cast doesn't carry.
+    /// (`consult` refuses an explorer override on a `consult = "solo"` cast; see
+    /// [`consult_explorer_arm`](Self::consult_explorer_arm).)
     /// Either way the configured slot's pins/tunables are dropped — they described the
     /// *configured* model; the new id classifies fresh.
     pub(crate) fn override_model(
@@ -529,6 +531,36 @@ impl Resolver {
             Some(_) => self.arm(cast, role).map(Some),
             None => Ok(None),
         }
+    }
+
+    /// The explorer arm a `consult` runs with: `None` when the cast runs `consult` solo
+    /// (`Cast::consult_solo`), so no explorer model is resolved or called. A cast with
+    /// an explicit `consult = "solo"` refuses an `explorer_model` override, which could
+    /// not take effect; a cast that is solo only because it has no explorer slot keeps
+    /// the override as the way to add one.
+    pub(crate) fn consult_explorer_arm(
+        &self,
+        cast: &Cast,
+        explorer_model: Option<&str>,
+        model_arg: &str,
+    ) -> Result<Option<Arm>, McpError> {
+        if cast.consult == Some(ConsultMode::Solo) {
+            if explorer_model.is_some() {
+                return Err(McpError::invalid_params(
+                    format!(
+                        "{model_arg} was sent, but cast `{name}` has consult = \"solo\": its \
+                         synth reads the code itself and no explorer runs for `consult`. \
+                         Drop {model_arg}, use `explore` for an explorer survey, or pick a \
+                         cast with consult = \"team\" (`kaibo://config` lists each cast's \
+                         mode)",
+                        name = cast.name
+                    ),
+                    None,
+                ));
+            }
+            return Ok(None);
+        }
+        self.optional_arm(cast, ModelRole::Explorer)
     }
 
     /// Assemble the operator's house rules for this call against the resolved `root`:
