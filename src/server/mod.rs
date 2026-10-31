@@ -990,7 +990,7 @@ const CAST_ENUM_RULES: &[CastEnumRule] = &[
         &["batch_submit"],
         Config::cast_is_batch,
         "a cast whose synth runs on the batch lane (`lane = \"batch\"`, or the `batch = true` \
-         sugar) — Anthropic, Gemini, or a hosted OpenAI Platform backend",
+         sugar) — Anthropic, Gemini, OpenRouter, or a hosted OpenAI Platform backend",
     ),
     (
         &["deliberate"],
@@ -4502,7 +4502,11 @@ the catalog leaves a gap. Prefer an undated ID that tracks new releases: \
 `~author/family-latest`, such as `~anthropic/claude-sonnet-latest`. Anthropic and hosted \
 OpenAI serve no such alias; take the newest ID of the family from the listing. A \
 built-in cast already carries a current ID, and kaibo releases move it, so override a \
-built-in slot only when I want a different model. For OpenRouter, the public catalog \
+built-in slot only when I want a different model (for example, the built-in `gemini` and \
+`gemini-batch` casts synth `gemini-pro-latest` so any Gemini account works out of the box; \
+if my account or OpenRouter catalog lists Gemini Argon, pin that Argon ID on the `synth` \
+slot — or use OpenRouter's `~google/gemini-pro-latest` — and size `max_tokens` from its \
+advertised `output` ceiling). For OpenRouter, the public catalog \
 `GET https://openrouter.ai/api/v1/models?supported_parameters=tools&category=programming` \
 lists tool-capable coding models with live pricing and context length (a consult cast \
 needs `tools` support). To update models to the newest release, list each configured \
@@ -4534,7 +4538,12 @@ opening access or changing the host's tool approval settings.
 7. Staff every tool my keys allow, not only `consult`. Model-backed tools need cast slots, and \
 `runtime.unstaffable_tools` in the resolved config names each gap. Any text-provider key \
 (DeepSeek, Anthropic, Gemini, OpenRouter, or a local endpoint) staffs `consult`, `explore`, \
-and `oneshot` through a built-in cast. An OpenRouter key also staffs `decide`: add \
+and `oneshot` through a built-in cast. Anthropic, Gemini, OpenRouter, or a hosted OpenAI \
+Platform key also staffs `batch_submit` (`lane = \"batch\"`; `anthropic-batch` and \
+`gemini-batch` are built in), and any text backend staffs `deliberate` when a cast pairs an \
+interactive `explorer` with an offline `synth` (`lane = \"batch\"` on those four, or \
+`lane = \"direct\"` on any backend, as `gemini-deliberate` in the example config shows). \
+An OpenRouter key also staffs `decide`: add \
 `[casts.judge]` with `decision = \"openrouter/~typesafe/jev-latest\"` (use the backend's name \
 if it is not `openrouter`). The `judge` cast has no explorer or synth, so callers pass \
 `cast = \"judge\"` to `decide`; the default cast cannot decide. `generate` needs a media \

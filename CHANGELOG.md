@@ -15,12 +15,29 @@ record. Each later release appends a new section at the top.
 
 ## [Unreleased]
 
+### Added
+- `batch_submit` and `deliberate` run on `openrouter` backends via `/api/v1/batches`, stripping any `:batch` suffix from `list_models` ids.
+- OpenRouter slots on `google/gemini-*` and `~google/gemini-*` classify as vision-capable without an explicit `vision = true` pin.
+- `kaibo configure` and `docs/config.example.toml` cover Gemini Argon (`max_tokens` sizing from `list_models`), `batch_submit`, and `deliberate`.
+
 ### Changed
+- The built-in `gemini` cast's synth is `gemini/gemini-pro-latest` (explorer stays `gemini/gemini-flash-latest`).
 - Moves to rig 0.46, with the TLS tree still free of aws-lc, OpenSSL, and the bundled `webpki-root-certs` roots.
 - A `Retry-After` header from a rate-limited provider now sets the retry wait, along with the delay in the body.
 - A malformed-generation retry now spends one of the run's model-call turns, where it used to spend none.
 - The footer's `in` token count includes cached tokens for Anthropic, as it already did for OpenAI-shaped providers.
 - OpenRouter prompt caching is sent as a request-level `cache_control` marker.
+
+### Fixed
+- `batch_submit` and `deliberate` on a `gemini` batch slot refuse invalid `effort` rungs (`max`, `xhigh`, `none`) at slot resolution instead of failing mid-batch.
+
+## [0.6.1] — 2026-10-31
+
+### Security
+- `rustls-webpki` 0.103.16 fixes RUSTSEC-2026-0382: certificate checks could accept chains through distrusted emSign intermediates.
+- `rustls` 0.23.46, `tokio-rustls` 0.26.6, `rustls-native-certs` 0.8.5, and `rustls-platform-verifier` 0.7.1 bring the rest of the TLS stack to its latest patch releases.
+- The container image moves to the current `distroless/static:nonroot`, whose CA bundle drops the `emSign ECC Root CA - G3` and Comodo `AAA Certificate Services` roots.
+
 
 ## [0.6.0] — 2026-10-13
 

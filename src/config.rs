@@ -2623,11 +2623,11 @@ pub fn default_models(kind: ProviderKind) -> (&'static str, &'static str) {
         // `deepseek-v4-flash` was retired under us, and the built-in dialed it until
         // 2026-09-10.
         credentials::WireKind::DeepSeek => ("deepseek-flash", "deepseek-flash"),
-        // Flash is the floor (2026-10-10): no built-in pins a lite model. Both roles use
-        // the `gemini-flash-latest` alias, which tracks each new flash generation
-        // (it served `gemini-3.8-flash` on 2026-10-12) the way `gemini-pro-latest` does
-        // for gemini-batch. Catalog: 1048576 input, 65536 output, thinking.
-        credentials::WireKind::Gemini => ("gemini-flash-latest", "gemini-flash-latest"),
+        // Flash is the floor (2026-10-10): no built-in pins a lite model. The explorer
+        // surveys with `gemini-flash-latest` and the synth answers with
+        // `gemini-pro-latest` — both undated aliases that track each new release and
+        // work across standard Gemini accounts.
+        credentials::WireKind::Gemini => ("gemini-flash-latest", "gemini-pro-latest"),
         // OpenRouter's job here is a family we *can't* reach directly (we key
         // DeepSeek, Gemini, and Anthropic on their own backends), so the gateway
         // default is Qwen — a distinct lineage for a genuine cross-family read.
@@ -4257,7 +4257,7 @@ mod tests {
             (ProviderKind::DeepSeek, ("deepseek-flash", "deepseek-flash")),
             (
                 ProviderKind::Gemini,
-                ("gemini-flash-latest", "gemini-flash-latest"),
+                ("gemini-flash-latest", "gemini-pro-latest"),
             ),
             (
                 ProviderKind::OpenRouter,

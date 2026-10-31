@@ -270,12 +270,17 @@ fn is_vision_capable(wire: WireKind, model: &str) -> bool {
         // arbitrary id.
         WireKind::Openai => false,
         // OpenRouter fronts every model — vision-capable and text-only alike — so the
-        // capability is a property of the pinned *model*, not the gateway. Opt in per
-        // slot (`vision = true`), like the generic OpenAI kind. The built-in openrouter
-        // cast splits by role: its explorer default (multimodal `qwen3.8-flash`) pins
-        // vision on, while its synth default (text-only `qwen3.7-max`) leaves the slot
-        // `None` and lets this false stand.
-        WireKind::OpenRouter => false,
+        // capability is a property of the pinned *model*, not the gateway. The
+        // `google/gemini-*` / `~google/gemini-*` line is natively multimodal across
+        // 2.x/3.x/4.x (matching `WireKind::Gemini` above, so Argon/Pro/Flash on
+        // OpenRouter see without a manual pin); other families opt in per slot
+        // (`vision = true`). The built-in openrouter cast splits by role: its explorer
+        // default (multimodal `qwen3.8-flash`) pins vision on, while its synth default
+        // (text-only `qwen3.7-max`) leaves the slot `None` and lets `false` stand.
+        WireKind::OpenRouter => {
+            let slug = model.trim().trim_start_matches('~').to_ascii_lowercase();
+            slug.starts_with("google/gemini-")
+        }
     }
 }
 
