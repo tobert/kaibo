@@ -711,6 +711,7 @@ mod tests {
             key_optional: false,
             request_timeout: Duration::from_secs(30),
             data_collection: DataCollection::default(),
+            prompt_cache: crate::config::PromptCache::default(),
             wire: None,
         }
     }

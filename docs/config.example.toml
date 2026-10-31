@@ -108,6 +108,7 @@ scratch_limit_bytes = 67108864      # in-memory root scratch; a write past it is
 # Alternative to api_key_file:
 # api_key_cmd = ["op", "read", "op://Vault/Kaibo/Anthropic-key"]
 # Commands use argv, no shell; stdin closed; 30-second limit; output never logged.
+# prompt_cache = "short"            # default; "long" = 1-hour cache, "off" = no marker
 
 # [backends.deepseek]
 # api_key_file = "~/.deepseek-key"

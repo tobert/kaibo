@@ -2802,6 +2802,7 @@ mod tests {
             key_optional: false,
             request_timeout: Duration::from_secs(30),
             data_collection: Default::default(),
+            prompt_cache: Default::default(),
             wire: None,
         }
     }
@@ -5121,6 +5122,7 @@ mod tests {
             request_timeout: std::time::Duration::from_secs(60),
             wire: None,
             data_collection: crate::config::DataCollection::Allow,
+            prompt_cache: Default::default(),
         };
         let slot = ModelSlot::bare("openrouter", "google/gemini-4-argon:batch");
         let client = OpenRouterBatch::from_slot(&or_backend, &slot, &Defaults::default()).unwrap();

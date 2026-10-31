@@ -71,6 +71,16 @@ type ToolFactory<'a> = &'a (dyn Fn() -> Result<Vec<DynamicTool>> + Send + Sync);
 /// dialect name, and the name `deepseek` is hard-wired to "none do".
 /// `a_deepseek_image_reaches_the_wire_as_an_image_url_part` is the test that fails the day
 /// this stops working.
+/// Apply a backend's [`crate::config::PromptCache`] to an arm's model: `Short` and
+/// `Long` map to rig's portable cache retentions, `Off` leaves the request unmarked.
+fn with_prompt_cache(llm: Llm, cache: crate::config::PromptCache) -> Llm {
+    match cache {
+        crate::config::PromptCache::Short => llm.with_cache(CacheRetention::Short),
+        crate::config::PromptCache::Long => llm.with_cache(CacheRetention::Long),
+        crate::config::PromptCache::Off => llm,
+    }
+}
+
 fn deepseek_dialect() -> openai::wire::Dialect {
     let mut quirks = openai::wire::DEEPSEEK.quirks;
     quirks.rewrite = openai::wire::BodyRewrite::None;
@@ -396,12 +406,14 @@ impl Arm {
                 // rig's built-in https://api.anthropic.com; set, it points at an
                 // Anthropic-Messages-API-compatible gateway/proxy instead.
                 let key = backend.resolve_key()?;
-                let mut config = anthropic::AnthropicConfig::new(key);
-                if let Some(base_url) = backend.base_url.as_deref() {
-                    config = config.with_base_url(base_url);
-                }
-                let model = config.connect(http).completion(&slot.id);
-                Ok(Self::from_model(Llm::new(model), &slot.id, t.max_tokens, params, caps))
+                let model = Self::anthropic_completion_model(
+                    http,
+                    key,
+                    backend.base_url.as_deref(),
+                    &slot.id,
+                    backend.prompt_cache,
+                );
+                Ok(Self::from_model(model, &slot.id, t.max_tokens, params, caps))
             }
             WireKind::DeepSeek => {
                 let key = backend.resolve_key()?;
@@ -429,7 +441,8 @@ impl Arm {
                 // A keyed gateway with a *fixed* endpoint (rig pins the base URL), so —
                 // unlike the openai kind — there is no base_url to resolve.
                 let key = backend.resolve_key()?;
-                let model = Self::openrouter_completion_model(http, key, &slot.id);
+                let model =
+                    Self::openrouter_completion_model(http, key, &slot.id, backend.prompt_cache);
                 Ok(Self::from_model(model, &slot.id, t.max_tokens, params, caps))
             }
             WireKind::Openai => {
@@ -466,8 +479,37 @@ impl Arm {
         }
     }
 
-    /// Build the OpenRouter arm's completion model: explicit prompt caching ON.
-    /// The request carries a top-level `cache_control: ephemeral` marker, so
+    /// Build the Anthropic arm's completion model with the backend's prompt cache.
+    ///
+    /// kaibo's tool loop resends the same prefix every turn (tools, the static
+    /// preamble, then the growing transcript), so Anthropic's automatic caching — a
+    /// top-level `cache_control` marker, which rig emits for a request-level cache
+    /// option — turns each turn's re-read into a cache read. `Short` is Anthropic's
+    /// 5-minute cache, `Long` the 1-hour one (`ttl: "1h"`), and `Off` sends no marker,
+    /// for a Messages-compatible gateway that rejects the field.
+    ///
+    /// A named seam, generic over the HTTP backend, for the same reason as
+    /// [`Self::openrouter_completion_model`]: a test drives it with a capture
+    /// transport and reads the marker off the serialized body.
+    fn anthropic_completion_model<H>(
+        http: H,
+        key: String,
+        base_url: Option<&str>,
+        id: &str,
+        cache: crate::config::PromptCache,
+    ) -> Llm
+    where
+        H: rig_core::http_client::HttpClientExt + 'static,
+    {
+        let mut config = anthropic::AnthropicConfig::new(key);
+        if let Some(base_url) = base_url {
+            config = config.with_base_url(base_url);
+        }
+        with_prompt_cache(Llm::new(config.connect(http).completion(id)), cache)
+    }
+
+    /// Build the OpenRouter arm's completion model: prompt caching on unless the backend
+    /// sets `prompt_cache = "off"`. The request carries a top-level `cache_control` marker, so
     /// Anthropic-upstream slugs bill the resident preamble and the growing transcript at
     /// cache-read rates instead of full input price every turn; implicit-caching
     /// upstreams (DeepSeek/GLM/Kimi/Gemini/OpenAI) are sent no marker. Kept as a named
@@ -476,7 +518,12 @@ impl Arm {
     /// Generic over the HTTP backend so a test can drive it with a capture transport
     /// and read the marker off the serialized body — the only place that answers
     /// whether this constructor did its job.
-    fn openrouter_completion_model<H>(http: H, key: String, id: &str) -> Llm
+    fn openrouter_completion_model<H>(
+        http: H,
+        key: String,
+        id: &str,
+        cache: crate::config::PromptCache,
+    ) -> Llm
     where
         H: rig_core::http_client::HttpClientExt + 'static,
     {
@@ -489,7 +536,7 @@ impl Arm {
         let model = openai::OpenAIConfig::with_key(&openai::wire::OPENROUTER, key)
             .connect(http)
             .chat(id);
-        Llm::new(model).with_cache(CacheRetention::Short)
+        with_prompt_cache(Llm::new(model), cache)
     }
 
     /// Does a `view_image` on this arm need the user-turn rewrite? True exactly when
@@ -7195,6 +7242,7 @@ mod tests {
             key_optional: true,
             request_timeout: Duration::from_secs(30),
             data_collection: Default::default(),
+            prompt_cache: Default::default(),
             wire: None,
         };
         let slot = ModelSlot {
@@ -7248,6 +7296,7 @@ mod tests {
             key_optional: true,
             request_timeout: Duration::from_secs(30),
             data_collection: Default::default(),
+            prompt_cache: Default::default(),
             wire: None,
         };
         assert!(
@@ -7309,6 +7358,7 @@ mod tests {
             key_optional: true,
             request_timeout: Duration::from_secs(30),
             data_collection: Default::default(),
+            prompt_cache: Default::default(),
             wire: None,
         };
         // `docs/config.example.toml` used to invite exactly this, and it broke every
@@ -7381,6 +7431,7 @@ mod tests {
             key_optional: true,
             request_timeout: Duration::from_secs(30),
             data_collection: Default::default(),
+            prompt_cache: Default::default(),
             wire: Some(crate::config::OpenaiWire::Responses),
         };
         assert!(
@@ -7428,6 +7479,7 @@ mod tests {
             key_optional: true,
             request_timeout: Duration::from_secs(30),
             data_collection: Default::default(),
+            prompt_cache: Default::default(),
             wire: None,
         };
         let slot = ModelSlot {
@@ -7471,6 +7523,7 @@ mod tests {
             key_optional: true,
             request_timeout: Duration::from_secs(30),
             data_collection: Default::default(),
+            prompt_cache: Default::default(),
             wire: None,
         };
         let slot = ModelSlot::bare("anthropic", "claude-sonnet-4-6");
@@ -7502,6 +7555,7 @@ mod tests {
             key_optional: true,
             request_timeout: Duration::from_secs(30),
             data_collection: Default::default(),
+            prompt_cache: Default::default(),
             wire: None,
         };
         let defaults = crate::config::Defaults {
@@ -7534,6 +7588,7 @@ mod tests {
             key_optional: true,
             request_timeout: Duration::from_secs(30),
             data_collection: Default::default(),
+            prompt_cache: Default::default(),
             wire: None,
         };
         let slot = ModelSlot::bare("gemini", "gemini-3.5-flash");
@@ -7575,6 +7630,7 @@ mod tests {
             key_optional: false,
             request_timeout: Duration::from_secs(30),
             data_collection: Default::default(),
+            prompt_cache: Default::default(),
             wire: None,
         };
         let slot = ModelSlot {
@@ -7624,6 +7680,7 @@ mod tests {
             key_optional: false,
             request_timeout: Duration::from_secs(30),
             data_collection: crate::config::DataCollection::Allow,
+            prompt_cache: crate::config::PromptCache::default(),
             wire: None,
         };
         let slot = ModelSlot::bare("openrouter", "~anthropic/claude-sonnet-latest");
@@ -7661,6 +7718,7 @@ mod tests {
             key_optional: false,
             request_timeout: Duration::from_secs(30),
             data_collection: Default::default(),
+            prompt_cache: Default::default(),
             wire: None,
         };
         let slot = ModelSlot {
@@ -7712,6 +7770,7 @@ mod tests {
             key_optional: false,
             request_timeout: Duration::from_secs(30),
             data_collection: Default::default(),
+            prompt_cache: Default::default(),
             wire: None,
         };
         let slot = ModelSlot::bare("openrouter", "~anthropic/claude-sonnet-latest");
@@ -7781,7 +7840,12 @@ mod tests {
     #[tokio::test]
     async fn openrouter_completion_sends_max_tokens_natively() {
         let http = CaptureHttp::default();
-        let llm = Arm::openrouter_completion_model(http.clone(), "sk-or-test".into(), "qwen/qwen3.7-max");
+        let llm = Arm::openrouter_completion_model(
+            http.clone(),
+            "sk-or-test".into(),
+            "qwen/qwen3.7-max",
+            crate::config::PromptCache::default(),
+        );
         let request = llm
             .request(Message::user("hi"))
             .preamble("ground every claim")
@@ -7797,6 +7861,80 @@ mod tests {
         assert!(
             body.get("max_completion_tokens").is_none(),
             "exactly one budget field on the wire: {body}"
+        );
+    }
+
+    /// The Anthropic arm carries the backend's `prompt_cache` onto the wire. kaibo's
+    /// tool loop resends its whole prefix every turn, so the marker is what turns those
+    /// re-reads into cache reads. Asserted on the serialized Messages body, like the
+    /// OpenRouter test below: `short` is a top-level ephemeral marker (Anthropic's
+    /// automatic caching, 5 minutes), `long` adds `ttl: "1h"`, and `off` sends none.
+    #[tokio::test]
+    async fn anthropic_arm_sends_the_backends_prompt_cache() {
+        use crate::config::PromptCache;
+
+        async fn body_for(cache: PromptCache) -> Value {
+            let http = CaptureHttp::default();
+            let llm = Arm::anthropic_completion_model(
+                http.clone(),
+                "sk-ant-test".into(),
+                None,
+                "claude-sonnet-5-5",
+                cache,
+            );
+            let request = llm
+                .request(Message::user("hi"))
+                .preamble("ground every claim")
+                .max_tokens(4096);
+            // The capture transport always errors; the body is already built by then.
+            let _ = llm.dyn_model().call(request).await;
+            http.recorded().expect("rig serialized a request body")
+        }
+
+        let short = body_for(PromptCache::Short).await;
+        assert_eq!(
+            short.pointer("/cache_control"),
+            Some(&json!({"type": "ephemeral"})),
+            "the default caches with Anthropic's short (5-minute) retention: {short}"
+        );
+
+        let long = body_for(PromptCache::Long).await;
+        assert_eq!(
+            long.pointer("/cache_control"),
+            Some(&json!({"type": "ephemeral", "ttl": "1h"})),
+            "`long` asks for the 1-hour cache: {long}"
+        );
+
+        let off = body_for(PromptCache::Off).await;
+        assert!(
+            !off.to_string().contains("cache_control"),
+            "`off` sends no cache marker anywhere in the body: {off}"
+        );
+
+        assert_eq!(
+            PromptCache::default(),
+            PromptCache::Short,
+            "caching is on unless a backend turns it off"
+        );
+    }
+
+    /// `prompt_cache = "off"` on an OpenRouter backend removes the marker the arm
+    /// otherwise always sends.
+    #[tokio::test]
+    async fn openrouter_arm_honors_prompt_cache_off() {
+        let http = CaptureHttp::default();
+        let llm = Arm::openrouter_completion_model(
+            http.clone(),
+            "sk-or-test".into(),
+            "~anthropic/claude-sonnet-latest",
+            crate::config::PromptCache::Off,
+        );
+        let request = llm.request(Message::user("hi")).max_tokens(4096);
+        let _ = llm.dyn_model().call(request).await;
+        let body = http.recorded().expect("rig serialized a request body");
+        assert!(
+            !body.to_string().contains("cache_control"),
+            "`off` sends no cache marker: {body}"
         );
     }
 
@@ -7841,6 +7979,7 @@ mod tests {
             http.clone(),
             "sk-or-test".into(),
             "~anthropic/claude-sonnet-latest",
+            crate::config::PromptCache::default(),
         );
         let armed = body_sent_by(&armed_llm, &http).await;
         assert_eq!(
@@ -7885,6 +8024,7 @@ mod tests {
             key_optional: false,
             request_timeout: Duration::from_secs(30),
             data_collection: Default::default(),
+            prompt_cache: Default::default(),
             wire: None,
         };
         let slot = ModelSlot::bare("anthropic", "claude-haiku-4-5");
@@ -7918,6 +8058,7 @@ mod tests {
             key_optional: false,
             request_timeout: Duration::from_secs(30),
             data_collection: Default::default(),
+            prompt_cache: Default::default(),
             wire: None,
         };
         let slot = ModelSlot::bare("gemini", "gemini-3.5-flash");
