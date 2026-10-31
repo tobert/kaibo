@@ -15,6 +15,17 @@ record. Each later release appends a new section at the top.
 
 ## [Unreleased]
 
+### Added
+- `batch_submit` and `deliberate` run on `openrouter` backends via `/api/v1/batches`, stripping any `:batch` suffix from `list_models` ids.
+- OpenRouter slots on `google/gemini-*` and `~google/gemini-*` classify as vision-capable without an explicit `vision = true` pin.
+- `kaibo configure` and `docs/config.example.toml` cover Gemini Argon (`max_tokens` sizing from `list_models`), `batch_submit`, and `deliberate`.
+
+### Changed
+- The built-in `gemini` cast's synth is `gemini/gemini-pro-latest` (explorer stays `gemini/gemini-flash-latest`).
+
+### Fixed
+- `batch_submit` and `deliberate` on a `gemini` batch slot refuse invalid `effort` rungs (`max`, `xhigh`, `none`) at slot resolution instead of failing mid-batch.
+
 ## [0.6.1] — 2026-10-31
 
 ### Security

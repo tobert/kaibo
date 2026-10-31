@@ -138,7 +138,11 @@ OpenRouter is a keyed gateway rather than a wire protocol of its own. One
   each onto the upstream's own knob — so `xhigh`/`max` land here even on models that
   refuse them on that vendor's direct API (measured; see the ladder table under
   [`[defaults]`](#defaults)).
-- **No `batch` lane.**
+- **`batch` lane (`/api/v1/batches`).** OpenRouter runs inline Chat Completions batches
+  on a 24h completion window. If `list_models` shows a `:batch` variant (`org/model:batch`),
+  kaibo strips `:batch` automatically before sending the batch request. Cancelling an
+  in-progress OpenRouter batch is unsupported upstream (`job_cancel` refuses and keeps the
+  handle so `job_get` can collect it once terminal).
 - **`data_collection` defaults to `deny`.** One slug routes across competing upstream
   hosts whose data policies differ, and kaibo's prompts carry your source, so
   no-collection routing is pinned on every request. A model whose only hosts collect
@@ -253,7 +257,8 @@ kind:
 |---|---|
 | `anthropic`, `gemini` | vision on |
 | `deepseek` | vision on for `deepseek-flash`; off for any other id |
-| `openai`, `openrouter` | vision off until pinned |
+| `openrouter` | vision on for `google/gemini-*` and `~google/gemini-*`; off until pinned for other ids |
+| `openai` | vision off until pinned |
 
 A generic endpoint is vision-off until its config says otherwise, because kaibo cannot
 know what serves an arbitrary model id. `kaibo://config` reports the *resolved*
@@ -487,7 +492,7 @@ not OpenAI Platform's own but should still take the Responses shape; see
 |---|---|---|---|
 | `anthropic` | a Haiku | a Sonnet | |
 | `deepseek` | `deepseek/deepseek-flash` | `deepseek/deepseek-flash` | |
-| `gemini` | `gemini/gemini-flash-latest` | `gemini/gemini-flash-latest` | |
+| `gemini` | `gemini/gemini-flash-latest` | `gemini/gemini-pro-latest` | |
 | `openrouter` | a Qwen flash | a Qwen max | |
 | `openai-local` | a small Gemma | a larger Gemma | |
 | `gemini-batch` | — | `gemini/gemini-pro-latest` | `batch` |
@@ -532,9 +537,9 @@ Rules:
 - `explore` is exempt: it runs only the explorer arm, which is always interactive, so a
   deliberate or direct cast's explorer is valid there. It needs an `explorer` slot and
   nothing more.
-- A `batch`-lane synth must sit on a batch-capable backend: Anthropic, Gemini, or a
-  hosted OpenAI Platform backend. A local OpenAI-compatible server has no Batch API, so
-  declaring `lane = "batch"` on a slot elsewhere is a load error.
+- A `batch`-lane synth must sit on a batch-capable backend: Anthropic, Gemini,
+  OpenRouter, or a hosted OpenAI Platform backend. A local OpenAI-compatible server has
+  no Batch API, so declaring `lane = "batch"` on a slot elsewhere is a load error.
 - A lane on an `explorer` slot is a load error. The explorer always runs interactively.
 - Because lane lives on the slot, a cast may pair an interactive explorer with an
   offline synth. That shape is what staffs `deliberate`. The built-in batch casts stay
@@ -713,13 +718,13 @@ No built-in cast has a media slot or pairs an explorer with an offline synth, so
 |---|---|---|
 | DeepSeek, Anthropic, Gemini, or OpenRouter, or a local endpoint | `consult`, `explore`, `oneshot` | none beyond the key source |
 | a hosted OpenAI Platform key | the same three | a new `openai` backend and cast, as `[backends.gpt]` and `[casts.gpt]` show |
-| Anthropic, Gemini, or a hosted OpenAI Platform key | also `batch_submit` | a cast whose synth has `lane = "batch"`; `anthropic-batch` and `gemini-batch` are built in |
-| any of the above | also `deliberate` | a cast pairing an `explorer` with an offline synth: `lane = "batch"` on the three keys above, or `lane = "direct"` on any backend |
+| Anthropic, Gemini, OpenRouter, or a hosted OpenAI Platform key | also `batch_submit` | a cast whose synth has `lane = "batch"`; `anthropic-batch` and `gemini-batch` are built in |
+| any of the above | also `deliberate` | a cast pairing an `explorer` with an offline synth: `lane = "batch"` on the four keys above, or `lane = "direct"` on any backend |
 | OpenRouter | also `decide` | a cast with a `decision` slot |
 | a key for a `stability`, `gemini-media`, `bfl`, `openai-images`, or `dashscope` backend | `generate` | an `image` slot, or an `audio` slot on `stability` and `gemini-media` only; `[cas]` on |
 
-OpenRouter does not staff `generate`. `kaibo configure` covers `consult`, `decide`, and
-`generate`; the batch and `deliberate` casts are in `docs/config.example.toml`.
+OpenRouter does not staff `generate`. `kaibo configure` covers `consult`, `batch_submit`,
+`deliberate`, `decide`, and `generate`; example casts are in `docs/config.example.toml`.
 
 ### Finding out why a tool is missing
 

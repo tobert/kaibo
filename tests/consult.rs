@@ -731,11 +731,25 @@ fn model_caps_classify_per_kind_and_honor_the_override() {
     // per slot rather than guessed from an arbitrary id.
     assert!(!ModelCaps::resolve(ProviderKind::Openai, "Gemma-4-E4B-it-GGUF", None).vision);
     assert!(ModelCaps::resolve(ProviderKind::Openai, "Gemma-4-E4B-it-GGUF", Some(true)).vision);
-    // OpenRouter is the same shape: the gateway fronts blind and sighted models
-    // alike, so vision is the pinned model's property — opt-in per slot. The
-    // built-in cast splits by role: its explorer default is multimodal and pins
-    // vision on; its text-only synth default leaves the slot None. The literal id
-    // below is arbitrary — the OpenRouter classifier ignores it, keying on the kind.
+    // OpenRouter is the same shape for arbitrary families: the gateway fronts blind
+    // and sighted models alike, so vision is the pinned model's property — opt-in per
+    // slot, with the `google/gemini-*` / `~google/gemini-*` line classified multimodal
+    // directly (matching `WireKind::Gemini`, so Argon/Pro/Flash overrides and slots on
+    // OpenRouter see without a manual pin).
+    for gemini_slug in [
+        "google/gemini-4-argon",
+        "~google/gemini-pro-latest",
+        "~google/gemini-flash-latest",
+        "google/gemini-3.8-flash",
+    ] {
+        assert!(
+            ModelCaps::resolve(ProviderKind::OpenRouter, gemini_slug, None).vision,
+            "OpenRouter Gemini slug {gemini_slug:?} must classify as vision-capable"
+        );
+    }
+    assert!(
+        !ModelCaps::resolve(ProviderKind::OpenRouter, "google/gemini-4-argon", Some(false)).vision
+    );
     assert!(
         !ModelCaps::resolve(
             ProviderKind::OpenRouter,
