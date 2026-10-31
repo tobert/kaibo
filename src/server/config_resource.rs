@@ -333,6 +333,11 @@ pub(crate) fn render_config_resource(
         /// absent on every other kind.
         #[serde(skip_serializing_if = "Option::is_none")]
         data_collection: Option<&'static str>,
+        /// Anthropic and OpenRouter only: the prompt-cache retention every interactive
+        /// request asks for (`"short"` — the default — `"long"`, or `"off"`). Absent on
+        /// every other kind, which sends no cache marker.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        prompt_cache: Option<&'static str>,
         /// openai kind only: the *resolved* interactive request wire —
         /// `"responses"` or `"chat"` (see [`crate::config::Backend::uses_responses_wire`]).
         /// An explicit `wire` config value renders as itself; unset renders the
@@ -415,6 +420,7 @@ pub(crate) fn render_config_resource(
                 key_optional,
                 request_timeout,
                 data_collection,
+                prompt_cache,
                 wire: _,
             } = b;
             let rendered_base_url = if *kind == crate::credentials::ProviderKind::Openai {
@@ -439,6 +445,12 @@ pub(crate) fn render_config_resource(
                         crate::config::DataCollection::Allow => "allow",
                     },
                 ),
+                prompt_cache: matches!(
+                    kind,
+                    crate::credentials::ProviderKind::Anthropic
+                        | crate::credentials::ProviderKind::OpenRouter
+                )
+                .then_some(prompt_cache.as_str()),
                 // Resolved, not raw: an unset `wire` still has an effective shape
                 // (the endpoint-exact heuristic), so render what the backend will
                 // actually do, not just what was configured.

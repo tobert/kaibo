@@ -83,6 +83,19 @@ async fn the_artifact_fetch_client_refuses_plaintext_the_ordinary_client_accepts
                 return;
             };
             tokio::spawn(async move {
+                // Read the request head before answering, as a real server does. A
+                // response written before the client finishes sending its request
+                // is one hyper may reject as `UnexpectedMessage` (it did from tokio
+                // 1.54 on), which would fail the control below for the fixture's
+                // sake, not the client's.
+                let mut head = Vec::new();
+                let mut buf = [0u8; 1024];
+                while !head.windows(4).any(|w| w == b"\r\n\r\n") {
+                    match tokio::io::AsyncReadExt::read(&mut sock, &mut buf).await {
+                        Ok(0) | Err(_) => return,
+                        Ok(n) => head.extend_from_slice(&buf[..n]),
+                    }
+                }
                 let body = "ok";
                 let response = format!(
                     "HTTP/1.1 200 OK\r\ncontent-type: text/plain\r\n\

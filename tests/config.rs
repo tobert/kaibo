@@ -1330,6 +1330,7 @@ fn local_backend(api_key_file: Option<String>, key_optional: bool) -> Backend {
         key_optional,
         request_timeout: Duration::from_secs(900),
         data_collection: Default::default(),
+        prompt_cache: Default::default(),
         wire: None,
     }
 }
@@ -1359,6 +1360,7 @@ fn key_optional_gemini_backend_resolves_to_an_empty_query_key() {
         key_optional: true,
         request_timeout: Duration::from_secs(900),
         data_collection: Default::default(),
+        prompt_cache: Default::default(),
         wire: None,
     };
     assert_eq!(
@@ -1408,6 +1410,7 @@ fn required_key_with_no_source_is_an_error() {
         key_optional: false,
         request_timeout: Duration::from_secs(900),
         data_collection: Default::default(),
+        prompt_cache: Default::default(),
         wire: None,
     };
     let err = b.resolve_key().unwrap_err();
@@ -3006,6 +3009,7 @@ fn key_status_reads_a_declared_cmd_as_present_without_running_it() {
         key_optional: false,
         request_timeout: Duration::from_secs(900),
         data_collection: Default::default(),
+        prompt_cache: Default::default(),
         wire: None,
     };
     assert_eq!(b.key_status(|_| None), kaibo::config::KeyStatus::Present);
@@ -3035,6 +3039,7 @@ fn declared_env_wins_over_the_cmd_without_running_it() {
         key_optional: false,
         request_timeout: Duration::from_secs(900),
         data_collection: Default::default(),
+        prompt_cache: Default::default(),
         wire: None,
     };
 
@@ -3079,6 +3084,7 @@ fn a_declared_key_cmd_resolves_even_on_a_key_optional_backend() {
         key_optional: true,
         request_timeout: Duration::from_secs(900),
         data_collection: Default::default(),
+        prompt_cache: Default::default(),
         wire: None,
     };
     let key = b.resolve_key().expect("cmd runs before the placeholder");
