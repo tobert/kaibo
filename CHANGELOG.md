@@ -15,10 +15,15 @@ record. Each later release appends a new section at the top.
 
 ## [Unreleased]
 
+### Security
+- `tokio` 1.54.1 fixes RUSTSEC-2026-0386 (`AsyncFd` constructors accepted any file descriptor); kaibo calls no `AsyncFd` itself.
+
 ### Added
 - `batch_submit` and `deliberate` run on `openrouter` backends via `/api/v1/batches`, stripping any `:batch` suffix from `list_models` ids.
 - OpenRouter slots on `google/gemini-*` and `~google/gemini-*` classify as vision-capable without an explicit `vision = true` pin.
 - `kaibo configure` and `docs/config.example.toml` cover Gemini Argon (`max_tokens` sizing from `list_models`), `batch_submit`, and `deliberate`.
+- `anthropic` backends use prompt caching, so each tool-loop turn re-reads its prefix at the cache-read rate.
+- `prompt_cache = "short" | "long" | "off"` on an `anthropic` or `openrouter` backend sets the cache retention; `short` is the default.
 
 ### Changed
 - The built-in `gemini` cast's synth is `gemini/gemini-pro-latest` (explorer stays `gemini/gemini-flash-latest`).

@@ -647,6 +647,52 @@ impl std::str::FromStr for DataCollection {
     }
 }
 
+/// Provider prompt caching for a backend's interactive calls. kaibo's tool loop sends
+/// the same growing prefix (tools, system prompt, transcript) every turn, so a cache
+/// marker turns each re-read into a cache read. Config: `prompt_cache = "short" |
+/// "long" | "off"` on an `anthropic`- or `openrouter`-kind backend (anywhere else is a
+/// load error). `Short` is the provider's minutes-scale cache (Anthropic: 5 minutes),
+/// `Long` its hour-scale one (Anthropic: 1 hour, written at a higher price), and `Off`
+/// sends no marker — for a gateway that rejects the field.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PromptCache {
+    /// The provider's short retention (default).
+    #[default]
+    Short,
+    /// The provider's long retention.
+    Long,
+    /// No cache marker on the request.
+    Off,
+}
+
+impl PromptCache {
+    /// The config spelling, as `kaibo://config` renders it.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Short => "short",
+            Self::Long => "long",
+            Self::Off => "off",
+        }
+    }
+}
+
+impl std::str::FromStr for PromptCache {
+    type Err = anyhow::Error;
+    fn from_str(s: &str) -> Result<Self> {
+        match s {
+            "short" => Ok(Self::Short),
+            "long" => Ok(Self::Long),
+            "off" => Ok(Self::Off),
+            other => bail!(
+                "prompt_cache {other:?} is not a retention. Use \"short\" (the \
+                 provider's minutes-scale cache, the default), \"long\" (its \
+                 hour-scale cache), or \"off\" (send no cache marker). Run `kaibo \
+                 example-config` for the shape"
+            ),
+        }
+    }
+}
+
 /// Which request shape an `openai`-kind backend speaks for interactive calls:
 /// rig's Responses client (`/v1/responses`) or the OpenAI-compatible Chat
 /// Completions client (`/v1/chat/completions`). Optional per backend — unset
@@ -720,6 +766,10 @@ pub struct Backend {
     /// Deny by default on every kind; only an openrouter-kind backend may set it,
     /// and only the openrouter arm reads it.
     pub data_collection: DataCollection,
+    /// Anthropic and OpenRouter only: the prompt-cache retention every interactive
+    /// request asks for (see [`PromptCache`]). `Short` by default; only those two
+    /// kinds may set it, and only their arms read it.
+    pub prompt_cache: PromptCache,
     /// `openai` kind only: an explicit override of which request shape this
     /// backend's interactive calls use (see [`OpenaiWire`]). `None` (the common
     /// case) defers to [`Backend::uses_responses_wire`]'s endpoint-exact
@@ -2464,6 +2514,8 @@ fn backend_template(kind: ProviderKind, defaults: &Defaults) -> Backend {
         // Deny is the only safe default: kaibo's prompts carry source code, and
         // routing them to a data-collecting host must be an explicit choice.
         data_collection: DataCollection::Deny,
+        // On by default: the tool loop resends its whole prefix every turn.
+        prompt_cache: PromptCache::Short,
         // Unset defers to the endpoint-exact heuristic (`uses_responses_wire`).
         wire: None,
     }
@@ -2892,6 +2944,8 @@ struct RawBackend {
     key_optional: Option<bool>,
     request_timeout_secs: Option<u64>,
     data_collection: Option<String>,
+    /// `anthropic` and `openrouter` kinds only — see [`PromptCache`].
+    prompt_cache: Option<String>,
     /// `openai` kind only — see [`OpenaiWire`]. A load error on any other kind.
     wire: Option<String>,
 }
@@ -2948,6 +3002,25 @@ impl RawBackend {
             b.data_collection = v
                 .parse()
                 .with_context(|| format!("backend {:?} data_collection", b.name))?;
+        }
+        if let Some(v) = &self.prompt_cache {
+            // Only these two arms send a cache marker. Naming the knob on any other
+            // kind is a config mistake worth a loud error: the operator would believe
+            // they had turned caching on or off when nothing reads the setting.
+            if !matches!(b.kind, ProviderKind::Anthropic | ProviderKind::OpenRouter) {
+                bail!(
+                    "backend {:?} (kind {:?}) sets prompt_cache, but only the \
+                     `anthropic` and `openrouter` kinds send a cache marker; other \
+                     providers cache automatically or not at all. Remove \
+                     `prompt_cache` from [backends.{}]",
+                    b.name,
+                    b.kind,
+                    b.name
+                );
+            }
+            b.prompt_cache = v
+                .parse()
+                .with_context(|| format!("backend {:?} prompt_cache", b.name))?;
         }
         if let Some(v) = &self.wire {
             // The knob only exists on the openai kind — naming it anywhere else
@@ -4532,6 +4605,71 @@ mod tests {
         let msg = format!("{err:#}");
         assert!(
             msg.contains("data_collection") && msg.contains("openrouter"),
+            "got: {msg}"
+        );
+    }
+
+    /// Prompt caching is on by default on both kinds that send a marker, and each
+    /// explicit retention parses and sticks.
+    #[test]
+    fn prompt_cache_defaults_short_and_parses_each_retention() {
+        let cfg = Config::builtin();
+        for name in ["anthropic", "openrouter"] {
+            assert_eq!(
+                cfg.resolve_backend(name).unwrap().prompt_cache,
+                PromptCache::Short,
+                "the built-in {name} backend caches out of the box"
+            );
+        }
+        for (spelled, want) in [
+            ("short", PromptCache::Short),
+            ("long", PromptCache::Long),
+            ("off", PromptCache::Off),
+        ] {
+            let cfg = Config::from_toml_str(&format!(
+                "[backends.anthropic]\nprompt_cache = {spelled:?}\n\
+                 [backends.openrouter]\nprompt_cache = {spelled:?}\n"
+            ))
+            .unwrap();
+            for name in ["anthropic", "openrouter"] {
+                assert_eq!(cfg.resolve_backend(name).unwrap().prompt_cache, want);
+            }
+            assert_eq!(want.as_str(), spelled, "the rendered spelling round-trips");
+        }
+    }
+
+    /// A value outside the three retentions is a load error naming all three.
+    #[test]
+    fn prompt_cache_rejects_an_unknown_value() {
+        let err = Config::from_toml_str(
+            r#"
+            [backends.anthropic]
+            prompt_cache = "5m"
+            "#,
+        )
+        .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("short") && msg.contains("long") && msg.contains("off"),
+            "got: {msg}"
+        );
+    }
+
+    /// Only the anthropic and openrouter arms send a marker. Setting the key on any
+    /// other kind is refused at load, naming the key and the kinds that take it, so an
+    /// operator never believes they changed caching when nothing reads the setting.
+    #[test]
+    fn prompt_cache_is_anthropic_and_openrouter_only() {
+        let err = Config::from_toml_str(
+            r#"
+            [backends.deepseek]
+            prompt_cache = "off"
+            "#,
+        )
+        .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("prompt_cache") && msg.contains("anthropic") && msg.contains("openrouter"),
             "got: {msg}"
         );
     }

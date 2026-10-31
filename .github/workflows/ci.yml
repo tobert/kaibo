@@ -48,10 +48,30 @@ jobs:
       - name: TLS invariant (no C crypto/TLS in the tree)
         shell: bash
         run: |
-          for pkg in aws-lc-rs aws-lc-sys openssl-sys native-tls; do
+          # mimalloc rides here too: turso's default features pull it in as a
+          # global-allocator hijack (AGENTS.md's persistence invariant).
+          for pkg in aws-lc-rs aws-lc-sys openssl-sys native-tls mimalloc; do
             out=$(cargo tree -i "$pkg" 2>&1 || true)
             if ! grep -q "did not match any packages" <<<"$out"; then
               echo "TLS invariant violated: $pkg is present in the dependency tree"
+              echo "$out"
+              exit 1
+            fi
+          done
+
+      # The bundled-roots crate (RUSTSEC-2026-0381) must not be built into a release
+      # binary: kaibo trusts the platform's roots. It is in Cargo.lock as a wasm32-only
+      # dependency of rustls-platform-verifier, so a lockfile check would always fail.
+      # The check is per release target. "nothing to print" is the passing case: the
+      # package is in the lock, but nothing on that target depends on it.
+      - name: Bundled roots (webpki-root-certs) built for no release target
+        shell: bash
+        run: |
+          for target in x86_64-unknown-linux-musl aarch64-unknown-linux-musl \
+                        x86_64-apple-darwin aarch64-apple-darwin x86_64-pc-windows-msvc; do
+            out=$(cargo tree -i webpki-root-certs --target "$target" 2>&1 || true)
+            if ! grep -qE "nothing to print|did not match any packages" <<<"$out"; then
+              echo "webpki-root-certs is built for $target"
               echo "$out"
               exit 1
             fi

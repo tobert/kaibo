@@ -1,0 +1,24 @@
+# cargo-deny configuration, used by .github/workflows/advisories.yml.
+#
+# Only the `advisories` check runs today: every crate in Cargo.lock is checked against the
+# RustSec advisory database. RUSTSEC-2026-0382 (rustls-webpki, 0.6.1) was caught by hand;
+# this is the gate that catches the next one. The TLS and C-crypto bans stay in ci.yml's
+# `cargo tree -i` guard, which AGENTS.md documents.
+
+[graph]
+# The five release targets (.github/workflows/release.yml). A dependency built only for
+# another platform (rustls-platform-verifier's wasm32-only webpki-root-certs, for
+# example) ships in no kaibo binary, so an advisory against it is not ours.
+targets = [
+    "x86_64-unknown-linux-musl",
+    "aarch64-unknown-linux-musl",
+    "x86_64-apple-darwin",
+    "aarch64-apple-darwin",
+    "x86_64-pc-windows-msvc",
+]
+
+[advisories]
+version = 2
+# An entry here silences one advisory. Each one names the advisory, the reason it does not
+# apply to kaibo, and the date to look again. Prefer a dependency bump.
+ignore = []

@@ -1,0 +1,30 @@
+# Dependabot: keeps the SHA-pinned actions and the digest-pinned base image current.
+#
+# - github-actions / docker: weekly version updates. Every action and the distroless base
+#   are pinned by SHA or digest, so nothing moves without a reviewed pull request. The
+#   distroless digest sat unchanged from 2026-07-13 to 0.6.1 because nothing proposed it.
+# - cargo: security updates only (open-pull-requests-limit 0 turns off version-update PRs).
+#   kaish-kernel and turso are exact-pinned on purpose, and a bump of either is a
+#   reviewed change with its own checks (AGENTS.md); advisories.yml reports new
+#   advisories daily. Security-update PRs also need "Dependabot security updates" turned
+#   on in the repository settings.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      actions:
+        patterns: ["*"]
+
+  - package-ecosystem: docker
+    directory: /
+    schedule:
+      interval: weekly
+
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 0
