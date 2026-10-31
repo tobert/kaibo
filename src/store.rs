@@ -41,9 +41,12 @@
 //! > **Mixing a multiprocess-WAL open with a non-MP open of the same file silently loses
 //! > acknowledged writes** — both opens succeed, operate on divergent WAL views, and
 //! > `PRAGMA integrity_check` still reports `ok`. The upstream guard that is *documented*
-//! > to reject a mixed open **does not fire in turso 0.7.0** (empirically verified
-//! > 2026-07-17). This is precisely the silent-data-loss class kaibo's "crash over
-//! > corrupt" principle exists to forbid.
+//! > to reject a mixed open **did not fire in turso 0.7.0** (empirically verified
+//! > 2026-07-17). turso 0.8.3 ships such a guard (it fails the open with a "Locking
+//! > error: ... already open [with|without] experimental multiprocess WAL" message);
+//! > kaibo has not verified that it fires, and [`is_lock_error`] keeps that error fatal
+//! > instead of mapping it to [`StoreError::SingleProcessLocked`]. This is precisely the
+//! > silent-data-loss class kaibo's "crash over corrupt" principle exists to forbid.
 //!
 //! So the MP flag is hardwired here and this helper is the sole open site *by design*.
 //! **Any future second open-site is a data-loss bug**, not a refactor — route every open
@@ -343,7 +346,7 @@ impl SessionStore {
         Ok(())
     }
 
-    /// The v1 schema (from empty). `STRICT` tables throughout (turso 0.7 enables strict
+    /// The v1 schema (from empty). `STRICT` tables throughout (turso enables strict
     /// unconditionally); `ON CONFLICT` upserts for the session/batch rows.
     async fn apply_v1(conn: &Connection) -> Result<()> {
         conn.execute_batch(
@@ -609,7 +612,8 @@ pub fn create_state_dir(dir: &Path) -> Result<()> {
 /// The ONE and ONLY place that calls turso's [`Builder`]. See the module doc-comment:
 /// mixing a multiprocess-WAL open with a non-MP open of the same file silently loses
 /// acknowledged writes (with `integrity_check` still `ok`, and the documented upstream
-/// rejection guard NOT firing in turso 0.7.0, empirically verified 2026-07-17). That is
+/// rejection guard NOT firing in turso 0.7.0, empirically verified 2026-07-17; 0.8.3 ships a
+/// guard, see [`is_lock_error`], not yet verified to fire). That is
 /// why the MP flag is hardwired on the platforms that support it, why this is the sole
 /// open site, and why **any future second open-site is a data-loss bug** — route every
 /// open through here.
@@ -634,13 +638,21 @@ async fn build_database(path: &Path) -> Result<Database> {
     }
 }
 
-/// Does this turso error mean the file is already locked by another process? turso 0.7.0
-/// has no dedicated lock variant — the open failure surfaces as `Error::Error(msg)` whose
-/// text names the lock ("Locking error: … File is locked by another process") — so we
-/// match on the message. Positive, narrow match: only a genuine lock message maps to the
-/// single-process refusal; anything else stays a raw turso error.
+/// Does this turso error mean the file is already locked by another process? turso has no
+/// dedicated lock variant: a held file lock surfaces as `Error::Error(msg)` whose text
+/// names the lock ("Locking error: Failed locking file '..'. File is locked by another
+/// process"), so we match on the message. Positive, narrow match: only a genuine lock
+/// message maps to the single-process refusal; anything else stays a raw turso error.
+///
+/// turso 0.8 added a guard that rejects a mixed multiprocess/non-multiprocess open, and it
+/// reports through the same "Locking error:" prefix ("... Database is already open with[out]
+/// experimental multiprocess WAL in another process"). That is a data-loss hazard, not a
+/// held lock, so any message naming the multiprocess WAL stays fatal.
 fn is_lock_error(e: &turso::Error) -> bool {
     let msg = e.to_string().to_lowercase();
+    if msg.contains("multiprocess wal") {
+        return false;
+    }
     msg.contains("locked") || msg.contains("locking")
 }
 
@@ -658,7 +670,7 @@ async fn user_version(conn: &Connection) -> Result<i64> {
 /// clock-free LRU key. **Strictly increasing when called inside a `BEGIN IMMEDIATE`
 /// transaction** (as both writers do): `IMMEDIATE` takes the write lock up front, so a
 /// concurrent writer blocks until we commit and then reads a strictly larger max — no two
-/// committed writes tie. (turso 0.7 rejects this as an inline `SET`/`VALUES` subquery, so it
+/// committed writes tie. (turso rejects this as an inline `SET`/`VALUES` subquery, so it
 /// is a separate statement; correctness rests on the enclosing transaction, not autocommit.)
 async fn next_touch(conn: &Connection) -> Result<i64> {
     let mut rows = conn
@@ -928,7 +940,7 @@ mod tests {
     use super::*;
 
     /// The one carve-out from fatal open errors rests on this text match, so pin it: the
-    /// message turso 0.7 gives for a file another process holds maps to the lock refusal,
+    /// message turso gives for a file another process holds maps to the lock refusal,
     /// and an unrelated open failure does not, so it stays fatal.
     #[test]
     fn is_lock_error_matches_only_a_lock_message() {
@@ -946,6 +958,39 @@ mod tests {
                 !is_lock_error(&other),
                 "{other} must stay a fatal open error"
             );
+        }
+    }
+
+    /// The mixed-open guard turso 0.8.3 added reports through `LockingError`, so its text
+    /// starts "Locking error:". It is NOT a held file lock: degrading to in-memory
+    /// sessions would hide a live data-loss hazard, so it must stay a fatal open error.
+    /// The strings below are copied from `turso_core-0.8.3/database.rs`.
+    #[test]
+    fn is_lock_error_rejects_the_mixed_multiprocess_open_guard() {
+        for msg in [
+            "Locking error: Failed opening database '/s/state.db'. Database is already open \
+             with experimental multiprocess WAL in another process",
+            "Locking error: Failed opening database '/s/state.db'. Database is already open \
+             without experimental multiprocess WAL in another process",
+        ] {
+            assert!(
+                !is_lock_error(&turso::Error::Error(msg.into())),
+                "{msg} must stay a fatal open error"
+            );
+        }
+    }
+
+    /// The genuine held-lock messages, from `turso_core-0.8.3/io/{unix,windows,windows_lock,
+    /// io_uring}.rs`, still map to the single-process refusal.
+    #[test]
+    fn is_lock_error_accepts_every_genuine_held_lock_message() {
+        for msg in [
+            "Locking error: Failed locking file '/s/state.db'. File is locked by another process",
+            "Locking error: Failed locking file. File is locked by another process",
+            "Locking error: Failed locking shared WAL coordination file. File is locked by \
+             another process",
+        ] {
+            assert!(is_lock_error(&turso::Error::Error(msg.into())), "{msg}");
         }
     }
 
