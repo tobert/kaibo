@@ -20,6 +20,7 @@ record. Each later release appends a new section at the top.
 ### Security
 - `rustls-webpki` 0.103.16 fixes RUSTSEC-2026-0382: certificate checks could accept chains through distrusted emSign intermediates.
 - `rustls` 0.23.46, `tokio-rustls` 0.26.6, `rustls-native-certs` 0.8.5, and `rustls-platform-verifier` 0.7.1 bring the rest of the TLS stack to its latest patch releases.
+- The container image moves to the current `distroless/static:nonroot`, whose CA bundle drops the `emSign ECC Root CA - G3` and Comodo `AAA Certificate Services` roots.
 
 ## [0.6.0] — 2026-10-13
 
