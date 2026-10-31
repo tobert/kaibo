@@ -523,3 +523,101 @@ async fn store_futures_are_send() {
     store.record_turn("s", "q", "a").await.unwrap();
     let _: PathBuf = Path::new("/x").to_path_buf();
 }
+
+// ---------------------------------------------------------------------------------------
+// On-disk compatibility with a state db written by an older turso (the pin bump gate).
+// ---------------------------------------------------------------------------------------
+
+/// The content the fixture generator writes and the compat test expects, in one place.
+const FIXTURE_SESSION: &str = "fixture-session";
+const FIXTURE_BATCH: (&str, &str, &str) = ("anthropic", "msgbatch_fixture", "fixture-label");
+
+fn fixtures_dir() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/turso-0.7.2")
+}
+
+/// GENERATOR for `tests/fixtures/turso-0.7.2/`; the full recipe is in that directory's
+/// README. Run ONLY with the turso 0.7.2 writer code checked out
+/// (`git checkout 280ef98 -- Cargo.toml Cargo.lock src/store.rs`), with `SCHEMA_VERSION`
+/// still 2. Run under any newer pin it silently produces a newer-version fixture and the
+/// compatibility test then proves nothing. It writes through the real [`SessionStore`]
+/// and copies the files while the store is STILL OPEN, so the copy carries a live `-wal`
+/// and `-tshm` the way a killed MCP server leaves them (no clean-close checkpoint).
+#[tokio::test]
+#[ignore = "generator: run by hand under the old turso pin, see the doc comment"]
+async fn generate_turso_fixture() {
+    let out = PathBuf::from(std::env::var("KAIBO_FIXTURE_OUT").expect("KAIBO_FIXTURE_OUT"));
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("state.db");
+    let store = SessionStore::open(&path, cap(8), &[]).await.unwrap();
+    store.record_turn(FIXTURE_SESSION, "q1", "a1 ünï").await.unwrap();
+    store.record_turn(FIXTURE_SESSION, "q2", "a2").await.unwrap();
+    store.record_turn("other", "oq", "oa").await.unwrap();
+    // A fixed far-future `created_at` (year 2100) so the open-time 30-day TTL prune can
+    // never expire the handle; the timestamp is not what the fixture proves.
+    store
+        .put_batch_at(
+            FIXTURE_BATCH.0,
+            FIXTURE_BATCH.1,
+            Some(FIXTURE_BATCH.2),
+            Some(7),
+            4_102_444_800,
+        )
+        .await
+        .unwrap();
+    std::fs::create_dir_all(&out).unwrap();
+    for entry in std::fs::read_dir(dir.path()).unwrap() {
+        let entry = entry.unwrap();
+        std::fs::copy(entry.path(), out.join(entry.file_name())).unwrap();
+    }
+    drop(store);
+}
+
+/// A state db written by turso 0.7.2 (live WAL and `-tshm` sidecars included) must open
+/// under the current pin and read back every session and batch handle, and accept writes.
+///
+/// Unix 64-bit only: the fixture was written with multiprocess WAL, and kaibo opens
+/// non-multiprocess elsewhere (Windows), which against this file is exactly the forbidden
+/// mixed open.
+#[cfg(all(unix, target_pointer_width = "64"))]
+#[tokio::test]
+async fn opens_a_state_db_written_by_turso_0_7_2() {
+    let dir = TempDir::new().unwrap();
+    let mut copied = Vec::new();
+    for entry in std::fs::read_dir(fixtures_dir()).unwrap() {
+        let entry = entry.unwrap();
+        if entry.file_name() == "README.md" {
+            continue;
+        }
+        std::fs::copy(entry.path(), dir.path().join(entry.file_name())).unwrap();
+        copied.push(entry.file_name().to_string_lossy().into_owned());
+    }
+    assert!(copied.iter().any(|n| n == "state.db"), "fixture has state.db: {copied:?}");
+    let path = dir.path().join("state.db");
+    // The premise: all data sits in an uncheckpointed WAL over a one-page db. A
+    // checkpointed or regenerated fixture would pass while proving nothing.
+    let db_len = std::fs::metadata(&path).unwrap().len();
+    let wal_len = std::fs::metadata(dir.path().join("state.db-wal")).unwrap().len();
+    assert_eq!(db_len, 4096, "fixture state.db must be one page; regenerate per its README");
+    assert!(wal_len > 0, "fixture state.db-wal must be non-empty (uncheckpointed)");
+    let store = SessionStore::open(&path, cap(8), &[])
+        .await
+        .unwrap_or_else(|e| panic!("0.7.2 fixture must open (files {copied:?}): {e}"));
+    assert_eq!(
+        store.replay(FIXTURE_SESSION).await.unwrap(),
+        vec![turn("q1", "a1 ünï"), turn("q2", "a2")]
+    );
+    assert_eq!(store.replay("other").await.unwrap(), vec![turn("oq", "oa")]);
+    let h = store
+        .get_batch(FIXTURE_BATCH.0, FIXTURE_BATCH.1)
+        .await
+        .unwrap()
+        .expect("batch handle from the old file");
+    assert_eq!(h.label.as_deref(), Some(FIXTURE_BATCH.2));
+    assert_eq!(h.submitted_count, Some(7));
+    // And it stays writable, and the new write survives another reopen.
+    store.record_turn(FIXTURE_SESSION, "q3", "a3").await.unwrap();
+    drop(store);
+    let store = SessionStore::open(&path, cap(8), &[]).await.unwrap();
+    assert_eq!(store.replay(FIXTURE_SESSION).await.unwrap().len(), 3);
+}

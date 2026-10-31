@@ -117,7 +117,7 @@ surface rule in the invariants).
   (sandbox lever 3, unchanged) can never reach. The model can *trigger* it by calling a
   tool on a cmd-backed backend, but cannot control its argv or environment.
 - **Persistence engine (turso) — do not weaken.** Pure-Rust `turso`, **exact-pinned**
-  (`=0.7.x` — `.db-tshm` format and API both drift between releases) with
+  (`=0.8.x` — `.db-tshm` format and API both drift between releases) with
   **`default-features = false`** (defaults pull mimalloc's global-allocator hijack + fts)
   and **`sync` off** (it materializes a network stack, breaching stdio-only + the
   aws-lc-free tree). **One DB-open helper**, MP-WAL hardwired on for 64-bit Unix: a mixed
