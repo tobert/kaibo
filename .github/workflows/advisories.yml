@@ -1,0 +1,39 @@
+# RustSec advisory gate: every crate in Cargo.lock is checked against the advisory
+# database (deny.toml holds the configuration). Separate from ci.yml on purpose: a new
+# advisory is published against the database, not against a change, so this runs on a
+# schedule too, and a fresh advisory fails here instead of blocking every unrelated pull
+# request's test job.
+name: advisories
+
+on:
+  pull_request:
+    paths:
+      - Cargo.lock
+      - Cargo.toml
+      - deny.toml
+      - .github/workflows/advisories.yml
+  push:
+    branches: [main]
+  schedule:
+    - cron: "17 6 * * *" # daily, 06:17 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: advisories-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  advisories:
+    name: cargo deny check advisories
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
+        with:
+          command: check
+          arguments: --locked
+          command-arguments: advisories
