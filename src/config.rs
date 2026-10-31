@@ -2001,7 +2001,8 @@ impl Config {
                     _ => bail!(
                         "cast {name:?}: consult = {raw_mode:?} is not a mode — use \"solo\" \
                          (the synth reads the code itself) or \"team\" (the synth delegates \
-                         to the explorer), or remove the key to follow the slots"
+                         to the explorer), or remove the key to follow the slots; \
+                         `kaibo example-config` shows the shape"
                     ),
                 });
             }

@@ -345,6 +345,7 @@ pub struct ConsultInput {
 
     /// Override the explorer (investigation) model id. See `kaibo://tools` for override
     /// semantics (ids are verbatim; pair with `explorer_backend` to also retarget).
+    /// Refused on a cast with `consult = "solo"`, which runs no explorer.
     #[serde(default)]
     pub explorer_model: Option<String>,
 
@@ -371,8 +372,8 @@ pub struct ConsultInput {
 
     /// Attach the explorer's aggregated report as `structured_content` alongside the
     /// answer, for debugging the hand-off. Off by default (it can be large; an empty
-    /// report means no sweep ran: the synth read everything itself, or the cast has no
-    /// explorer).
+    /// report means no sweep ran: the synth read everything itself, the cast runs
+    /// `consult` solo, or the cast has no explorer).
     #[serde(default)]
     pub include_report: bool,
 
@@ -1921,7 +1922,7 @@ impl KaiboHandler {
             answer with `file:line` citations. A synthesis agent (DeepSeek, Gemini, \
             Anthropic, OpenRouter, or local — pick with `cast`) drives a READ-ONLY shell over \
             the project: it reads the real, current source, delegates broad sweeps to a fast \
-            explorer when its cast has one, and answers with evidence, never modifying anything. Describe your \
+            explorer when its cast runs a team, and answers with evidence, never modifying anything. Describe your \
             intent in prose; kaibo locates the code itself, so you don't paste files or \
             diffs. `attach` puts specific files in front of it; `session_id` threads a \
             multi-turn consultation. For a toolless opinion use `oneshot`; to run in the \
@@ -4779,7 +4780,8 @@ A model id is sent **verbatim** — an id with a `/` in it (HuggingFace-style
 `org/model-name`) is still one id, not a path. The `*_model` override keeps the slot's
 configured backend; pair it with the matching `*_backend` (`synth_backend`, `backend`, …)
 to retarget the slot to a different connection wholesale — which also lets you fill a role
-the cast doesn't otherwise carry.
+the cast doesn't otherwise carry. A cast set to solo `consult` refuses an explorer
+override on `consult`, since it runs no explorer there.
 
 ## Survey the code, or get an answer: `explore` vs `consult`
 

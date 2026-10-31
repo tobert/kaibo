@@ -3526,6 +3526,64 @@ mod tests {
         assert_eq!(error_envelope(err.kind, &err.message)["kind"], "usage");
     }
 
+    /// `--explorer-model` on a cast with `consult = "solo"` (the built-in `anthropic`)
+    /// is a usage error (exit 2) naming the refusal, raised before any key is resolved.
+    /// This ties the CLI call site to `Resolver::consult_explorer_arm`: reverting it to
+    /// `optional_arm` resolves the explorer and fails this test. The server's `consult`
+    /// and `consult_submit` sites have no arm-injection seam (they build arms with
+    /// `Arm::from_slot` on the real client), so only `consult_explorer_arm` itself is
+    /// tested there.
+    #[tokio::test]
+    async fn explorer_model_on_a_solo_cast_is_a_usage_error_exit_2() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config::builtin();
+        config.root = Some(dir.path().to_path_buf());
+        let inline_budget = config.defaults.inline_attach_budget;
+        let call_deadline = config.defaults.call_deadline;
+        let et = config.defaults.explorer_max_turns;
+        let st = config.defaults.synth_max_turns;
+        let sandbox = config.sandbox.clone();
+        let persistence = config.persistence.clone();
+        let cap = config.defaults.session_capacity;
+        let resolver = Resolver::from_config(Arc::new(config)).unwrap();
+
+        let cli = Cli::parse_from([
+            "kaibo",
+            "consult",
+            "q",
+            "--cast",
+            "anthropic",
+            "--explorer-model",
+            "x",
+            "--json",
+        ]);
+        let common = cli.common.clone();
+        let args = match cli.command {
+            Some(Command::Consult(c)) => c,
+            _ => unreachable!("parsed a consult subcommand"),
+        };
+
+        let err = resolve_and_run(
+            &common,
+            &args,
+            &resolver,
+            inline_budget,
+            call_deadline,
+            et,
+            st,
+            &sandbox,
+            &persistence,
+            cap,
+        )
+        .await
+        .expect_err("an explorer override on a solo cast must be refused");
+        assert_eq!(err.code, EXIT_USAGE);
+        assert_eq!(err.kind, "usage");
+        for needle in ["--explorer-model", "consult = \"solo\"", "`explore`"] {
+            assert!(err.message.contains(needle), "{needle}: {}", err.message);
+        }
+    }
+
     // --- stage 2 subcommands -------------------------------------------------
 
     #[test]

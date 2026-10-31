@@ -389,9 +389,10 @@ pub(crate) fn render_config_resource(
     struct CastDoc {
         #[serde(flatten)]
         slots: BTreeMap<&'static str, SlotDoc>,
-        /// The effective `consult` mode: `"solo"` (the synth reads the code itself) or
-        /// `"team"` (the synth delegates to the explorer). Resolved, so a cast with no
-        /// `consult` key shows what its slots imply. Absent on a cast with no
+        /// The configured `consult` mode: `"solo"` (the synth reads the code itself) or
+        /// `"team"` (the synth delegates to the explorer). A cast with no `consult` key
+        /// shows what its slots imply. A per-call explorer override on a cast that is
+        /// solo only for lack of an explorer slot adds one and runs team. Absent on a cast with no
         /// interactive synth, which runs no `consult` at all.
         #[serde(skip_serializing_if = "Option::is_none")]
         consult: Option<&'static str>,

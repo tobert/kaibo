@@ -247,7 +247,7 @@ such a cast is refused, because `consult` would not use it. `consult = "team"` o
 with no `explorer` slot is a load error. The built-in `anthropic` cast sets
 `consult = "solo"`; restate `consult = "team"` on it to get the old behavior back. The key
 survives a re-declaration of the cast's slots. `kaibo://config` shows each cast's
-effective mode under `consult`.
+configured mode under `consult` (a per-call `explorer_model` with `explorer_backend` on a cast that is solo only for lack of an explorer slot adds one and runs team).
 
 ```toml
 [casts.flash-solo]                  # no explorer, so solo by default

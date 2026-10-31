@@ -433,6 +433,8 @@ impl Resolver {
     /// `org/model`) is still one id, never parsed for a backend. Retargeting is the
     /// explicit `backend` arg's job: when set, it resolves (aliases included) and the
     /// slot is replaced wholesale, which also works on a role the cast doesn't carry.
+    /// (`consult` refuses an explorer override on a `consult = "solo"` cast; see
+    /// [`consult_explorer_arm`](Self::consult_explorer_arm).)
     /// Either way the configured slot's pins/tunables are dropped — they described the
     /// *configured* model; the new id classifies fresh.
     pub(crate) fn override_model(

@@ -152,12 +152,10 @@ api_key_cmd = ["op", "read", "op://Vault/Kaibo/Deepseek-key"]
 explorer = "deepseek/deepseek-flash"
 synth = "gemini/gemini-pro-latest"
 
-# `consult = "solo"` makes `consult` read the code with the synth alone; the explorer
-# still serves `explore`. Default: "team" with an explorer, "solo" without. See docs/config.md.
 [casts.opus-solo]
 explorer = "anthropic/<current Haiku id>"
 synth = "anthropic/<current Opus id>"
-consult = "solo"
+consult = "solo"                    # or "team"; default: team with an explorer; see docs/config.md
 
 [casts.local-only]
 explorer = "gemma/Gemma-4-E4B-it-GGUF"
