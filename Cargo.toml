@@ -152,8 +152,8 @@ lru = "0.18"
 # `cargo tree -i` (see the store module doc-comment for the audit).
 # 0.7.2 -> 0.8.3: a state.db written by 0.7.2 (live WAL + `.db-tshm`) opens and reads back
 # under 0.8.3 — proven by tests/store.rs against tests/fixtures/turso-0.7.2. The `.tshm`
-# format version stays 1, the leaf crate set is unchanged, and the defaults still carry
-# mimalloc + fts (so `default-features = false` still matters). 0.8 adds an upstream guard
+# format version stays 1, the leaf crate set is unchanged, and the facade's defaults
+# (`default = ["mimalloc", "fts"]`, checked in 0.8.3's `[features]`) still carry both (so `default-features = false` still matters). 0.8 adds an upstream guard
 # that rejects a mixed MP/non-MP open; it is not yet verified to fire, so the single open
 # site stays load-bearing.
 # 0.7.1 -> 0.7.2: checked upstream's compare (14 commits) before pinning forward — the
@@ -165,11 +165,13 @@ turso = { version = "=0.8.3", default-features = false }
 # crate: turso requires `turso_core = "0.8.3"`, a caret, so a plain `cargo update`
 # moved the engine alone past the pin (seen 2026-09-22, when 0.7.1's facade resolved a
 # 0.7.2 core). Every turso crate requires its siblings as a caret at its own version,
-# so a pin holds the crates that DEPEND on the pinned one (`turso_sdk_kit`,
-# `turso_sync_engine`, `turso_sync_sdk_kit` through the core) but not the ones it
-# depends on. Hence the core plus every leaf below it. A bump moves all five lines with
-# the facade, or resolution fails. None is named in code; `default-features = false`
-# on each so these lines request no feature the facade's edges don't already.
+# so the pins below hold the engine and the crates it depends on (the core and its leaves).
+# `turso_sdk_kit`, `turso_sync_engine` and `turso_sync_sdk_kit` sit above the core and are
+# NOT pinned by anything here: `Cargo.lock` plus `--locked` hold them. Do not add pins for
+# them; naming `turso_sdk_kit` directly could compile bindgen/libclang into the build. A
+# bump moves all five lines with the facade, or resolution fails. None is named in code;
+# `default-features = false` on each so these lines request no feature the facade's edges
+# don't already.
 turso_core = { version = "=0.8.3", default-features = false }
 turso_parser = { version = "=0.8.3", default-features = false }
 turso_ext = { version = "=0.8.3", default-features = false }
