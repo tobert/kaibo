@@ -22,6 +22,7 @@ record. Each later release appends a new section at the top.
 
 ### Changed
 - The built-in `gemini` cast's synth is `gemini/gemini-pro-latest` (explorer stays `gemini/gemini-flash-latest`).
+- Moves to turso 0.8.3; an existing `state.db` from 0.7.2 opens unchanged.
 - Moves to rig 0.46, with the TLS tree still free of aws-lc, OpenSSL, and the bundled `webpki-root-certs` roots.
 - A `Retry-After` header from a rate-limited provider now sets the retry wait, along with the delay in the body.
 - A malformed-generation retry now spends one of the run's model-call turns, where it used to spend none.
