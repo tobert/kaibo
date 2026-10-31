@@ -15,6 +15,19 @@ record. Each later release appends a new section at the top.
 
 ## [Unreleased]
 
+### Changed
+- Moves to rig 0.46, with the TLS tree still free of aws-lc, OpenSSL, and the bundled `webpki-root-certs` roots.
+- A `Retry-After` header from a rate-limited provider now sets the retry wait, along with the delay in the body.
+- A malformed-generation retry now spends one of the run's model-call turns, where it used to spend none.
+- The footer's `in` token count includes cached tokens for Anthropic, as it already did for OpenAI-shaped providers.
+- OpenRouter prompt caching now marks the whole growing transcript, not only the system prompt.
+
+### Fixed
+- Gemini rejects `xhigh`, `max`, and `none` effort at startup with the four rungs Google takes, now from kaibo's own check since rig no longer reports them.
+
+### Removed
+- Stability's unused adapter for rig's image-generation trait, which rig 0.46 no longer has.
+
 ## [0.6.0] — 2026-10-13
 
 ### Added

@@ -1,28 +1,25 @@
-//! One record per completion. Wrap a phase's completion model so every turn's
-//! provider response is *seen* on its way past — most of all the **finish reason**,
-//! which rig's agent layer discards before kaibo can read it.
+//! One record per completion. A [`Watch`] sees every turn's provider response on its
+//! way past — most of all the **finish reason** — and records it, with the call's
+//! duration, into a per-phase [`CompletionLog`].
 //!
-//! The gap this closes: `rig_core::completion::CompletionResponse` carries `raw`,
-//! the provider's own payload serialized, but the agent hook event
-//! (`rig-agent`'s `CompletionCall`) is a deliberately medium-neutral shape — prompt,
-//! content, usage, message id, and no raw response. So a consult that came back
-//! empty was reported as a plain success and nothing on the wire could tell an early
-//! stop from a `content_filter` refusal from a truncation. `CompletionModel` is a
-//! *trait*, and `Agent<M: CompletionModel>` is generic over it, so wrapping the model
-//! the loop calls puts us on the one path every turn takes — including the turns
-//! *inside* the tool loop, which no hook reaches.
+//! The gap this closes: a consult that came back empty used to be reported as a plain
+//! success, and nothing on the wire could tell an early stop from a `content_filter`
+//! refusal from a truncation. `rig_core::completion::CompletionResponse` carries `raw`,
+//! the provider's own payload serialized, and rig's agent shows it to a hook at the
+//! outcome of every completion dispatch — including the turns *inside* the tool loop
+//! and the forced final turn. (Up to rig 0.42 the only way onto that path was to wrap
+//! the `CompletionModel`; 0.46 erases models, and an [`AgentHook`] is the seam.)
 //!
 //! This is [`crate::tool_span`]'s sibling: `traced` wraps a tool so each call is
-//! observed, [`watched`] wraps a model so each completion is. Both are transparent —
-//! [`Watched`] forwards `completion`/`stream` verbatim and returns the provider's
-//! response and errors untouched, so nothing about a call changes except that we now
-//! know how it ended.
+//! observed, [`Watch`] watches a model so each completion is. Both are transparent —
+//! [`Watch`] returns the provider's response and errors untouched, so nothing about a
+//! call changes except that we now know how it ended.
 //!
 //! **Provider-agnostic by construction, not by a match arm per backend.** rig fills
-//! `raw` at every provider seam, so the wrapper reads the finish reason out of that
-//! JSON under the spellings providers actually ship ([`finish_reason`]). rig 0.42 also
-//! carries a normalized `finish_reason()`; kaibo keeps the provider's own word, since
-//! the normalized one flattens exactly the detail a diagnosis needs. An unfamiliar shape yields
+//! `raw` at every provider seam, so the watcher reads the finish reason out of that
+//! JSON under the spellings providers actually ship ([`finish_reason`]). rig 0.46 also
+//! carries a normalized `FinishReason` on the response; kaibo keeps the provider's own
+//! word, since the normalized one flattens exactly the detail a diagnosis needs. An unfamiliar shape yields
 //! `None` — "we don't know", never a broken call — which is the right degrade for a
 //! gateway or a provider rig grows next month.
 //!

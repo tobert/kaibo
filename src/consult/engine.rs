@@ -946,8 +946,8 @@ fn transcript_has_tool_results(history: &[Message]) -> bool {
 /// answer") — one concept, one wording, two lanes.
 ///
 /// `finish_reason` comes off the phase's [`CompletionLog`] — the provider's own word
-/// for how its last completion ended, read from the raw response the [`Watched`]
-/// wrapper records. `None` means the provider reported none, and that is stated as
+/// for how its last completion ended, read from the raw response the [`Watch`]
+/// hook records. `None` means the provider reported none, and that is stated as
 /// absence rather than implied to be a clean stop: on some wires (OpenAI's Responses
 /// API) reporting nothing *is* the normal completion signal, so absence carries no
 /// verdict either way.
@@ -1470,15 +1470,13 @@ where
 
 /// [`run_phase`] with the per-turn completion record kept.
 ///
-/// rig's agent layer hands back only what its medium-neutral hook event carries —
-/// content and usage — so a phase that stopped early, got truncated, or was refused
-/// by a classifier looks identical to one that finished. The provider *did* say which
-/// (`finish_reason` / `stop_reason` / `finishReason`); it lives on
-/// `CompletionResponse::raw`, which the loop discards. Wrapping the model in
-/// [`Watched`] puts the record on the one path every completion takes — **including
-/// the turns inside the tool loop and the forced final turn**, which no hook reaches —
-/// and `log` is the caller's slot for it, readable after this returns whether the
-/// phase succeeded or failed.
+/// rig's agent layer hands back only the answer and the summed usage, so a phase that
+/// stopped early, got truncated, or was refused by a classifier looks identical to one
+/// that finished. The provider *did* say which (`finish_reason` / `stop_reason` /
+/// `finishReason`); it lives on `CompletionResponse::raw`. A [`Watch`] hook sees every
+/// completion's outcome — **including the turns inside the tool loop and the forced
+/// final turn** — and `log` is the caller's slot for the record, readable after this
+/// returns whether the phase succeeded or failed.
 ///
 /// The log is per call, never global: a phase makes its own, so concurrent consults
 /// never mix. It holds plain data and crosses `.await` freely — nothing to do with the
@@ -1594,9 +1592,9 @@ where
     result
 }
 
-/// The bounded tool loop itself, driving whatever model it's handed — in production a
-/// [`crate::completion_watch::Watched`] wrapper inside a retry wrapper, so every turn below (main loop,
-/// view_image resume, forced finalize) records on its way past.
+/// The bounded tool loop itself, driving the model it's handed. Every agent it builds
+/// carries the [`Watch`] hook, so every turn below (main loop, view_image resume, forced
+/// finalize) records on its way past.
 #[allow(clippy::too_many_arguments)] // each arg is a distinct, named loop input
 async fn run_phase_loop<F>(
     model: &Llm,
