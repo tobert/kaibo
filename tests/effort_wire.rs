@@ -239,9 +239,20 @@ async fn on_the_wire(path: Path, effort: &str) -> Result<Option<Value>, String> 
         Path::AnthropicAdaptive | Path::AnthropicBudget => {
             body.pointer("/output_config/effort").cloned()
         }
-        Path::Gemini => body
-            .pointer("/generationConfig/thinkingConfig/thinkingLevel")
-            .cloned(),
+        Path::Gemini => {
+            // kaibo's blob and rig's typed budget share the `generationConfig` key. rig
+            // 0.46 merges the blob as raw JSON, so a top-level replace would drop the
+            // `max_tokens` budget (and with it the headroom thinking needs) without an
+            // error. Pin that both halves land in the one object.
+            assert_eq!(
+                body.pointer("/generationConfig/maxOutputTokens"),
+                Some(&serde_json::json!(4096)),
+                "Gemini lost its max_tokens budget when kaibo's generationConfig merged \
+                 (effort {effort:?}): {body}"
+            );
+            body.pointer("/generationConfig/thinkingConfig/thinkingLevel")
+                .cloned()
+        }
         Path::DeepSeek => body.pointer("/reasoning_effort").cloned(),
         // OpenRouter's `none` is the structural disable rather than an effort string;
         // either shape counts as "the setting reached the gateway".

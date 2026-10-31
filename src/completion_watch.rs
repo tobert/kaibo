@@ -244,9 +244,10 @@ impl CompletionLog {
     }
 
     /// How many completions this phase attempted — every turn of the tool loop, the
-    /// forced final turn, each retry (a malformed generation or a transient transport
-    /// failure sent again), and every call that failed. The watcher sits inside the
-    /// retry wrapper, so each attempt the provider sees is one here. This is
+    /// forced final turn, each malformed-generation retry (a rig-level turn sent
+    /// again), and every call that failed. A transient transport retry (429/5xx) is
+    /// **not** counted: `RetryingHttp` sits under rig, below this hook, so one
+    /// completion that took several HTTP requests is one attempt here. This is
     /// `gen_ai.invoke_agent.inference_calls`.
     pub fn attempts(&self) -> u64 {
         self.attempts.load(Ordering::Relaxed)

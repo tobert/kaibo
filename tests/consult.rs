@@ -135,7 +135,8 @@ fn thinking_is_enabled_for_kinds_with_a_request_toggle() {
     );
 
     // Gemini (3.x+): nested under generationConfig.thinkingConfig with camelCase keys —
-    // rig parses these into a typed GenerationConfig, so the shape must be exact. The
+    // rig 0.46 merges this blob into the body as raw JSON, deep-merging beside its own
+    // `maxOutputTokens` (pinned in tests/effort_wire.rs), so the shape must be exact. The
     // whole 3-line takes a level; the default effort rides it as thinkingLevel.
     let g = thinking_params(ProviderKind::Gemini, "gemini-3.5-flash", THINKING_BUDGET)
         .expect("gemini has a thinking toggle");
@@ -214,8 +215,8 @@ fn anthropic_tier_closes_over_the_past_and_stays_open_to_new_releases() {
 #[test]
 fn every_gemini_id_takes_thinking_level_not_budget() {
     // kaibo targets the Gemini 3-line and newer, whose whole family uses `thinkingLevel`
-    // (mutually exclusive with the retired 2.5-era budget); rig's typed ThinkingConfig
-    // serializes the level as snake_case "high". Every Gemini id kaibo ships must route
+    // (mutually exclusive with the retired 2.5-era budget); the level reaches the wire
+    // as the string kaibo wrote ("high"). Every Gemini id kaibo ships must route
     // there — the dash 3-line, the dotted 3.x previews, and the `-latest` aliases whose
     // literal id carries no version at all.
     for id in [

@@ -328,7 +328,10 @@ fn malformed_turn(finish: Option<&FinishReason>, content: &[AssistantContent]) -
 /// Sends a turn again when the provider ended it with a malformed-generation finish
 /// reason ([`is_malformed_generation`]), up to [`MALFORMED_RETRIES`] times per run.
 ///
-/// One instance per run: the counter is the run's allowance. A retry reuses the same
+/// One instance per agent run: the counter is that run's allowance. `run_phase_loop`
+/// builds a fresh one each time it starts or resumes the agent (a `view_image` resume
+/// is a new agent run), so a phase that resumes gets a fresh allowance; the phase's
+/// turn cap still bounds the total. A retry reuses the same
 /// prompt and history, so the next attempt is a fresh sampling of the request that just
 /// failed. Every other turn is accepted untouched.
 #[derive(Clone, Debug)]

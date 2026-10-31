@@ -593,10 +593,11 @@ impl ModelShape {
             }
             ThinkingStyle::AnthropicAdaptive => {
                 obj.insert("thinking".into(), json!({ "type": "adaptive" }));
-                // rig 0.34 flattens additional_params into the Messages body; its typed
-                // `output_config` field models only `{format}` and stays `None` (kaibo
-                // sets no output schema), so this flattened key is the only `output_config`
-                // emitted. If kaibo ever adds structured output, revisit — two keys 400.
+                // rig 0.46 merges additional_params into the Messages body as raw JSON.
+                // kaibo sets no output schema, so rig writes no `output_config` of its
+                // own and this key is the only one. If kaibo ever adds structured output,
+                // check that rig merges the two objects rather than sending one over the
+                // other.
                 obj.insert("output_config".into(), json!({ "effort": effort }));
             }
             ThinkingStyle::GeminiLevel => {

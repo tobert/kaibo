@@ -3509,6 +3509,77 @@ mod tests {
         );
     }
 
+    /// The forced final turn after the turn cap is recorded too. It runs on its own
+    /// one-turn agent (`finalize_after_max_turns`), so it needs its own `Watch` hook;
+    /// without one, the log and the `run_phase` span would report the last *tool*
+    /// turn's ending as the phase's ending. Every loop turn here reports `tool_use`
+    /// and only the finalize turn reports `end_turn`, so a missing hook cannot pass.
+    #[tokio::test]
+    async fn the_completion_log_records_the_forced_final_turn_after_the_cap() {
+        const MODEL: &str = "driver";
+        let client = ScriptedClient::builder()
+            .on_model(MODEL, |req| {
+                if req.tool_choice == Some(ToolChoice::None) {
+                    Ok(with_raw(
+                        text_response("the final answer"),
+                        json!({"stop_reason": "end_turn"}),
+                    ))
+                } else {
+                    Ok(with_raw(
+                        tool_call_response("c1", "run_kaish", json!({"script": "echo again"})),
+                        json!({"stop_reason": "tool_use"}),
+                    ))
+                }
+            })
+            .build();
+
+        let dir = tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let log = CompletionLog::new();
+        let model = client.completion_model(MODEL);
+        let (answer, _usage) = run_phase_logged(
+            &log,
+            &model,
+            MODEL,
+            "answer the question",
+            16384,
+            None,
+            Message::user("q"),
+            2,
+            None,
+            Arc::new(crate::progress::NullSink),
+            ModelRole::Synth,
+            || {
+                Ok(vec![traced(RunKaish::new(KaishWorker::spawn_with(
+                    &root,
+                    SandboxConfig::default(),
+                )?))])
+            },
+            false,
+            None,
+        )
+        .await
+        .expect("the finalize turn answers after the cap");
+
+        assert_eq!(answer, "the final answer");
+        let turns = log.turns();
+        assert!(
+            turns.len() >= 2,
+            "the loop turns and the finalize turn are all recorded: {turns:?}"
+        );
+        assert!(
+            turns[..turns.len() - 1]
+                .iter()
+                .all(|t| t.finish_reason.as_deref() == Some("tool_use")),
+            "every turn before the finalize is a tool turn: {turns:?}"
+        );
+        assert_eq!(
+            log.last_finish_reason().as_deref(),
+            Some("end_turn"),
+            "the phase's ending is the forced final turn's, not the last tool turn's"
+        );
+    }
+
     /// A malformed tool call mid-loop costs one extra request, not the investigation.
     ///
     /// The live shape (a Gemini Flash explorer inside a `deliberate`): the model
