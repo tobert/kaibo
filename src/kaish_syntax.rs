@@ -1207,6 +1207,7 @@ mod tests {
             "local-direct".to_string(),
             Cast {
                 name: "local-direct".to_string(),
+                consult: None,
                 slots: std::collections::BTreeMap::from([
                     (
                         ModelRole::Explorer,
@@ -1276,6 +1277,7 @@ mod tests {
                 name.clone(),
                 Cast {
                     name: name.clone(),
+                    consult: None,
                     slots: std::collections::BTreeMap::from([(ModelRole::Synth, synth)]),
                 },
             );
@@ -1313,6 +1315,7 @@ mod tests {
                 name.to_string(),
                 Cast {
                     name: name.to_string(),
+                    consult: None,
                     slots: std::collections::BTreeMap::from([(role, ModelSlot::bare(backend, id))]),
                 },
             );
@@ -1400,6 +1403,7 @@ mod tests {
                 name.clone(),
                 Cast {
                     name: name.clone(),
+                    consult: None,
                     slots: std::collections::BTreeMap::from([(
                         ModelRole::Synth,
                         ModelSlot::bare("openrouter", "~google/gemini-flash-latest"),
@@ -1523,6 +1527,7 @@ mod tests {
                 name.clone(),
                 Cast {
                     name: name.clone(),
+                    consult: None,
                     slots: std::collections::BTreeMap::from([(
                         ModelRole::Synth,
                         ModelSlot::bare("deepseek", "deepseek-flash"),

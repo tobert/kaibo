@@ -16,11 +16,13 @@ record. Each later release appends a new section at the top.
 ## [Unreleased]
 
 ### Added
+- A cast's `consult = "solo" | "team"` key runs `consult` with the synth alone, keeping the explorer slot for `explore` and `deliberate`; `kaibo://config` shows each cast's mode.
 - `batch_submit` and `deliberate` run on `openrouter` backends via `/api/v1/batches`, stripping any `:batch` suffix from `list_models` ids.
 - OpenRouter slots on `google/gemini-*` and `~google/gemini-*` classify as vision-capable without an explicit `vision = true` pin.
 - `kaibo configure` and `docs/config.example.toml` cover Gemini Argon (`max_tokens` sizing from `list_models`), `batch_submit`, and `deliberate`.
 
 ### Changed
+- The built-in `anthropic` cast sets `consult = "solo"`: the Sonnet reads the code itself, and the Haiku explorer serves `explore` only.
 - The built-in `gemini` cast's synth is `gemini/gemini-pro-latest` (explorer stays `gemini/gemini-flash-latest`).
 - Moves to rig 0.46, with the TLS tree still free of aws-lc, OpenSSL, and the bundled `webpki-root-certs` roots.
 - A `Retry-After` header from a rate-limited provider now sets the retry wait, along with the delay in the body.

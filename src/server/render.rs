@@ -1238,6 +1238,20 @@ mod tests {
         );
     }
 
+    /// A solo consult resolves no explorer, so its footer names the synth alone: the
+    /// explorer model never answered and is not listed.
+    #[test]
+    fn a_solo_consult_footer_names_only_the_synth() {
+        let out = with_provenance(
+            "a".into(),
+            "anthropic",
+            &consult_models(None, "claude-sonnet-5-5"),
+            &Usage::new(),
+        );
+        assert!(out.contains("synth `claude-sonnet-5-5`"), "{out}");
+        assert!(!out.contains("explorer"), "{out}");
+    }
+
     /// Provenance footer: the answer keeps its text, and the cast plus every labelled
     /// model is appended so a caller (a cross-model study most of all) sees which model
     /// produced the answer without cross-referencing `kaibo://config`.

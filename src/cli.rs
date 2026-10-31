@@ -996,10 +996,10 @@ async fn resolve_and_run(
             "synth_backend",
         )
         .map_err(SetupError::usage)?;
-    // A synth-only cast has no explorer: `consult` runs single-stage.
+    // A solo cast (`consult = "solo"`, or no explorer slot) runs single-stage.
     let explorer = resolver
-        .optional_arm(&cast, ModelRole::Explorer)
-        .map_err(SetupError::setup)?;
+        .consult_explorer_arm(&cast, args.explorer_model.as_deref(), "--explorer-model")
+        .map_err(SetupError::usage)?;
     let synth = resolver
         .arm(&cast, ModelRole::Synth)
         .map_err(SetupError::setup)?;
