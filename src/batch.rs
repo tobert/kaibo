@@ -1341,19 +1341,12 @@ impl GeminiBatch {
             .check_effort(&tunables.effort)
             .map_err(|e| anyhow::anyhow!("model {:?} (backend {:?}, batch): {e}", slot.id, backend.name))?;
         let (max_tokens, params) = batch_shaping(backend.kind, &slot.id, &tunables);
-        let wire = crate::consult::EffortWire::Gemini;
-        if let Err(detail) = crate::consult::preflight_params(wire, params.as_ref()) {
-            return Err(anyhow!(
-                "model {:?} (backend {:?}, batch): effort {:?} is not accepted on the Gemini \
-                 wire — Google's thinkingLevel accepts {}. Set the slot's `effort` (or \
-                 `[defaults]`) to one of those, or `thinking_style = \"off\"` to send no \
-                 thinkingLevel. ({detail})",
-                slot.id,
-                backend.name,
-                batch_effort(&tunables.effort),
-                crate::consult::accepted_efforts(wire).join(" | "),
-            ));
-        }
+        // The effort the batch actually sends (the depth floor may have lifted it) must be
+        // one Google's `thinkingLevel` takes; `check_effort` owns that ladder now that
+        // rig 0.46 carries the blob as raw JSON and no longer reports it.
+        crate::consult::ModelShape::resolve(backend.kind, &slot.id, tunables.thinking_style)
+            .check_effort(batch_effort(&tunables.effort))
+            .map_err(|e| anyhow::anyhow!("model {:?} (backend {:?}, batch): {e}", slot.id, backend.name))?;
         Ok(Self {
             http: batch_http_client(backend)?,
             api_key: backend.resolve_key()?,
@@ -4108,7 +4101,7 @@ mod tests {
         assert!(err.to_string().contains("Gemini batch provider"), "{err}");
     }
 
-    /// `GeminiBatch::from_slot` runs the same `EffortWire::Gemini` preflight as the
+    /// `GeminiBatch::from_slot` runs the same Gemini `check_effort` as the
     /// interactive `Arm::from_slot`: Google's protobuf enum accepts only
     /// `minimal|low|medium|high`, so `max`, `xhigh`, and `none` are refused before
     /// any dossier sweep or HTTP submit, naming the valid rungs.

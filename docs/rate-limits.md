@@ -3,6 +3,12 @@
 Living plan, `docs/probes.md` style: milestones up top, status log at the bottom.
 The branch is `rate-limits`; the worktree is `~/src/wt/kaibo-rate-limits`.
 
+**Update, rig 0.46:** the `Retried<M>` model wrapper this plan names cannot exist on rig's
+erased `DynModel`. The transient-transport retry is now `RetryingHttp` in
+`src/completion_retry.rs`, an `HttpClientExt` wrapper under the loop, and it reads the
+failed reply's headers, so a provider's `Retry-After` sets the wait. The malformed-generation
+retry is a turn hook. The findings below describe rig 0.41 and stay as written.
+
 ## The problem, measured
 
 - 2026-08-27: two `deliberate` calls on cast `gpt-deliberate` died in the DOSSIER

@@ -559,9 +559,9 @@ pub(crate) fn with_provenance(
 }
 
 /// Render the reported token usage as one compact footer line, or `None` when the
-/// provider reported nothing. rig zeroes every field of [`Usage`] when a provider
-/// omits usage metrics, and uses that all-zero value as its own "unknown" sentinel
-/// (`reported_usage`); we mirror it exactly with `== Usage::new()`, so a new rig
+/// provider reported nothing. rig leaves every field of [`Usage`] unset (`None`) when a provider
+/// omits usage metrics, and that all-unset value is its own "unknown" sentinel
+/// (`Usage::is_reported`); we mirror it exactly with `== Usage::new()`, so a new rig
 /// field can't quietly slip past this guard. We distinguish "cost this much" from
 /// "the backend told us nothing" rather than printing a misleading `0 in · 0 out`.
 /// Input and output always show; the cache splits and reasoning ride along only when
@@ -574,19 +574,17 @@ pub(super) fn fmt_usage(usage: &Usage) -> Option<String> {
     }
     let mut line = format!(
         "tokens · {} in · {} out",
-        usage.input_tokens, usage.output_tokens
+        usage.input_tokens.unwrap_or(0),
+        usage.output_tokens.unwrap_or(0)
     );
-    if usage.reasoning_tokens > 0 {
-        line.push_str(&format!(" · {} reasoning", usage.reasoning_tokens));
+    if let Some(n) = usage.reasoning_tokens.filter(|n| *n > 0) {
+        line.push_str(&format!(" · {n} reasoning"));
     }
-    if usage.cached_input_tokens > 0 {
-        line.push_str(&format!(" · {} cached", usage.cached_input_tokens));
+    if let Some(n) = usage.cached_input_tokens.filter(|n| *n > 0) {
+        line.push_str(&format!(" · {n} cached"));
     }
-    if usage.cache_creation_input_tokens > 0 {
-        line.push_str(&format!(
-            " · {} cache-write",
-            usage.cache_creation_input_tokens
-        ));
+    if let Some(n) = usage.cache_creation_input_tokens.filter(|n| *n > 0) {
+        line.push_str(&format!(" · {n} cache-write"));
     }
     Some(line)
 }
@@ -1295,11 +1293,7 @@ mod tests {
         assert_eq!(fmt_usage(&Usage::new()), None);
 
         // A plain report: input + output, no cache/reasoning noise.
-        let plain = Usage {
-            input_tokens: 48170,
-            output_tokens: 3102,
-            ..Usage::new()
-        };
+        let plain = Usage::new().input_tokens(48170).output_tokens(3102);
         assert_eq!(
             fmt_usage(&plain).unwrap(),
             "tokens · 48170 in · 3102 out",
@@ -1307,14 +1301,12 @@ mod tests {
         );
 
         // Everything present: reasoning + cache read + cache write ride along.
-        let rich = Usage {
-            input_tokens: 1000,
-            output_tokens: 200,
-            reasoning_tokens: 150,
-            cached_input_tokens: 800,
-            cache_creation_input_tokens: 64,
-            ..Usage::new()
-        };
+        let rich = Usage::new()
+            .input_tokens(1000)
+            .output_tokens(200)
+            .reasoning_tokens(150)
+            .cached_input_tokens(800)
+            .cache_creation_input_tokens(64);
         let line = fmt_usage(&rich).unwrap();
         assert!(line.contains("1000 in · 200 out"), "{line}");
         assert!(line.contains("150 reasoning"), "{line}");

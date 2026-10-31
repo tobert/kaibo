@@ -84,7 +84,7 @@ pub fn traced<T: Tool + 'static>(tool: T) -> DynamicTool {
     let definition = tool_definition(&tool);
     let name = definition.name.clone();
     let tool = Arc::new(tool);
-    DynamicTool::new(
+    DynamicTool::new_with_context(
         definition.name,
         definition.description,
         definition.parameters,
@@ -200,7 +200,8 @@ mod tests {
     /// stand-in: rig's erased `call` is private.
     async fn dispatch(tool: DynamicTool, args: &str) -> ToolResult {
         let name = tool.name().to_string();
-        let tools = ToolSet::from_dynamic_tools(vec![tool]);
+        let mut tools = ToolSet::default();
+        tools.add_dynamic_tool(tool);
         let mut context = ToolContext::default();
         tools.execute(&name, args, &mut context).await
     }

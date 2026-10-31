@@ -12,8 +12,8 @@
 //! - [`oneshot`] — the synthesis agent · no tools · the caller's context → a direct
 //!   answer. The thin counterpart: one upstream request, no codebase access.
 //!
-//! Each phase arrives as a resolved [`Arm`]: its own client (type-erased — the
-//! decided plumbing fork, `docs/casts.md`), model, request params, and caps. The
+//! Each phase arrives as a resolved [`Arm`]: its own model (type-erased behind rig's
+//! `DynModel<Completion>` — the decided plumbing fork, `docs/casts.md`), request params, and caps. The
 //! server resolves a cast's slots into arms ([`Arm::from_slot`]); a cast whose
 //! explorer and synth live on different backends — different wire protocols,
 //! even — runs each phase on its own client through the same loop primitive.
@@ -28,8 +28,8 @@ mod shaping;
 pub use config::{ConsultConfig, ExploreConfig, PhaseContext};
 pub(crate) use engine::explore_with;
 pub use engine::{
-    consult, deliberate_direct, oneshot, Arm, ConsultOutput, RunExplore, RunExploreArgs,
-    RunExploreError, Session,
+    consult, deliberate_direct, oneshot, Arm, ConsultOutput, Llm, ModelSource, RunExplore,
+    RunExploreArgs, RunExploreError, Session,
 };
 // `run_phase` is the offline-testable loop primitive; re-exported at crate scope so
 // `crate::consult::run_phase` (referenced in module docs) resolves. `run_phase_logged`
@@ -44,9 +44,8 @@ pub use prompts::{
     sweep_evidence_block, ConsultAttachment, Phase, PromptOverrides, ReportReader,
 };
 pub use shaping::{
-    accepted_efforts, effort_rank, effort_sinks, hosted_openai_accepts_reasoning,
+    effort_rank, effort_sinks, hosted_openai_accepts_reasoning,
     hosted_openai_accepts_sampling, hosted_openai_responses_params, inject_provider_prefs,
-    is_effort_off, known_efforts, preflight_params, request_params, thinking_params, EffortWire,
-    ModelCaps, ModelShape, ThinkingStyleOverride, DEFAULT_EFFORT, EFFORT_LADDER, EFFORT_OFF,
+    is_effort_off, known_efforts, request_params, thinking_params, ModelCaps, ModelShape, ThinkingStyleOverride, DEFAULT_EFFORT, EFFORT_LADDER, EFFORT_OFF,
     THINKING_BUDGET,
 };

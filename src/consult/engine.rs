@@ -3,33 +3,34 @@
 use std::collections::HashSet;
 use std::future::Future;
 use std::path::{Path, PathBuf};
-use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
 use rig_agent::agent::hook::{
-    AgentHook, CompletionCall, CompletionCallAction, HookContext, InvalidToolCallAction,
-    InvalidToolCallContext, ModelTurnAction, ModelTurnFinished, ToolResultAction, ToolResultEvent,
+    AgentHook, CompletionCallAction, CompletionCallEvent, HookContext, InvalidToolCallAction,
+    InvalidToolCallContext, ModelTurnAction, ModelTurnFinished, OutcomeAction, OutcomeEvent,
 };
 use rig_agent::agent::AgentBuilder;
 use rig_agent::completion::PromptError;
 use rig_agent::tool::{DynamicTool, Tool, ToolExecutionError, ToolOutput};
-use rig_core::client::CompletionClient;
 use rig_core::completion::message::{
     AssistantContent, DocumentSourceKind, Image, ImageMediaType, MimeType, ToolChoice, ToolResult,
     ToolResultContent, UserContent,
 };
-use rig_core::completion::{CompletionModel, FinishReason, Message, Usage};
-use rig_core::providers::{anthropic, deepseek, gemini, openai, openrouter};
+use rig_core::completion::{CacheRetention, CompletionRequest, FinishReason, Message, Usage};
+use rig_core::effect::Answered;
+use rig_core::operation::Completion;
+use rig_core::providers::{anthropic, gemini, openai};
+use rig_core::DynModel;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
 use crate::artifact::SaveArtifact;
 use crate::attach::Attachment;
-use crate::completion_retry::retried;
-use crate::completion_watch::{watched, CompletionLog};
+use crate::completion_retry::{retry_malformed, MalformedGenerationHook, RetryingHttp};
+use crate::completion_watch::{CompletionLog, Watch};
 use crate::config::{Backend, Defaults, ModelRole, ModelSlot};
 use crate::credentials::WireKind;
 use crate::explorer::RunKaish;
@@ -55,134 +56,139 @@ use super::shaping::{ModelCaps, ModelShape};
 /// loop, again for the turn-cap finalize turn — see [`run_phase`]).
 type ToolFactory<'a> = &'a (dyn Fn() -> Result<Vec<DynamicTool>> + Send + Sync);
 
-/// The eventual `(answer, usage)` a phase loop yields, boxed `Send` for the
-/// [`PhaseRunner`] vtable: the model's answer paired with the token [`Usage`] the
-/// provider reported for the phase (zero-valued when unreported). A named alias so
-/// the vtable signature stays readable — and under clippy's `type_complexity` bar.
-type PhaseFuture<'a> = Pin<Box<dyn Future<Output = Result<(String, Usage)>> + Send + 'a>>;
-
-/// The object-safe seam one [`Arm`] runs its loops through: a pre-built
-/// completion model erased behind a vtable. rig's provider models are distinct
-/// concrete types; monomorphizing every phase combination would be a kinds² macro
-/// product (the decided plumbing fork, `docs/casts.md`) — the calls are
-/// network-bound, so dynamic dispatch here is free. The one implementation,
-/// [`ModelArm`], forwards to the generic [`run_phase`], which stays the
-/// offline-testable primitive.
-trait PhaseRunner: Send + Sync {
-    #[allow(clippy::too_many_arguments)] // mirrors run_phase's loop inputs
-    fn run_phase<'a>(
-        &'a self,
-        preamble: &'a str,
-        max_tokens: u64,
-        temperature: Option<f64>,
-        initial_prompt: Message,
-        max_turns: usize,
-        params: Option<&'a Value>,
-        progress: Arc<dyn ProgressSink>,
-        role: ModelRole,
-        make_tools: ToolFactory<'a>,
-        break_on_tool_images: bool,
-        identity: Option<crate::metrics::PhaseIdentity>,
-    ) -> PhaseFuture<'a>;
-
-    /// One completion, straight to the provider — no agent, no tool loop. The
-    /// single-shot phases (`oneshot`, `deliberate`'s direct lane) are exactly one
-    /// upstream request by definition, so they say so instead of asking a tool loop
-    /// to arrive at the same place with an empty toolset. See [`run_completion`].
-    fn complete<'a>(
-        &'a self,
-        preamble: &'a str,
-        max_tokens: u64,
-        temperature: Option<f64>,
-        prompt: Message,
-        params: Option<&'a Value>,
-        identity: Option<crate::metrics::PhaseIdentity>,
-    ) -> PhaseFuture<'a>;
-}
-
-/// The concrete pre-built completion model behind the [`PhaseRunner`] vtable.
-/// Holding the *model* (not a client + id) lets a provider-specific constructor
-/// ride along — the OpenRouter arm's explicit prompt caching is set once here and
-/// every loop turn inherits it.
-struct ModelArm<M> {
-    model: M,
-    /// The model id, for the `run_phase` span — the vtable erases the type, and
-    /// the telemetry must keep naming which model ran (it's how spend and
-    /// behavior get attributed per model when reading traces).
-    name: String,
-}
-
-impl<M> PhaseRunner for ModelArm<M>
-where
-    M: CompletionModel + Clone + 'static,
-{
-    fn run_phase<'a>(
-        &'a self,
-        preamble: &'a str,
-        max_tokens: u64,
-        temperature: Option<f64>,
-        initial_prompt: Message,
-        max_turns: usize,
-        params: Option<&'a Value>,
-        progress: Arc<dyn ProgressSink>,
-        role: ModelRole,
-        make_tools: ToolFactory<'a>,
-        break_on_tool_images: bool,
-        identity: Option<crate::metrics::PhaseIdentity>,
-    ) -> PhaseFuture<'a> {
-        Box::pin(run_phase(
-            &self.model,
-            &self.name,
-            preamble,
-            max_tokens,
-            temperature,
-            initial_prompt,
-            max_turns,
-            params,
-            progress,
-            role,
-            make_tools,
-            break_on_tool_images,
-            identity,
-        ))
+/// rig's DeepSeek dialect, with image input switched on.
+///
+/// rig 0.46 reads DeepSeek's API as text-only: its `DeepSeek` body rewrite turns off
+/// content-part arrays, so an image attached to a user turn is replaced by the text
+/// "(image omitted: model does not support images)" before the request leaves. kaibo
+/// measured the opposite for `deepseek-flash` (live probe 2026-09-21: a red PNG answered
+/// "Red"), and classifies that model as sighted (`ModelCaps`), so the dialect keeps every
+/// other DeepSeek quirk (the `reasoning_content` field, the strict-tools route) and drops
+/// only that rewrite. The rewrite's one other job is removing a *forced* tool choice
+/// while the model thinks; kaibo sends `auto` or `none`, never a forced one.
+///
+/// The dialect needs a name of its own: rig decides which models read images by
+/// dialect name, and the name `deepseek` is hard-wired to "none do".
+/// `a_deepseek_image_reaches_the_wire_as_an_image_url_part` is the test that fails the day
+/// this stops working.
+fn deepseek_dialect() -> openai::wire::Dialect {
+    let mut quirks = openai::wire::DEEPSEEK.quirks;
+    quirks.rewrite = openai::wire::BodyRewrite::None;
+    openai::wire::Dialect {
+        name: "deepseek-sighted",
+        quirks,
+        ..openai::wire::DEEPSEEK
     }
+}
 
-    fn complete<'a>(
+/// Stamps an app's name and URL on every request, the two headers OpenRouter reads to
+/// attribute traffic to an app in its dashboard.
+struct AppIdentity {
+    title: &'static str,
+    referer: &'static str,
+}
+
+impl rig_core::http_client::HttpMiddleware for AppIdentity {
+    fn before_request_headers<'a>(
         &'a self,
-        preamble: &'a str,
-        max_tokens: u64,
-        temperature: Option<f64>,
-        prompt: Message,
-        params: Option<&'a Value>,
-        identity: Option<crate::metrics::PhaseIdentity>,
-    ) -> PhaseFuture<'a> {
+        _exchange: rig_core::http_client::Exchange<'a>,
+        headers: &'a mut http::HeaderMap,
+    ) -> rig_core::wasm_compat::WasmBoxedFuture<'a, rig_core::http_client::Result<()>> {
         Box::pin(async move {
-            run_completion(
-                &self.model,
-                &self.name,
-                &CompletionLog::new(),
-                preamble,
-                max_tokens,
-                temperature,
-                prompt,
-                params,
-                identity,
-            )
-            .await
+            for (name, value) in [("x-openrouter-title", self.title), ("http-referer", self.referer)] {
+                headers.insert(
+                    http::header::HeaderName::from_static(name),
+                    http::HeaderValue::from_static(value),
+                );
+            }
+            Ok(())
         })
     }
 }
 
-/// One resolved phase arm: its own client + model + request params + caps. The
-/// unit `consult`/`oneshot` (and the nested `explore′`) receive — they never learn
-/// about backends or casts. The server resolves a cast's slots into arms
-/// ([`Arm::from_slot`]); tests inject any [`CompletionClient`] (the scripted
-/// offline one included) via [`Arm::new`], which is what keeps the mock harness
-/// driving the *real* loop with no network.
+/// A completion model, erased to its operation, plus the one request-time option that
+/// belongs to the arm rather than to a phase. rig 0.46 pairs a wire (Anthropic
+/// Messages, OpenAI Chat, Gemini GenerateContent, ...) with a transport and erases the
+/// pair behind [`DynModel`], so every phase loop below is a plain function over this
+/// one type instead of generic over a provider's concrete model.
+///
+/// `cache` is the prompt-cache retention the arm asks for on every request. It rides here
+/// because rig 0.46 carries it as a portable request option (`GenerationOptions::cache`)
+/// where 0.42 carried it as a flag on the OpenRouter model, and the arm is where kaibo
+/// knows it.
+#[derive(Clone)]
+pub struct Llm {
+    model: DynModel<Completion>,
+    cache: Option<CacheRetention>,
+}
+
+impl Llm {
+    /// Erase `model` with no cache option.
+    pub fn new(model: impl Into<DynModel<Completion>>) -> Self {
+        Self {
+            model: model.into(),
+            cache: None,
+        }
+    }
+
+    /// The same model asking for prompt caching at `retention` on every request.
+    pub fn with_cache(mut self, retention: CacheRetention) -> Self {
+        self.cache = Some(retention);
+        self
+    }
+
+    /// The erased model itself, for callers that talk to rig's `DynModel` directly.
+    pub fn dyn_model(&self) -> &DynModel<Completion> {
+        &self.model
+    }
+
+    /// An agent builder over this model, carrying the arm's request options.
+    fn agent(&self) -> AgentBuilder {
+        let builder = AgentBuilder::new(self.model.clone());
+        match self.cache {
+            Some(retention) => builder.cache(retention),
+            None => builder,
+        }
+    }
+
+    /// A one-prompt request carrying the arm's request options.
+    fn request(&self, prompt: Message) -> CompletionRequest {
+        let request = CompletionRequest::new(prompt);
+        match self.cache {
+            Some(retention) => request.cache(retention),
+            None => request,
+        }
+    }
+}
+
+impl<W, T> From<rig_core::Model<W, T>> for Llm
+where
+    rig_core::Model<W, T>: Into<DynModel<Completion>>,
+{
+    fn from(model: rig_core::Model<W, T>) -> Self {
+        Self::new(model)
+    }
+}
+
+/// Where a test gets its completion models: `completion_model(id)` returns the model
+/// that answers to `id`. The offline scripted client in `test_support` implements it, and
+/// that is what lets `Arm::new` drive the real consult loop with no network. A live arm
+/// never goes through this; [`Arm::from_slot`] builds its [`Llm`] from a backend.
+pub trait ModelSource {
+    /// The model that answers to `id`.
+    fn completion_model(&self, id: &str) -> Llm;
+}
+
+/// One resolved phase arm: its own model + request params + caps. The unit
+/// `consult`/`oneshot` (and the nested `explore′`) receive — they never learn about
+/// backends or casts. The server resolves a cast's slots into arms
+/// ([`Arm::from_slot`]); tests inject any [`ModelSource`] (the scripted offline one
+/// included) via [`Arm::new`], which is what keeps the mock harness driving the *real*
+/// loop with no network.
 #[derive(Clone)]
 pub struct Arm {
-    runner: Arc<dyn PhaseRunner>,
-    /// The model id this arm addresses (diagnostics; the runner carries its own).
+    llm: Llm,
+    /// The model id this arm addresses (diagnostics and the `run_phase` span).
     pub model: String,
     /// Output headroom for this arm's completions. **Thinking is on**, so
     /// reasoning eats this budget — it sits well above the thinking budget baked
@@ -220,63 +226,43 @@ impl std::fmt::Debug for Arm {
 }
 
 impl Arm {
-    /// Wrap an already-constructed client as an arm. The injection seam: the
-    /// server's live arms and the tests' scripted ones meet the loop here.
-    pub fn new<C>(
+    /// Wrap a model source as an arm. The injection seam: the server's live arms and
+    /// the tests' scripted ones meet the loop here.
+    pub fn new<C: ModelSource>(
         client: C,
         model: impl Into<String>,
         max_tokens: u64,
         params: Option<Value>,
         caps: ModelCaps,
-    ) -> Self
-    where
-        C: CompletionClient + Clone + Send + Sync + 'static,
-        C::CompletionModel: Clone + 'static,
-    {
+    ) -> Self {
         let model = model.into();
-        Self::from_model(
-            client.completion_model(&model),
-            model,
-            max_tokens,
-            params,
-            caps,
-        )
+        Self::from_model(client.completion_model(&model), model, max_tokens, params, caps)
     }
 
-    /// Wrap a pre-built completion model as an arm — the seam a provider-specific
-    /// model constructor (OpenRouter's prompt-caching flag) enters through.
-    fn from_model<M>(
-        model_impl: M,
+    /// Wrap a pre-built model as an arm — the seam a provider-specific model
+    /// constructor (OpenRouter's prompt-caching flag) enters through.
+    fn from_model(
+        llm: Llm,
         model: impl Into<String>,
         max_tokens: u64,
         params: Option<Value>,
         caps: ModelCaps,
-    ) -> Self
-    where
-        M: CompletionModel + Clone + 'static,
-    {
-        Self::from_model_with_temperature(model_impl, model, max_tokens, None, params, caps)
+    ) -> Self {
+        Self::from_model_with_temperature(llm, model, max_tokens, None, params, caps)
     }
 
-    /// Wrap a pre-built completion model with an optional typed temperature.
-    fn from_model_with_temperature<M>(
-        model_impl: M,
+    /// Wrap a pre-built model with an optional typed temperature.
+    fn from_model_with_temperature(
+        llm: Llm,
         model: impl Into<String>,
         max_tokens: u64,
         temperature: Option<f64>,
         params: Option<Value>,
         caps: ModelCaps,
-    ) -> Self
-    where
-        M: CompletionModel + Clone + 'static,
-    {
-        let model = model.into();
+    ) -> Self {
         Self {
-            runner: Arc::new(ModelArm {
-                model: model_impl,
-                name: model.clone(),
-            }),
-            model,
+            llm,
+            model: model.into(),
             max_tokens,
             temperature,
             params,
@@ -374,38 +360,18 @@ impl Arm {
         // config opt-in. A no-op for every other kind.
         let params =
             super::shaping::inject_provider_prefs(backend.kind, params, backend.data_collection);
-        // Preflight the blob through rig's OWN request builder for this wire. Two of the
-        // six wires parse it into a typed struct whose reasoning rungs are a closed enum,
-        // so an effort rig can't name dies *inside rig* at call time with a bare serde
-        // line ("unknown variant `max`") that says nothing about which slot of which cast
-        // asked for it. Asking here — the single live construction point — turns that into
-        // a boundary error naming the slot and the rungs that wire does take. It stays a
-        // preflight, not a policy: the accepted list is read back out of rig, so a rig bump
-        // that adds a rung needs no kaibo change, and effort stays a passthrough string
-        // everywhere rig lets it be one.
-        let wire = super::shaping::EffortWire::resolve(backend.kind, responses_wire);
-        if let Err(detail) = super::shaping::preflight_params(wire, params.as_ref()) {
-            return Err(anyhow!(
-                "model {:?} (backend {:?}, {} slot): effort {:?} is refused by rig's {} \
-                 request builder before the request leaves kaibo. That ceiling is \
-                 rig-core's typed client, not the provider's API — this wire accepts {}. \
-                 Set the slot's `effort` (or `[defaults]`) to one of those, or point the \
-                 slot at a backend whose wire passes effort through. (rig: {detail})",
-                slot.id,
-                backend.name,
-                role.key(),
-                t.effort,
-                wire.label(),
-                super::shaping::accepted_efforts(wire).join(" | "),
-            ));
-        }
         let caps = ModelCaps::resolve(backend.kind, &slot.id, slot.vision);
 
         // One HTTP backend carrying the per-request deadline, built by the shared
         // `crate::tls::https_client` (ring installed, `rustls-no-provider`, no OpenSSL/C —
         // the one client-build site). It bounds the otherwise-brakeless non-streaming call
-        // (the 2026-06-06 wedge; see the helper's doc). Injected via rig's `.http_client(..)`.
+        // (the 2026-06-06 wedge; see the helper's doc). Handed to rig as its transport
+        // through `From<reqwest::Client> for ReqwestClient`, never rig's own shared client
+        // (that one is built with the bundled-roots TLS feature this tree keeps off), and
+        // wrapped so a transient 429/5xx waits and is sent again underneath the loop
+        // (`crate::completion_retry`).
         let http = crate::tls::https_client(backend.request_timeout)?;
+        let http = RetryingHttp::new(rig_reqwest::ReqwestClient::from(http), &slot.id);
 
         // A media backend has no completion model to build an arm from — it is reached
         // through the media seam (`crate::media::MediaArm`) on a media cast slot, never
@@ -430,63 +396,41 @@ impl Arm {
                 // rig's built-in https://api.anthropic.com; set, it points at an
                 // Anthropic-Messages-API-compatible gateway/proxy instead.
                 let key = backend.resolve_key()?;
-                let mut builder = anthropic::Client::builder().api_key(&key);
+                let mut config = anthropic::AnthropicConfig::new(key);
                 if let Some(base_url) = backend.base_url.as_deref() {
-                    builder = builder.base_url(base_url);
+                    config = config.with_base_url(base_url);
                 }
-                let client = builder
-                    .http_client(http)
-                    .build()
-                    .map_err(|e| anyhow!("anthropic client init: {e}"))?;
-                Ok(Self::new(client, &slot.id, t.max_tokens, params, caps))
+                let model = config.connect(http).completion(&slot.id);
+                Ok(Self::from_model(Llm::new(model), &slot.id, t.max_tokens, params, caps))
             }
             WireKind::DeepSeek => {
                 let key = backend.resolve_key()?;
-                let client = deepseek::Client::builder()
-                    .api_key(&key)
-                    .http_client(http)
-                    .build()
-                    .map_err(|e| anyhow!("deepseek client init: {e}"))?;
-                Ok(Self::new(client, &slot.id, t.max_tokens, params, caps))
+                let model = openai::OpenAIConfig::with_key(&deepseek_dialect(), key)
+                    .connect(http)
+                    .chat(&slot.id);
+                Ok(Self::from_model(Llm::new(model), &slot.id, t.max_tokens, params, caps))
             }
             WireKind::Gemini => {
                 // base_url is optional here (unlike the openai kind): unset dials
                 // rig's built-in https://generativelanguage.googleapis.com; set, it
                 // points at a Gemini-API-compatible gateway/proxy instead. Same
                 // pattern as the Anthropic arm above — the contract is a HOST ROOT,
-                // since rig's builder appends its own versioned path
+                // since rig's wire appends its own versioned path
                 // (`/v1beta/models/...`) rather than taking one baked in.
                 let key = backend.resolve_key()?;
-                let mut builder = gemini::Client::builder().api_key(&key);
+                let mut config = gemini::GeminiConfig::new(key);
                 if let Some(base_url) = backend.base_url.as_deref() {
-                    builder = builder.base_url(base_url);
+                    config = config.with_base_url(base_url);
                 }
-                let client = builder
-                    .http_client(http)
-                    .build()
-                    .map_err(|e| anyhow!("gemini client init: {e}"))?;
-                Ok(Self::new(client, &slot.id, t.max_tokens, params, caps))
+                let model = config.connect(http).completion(&slot.id);
+                Ok(Self::from_model(Llm::new(model), &slot.id, t.max_tokens, params, caps))
             }
             WireKind::OpenRouter => {
                 // A keyed gateway with a *fixed* endpoint (rig pins the base URL), so —
-                // unlike the openai kind — there is no base_url to resolve. `with_app_identity`
-                // stamps the X-OpenRouter-Title / HTTP-Referer headers so kaibo's traffic is
-                // identifiable in the OpenRouter dashboard.
+                // unlike the openai kind — there is no base_url to resolve.
                 let key = backend.resolve_key()?;
-                let client = openrouter::Client::builder()
-                    .api_key(&key)
-                    .http_client(http)
-                    .with_app_identity("kaibo", "https://github.com/tobert/kaibo")
-                    .build()
-                    .map_err(|e| anyhow!("openrouter client init: {e}"))?;
-                let model = Self::openrouter_completion_model(&client, &slot.id);
-                Ok(Self::from_model(
-                    model,
-                    &slot.id,
-                    t.max_tokens,
-                    params,
-                    caps,
-                ))
+                let model = Self::openrouter_completion_model(http, key, &slot.id);
+                Ok(Self::from_model(model, &slot.id, t.max_tokens, params, caps))
             }
             WireKind::Openai => {
                 // Any OpenAI-compatible endpoint, addressed by the backend's base
@@ -494,15 +438,12 @@ impl Arm {
                 // returns the configured key or a placeholder the server ignores.
                 let base_url = backend.resolved_base_url();
                 let key = backend.resolve_key()?;
+                let client = openai::OpenAIConfig::new(key)
+                    .with_base_url(&base_url)
+                    .connect(http);
                 if responses_wire {
-                    let client = openai::Client::builder()
-                        .api_key(&key)
-                        .base_url(&base_url)
-                        .http_client(http)
-                        .build()
-                        .map_err(|e| anyhow!("openai responses client init at {base_url}: {e}"))?;
                     Ok(Self::from_model_with_temperature(
-                        client.completion_model(&slot.id),
+                        Llm::new(client.responses(&slot.id)),
                         &slot.id,
                         t.max_tokens,
                         typed_temperature,
@@ -511,42 +452,44 @@ impl Arm {
                     ))
                 } else {
                     // The chat-completions wire is where vLLM sends both reasoning
-                    // spellings on one message, which rig-core 0.41 cannot decode
-                    // (`crate::wire_repair`). Only this wire carries the `choices`
-                    // shape the repair recognizes, so only this client is wrapped —
-                    // the Responses builder above keeps the bare client.
-                    let client = openai::CompletionsClient::builder()
-                        .api_key(&key)
-                        .base_url(&base_url)
-                        .http_client(crate::wire_repair::Repaired::new(http))
-                        .build()
-                        .map_err(|e| anyhow!("openai client init at {base_url}: {e}"))?;
-                    Ok(Self::new(client, &slot.id, t.max_tokens, params, caps))
+                    // spellings on one message; rig 0.46 decodes that as is
+                    // (`tests/vllm_reasoning.rs`).
+                    Ok(Self::from_model(
+                        Llm::new(client.chat(&slot.id)),
+                        &slot.id,
+                        t.max_tokens,
+                        params,
+                        caps,
+                    ))
                 }
             }
         }
     }
 
     /// Build the OpenRouter arm's completion model: explicit prompt caching ON.
-    /// rig marks the system prompt with a `cache_control: ephemeral` breakpoint,
-    /// so Anthropic-upstream slugs bill the resident preamble at cache-read rates
-    /// instead of full input price every turn; implicit-caching upstreams
-    /// (DeepSeek/GLM/Kimi/Gemini/OpenAI) ignore the marker. The growing
-    /// transcript is not marked — an upstream rig limitation. Kept as a named seam so
-    /// the construction is unit-testable, and
-    /// `from_slot` must route through here.
+    /// The request carries a top-level `cache_control: ephemeral` marker, so
+    /// Anthropic-upstream slugs bill the resident preamble and the growing transcript at
+    /// cache-read rates instead of full input price every turn; implicit-caching
+    /// upstreams (DeepSeek/GLM/Kimi/Gemini/OpenAI) are sent no marker. Kept as a named
+    /// seam so the construction is unit-testable, and `from_slot` must route through here.
     ///
     /// Generic over the HTTP backend so a test can drive it with a capture transport
     /// and read the marker off the serialized body — the only place that answers
-    /// whether this constructor did its job, since rig exposes no readable flag.
-    fn openrouter_completion_model<H>(
-        client: &openrouter::Client<H>,
-        id: &str,
-    ) -> openrouter::CompletionModel<H>
+    /// whether this constructor did its job.
+    fn openrouter_completion_model<H>(http: H, key: String, id: &str) -> Llm
     where
-        openrouter::Client<H>: CompletionClient<CompletionModel = openrouter::CompletionModel<H>>,
+        H: rig_core::http_client::HttpClientExt + 'static,
     {
-        client.completion_model(id).with_prompt_caching()
+        // `X-OpenRouter-Title` / `HTTP-Referer` stamp kaibo's traffic so it is
+        // identifiable in the OpenRouter dashboard.
+        let http = rig_core::http_client::DynHttpClient::new(http).with_middleware(AppIdentity {
+            title: "kaibo",
+            referer: "https://github.com/tobert/kaibo",
+        });
+        let model = openai::OpenAIConfig::with_key(&openai::wire::OPENROUTER, key)
+            .connect(http)
+            .chat(id);
+        Llm::new(model).with_cache(CacheRetention::Short)
     }
 
     /// Does a `view_image` on this arm need the user-turn rewrite? True exactly when
@@ -571,21 +514,22 @@ impl Arm {
         role: ModelRole,
         make_tools: ToolFactory<'_>,
     ) -> Result<(String, Usage)> {
-        self.runner
-            .run_phase(
-                preamble,
-                self.max_tokens,
-                self.temperature,
-                initial_prompt,
-                max_turns,
-                self.params.as_ref(),
-                progress,
-                role,
-                make_tools,
-                self.rewrites_tool_images(),
-                self.identity,
-            )
-            .await
+        run_phase(
+            &self.llm,
+            &self.model,
+            preamble,
+            self.max_tokens,
+            self.temperature,
+            initial_prompt,
+            max_turns,
+            self.params.as_ref(),
+            progress,
+            role,
+            make_tools,
+            self.rewrites_tool_images(),
+            self.identity,
+        )
+        .await
     }
 
     /// Ask this arm one question and take its answer: a single completion with this
@@ -598,16 +542,18 @@ impl Arm {
         preamble: &str,
         prompt: Message,
     ) -> Result<(String, Usage)> {
-        self.runner
-            .complete(
-                preamble,
-                self.max_tokens,
-                self.temperature,
-                prompt,
-                self.params.as_ref(),
-                self.identity,
-            )
-            .await
+        run_completion(
+            &self.llm,
+            &self.model,
+            &CompletionLog::new(),
+            preamble,
+            self.max_tokens,
+            self.temperature,
+            prompt,
+            self.params.as_ref(),
+            self.identity,
+        )
+        .await
     }
 }
 
@@ -761,7 +707,10 @@ fn turn_wrote_nothing(content: &[AssistantContent]) -> bool {
         AssistantContent::Text(text) => !text.text.trim().is_empty(),
         AssistantContent::ToolCall(_) => true,
         AssistantContent::Image(_) => true,
-        AssistantContent::Reasoning(_) => false,
+        // Reasoning, and any provider item with no canonical meaning, is not an answer.
+        // `AssistantContent` is `#[non_exhaustive]` in 0.46, so a new variant lands here
+        // as "not an answer" until someone classifies it.
+        _ => false,
     })
 }
 
@@ -822,9 +771,9 @@ impl NoAnswer {
 /// `spent` is what the phase already used; the forced turn's usage is added to it,
 /// never substituted.
 #[allow(clippy::too_many_arguments)] // mirrors run_phase's loop inputs
-async fn write_up_or_fail<M>(
-    model: &M,
-    log: &CompletionLog,
+async fn write_up_or_fail(
+    model: &Llm,
+    watch: &Watch,
     model_name: &str,
     preamble: &str,
     max_tokens: u64,
@@ -838,10 +787,7 @@ async fn write_up_or_fail<M>(
     role: ModelRole,
     progress: &dyn ProgressSink,
     cause: NoAnswer,
-) -> Result<(String, Usage)>
-where
-    M: CompletionModel + Clone + 'static,
-{
+) -> Result<(String, Usage)> {
     if !transcript_has_tool_results(&transcript) {
         return Err(empty_answer_error(
             model_name,
@@ -849,7 +795,7 @@ where
             turns,
             max_turns,
             &spent,
-            log.last_finish_reason().as_deref(),
+            watch.log().last_finish_reason().as_deref(),
             max_tokens,
             &format!(
                 "{}, and its transcript holds no tool results to write up — asking it to \
@@ -876,7 +822,7 @@ where
     tracing::warn!(
         model = model_name,
         turns,
-        output_tokens = spent.output_tokens,
+        output_tokens = spent.output_tokens.unwrap_or(0),
         cause = ?cause,
         effort = ?effort,
         "phase ended with no answer text and evidence gathered — forcing one final \
@@ -889,6 +835,7 @@ where
     let thinking = lowered.as_ref().map(|(params, _)| params).or(thinking);
     let (answer, retry_usage) = forced_finish_turn(
         model,
+        watch,
         preamble,
         max_tokens,
         temperature,
@@ -913,7 +860,7 @@ where
             turns + 1,
             max_turns,
             &usage,
-            log.last_finish_reason().as_deref(),
+            watch.log().last_finish_reason().as_deref(),
             max_tokens,
             &format!(
                 "{}; it was asked once{asked_at} to write the answer it owed and came back \
@@ -999,8 +946,8 @@ fn transcript_has_tool_results(history: &[Message]) -> bool {
 /// answer") — one concept, one wording, two lanes.
 ///
 /// `finish_reason` comes off the phase's [`CompletionLog`] — the provider's own word
-/// for how its last completion ended, read from the raw response the [`Watched`]
-/// wrapper records. `None` means the provider reported none, and that is stated as
+/// for how its last completion ended, read from the raw response the [`Watch`]
+/// hook records. `None` means the provider reported none, and that is stated as
 /// absence rather than implied to be a clean stop: on some wires (OpenAI's Responses
 /// API) reporting nothing *is* the normal completion signal, so absence carries no
 /// verdict either way.
@@ -1029,12 +976,13 @@ fn empty_answer_error(
     let slot = role.key();
     let (budget, advice) = match finish_reason {
         // Only claim the budget went to reasoning when the provider counted reasoning.
-        Some(r) if is_output_limit(r) && usage.reasoning_tokens > 0 => (
+        Some(r) if is_output_limit(r) && usage.reasoning_tokens.unwrap_or(0) > 0 => (
             format!(
                 " The provider stopped the model at its output limit (finish_reason \"{r}\", \
                  max_tokens {max_tokens}) with {} of {} output tokens spent on reasoning, so \
                  the model used its output budget reasoning and never wrote the answer.",
-                usage.reasoning_tokens, usage.output_tokens,
+                usage.reasoning_tokens.unwrap_or(0),
+                usage.output_tokens.unwrap_or(0),
             ),
             format!(
                 "Retry the call, since how long a model reasons varies from call to call; \
@@ -1048,7 +996,7 @@ fn empty_answer_error(
                 " The provider stopped the model at its output limit (finish_reason \"{r}\", \
                  max_tokens {max_tokens}) after all {} output tokens, with no answer text. It \
                  reported no reasoning count, so kaibo cannot say how the budget was spent.",
-                usage.output_tokens,
+                usage.output_tokens.unwrap_or(0),
             ),
             format!(
                 "Retry the call; send a smaller question; or use another cast. To change the \
@@ -1067,7 +1015,10 @@ fn empty_answer_error(
          review that never happened. Diagnostics: {turns} of {max_turns} turns used, \
          {} input tokens ({} cached), {} output tokens, {} reasoning tokens reported; \
          {reason}. {advice}",
-        usage.input_tokens, usage.cached_input_tokens, usage.output_tokens, usage.reasoning_tokens,
+        usage.input_tokens.unwrap_or(0),
+        usage.cached_input_tokens.unwrap_or(0),
+        usage.output_tokens.unwrap_or(0),
+        usage.reasoning_tokens.unwrap_or(0),
     )))
 }
 
@@ -1258,9 +1209,9 @@ const TOOL_IMAGE_ACK: &str = "Loaded the requested image; it is shown in the nex
 /// **Why flag now, stop next — not mid-turn.** A single assistant turn can call
 /// `view_image` *and* `run_kaish` together; stopping the instant `view_image` returns
 /// would drop the other tool's result and orphan its `tool_use`. And a stop from
-/// `on_tool_result` hands back a transcript snapshotted *before* the turn's results are
+/// the tool-result outcome hands back a transcript snapshotted *before* the turn's results are
 /// folded into the run's messages, so it wouldn't even carry the image we came for. So
-/// we only *set a flag* on `on_tool_result`, and stop on the **next**
+/// we only *set a flag* on the tool-result outcome (`on_outcome`), and stop on the **next**
 /// `on_completion_call` — the point where rig has written every tool result of the
 /// triggering turn into the transcript and the stop returns it complete. Disabled
 /// (`enabled == false`) every callback is a no-op, so installing it on a transport
@@ -1284,21 +1235,21 @@ impl ToolImageBreakHook {
 }
 
 impl AgentHook for ToolImageBreakHook {
-    async fn on_tool_result(
-        &self,
-        _ctx: &HookContext,
-        event: ToolResultEvent<'_>,
-    ) -> ToolResultAction {
-        if self.enabled && tool_output_carries_image(event.presentation) {
-            self.saw_tool_image.store(true, Ordering::SeqCst);
+    async fn on_outcome(&self, _ctx: &HookContext, event: OutcomeEvent<'_>) -> OutcomeAction {
+        if self.enabled {
+            if let Ok(Answered::ToolResult { result }) = event.outcome {
+                if tool_output_carries_image(result.output()) {
+                    self.saw_tool_image.store(true, Ordering::SeqCst);
+                }
+            }
         }
-        ToolResultAction::Keep
+        OutcomeAction::Proceed
     }
 
     async fn on_completion_call(
         &self,
         _ctx: &HookContext,
-        _event: CompletionCall<'_>,
+        _event: CompletionCallEvent<'_>,
     ) -> CompletionCallAction {
         if self.enabled && self.saw_tool_image.load(Ordering::SeqCst) {
             CompletionCallAction::Stop(TOOL_IMAGE_BREAK.to_string())
@@ -1373,9 +1324,9 @@ fn rewrite_tool_image_history(history: Vec<Message>) -> Vec<Message> {
                 {
                     let ToolResult {
                         call,
-                        provider,
                         name,
                         content,
+                        is_error,
                     } = tr;
                     // Split the result into its text (the load note → ack) and its
                     // image(s) (→ a user turn each).
@@ -1393,9 +1344,9 @@ fn rewrite_tool_image_history(history: Vec<Message>) -> Vec<Message> {
                     };
                     new_parts.push(UserContent::ToolResult(ToolResult {
                         call,
-                        provider,
                         name,
                         content,
+                        is_error,
                     }));
                 }
                 other => new_parts.push(other),
@@ -1480,8 +1431,8 @@ fn split_for_resume(mut history: Vec<Message>) -> (Vec<Message>, Message) {
 /// **Seeing how each turn ended.** This is [`run_phase_logged`] with a log nobody
 /// keeps — reach for that one when the phase's per-turn finish reasons are the point.
 #[allow(clippy::too_many_arguments)] // each arg is a distinct, named loop input
-pub(crate) async fn run_phase<M, F>(
-    model: &M,
+pub(crate) async fn run_phase<F>(
+    model: &Llm,
     model_name: &str,
     preamble: &str,
     max_tokens: u64,
@@ -1496,7 +1447,6 @@ pub(crate) async fn run_phase<M, F>(
     identity: Option<crate::metrics::PhaseIdentity>,
 ) -> Result<(String, Usage)>
 where
-    M: CompletionModel + Clone + 'static,
     F: Fn() -> Result<Vec<DynamicTool>>,
 {
     run_phase_logged(
@@ -1520,15 +1470,13 @@ where
 
 /// [`run_phase`] with the per-turn completion record kept.
 ///
-/// rig's agent layer hands back only what its medium-neutral hook event carries —
-/// content and usage — so a phase that stopped early, got truncated, or was refused
-/// by a classifier looks identical to one that finished. The provider *did* say which
-/// (`finish_reason` / `stop_reason` / `finishReason`); it lives on
-/// `CompletionResponse::raw`, which the loop discards. Wrapping the model in
-/// [`Watched`] puts the record on the one path every completion takes — **including
-/// the turns inside the tool loop and the forced final turn**, which no hook reaches —
-/// and `log` is the caller's slot for it, readable after this returns whether the
-/// phase succeeded or failed.
+/// rig's agent layer hands back only the answer and the summed usage, so a phase that
+/// stopped early, got truncated, or was refused by a classifier looks identical to one
+/// that finished. The provider *did* say which (`finish_reason` / `stop_reason` /
+/// `finishReason`); it lives on `CompletionResponse::raw`. A [`Watch`] hook sees every
+/// completion's outcome — **including the turns inside the tool loop and the forced
+/// final turn** — and `log` is the caller's slot for the record, readable after this
+/// returns whether the phase succeeded or failed.
 ///
 /// The log is per call, never global: a phase makes its own, so concurrent consults
 /// never mix. It holds plain data and crosses `.await` freely — nothing to do with the
@@ -1560,9 +1508,9 @@ where
         gen_ai.response.finish_reason = tracing::field::Empty,
     )
 )]
-pub(crate) async fn run_phase_logged<M, F>(
+pub(crate) async fn run_phase_logged<F>(
     log: &CompletionLog,
-    model: &M,
+    model: &Llm,
     model_name: &str,
     preamble: &str,
     max_tokens: u64,
@@ -1577,7 +1525,6 @@ pub(crate) async fn run_phase_logged<M, F>(
     identity: Option<crate::metrics::PhaseIdentity>,
 ) -> Result<(String, Usage)>
 where
-    M: CompletionModel + Clone + 'static,
     F: Fn() -> Result<Vec<DynamicTool>>,
 {
     // Surface the exact reasoning/sampling params this phase ships (constant across the
@@ -1592,23 +1539,17 @@ where
     // the phase starts and closes when it answers or fails, which is the same span
     // this function is instrumented with.
     let started = std::time::Instant::now();
+    // The watcher times and records every completion the loop makes (an agent hook), and
+    // the beat rides it: the one place a call's duration is known, labeled with the role
+    // the caller named so a poller reads "synth chat" and "explorer chat" apart. A failed
+    // attempt counts as the inference call it was; a response is recorded only when one
+    // comes back, so the log holds one record per turn. Transient transport failures are
+    // retried underneath, in the HTTP client (`crate::completion_retry::RetryingHttp`),
+    // so the loop never sees them.
+    let watch = Watch::new(log.clone(), identity, model_name).with_beat(progress.clone(), role.key());
     let result = run_phase_loop(
-        // Two wrappers, innermost first: [`watched`] times and records each attempt the
-        // provider sees, then [`retried`] sends a turn the provider could not parse (or
-        // a transient transport failure) again. The watcher sits inside the retry so a
-        // call's duration is the provider's alone — never kaibo's own backoff sleep —
-        // and so a failed attempt counts as the inference call it was; a response is
-        // recorded only when one comes back, so the log still holds one record per
-        // turn. The retry sits below the loop because the loop loses the transcript on
-        // a completion error (`crate::completion_retry`). The beat rides the watcher:
-        // the one place a call's duration is known, labeled with the role the caller
-        // named so a poller reads "synth chat" and "explorer chat" apart.
-        &retried(
-            watched(model.clone(), log.clone(), identity, model_name)
-                .with_beat(progress.clone(), role.key()),
-            model_name,
-        ),
-        log,
+        model,
+        &watch,
         model_name,
         preamble,
         max_tokens,
@@ -1651,13 +1592,13 @@ where
     result
 }
 
-/// The bounded tool loop itself, driving whatever model it's handed — in production a
-/// [`crate::completion_watch::Watched`] wrapper inside a retry wrapper, so every turn below (main loop,
-/// view_image resume, forced finalize) records on its way past.
+/// The bounded tool loop itself, driving the model it's handed. Every agent it builds
+/// carries the [`Watch`] hook, so every turn below (main loop, view_image resume, forced
+/// finalize) records on its way past.
 #[allow(clippy::too_many_arguments)] // each arg is a distinct, named loop input
-async fn run_phase_loop<M, F>(
-    model: &M,
-    log: &CompletionLog,
+async fn run_phase_loop<F>(
+    model: &Llm,
+    watch: &Watch,
     model_name: &str,
     preamble: &str,
     max_tokens: u64,
@@ -1671,7 +1612,6 @@ async fn run_phase_loop<M, F>(
     role: ModelRole,
 ) -> Result<(String, Usage)>
 where
-    M: CompletionModel + Clone + 'static,
     F: Fn() -> Result<Vec<DynamicTool>>,
 {
     // Loop state across view_image-break resumes. The caller hands us the *assembled*
@@ -1696,7 +1636,7 @@ where
             full.push(prompt);
             return finalize_after_max_turns(
                 model,
-                log,
+                watch,
                 model_name,
                 preamble,
                 max_tokens,
@@ -1710,9 +1650,7 @@ where
             .await;
         }
 
-        let mut builder = AgentBuilder::new(model.clone())
-            .preamble(preamble)
-            .max_tokens(max_tokens);
+        let mut builder = model.agent().preamble(preamble).max_tokens(max_tokens);
         if let Some(t) = temperature {
             builder = builder.temperature(t);
         }
@@ -1739,8 +1677,14 @@ where
         // two the same way is possible and not yet done; until then they are a
         // documented undercount rather than silently exact.
         let result = agent
-            .runner(prompt.clone())
+            .prompt(prompt.clone())
             .history(history.clone())
+            // The watcher: times and records every completion of this run, failures
+            // included (it never changes an answer).
+            .add_hook(watch.clone())
+            // Sends a turn the provider ended as a malformed generation again, inside the
+            // run's turn budget (`crate::completion_retry`).
+            .add_hook(MalformedGenerationHook::new(model_name))
             .add_hook(ToolImageBreakHook::new(break_on_tool_images))
             // Every tool-driven phase runs through this loop, so installing the hook here
             // is what gives the consult driver, each delegated `explore′` sweep, and the
@@ -1754,7 +1698,7 @@ where
             .await;
 
         match result {
-            Ok(resp) if !resp.output.trim().is_empty() => return Ok((resp.output, resp.usage)),
+            Ok(resp) if !resp.output().trim().is_empty() => return Ok((resp.output(), resp.usage)),
             // An `Ok` with no answer text. rig treats a textless terminal turn as a clean
             // finish and hands back `output: ""` (its own
             // `prompt_request_stops_cleanly_on_empty_terminal_turn` pins that as intended),
@@ -1773,10 +1717,10 @@ where
                 // and re-asking blind is the fabrication risk the gate exists to refuse.
                 let turns = count_model_turns(&history) + resp.completion_calls.len();
                 let mut full = history;
-                full.extend(resp.messages.unwrap_or_default());
+                full.extend(resp.messages);
                 return write_up_or_fail(
                     model,
-                    log,
+                    watch,
                     model_name,
                     preamble,
                     max_tokens,
@@ -1799,7 +1743,7 @@ where
             // whole investigation; [`CutOffStopHook`] stops the run one step earlier, so
             // rig hands back the transcript instead. From here it is the same recovery as
             // the empty `Ok` above, told the true reason.
-            Err(PromptError::PromptCancelled {
+            Err(PromptError::Cancelled {
                 chat_history,
                 reason,
             }) if reason == CUT_OFF_STOP => {
@@ -1807,7 +1751,7 @@ where
                 let turns = count_model_turns(&history) + cut_off_turn;
                 return write_up_or_fail(
                     model,
-                    log,
+                    watch,
                     model_name,
                     preamble,
                     max_tokens,
@@ -1824,20 +1768,20 @@ where
                 )
                 .await;
             }
-            Err(PromptError::MaxTurnsError { chat_history, .. }) => {
+            Err(PromptError::MaxTurns { chat_history, .. }) => {
                 // The loop hit its cap and is about to write a forced final answer —
                 // tell the caller, so a watching client sees "wrapping up" not silence.
                 progress.emit(PhaseEvent::TurnCapReached);
                 return finalize_after_max_turns(
                     model,
-                    log,
+                    watch,
                     model_name,
                     preamble,
                     max_tokens,
                     temperature,
                     thinking,
                     make_tools()?,
-                    *chat_history,
+                    chat_history,
                     max_turns,
                     role,
                 )
@@ -1847,7 +1791,7 @@ where
             // call, so every `tool_use` in the triggering turn is already answered in
             // this transcript — co-tool-call orphaning is structurally impossible.
             // Move each view_image image onto its own user turn and resume.
-            Err(PromptError::PromptCancelled {
+            Err(PromptError::Cancelled {
                 chat_history,
                 reason,
             }) if reason == TOOL_IMAGE_BREAK => {
@@ -1871,8 +1815,9 @@ where
 /// it deliberately does not judge the answer, leaving the empty check to the callers
 /// that know which diagnostics belong on it.
 #[allow(clippy::too_many_arguments)] // mirrors run_phase's loop inputs
-async fn forced_finish_turn<M>(
-    model: &M,
+async fn forced_finish_turn(
+    model: &Llm,
+    watch: &Watch,
     preamble: &str,
     max_tokens: u64,
     temperature: Option<f64>,
@@ -1880,12 +1825,10 @@ async fn forced_finish_turn<M>(
     tools: Vec<DynamicTool>,
     chat_history: Vec<Message>,
     note: &str,
-) -> std::result::Result<(String, Usage), PromptError>
-where
-    M: CompletionModel + Clone + 'static,
-{
+) -> std::result::Result<(String, Usage), PromptError> {
     let (history, prompt) = finalize_prompt(chat_history, note);
-    let mut builder = AgentBuilder::new(model.clone())
+    let mut builder = model
+        .agent()
         .preamble(preamble)
         .max_tokens(max_tokens)
         .tool_choice(ToolChoice::None);
@@ -1900,12 +1843,13 @@ where
     // loop, so a single round is enough — and if a provider ignores ToolChoice::None
     // and still calls a tool, we surface that rather than recurse.
     agent
-        .runner(prompt)
+        .prompt(prompt)
         .history(history)
+        .add_hook(watch.clone())
         .max_turns(1)
         .run()
         .await
-        .map(|resp| (resp.output, resp.usage))
+        .map(|resp| (resp.output(), resp.usage))
 }
 
 /// The forced final turn after a phase hit its turn cap. See [`run_phase`]'s recovery
@@ -1915,9 +1859,9 @@ where
 /// empty success — so the answer passes the same [`empty_answer_error`] gate the early-
 /// stop path uses. There is no re-ask here: this already **is** the re-ask.
 #[allow(clippy::too_many_arguments)] // mirrors run_phase's loop inputs
-async fn finalize_after_max_turns<M>(
-    model: &M,
-    log: &CompletionLog,
+async fn finalize_after_max_turns(
+    model: &Llm,
+    watch: &Watch,
     model_name: &str,
     preamble: &str,
     max_tokens: u64,
@@ -1927,12 +1871,10 @@ async fn finalize_after_max_turns<M>(
     chat_history: Vec<Message>,
     max_turns: usize,
     role: ModelRole,
-) -> Result<(String, Usage)>
-where
-    M: CompletionModel + Clone + 'static,
-{
+) -> Result<(String, Usage)> {
     let (answer, usage) = forced_finish_turn(
         model,
+        watch,
         preamble,
         max_tokens,
         temperature,
@@ -1955,7 +1897,7 @@ where
             max_turns,
             max_turns,
             &usage,
-            log.last_finish_reason().as_deref(),
+            watch.log().last_finish_reason().as_deref(),
             max_tokens,
             "it used every turn and then wrote nothing when forced to conclude",
         ));
@@ -1999,8 +1941,8 @@ where
         error.type = tracing::field::Empty,
     )
 )]
-pub(crate) async fn run_completion<M>(
-    model: &M,
+pub(crate) async fn run_completion(
+    model: &Llm,
     model_name: &str,
     log: &CompletionLog,
     preamble: &str,
@@ -2009,10 +1951,7 @@ pub(crate) async fn run_completion<M>(
     prompt: Message,
     thinking: Option<&Value>,
     identity: Option<crate::metrics::PhaseIdentity>,
-) -> Result<(String, Usage)>
-where
-    M: CompletionModel + Clone + 'static,
-{
+) -> Result<(String, Usage)> {
     if let Some(t) = thinking {
         tracing::Span::current().record("gen_ai.request.thinking", tracing::field::display(t));
     }
@@ -2026,27 +1965,26 @@ where
     // answer, and a real answer — and an agent metric that skipped two of them would
     // undercount exactly the failures the conventions say to include.
     let outcome = async {
-        // Same two wrappers the loop uses, in the same order: the watcher inside the
-        // retry, so each attempt the provider sees is one record and its duration is
-        // the provider's alone, never kaibo's backoff sleep. A single-shot lane
-        // declares no tools, so it cannot fumble a tool call, but a provider that could
-        // not shape the response (`MalformedResponse`) reaches here too and is worth
-        // the same retry.
-        let mut builder = retried(
-            watched(model.clone(), log.clone(), identity, model_name),
-            model_name,
-        )
-        .completion_request(prompt)
-        .preamble(preamble.to_string())
-        .max_tokens(max_tokens);
+        // The same recording the loop gets, through the watcher's direct seam: each
+        // attempt the provider sees is one record, and its duration is the provider's
+        // alone, never kaibo's backoff sleep. A single-shot lane declares no tools, so it
+        // cannot fumble a tool call, but a provider that could not shape the response
+        // (`MalformedResponse`) reaches here too and is worth the same retry. Transient
+        // transport failures are retried underneath, in the HTTP client.
+        let watch = Watch::new(log.clone(), identity, model_name);
+        let mut request = model
+            .request(prompt)
+            .preamble(preamble.to_string())
+            .max_tokens(max_tokens);
         if let Some(t) = temperature {
-            builder = builder.temperature(t);
+            request = request.temperature(t);
         }
         if let Some(params) = thinking {
-            builder = builder.additional_params(params.clone());
+            request = request.additional_params(params.clone());
         }
-        // `send()` is `model.completion(builder.build())` — the one provider call.
-        let response = builder.send().await;
+        // One provider call per attempt.
+        let response =
+            retry_malformed(model_name, || watch.call(&model.model, request.clone())).await;
         if let Some(reason) = log.last_finish_reason() {
             tracing::Span::current().record("gen_ai.response.finish_reason", reason.as_str());
         }
@@ -2416,7 +2354,7 @@ impl Tool for RunExplore {
                     data: DocumentSourceKind::Base64(data_b64.clone()),
                     media_type: ImageMediaType::from_mime_type(mime),
                     detail: None,
-                    additional_params: None,
+                    native: None,
                 })),
                 Attachment::Text { .. } => None,
             }));
@@ -2882,7 +2820,7 @@ mod tests {
         tool_call_response, transcript_text, truncated, usage, with_raw, with_usage, CaptureHttp,
         RecordingSink, ScriptedClient,
     };
-    use rig_core::completion::CompletionRequest;
+    use rig_core::message::{AssistantMessage, CallId, ToolName};
     use std::fs;
     use std::num::NonZeroUsize;
     use std::path::Path;
@@ -3258,7 +3196,7 @@ mod tests {
         let flag = saw_image.clone();
         let client = ScriptedClient::builder()
             .on_model(MODEL, move |req| {
-                let has_image = req.chat_history.iter().any(|m| match m {
+                let has_image = req.chat_history.iter().any(|m| match &**m {
                     Message::User { content } => {
                         content.iter().any(|c| matches!(c, UserContent::Image(_)))
                     }
@@ -3325,7 +3263,7 @@ mod tests {
         let flag = saw_image.clone();
         let client = ScriptedClient::builder()
             .on_model(MODEL, move |req| {
-                let has_image = req.chat_history.iter().any(|m| match m {
+                let has_image = req.chat_history.iter().any(|m| match &**m {
                     Message::User { content } => {
                         content.iter().any(|c| matches!(c, UserContent::Image(_)))
                     }
@@ -3372,7 +3310,7 @@ mod tests {
                 let n = req
                     .chat_history
                     .iter()
-                    .find_map(|m| match m {
+                    .find_map(|m| match &**m {
                         Message::User { content } => Some(
                             content
                                 .iter()
@@ -3469,8 +3407,18 @@ mod tests {
             "oneshot is exactly ONE upstream request, got {}",
             direct.len()
         );
+        // rig 0.46 resolves the addressed model into the request itself, so each raw
+        // request names its own scripted id; that field differs by construction here.
+        let without_model = |raw: &Value| {
+            let mut raw = raw.clone();
+            raw.as_object_mut()
+                .expect("a serialized request is an object")
+                .remove("model");
+            raw
+        };
         assert_eq!(
-            direct[0].raw, looped[0].raw,
+            without_model(&direct[0].raw),
+            without_model(&looped[0].raw),
             "the direct completion must be request-for-request what the agent built"
         );
     }
@@ -3561,16 +3509,88 @@ mod tests {
         );
     }
 
+    /// The forced final turn after the turn cap is recorded too. It runs on its own
+    /// one-turn agent (`finalize_after_max_turns`), so it needs its own `Watch` hook;
+    /// without one, the log and the `run_phase` span would report the last *tool*
+    /// turn's ending as the phase's ending. Every loop turn here reports `tool_use`
+    /// and only the finalize turn reports `end_turn`, so a missing hook cannot pass.
+    #[tokio::test]
+    async fn the_completion_log_records_the_forced_final_turn_after_the_cap() {
+        const MODEL: &str = "driver";
+        let client = ScriptedClient::builder()
+            .on_model(MODEL, |req| {
+                if req.tool_choice == Some(ToolChoice::None) {
+                    Ok(with_raw(
+                        text_response("the final answer"),
+                        json!({"stop_reason": "end_turn"}),
+                    ))
+                } else {
+                    Ok(with_raw(
+                        tool_call_response("c1", "run_kaish", json!({"script": "echo again"})),
+                        json!({"stop_reason": "tool_use"}),
+                    ))
+                }
+            })
+            .build();
+
+        let dir = tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let log = CompletionLog::new();
+        let model = client.completion_model(MODEL);
+        let (answer, _usage) = run_phase_logged(
+            &log,
+            &model,
+            MODEL,
+            "answer the question",
+            16384,
+            None,
+            Message::user("q"),
+            2,
+            None,
+            Arc::new(crate::progress::NullSink),
+            ModelRole::Synth,
+            || {
+                Ok(vec![traced(RunKaish::new(KaishWorker::spawn_with(
+                    &root,
+                    SandboxConfig::default(),
+                )?))])
+            },
+            false,
+            None,
+        )
+        .await
+        .expect("the finalize turn answers after the cap");
+
+        assert_eq!(answer, "the final answer");
+        let turns = log.turns();
+        assert!(
+            turns.len() >= 2,
+            "the loop turns and the finalize turn are all recorded: {turns:?}"
+        );
+        assert!(
+            turns[..turns.len() - 1]
+                .iter()
+                .all(|t| t.finish_reason.as_deref() == Some("tool_use")),
+            "every turn before the finalize is a tool turn: {turns:?}"
+        );
+        assert_eq!(
+            log.last_finish_reason().as_deref(),
+            Some("end_turn"),
+            "the phase's ending is the forced final turn's, not the last tool turn's"
+        );
+    }
+
     /// A malformed tool call mid-loop costs one extra request, not the investigation.
     ///
     /// The live shape (a Gemini Flash explorer inside a `deliberate`): the model
-    /// fumbles one function call, the provider refuses to shape the response, and rig
-    /// hands back a `PromptError::CompletionError` carrying **no transcript** — so a
-    /// phase-level retry could only start over from the first prompt. The retry lives
-    /// under the loop ([`crate::completion_retry`]), where the request still holds every
-    /// turn. The proof that the investigation survived is in the third request: it still
-    /// carries the tool result the first two attempts were built on, and the answer is
-    /// written from it.
+    /// fumbles one function call and the provider ends the turn with
+    /// `finishReason: MALFORMED_FUNCTION_CALL` and no usable content. rig 0.46 carries
+    /// that as `FinishReason::Other`, which fails the run with **no transcript** — so a
+    /// phase-level retry could only start over from the first prompt.
+    /// [`crate::completion_retry::MalformedGenerationHook`] rejects the turn from
+    /// `on_model_turn_finished`, where the run still holds every turn. The proof that the
+    /// investigation survived is in the third request: it still carries the tool result
+    /// the first two attempts were built on, and the answer is written from it.
     #[tokio::test]
     async fn a_malformed_tool_call_mid_loop_is_retried_and_the_investigation_survives() {
         use std::sync::atomic::AtomicBool;
@@ -3590,9 +3610,9 @@ mod tests {
                     ));
                 }
                 if !fumbled.swap(true, Ordering::SeqCst) {
-                    return Err(crate::test_support::response_error(
-                        "Gemini stopped with finish_reason=MalformedFunctionCall: \
-                         malformed function call: default_api",
+                    return Ok(crate::test_support::with_finish_reason(
+                        reasoning_response("planning the call"),
+                        rig_core::completion::FinishReason::Other("MALFORMED_FUNCTION_CALL".into()),
                     ));
                 }
                 Ok(text_response("ANSWER: built on EVIDENCE"))
@@ -3709,8 +3729,8 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(answer, "done");
-        assert_eq!(reported.input_tokens, 321);
-        assert_eq!(reported.output_tokens, 21);
+        assert_eq!(reported.input_tokens, Some(321));
+        assert_eq!(reported.output_tokens, Some(21));
     }
 
     /// The recovery this whole hook exists for: a model names a tool that was never
@@ -4142,18 +4162,18 @@ mod tests {
 
         assert_eq!(
             out.usage.input_tokens,
-            ns * 100 + ne * 50,
+            Some(ns * 100 + ne * 50),
             "input tokens must sum synth + explorer completions"
         );
         assert_eq!(
             out.usage.output_tokens,
-            ns * 10 + ne * 5,
+            Some(ns * 10 + ne * 5),
             "output tokens must sum synth + explorer completions"
         );
         // And the explorer's share is genuinely included — the total strictly exceeds
         // the synth's own tokens, so dropping the nested sink would fail here.
         assert!(
-            out.usage.input_tokens > ns * 100,
+            out.usage.input_tokens > Some(ns * 100),
             "the delegated explorer's tokens must be folded into the consult total"
         );
     }
@@ -4664,7 +4684,7 @@ mod tests {
 
         let client = ScriptedClient::builder()
             .on_model(SYNTH, |req| {
-                let history: Vec<Message> = req.chat_history.clone();
+                let history: Vec<Message> = req.chat_history.iter().map(|m| (**m).clone()).collect();
                 if any_tool_result_image(&history) {
                     Ok(text_response("ANSWER: saw the diagram"))
                 } else {
@@ -4726,7 +4746,7 @@ mod tests {
 
         let client = ScriptedClient::builder()
             .on_model(SYNTH, |req| {
-                let history: Vec<Message> = req.chat_history.clone();
+                let history: Vec<Message> = req.chat_history.iter().map(|m| (**m).clone()).collect();
                 if user_image_messages(&history) > 0 {
                     Ok(text_response("ANSWER: saw the diagram"))
                 } else {
@@ -5219,7 +5239,7 @@ mod tests {
 
         let client = ScriptedClient::builder()
             .on_model(SYNTH, |req| {
-                let history: Vec<Message> = req.chat_history.clone();
+                let history: Vec<Message> = req.chat_history.iter().map(|m| (**m).clone()).collect();
                 assert!(
                     user_image_messages(&history) > 0,
                     "the single turn must carry the routed image"
@@ -5815,11 +5835,10 @@ mod tests {
 
         // The retry's usage is ADDED to what was already spent, never substituted —
         // the caller paid for both, so the footer must say so. (16,801 + 3,971.)
-        assert_eq!(
-            out.usage.output_tokens, 20_772,
+        assert_eq!(out.usage.output_tokens, Some(20_772),
             "the pre-retry spend must survive into the returned usage"
         );
-        assert_eq!(out.usage.input_tokens, 1_201_062);
+        assert_eq!(out.usage.input_tokens, Some(1_201_062));
     }
 
     /// **Gate direction 2 of 2: no evidence ⇒ error, and no forced turn is even attempted.**
@@ -5942,7 +5961,11 @@ mod tests {
         use rig_core::completion::message::Reasoning;
         let text = |t: &str| AssistantContent::text(t);
         let reasoning = AssistantContent::Reasoning(Reasoning::new("thinking"));
-        let call = AssistantContent::tool_call("c1", "run_kaish", serde_json::json!({}));
+        let call = AssistantContent::tool_call(
+            "c1",
+            rig_core::message::ToolName::new("run_kaish").unwrap(),
+            serde_json::json!({}),
+        );
         assert!(turn_wrote_nothing(&[]));
         assert!(turn_wrote_nothing(std::slice::from_ref(&reasoning)));
         assert!(turn_wrote_nothing(&[text("  \n"), reasoning.clone()]));
@@ -5974,10 +5997,7 @@ mod tests {
                     // The evidence is in; this turn reasons until it is cut off.
                     Ok(truncated(with_usage(
                         reasoning_response("Now weighing each function against the tests..."),
-                        Usage {
-                            reasoning_tokens: 32_768,
-                            ..usage(64_688, 32_768)
-                        },
+                        usage(64_688, 32_768).reasoning_tokens(32_768),
                     )))
                 } else {
                     Ok(with_usage(
@@ -6032,8 +6052,8 @@ mod tests {
         );
 
         // The cut-off turn was billed; it stays on the record (17,158 + 32,768 + 4,000).
-        assert_eq!(out.usage.output_tokens, 53_926);
-        assert_eq!(out.usage.reasoning_tokens, 32_768);
+        assert_eq!(out.usage.output_tokens, Some(53_926));
+        assert_eq!(out.usage.reasoning_tokens, Some(32_768));
     }
 
     /// The effort a recorded request carried, read from DeepSeek's `reasoning_effort`.
@@ -6074,19 +6094,20 @@ mod tests {
         sink
     }
 
-    /// The write-up effort must pass rig's own request builder on each wire that checks
-    /// effort against a closed list. `Arm::from_slot` preflights only the slot's effort,
-    /// so a write-up effort rig refused would fail inside the call, mid-recovery, as a
-    /// bare serde error that names no slot.
+    /// The write-up effort must pass the one effort check kaibo owns: Gemini's closed
+    /// `thinkingLevel` enum. A write-up effort Google refused would fail inside the call,
+    /// mid-recovery, as a provider error that names no slot.
     #[test]
-    fn the_cut_off_write_up_effort_passes_every_closed_effort_wire() {
-        use super::super::shaping::{accepted_efforts, EffortWire};
-        for wire in [EffortWire::Gemini, EffortWire::OpenaiResponses] {
-            assert!(
-                accepted_efforts(wire).contains(&CUT_OFF_WRITE_UP_EFFORT),
-                "{wire:?} must accept {CUT_OFF_WRITE_UP_EFFORT:?}"
-            );
-        }
+    fn the_cut_off_write_up_effort_passes_the_gemini_check() {
+        let gemini = ModelShape::resolve(
+            ProviderKind::Gemini,
+            "gemini-3.5-flash",
+            ThinkingStyleOverride::Auto,
+        );
+        assert!(
+            gemini.check_effort(CUT_OFF_WRITE_UP_EFFORT).is_ok(),
+            "Gemini must accept {CUT_OFF_WRITE_UP_EFFORT:?}"
+        );
     }
 
     /// The write-up after a cut-off thinks at [`CUT_OFF_WRITE_UP_EFFORT`], not at the
@@ -6103,10 +6124,7 @@ mod tests {
                 } else if transcript_text(req).contains("target_marker") {
                     Ok(truncated(with_usage(
                         reasoning_response("Now weighing each function against the tests..."),
-                        Usage {
-                            reasoning_tokens: 32_768,
-                            ..usage(64_688, 32_768)
-                        },
+                        usage(64_688, 32_768).reasoning_tokens(32_768),
                     )))
                 } else {
                     Ok(tool_call_response(
@@ -6155,10 +6173,7 @@ mod tests {
                 if is_finalize_turn(req) || transcript_text(req).contains("target_marker") {
                     Ok(truncated(with_usage(
                         reasoning_response("Still weighing..."),
-                        Usage {
-                            reasoning_tokens: 16_384,
-                            ..usage(64_688, 16_384)
-                        },
+                        usage(64_688, 16_384).reasoning_tokens(16_384),
                     )))
                 } else {
                     Ok(tool_call_response(
@@ -6243,10 +6258,7 @@ mod tests {
             .on_model(SYNTH, |_req| {
                 Ok(truncated(with_usage(
                     reasoning_response("Twenty-five cases; start with the first..."),
-                    Usage {
-                        reasoning_tokens: 16_384,
-                        ..usage(8_000, 16_384)
-                    },
+                    usage(8_000, 16_384).reasoning_tokens(16_384),
                 )))
             })
             .build();
@@ -6486,10 +6498,7 @@ mod tests {
             .on_model(MODEL, |_req| {
                 let resp = with_usage(
                     reasoning_response("Weighing each row..."),
-                    Usage {
-                        reasoning_tokens: 16384,
-                        ..usage(2_000, 16384)
-                    },
+                    usage(2_000, 16384).reasoning_tokens(16384),
                 );
                 Ok(with_raw(
                     resp,
@@ -6606,10 +6615,7 @@ mod tests {
             .on_model(EXPLORER, |_req| {
                 Ok(truncated(with_usage(
                     reasoning_response("surveying..."),
-                    Usage {
-                        reasoning_tokens: 16384,
-                        ..usage(2_000, 16384)
-                    },
+                    usage(2_000, 16384).reasoning_tokens(16384),
                 )))
             })
             .build();
@@ -7280,20 +7286,18 @@ mod tests {
         );
     }
 
-    /// An effort rig's typed request builder can't name fails **here**, at arm
-    /// construction, with a message an operator can act on — not mid-consult as a bare
-    /// `unknown variant \`max\``.
+    /// An effort Google's `thinkingLevel` enum can't name fails **here**, at arm
+    /// construction, with a message an operator can act on — not mid-consult as a
+    /// provider 400.
     ///
-    /// Two wires parse kaibo's blob into a typed struct with a closed rung set (rig's
-    /// Gemini `ThinkingLevel`, its Responses `ReasoningEffort`), and that ceiling is
-    /// rig's client rather than the provider's API — OpenAI's own endpoint takes `"max"`.
-    /// kaibo keeps no allowlist of its own, so the refusal comes from asking rig's
-    /// converter, and the rungs it offers are read back out of rig too
-    /// (`tests/effort_wire.rs` pins both against real request bodies). What this test
-    /// owns is the *message*: the model, the backend, the role, the value that failed,
-    /// whose ceiling it is, and what to type instead.
+    /// Gemini's level is a closed enum that Google itself enforces (`xhigh`, `max` and
+    /// `none` are refused, verified live), and rig 0.46 carries kaibo's blob as raw JSON,
+    /// so kaibo owns this one check ([`ModelShape::check_effort`]). It is not a global
+    /// allowlist: every other wire still passes an unknown rung through. What this test
+    /// owns is the *message*: the model, the backend, the role, the value that failed, and
+    /// what to type instead.
     #[test]
-    fn a_rig_refused_effort_fails_at_arm_construction_with_an_actionable_message() {
+    fn a_gemini_effort_google_refuses_fails_at_arm_construction_with_an_actionable_message() {
         let defaults = crate::config::Defaults::default();
         let backend = crate::config::Backend {
             name: "google".into(),
@@ -7314,24 +7318,18 @@ mod tests {
             ..ModelSlot::bare("google", "gemini-3.5-flash")
         };
         let err = Arm::from_slot(&backend, &slot, ModelRole::Synth, &defaults)
-            .expect_err("rig's Gemini builder refuses xhigh")
+            .expect_err("Gemini's thinking level has no xhigh")
             .to_string();
         assert!(err.contains("gemini-3.5-flash"), "names the model: {err}");
         assert!(err.contains("google"), "names the backend: {err}");
         assert!(err.contains("synth"), "names the role: {err}");
         assert!(err.contains("xhigh"), "names the value that failed: {err}");
         assert!(
-            err.contains("rig-core"),
-            "says whose ceiling this is, so the operator doesn't go hunting in \
-             Google's docs for a limit that isn't theirs: {err}"
-        );
-        assert!(
             err.contains("minimal | low | medium | high"),
             "offers the rungs this wire does take: {err}"
         );
 
-        // A rung the wire accepts builds normally — the preflight adds no ceiling of
-        // its own, it only reports rig's.
+        // A rung the wire accepts builds normally.
         let slot = ModelSlot {
             effort: Some("low".into()),
             ..ModelSlot::bare("google", "gemini-3.5-flash")
@@ -7344,7 +7342,7 @@ mod tests {
             "low"
         );
 
-        // And a passthrough wire keeps passing anything through — the preflight must not
+        // And a passthrough wire keeps passing anything through — the check must not
         // quietly become a global allowlist.
         let backend = crate::config::Backend {
             name: "deepseek".into(),
@@ -7735,37 +7733,22 @@ mod tests {
     #[tokio::test]
     async fn a_deepseek_image_reaches_the_wire_as_an_image_url_part() {
         let http = CaptureHttp::default();
-        let client = deepseek::Client::builder()
-            .api_key("sk-test")
-            .http_client(http.clone())
-            .build()
-            .expect("offline deepseek client construction");
+        let model = openai::OpenAIConfig::with_key(&deepseek_dialect(), "sk-test")
+            .connect(http.clone())
+            .chat("deepseek-flash");
         let image = Attachment::Image {
             path: "shot.png".into(),
             mime: "image/png",
             data_b64: "ZmFrZQ==".into(),
         };
-        let request = CompletionRequest {
-            model: None,
-            preamble: Some("describe it".into()),
-            chat_history: vec![user_turn_with_attachments(
-                std::slice::from_ref(&image),
-                "what color?".into(),
-            )],
-            documents: Vec::new(),
-            tools: Vec::new(),
-            temperature: None,
-            max_tokens: Some(64),
-            tool_choice: None,
-            additional_params: None,
-            output_schema: None,
-            record_telemetry_content: false,
-        };
+        let request = CompletionRequest::new(user_turn_with_attachments(
+            std::slice::from_ref(&image),
+            "what color?".into(),
+        ))
+        .preamble("describe it")
+        .max_tokens(64);
         // The capture transport always errors; the body is already built by then.
-        let _ = client
-            .completion_model("deepseek-flash")
-            .completion(request)
-            .await;
+        let _ = model.call(request).await;
         let body = http.recorded().expect("rig serialized a request body");
         let user = body["messages"]
             .as_array()
@@ -7798,28 +7781,14 @@ mod tests {
     #[tokio::test]
     async fn openrouter_completion_sends_max_tokens_natively() {
         let http = CaptureHttp::default();
-        let client = openrouter::Client::builder()
-            .api_key("sk-or-test")
-            .http_client(http.clone())
-            .build()
-            .expect("offline openrouter client construction");
-        let request = CompletionRequest {
-            model: None,
-            preamble: Some("ground every claim".into()),
-            chat_history: vec![Message::user("hi")],
-            documents: Vec::new(),
-            tools: Vec::new(),
-            temperature: None,
-            max_tokens: Some(4096),
-            tool_choice: None,
-            additional_params: Some(json!({ "reasoning": { "effort": "high" } })),
-            output_schema: None,
-            record_telemetry_content: false,
-        };
+        let llm = Arm::openrouter_completion_model(http.clone(), "sk-or-test".into(), "qwen/qwen3.7-max");
+        let request = llm
+            .request(Message::user("hi"))
+            .preamble("ground every claim")
+            .max_tokens(4096)
+            .additional_params(json!({ "reasoning": { "effort": "high" } }));
         // The capture transport always errors; the body is already built by then.
-        let _ = Arm::openrouter_completion_model(&client, "qwen/qwen3.7-max")
-            .completion(request)
-            .await;
+        let _ = llm.dyn_model().call(request).await;
         let body = http.recorded().expect("rig serialized a request body");
         assert_eq!(
             body["max_tokens"], 4096,
@@ -7843,68 +7812,54 @@ mod tests {
     /// short of the body would stay green through that.
     #[tokio::test]
     async fn openrouter_arm_enables_prompt_caching() {
-        async fn system_block(
-            model: openrouter::CompletionModel<CaptureHttp>,
-            http: &CaptureHttp,
-        ) -> Value {
-            let request = CompletionRequest {
-                model: None,
-                preamble: Some("ground every claim".into()),
-                chat_history: vec![Message::user("hi")],
-                documents: Vec::new(),
-                tools: Vec::new(),
-                temperature: None,
-                max_tokens: Some(4096),
-                tool_choice: None,
-                additional_params: None,
-                output_schema: None,
-                record_telemetry_content: false,
-            };
+        /// The serialized request body one arm sends for a one-turn prompt.
+        async fn body_sent_by(llm: &Llm, http: &CaptureHttp) -> Value {
+            let request = llm
+                .request(Message::user("hi"))
+                .preamble("ground every claim")
+                .max_tokens(4096);
             // The capture transport always errors; the body is already built by then.
-            let _ = model.completion(request).await;
-            http.recorded()
-                .expect("rig serialized a request body")
-                .pointer("/messages/0")
-                .cloned()
-                .expect("the system message leads the body")
+            let _ = llm.dyn_model().call(request).await;
+            http.recorded().expect("rig serialized a request body")
         }
 
-        let http = CaptureHttp::default();
-        let client = openrouter::Client::builder()
-            .api_key("sk-or-test")
-            .http_client(http.clone())
-            .build()
-            .expect("offline openrouter client construction");
-
         let plain_http = CaptureHttp::default();
-        let plain_client = openrouter::Client::builder()
-            .api_key("sk-or-test")
-            .http_client(plain_http.clone())
-            .build()
-            .expect("offline openrouter client construction");
-        let plain = system_block(
-            plain_client.completion_model("~anthropic/claude-sonnet-latest"),
-            &plain_http,
-        )
-        .await;
+        let plain_llm = Llm::new(
+            openai::OpenAIConfig::with_key(&openai::wire::OPENROUTER, "sk-or-test")
+                .connect(plain_http.clone())
+                .chat("~anthropic/claude-sonnet-latest"),
+        );
+        let plain = body_sent_by(&plain_llm, &plain_http).await;
         assert!(
             !plain.to_string().contains("cache_control"),
             "rig marks no breakpoint by default — the arm constructor is load-bearing: \
              {plain}"
         );
 
-        let armed = system_block(
-            Arm::openrouter_completion_model(&client, "~anthropic/claude-sonnet-latest"),
-            &http,
-        )
-        .await;
-        assert!(
-            armed.to_string().contains(r#""cache_control""#),
-            "the OpenRouter arm must put a cache breakpoint on the system prompt: {armed}"
+        let http = CaptureHttp::default();
+        let armed_llm = Arm::openrouter_completion_model(
+            http.clone(),
+            "sk-or-test".into(),
+            "~anthropic/claude-sonnet-latest",
         );
-        assert!(
-            armed.to_string().contains("ephemeral"),
-            "the breakpoint is the ephemeral kind OpenRouter bills against: {armed}"
+        let armed = body_sent_by(&armed_llm, &http).await;
+        assert_eq!(
+            armed.pointer("/cache_control/type"),
+            Some(&json!("ephemeral")),
+            "the OpenRouter arm must send the ephemeral cache marker OpenRouter bills \
+             against: {armed}"
+        );
+
+        // The app identity rides every request, so kaibo's traffic is attributable in the
+        // OpenRouter dashboard.
+        let headers = http.recorded_headers().expect("a request was sent");
+        assert_eq!(
+            headers.get("x-openrouter-title").and_then(|v| v.to_str().ok()),
+            Some("kaibo")
+        );
+        assert_eq!(
+            headers.get("http-referer").and_then(|v| v.to_str().ok()),
+            Some("https://github.com/tobert/kaibo")
         );
     }
 
@@ -8808,28 +8763,43 @@ mod tests {
 
     /// An assistant turn calling `view_image` by `id`.
     fn vi_call(id: &str) -> Message {
-        Message::Assistant {
-            id: None,
-            content: vec![AssistantContent::tool_call(
-                id,
-                ViewImage::NAME,
-                json!({ "path": "shot.png" }),
-            )],
+        assistant_calling(vec![tc(id, ViewImage::NAME, json!({ "path": "shot.png" }))])
+    }
+
+    /// A tool call block, naming its tool as rig 0.46 requires (a non-empty `ToolName`).
+    fn tc(id: &str, name: &str, args: Value) -> AssistantContent {
+        AssistantContent::tool_call(id, ToolName::new(name).expect("a non-empty tool name"), args)
+    }
+
+    /// An assistant turn holding `content`.
+    fn assistant_calling(content: Vec<AssistantContent>) -> Message {
+        Message::Assistant(AssistantMessage::new(content))
+    }
+
+    /// A tool result answering `id`, as the tool `name` returned `content`.
+    fn tool_result(id: &str, name: &str, content: Vec<ToolResultContent>) -> ToolResult {
+        ToolResult {
+            call: CallId::from_wire(id),
+            name: ToolName::new(name).expect("a non-empty tool name"),
+            content,
+            is_error: false,
         }
     }
 
     /// A `view_image` tool result: the load note (text) *and* the image part — the
     /// two typed content blocks `ViewImage` returns.
     fn vi_result(id: &str) -> UserContent {
-        UserContent::ToolResult(ToolResult {
-            call: rig_core::completion::message::ToolCallId::new_or_mint(id.to_string()),
-            provider: None,
-            name: ViewImage::NAME.to_string(),
-            content: vec![
+        UserContent::ToolResult(tool_result(
+            id,
+            ViewImage::NAME,
+            vec![
                 ToolResultContent::text("Loaded image shot.png (image/png, 1.0 KiB)."),
-                ToolResultContent::image_base64("ZmFrZQ==", None, None),
+                ToolResultContent::Image(Image {
+                    data: DocumentSourceKind::Base64("ZmFrZQ==".into()),
+                    ..Image::default()
+                }),
             ],
-        })
+        ))
     }
 
     /// True if any tool result anywhere still carries an image part.
@@ -8856,19 +8826,20 @@ mod tests {
     /// stays answered (now by text). The separate message is load-bearing — rig's
     /// openai converter drops non-tool parts from a mixed user turn.
     /// The rewrite rebuilds each image-bearing tool result, so it must carry the whole
-    /// identity across: `provider` is the id the wire echoes back to pair the result
-    /// with its call, and `name` is what name-keyed wires replay. Dropping either
-    /// would still pass the call-id checks in the other rewrite tests.
+    /// identity across: `call` is the id the wire echoes back to pair the result with its
+    /// call (a provider-issued id in rig 0.46), `name` is what name-keyed wires replay,
+    /// and `is_error` says whether the tool failed. Dropping any would still pass the
+    /// call-id checks in the other rewrite tests.
     #[test]
-    fn rewrite_keeps_the_tool_results_provider_id_and_name() {
-        use rig_core::completion::message::ProviderCallId;
+    fn rewrite_keeps_the_tool_results_provider_id_name_and_error_flag() {
         let UserContent::ToolResult(mut tr) = vi_result("call-1") else {
             unreachable!("vi_result builds a tool result")
         };
-        tr.provider = ProviderCallId::new("call_wire_1");
+        tr.call = CallId::from_wire("call_wire_1");
+        tr.is_error = true;
         let history = vec![
             Message::user("look at shot.png"),
-            vi_call("call-1"),
+            vi_call("call_wire_1"),
             Message::User {
                 content: vec![UserContent::ToolResult(tr)],
             },
@@ -8888,13 +8859,13 @@ mod tests {
             !any_tool_result_image(&out),
             "the rewrite ran on this result: {out:?}"
         );
-        assert_eq!(rewritten.call.as_str(), "call-1");
         assert_eq!(
-            rewritten.provider.as_ref().map(|p| p.call_id.as_str()),
+            rewritten.call.provider().map(|p| p.as_str()),
             Some("call_wire_1"),
             "the provider-issued id survives: {rewritten:?}"
         );
-        assert_eq!(rewritten.name, ViewImage::NAME, "the tool name survives");
+        assert_eq!(&*rewritten.name, ViewImage::NAME, "the tool name survives");
+        assert!(rewritten.is_error, "the failure flag survives");
     }
 
     #[test]
@@ -8922,7 +8893,7 @@ mod tests {
         assert!(
             out.iter().any(|m| matches!(m, Message::User { content }
                 if content.iter().any(|c| matches!(c, UserContent::ToolResult(tr)
-                    if tr.call.as_str() == "call-1"
+                    if &*tr.call.wire() == "call-1"
                     && tr.content.iter().all(|rc| matches!(rc, ToolResultContent::Text(_))))))),
             "the view_image tool_use stays answered by a text result: {out:?}"
         );
@@ -8972,21 +8943,18 @@ mod tests {
     /// proven separately in the driven loop test.)
     #[test]
     fn rewrite_leaves_a_co_tool_call_result_intact() {
-        let assistant = Message::Assistant {
-            id: None,
-            content: vec![
-                AssistantContent::tool_call("vi", ViewImage::NAME, json!({ "path": "shot.png" })),
-                AssistantContent::tool_call("rk", "run_kaish", json!({ "script": "ls" })),
-            ],
-        };
+        let assistant = assistant_calling(vec![
+            tc("vi", ViewImage::NAME, json!({ "path": "shot.png" })),
+            tc("rk", "run_kaish", json!({ "script": "ls" })),
+        ]);
         let results = Message::User {
             content: vec![
                 vi_result("vi"),
-                UserContent::tool_result(
+                UserContent::ToolResult(tool_result(
                     "rk",
                     "run_kaish",
                     vec![ToolResultContent::text("exit:0\nshot.png")],
-                ),
+                )),
             ],
         };
         let out = rewrite_tool_image_history(vec![Message::user("q"), assistant, results]);
@@ -8996,7 +8964,7 @@ mod tests {
         assert!(
             out.iter().any(|m| matches!(m, Message::User { content }
                 if content.iter().any(|c| matches!(c, UserContent::ToolResult(tr)
-                    if tr.call.as_str() == "rk"
+                    if &*tr.call.wire() == "rk"
                     && tr.content.iter().any(|rc| matches!(rc,
                         ToolResultContent::Text(t) if t.text.contains("shot.png"))))))),
             "the run_kaish tool_result is preserved verbatim: {out:?}"
@@ -9010,26 +8978,23 @@ mod tests {
     /// not the tool's name.
     #[test]
     fn rewrite_moves_an_explore_result_image_onto_a_separate_user_image_turn() {
-        let assistant = Message::Assistant {
-            id: None,
-            content: vec![AssistantContent::tool_call(
+        let assistant = assistant_calling(vec![tc(
+            "explore-1",
+            "explore",
+            json!({ "question": "what does the diagram show?" }),
+        )]);
+        let result = Message::User {
+            content: vec![UserContent::ToolResult(tool_result(
                 "explore-1",
                 "explore",
-                json!({ "question": "what does the diagram show?" }),
-            )],
-        };
-        let result = Message::User {
-            content: vec![UserContent::ToolResult(ToolResult {
-                call: rig_core::completion::message::ToolCallId::new_or_mint(
-                    "explore-1".to_string(),
-                ),
-                provider: None,
-                name: "explore".to_string(),
-                content: vec![
+                vec![
                     ToolResultContent::text("attached: docs/arch.png (image/png, 4.0 KiB)"),
-                    ToolResultContent::image_base64("ZmFrZQ==", None, None),
+                    ToolResultContent::Image(Image {
+                        data: DocumentSourceKind::Base64("ZmFrZQ==".into()),
+                        ..Image::default()
+                    }),
                 ],
-            })],
+            ))],
         };
         let out = rewrite_tool_image_history(vec![Message::user("q"), assistant, result]);
 
@@ -9045,7 +9010,7 @@ mod tests {
         assert!(
             out.iter().any(|m| matches!(m, Message::User { content }
                 if content.iter().any(|c| matches!(c, UserContent::ToolResult(tr)
-                    if tr.call.as_str() == "explore-1"
+                    if &*tr.call.wire() == "explore-1"
                     && tr.content.iter().all(|rc| matches!(rc, ToolResultContent::Text(_))))))),
             "the explore tool_use stays answered by a text-only result: {out:?}"
         );
@@ -9057,25 +9022,24 @@ mod tests {
     /// second on a channel the transport rejects. (DeepSeek review gap, 2026-07-26.)
     #[test]
     fn rewrite_moves_both_images_when_two_tools_carry_them() {
-        let assistant = Message::Assistant {
-            id: None,
-            content: vec![
-                AssistantContent::tool_call("vi", ViewImage::NAME, json!({ "path": "shot.png" })),
-                AssistantContent::tool_call("ex", "explore", json!({ "question": "diagram?" })),
-            ],
-        };
+        let assistant = assistant_calling(vec![
+            tc("vi", ViewImage::NAME, json!({ "path": "shot.png" })),
+            tc("ex", "explore", json!({ "question": "diagram?" })),
+        ]);
         let results = Message::User {
             content: vec![
                 vi_result("vi"),
-                UserContent::ToolResult(ToolResult {
-                    call: rig_core::completion::message::ToolCallId::new_or_mint("ex".to_string()),
-                    provider: None,
-                    name: "explore".to_string(),
-                    content: vec![
+                UserContent::ToolResult(tool_result(
+                    "ex",
+                    "explore",
+                    vec![
                         ToolResultContent::text("attached: docs/arch.png (image/png, 4.0 KiB)"),
-                        ToolResultContent::image_base64("ZmFrZTI=", None, None),
+                        ToolResultContent::Image(Image {
+                            data: DocumentSourceKind::Base64("ZmFrZTI=".into()),
+                            ..Image::default()
+                        }),
                     ],
-                }),
+                )),
             ],
         };
         let out = rewrite_tool_image_history(vec![Message::user("q"), assistant, results]);
@@ -9093,7 +9057,7 @@ mod tests {
             assert!(
                 out.iter().any(|m| matches!(m, Message::User { content }
                     if content.iter().any(|c| matches!(c, UserContent::ToolResult(tr)
-                        if tr.call.as_str() == id
+                        if &*tr.call.wire() == id
                         && tr.content.iter().all(|rc| matches!(rc, ToolResultContent::Text(_))))))),
                 "tool_use `{id}` stays answered by a text-only result: {out:?}"
             );
@@ -9126,7 +9090,7 @@ src/view_image.rs:177: json!({"response": note, "parts": [{"type":"image", "data
                 data: DocumentSourceKind::Base64("ZmFrZQ==".into()),
                 media_type: ImageMediaType::from_mime_type("image/png"),
                 detail: None,
-                additional_params: None,
+                native: None,
             }),
         ])
         .expect("two parts");

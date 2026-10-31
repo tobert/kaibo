@@ -369,15 +369,13 @@ Every row above except the Anthropic one was measured against the live endpoint,
 is re-checkable: `tests/consult.rs` carries an `#[ignore]`d probe per provider that fails
 if a ladder moves, rather than letting this table quietly rot.
 
-**rig's client can be a second ceiling on two wires**, independent of the provider: rig
-parses kaibo's params into a typed struct for Gemini and for OpenAI's Responses API, and
-a typed struct has a closed set of rungs. On rig 0.38 that made `max` fail for a hosted
-GPT slot even though OpenAI's own API accepted it; **rig 0.41 added the rung, so `max`
-now works there**. Gemini still stops at `high` — that one is Google's own limit, not
-rig's. kaibo asks rig's converter before each call and refuses with a message naming the
-cast, the slot, the backend and the rungs that wire *does* take, rather than letting a
-bare ``unknown variant `max` `` surface mid-consult. That list is read back out of rig,
-which is why the 0.41 upgrade widened it with no kaibo change.
+**Gemini is the one wire kaibo checks itself.** Google's `thinkingLevel` is a closed
+enum (`minimal`, `low`, `medium`, `high`), and `none`, `xhigh` and `max` fail on every
+call. kaibo refuses those at arm construction with a message naming the cast, the slot,
+the backend and the four values the wire does take, rather than letting a provider 400
+surface mid-consult. Every other wire passes the value through to the provider (rig 0.46
+sends kaibo's params as raw JSON on all of them); a rung that wire does not take comes
+back as the provider's own error.
 
 **`"none"` is an off-switch, not the shallowest rung.** kaibo treats it as a sentinel
 beside the ladder rather than a depth: where a provider ships a structural disable

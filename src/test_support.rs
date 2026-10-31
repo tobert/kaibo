@@ -1,13 +1,22 @@
-//! A scripted, offline stand-in for a provider client.
+//! A scripted, offline stand-in for a provider.
 //!
-//! kaibo's whole model surface flows through rig's [`CompletionClient`] /
-//! [`CompletionModel`] traits ([`crate::consult::run_phase`] is generic over the
-//! client). The live tests exercise that loop against a real provider; this harness
-//! lets us drive the *same* loop deterministically, with no network — so we can pin
-//! behavior the live tests can only observe flakily: that a `consult` tool call
-//! actually drives the nested `explore′` agent and aggregates into the report, that
-//! the turn-cap finalize path produces an answer, that a session's prior turns reach
-//! the next prompt.
+//! kaibo's whole model surface flows through rig's erased completion model
+//! ([`crate::consult::Llm`] over `DynModel<Completion>`): [`crate::consult::run_phase`]
+//! is a plain function over it. The live tests exercise that loop against a real
+//! provider; this harness lets us drive the *same* loop deterministically, with no
+//! network — so we can pin behavior the live tests can only observe flakily: that a
+//! `consult` tool call actually drives the nested `explore′` agent and aggregates into
+//! the report, that the turn-cap finalize path produces an answer, that a session's
+//! prior turns reach the next prompt.
+//!
+//! ## How it plugs in (rig 0.46)
+//!
+//! rig pairs a *wire* with a *transport* to make a model. This harness uses rig's own
+//! scripted wire (`rig_core::test_utils::MockScript`) and supplies the transport:
+//! [`ScriptedRuntime`] receives the request exactly as a real transport would (history
+//! already shaped for the wire), records it, and answers from a responder. Everything
+//! above the transport — the agent loop, hooks, tool dispatch, usage and finish-reason
+//! folding — is rig's real code.
 //!
 //! ## Design — content-driven, not consumption-ordered
 //!
@@ -15,8 +24,7 @@
 //! from it. The mock mirrors that: a **responder** is `Fn(&CompletionRequest) ->
 //! Result<…>`, registered per model id, that branches on the request's content
 //! (preamble, chat history, `tool_choice`, …) rather than on "which call number is
-//! this". That matters because rig executes a turn's tool calls with
-//! `buffer_unordered` (default concurrency 1, but *unordered* by construction): a
+//! this". That matters because rig can execute a turn's tool calls concurrently: a
 //! queue-pop mock ("the Nth call returns the Nth step") would be correct today and
 //! race the day a driver turn emits two `explore` calls or someone bumps tool
 //! concurrency. Branching on content is immune to that — and it also handles the
@@ -29,10 +37,9 @@
 //!   log so a test can assert *what was asked* (which model saw which preamble, what
 //!   `max_tokens`/`additional_params` rode along) independently of how it answered.
 //!
-//! `stream()` is intentionally `unimplemented!()`: kaibo only ever drives the
-//! non-streaming `prompt` loop, which calls `completion()`. If kaibo ever adopts the
-//! streaming prompt path, this mock grows a `stream` arm — a known boundary, not a
-//! silent gap.
+//! The scripted transport answers unary calls only: kaibo drives the non-streaming
+//! `run` loop. If kaibo ever adopts the streaming path, this mock grows a streaming
+//! arm — a known boundary, not a silent gap.
 
 #![allow(dead_code)] // shared across test binaries; each uses only a subset.
 
@@ -41,20 +48,23 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use bytes::Bytes;
-use rig_core::client::CompletionClient;
 use rig_core::completion::message::{
-    AssistantContent, Message, ToolChoice, ToolResultContent, UserContent,
+    AssistantContent, Message, ToolChoice, ToolName, ToolResultContent, UserContent,
 };
-use rig_core::completion::{
-    CompletionError, CompletionModel, CompletionRequest, CompletionResponse, Usage,
-};
+use rig_core::completion::{CompletionRequest, CompletionResponse, Usage};
+use rig_core::driver::{Exchange, Model, Opened, Opening, Transport};
+use rig_core::error::ProviderError;
 use rig_core::http_client::{self, HttpClientExt};
+use rig_core::message::Origin;
+use rig_core::test_utils::{MockFrame, MockScript, MOCK_API};
 use serde_json::Value;
+
+use crate::consult::Llm;
 
 /// How the mock answers one request for one model: branch on the request's content
 /// and return a response, or an error to exercise the failure paths.
 pub type Responder =
-    Arc<dyn Fn(&CompletionRequest) -> Result<CompletionResponse, CompletionError> + Send + Sync>;
+    Arc<dyn Fn(&CompletionRequest) -> Result<CompletionResponse, ProviderError> + Send + Sync>;
 
 /// A snapshot of one inbound completion request, captured for post-hoc assertions.
 /// Decoupled from the responder so a test can assert *what was asked* separately
@@ -100,28 +110,28 @@ impl RecordedRequest {
         Self {
             model: model.to_string(),
             preamble: preamble(req),
-            tool_names: req.tools.iter().map(|t| t.name.clone()).collect(),
+            tool_names: req.tools.iter().map(|t| t.name.to_string()).collect(),
             user_text: user_text(req),
             transcript: transcript_text(req),
             additional_params: req.additional_params.clone(),
             max_tokens: req.max_tokens,
             tool_choice: req.tool_choice.clone(),
-            chat_history: req.chat_history.clone(),
+            chat_history: req.chat_history.iter().map(|m| (**m).clone()).collect(),
             raw: serde_json::to_value(req).unwrap_or(Value::Null),
         }
     }
 }
 
 /// A scripted provider client. Cheap to clone — clones share one responder table and
-/// one request log, so the client rig hands to the nested `explore′` agent (a clone)
+/// one request log, so the model rig hands to the nested `explore′` agent (a clone)
 /// records into the same log and routes through the same responders.
 #[derive(Clone)]
 pub struct ScriptedClient {
     responders: Arc<HashMap<String, Responder>>,
-    /// Model ids whose `completion()` never returns — a *wedged provider*: the call
-    /// parks on an effectively unbounded async sleep instead of answering. This is
-    /// the failure mode a stopped/hung local server produces (the request goes out,
-    /// no response ever comes), and it's what the call-deadline backstop must catch.
+    /// Model ids whose call never returns — a *wedged provider*: the call parks on an
+    /// effectively unbounded async sleep instead of answering. This is the failure mode
+    /// a stopped/hung local server produces (the request goes out, no response ever
+    /// comes), and it's what the call-deadline backstop must catch.
     hangers: Arc<HashSet<String>>,
     log: Arc<Mutex<Vec<RecordedRequest>>>,
 }
@@ -132,6 +142,22 @@ impl ScriptedClient {
             responders: HashMap::new(),
             hangers: HashSet::new(),
         }
+    }
+
+    /// The scripted model that answers to `id`: rig's scripted wire over this client's
+    /// transport. Panics on first use of an id with no responder, naming the ids that
+    /// are registered.
+    pub fn completion_model(&self, id: impl Into<String>) -> Llm {
+        let id = id.into();
+        Llm::new(Model::new(
+            MockScript::default().with_id(id.clone()),
+            ScriptedRuntime {
+                id,
+                responders: self.responders.clone(),
+                hangers: self.hangers.clone(),
+                log: self.log.clone(),
+            },
+        ))
     }
 
     /// Snapshot of every request seen so far, in call order.
@@ -148,6 +174,18 @@ impl ScriptedClient {
     }
 }
 
+impl crate::consult::ModelSource for ScriptedClient {
+    fn completion_model(&self, id: &str) -> Llm {
+        ScriptedClient::completion_model(self, id)
+    }
+}
+
+impl crate::consult::ModelSource for &ScriptedClient {
+    fn completion_model(&self, id: &str) -> Llm {
+        ScriptedClient::completion_model(self, id)
+    }
+}
+
 pub struct ScriptedBuilder {
     responders: HashMap<String, Responder>,
     hangers: HashSet<String>,
@@ -158,7 +196,7 @@ impl ScriptedBuilder {
     /// and returns a response (or an error, to drive a failure path).
     pub fn on_model<F>(mut self, id: impl Into<String>, responder: F) -> Self
     where
-        F: Fn(&CompletionRequest) -> Result<CompletionResponse, CompletionError>
+        F: Fn(&CompletionRequest) -> Result<CompletionResponse, ProviderError>
             + Send
             + Sync
             + 'static,
@@ -167,9 +205,9 @@ impl ScriptedBuilder {
         self
     }
 
-    /// Make model `id` a *wedged provider*: its `completion()` records the request
-    /// then parks forever (an unbounded async sleep), never answering — the
-    /// stopped/hung-backend shape the call-deadline test drives. Needs no responder.
+    /// Make model `id` a *wedged provider*: its call records the request then parks
+    /// forever (an unbounded async sleep), never answering — the stopped/hung-backend
+    /// shape the call-deadline test drives. Needs no responder.
     pub fn hang_model(mut self, id: impl Into<String>) -> Self {
         self.hangers.insert(id.into());
         self
@@ -184,14 +222,52 @@ impl ScriptedBuilder {
     }
 }
 
-/// The model handle rig builds per `client.agent(model)`. Carries its own id (the
-/// routing key) plus shared handles to the responder table and request log.
+/// The scripted transport for one model id. Carries its id (the routing key) plus
+/// shared handles to the responder table and request log.
 #[derive(Clone)]
-pub struct ScriptedModel {
+pub struct ScriptedRuntime {
     id: String,
     responders: Arc<HashMap<String, Responder>>,
     hangers: Arc<HashSet<String>>,
     log: Arc<Mutex<Vec<RecordedRequest>>>,
+}
+
+/// A scripted response's `raw` is free-form JSON a responder can shape into whatever
+/// wire form the test is about — an Anthropic `stop_reason`, a Gemini
+/// `candidates[].finishReason` — which is what lets the offline harness drive
+/// [`Watch`](crate::completion_watch::Watch), whose whole job is reading that payload.
+/// `Value::Null` is the default: a response that reports nothing.
+impl Transport<MockScript> for ScriptedRuntime {
+    fn send(&self, request: CompletionRequest, _exchange: Exchange) -> Opening<MockFrame> {
+        // Record first, so even a request that the responder errors on is observable.
+        self.log
+            .lock()
+            .expect("request log poisoned")
+            .push(RecordedRequest::capture(&self.id, &request));
+        let id = self.id.clone();
+        let hangs = self.hangers.contains(&id);
+        let responder = self.responders.get(&id).cloned();
+        let registered: Vec<String> = self.responders.keys().cloned().collect();
+        Opening::new(async move {
+            // A wedged provider: the request went out (recorded above) and no answer ever
+            // comes. Park effectively forever — a real call-deadline fires long before
+            // this elapses, and the request is already observable in the log.
+            if hangs {
+                tokio::time::sleep(Duration::from_secs(24 * 60 * 60)).await;
+            }
+            let responder = responder.unwrap_or_else(|| {
+                panic!(
+                    "scripted client has no responder for model {id:?} (registered: {registered:?})"
+                )
+            });
+            let response = responder(&request)?;
+            let document = response.raw.clone();
+            Ok(Opened::new(futures::stream::iter([Ok(MockFrame::Response(
+                Box::new(response),
+            ))]))
+            .with_document(document))
+        })
+    }
 }
 
 /// An [`HttpClientExt`] that records the request body rig built, then fails.
@@ -200,14 +276,20 @@ pub struct ScriptedModel {
 /// hands the request to the transport, so no network, no key, and no canned response
 /// are needed. This is how a unit test asks "what would kaibo actually have sent?",
 /// which is the only honest form of the question for a provider option that shows up
-/// as a transformation of the outgoing body rather than a readable field.
+/// as a transformation of the outgoing body rather than a readable field. `Clone`s
+/// share one record, and the headers are kept beside each body.
 #[derive(Clone, Debug, Default)]
-pub struct CaptureHttp(Arc<Mutex<Vec<serde_json::Value>>>);
+pub struct CaptureHttp(Arc<Mutex<Vec<(http::HeaderMap, serde_json::Value)>>>);
 
 impl CaptureHttp {
     /// The first body rig serialized, if it got that far.
     pub fn recorded(&self) -> Option<serde_json::Value> {
-        self.0.lock().unwrap().first().cloned()
+        self.0.lock().unwrap().first().map(|(_, body)| body.clone())
+    }
+
+    /// The headers of the first request, if one was sent.
+    pub fn recorded_headers(&self) -> Option<http::HeaderMap> {
+        self.0.lock().unwrap().first().map(|(h, _)| h.clone())
     }
 }
 
@@ -223,12 +305,12 @@ impl HttpClientExt for CaptureHttp {
         T: Into<Bytes> + Send,
         U: From<Bytes> + Send + 'static,
     {
-        let (_parts, body) = req.into_parts();
+        let (parts, body) = req.into_parts();
         let bytes: Bytes = body.into();
-        self.0
-            .lock()
-            .unwrap()
-            .push(serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null));
+        self.0.lock().unwrap().push((
+            parts.headers,
+            serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null),
+        ));
         async move { Err(http_client::Error::StreamEnded) }
     }
 
@@ -260,58 +342,6 @@ impl HttpClientExt for CaptureHttp {
     }
 }
 
-impl CompletionClient for ScriptedClient {
-    type CompletionModel = ScriptedModel;
-
-    fn completion_model(&self, model: impl Into<String>) -> ScriptedModel {
-        ScriptedModel {
-            id: model.into(),
-            responders: self.responders.clone(),
-            hangers: self.hangers.clone(),
-            log: self.log.clone(),
-        }
-    }
-}
-
-/// A scripted response's `raw` is free-form JSON a responder can shape into whatever
-/// wire form the test is about — an Anthropic `stop_reason`, a Gemini
-/// `candidates[].finishReason` — which is what lets the offline harness drive
-/// [`Watched`](crate::completion_watch::Watched), whose whole job is reading that
-/// payload. `Value::Null` is the default: a response that reports nothing.
-impl CompletionModel for ScriptedModel {
-    async fn completion(
-        &self,
-        request: CompletionRequest,
-    ) -> Result<CompletionResponse, CompletionError> {
-        // Record first, so even a request that the responder errors on is observable.
-        self.log
-            .lock()
-            .expect("request log poisoned")
-            .push(RecordedRequest::capture(&self.id, &request));
-        // A wedged provider: the request went out (recorded above) and no answer ever
-        // comes. Park effectively forever — a real call-deadline fires long before this
-        // elapses, and the request is already observable in the log.
-        if self.hangers.contains(&self.id) {
-            tokio::time::sleep(Duration::from_secs(24 * 60 * 60)).await;
-        }
-        let responder = self.responders.get(&self.id).unwrap_or_else(|| {
-            panic!(
-                "scripted client has no responder for model {:?} (registered: {:?})",
-                self.id,
-                self.responders.keys().collect::<Vec<_>>()
-            )
-        });
-        responder(&request)
-    }
-
-    async fn stream(
-        &self,
-        _request: CompletionRequest,
-    ) -> Result<rig_core::streaming::StreamingCompletionResponse, CompletionError> {
-        unimplemented!("kaibo drives the non-streaming prompt loop; the mock never streams")
-    }
-}
-
 // ---- response builders -----------------------------------------------------
 
 /// A final text answer — ends the tool loop.
@@ -320,17 +350,11 @@ pub fn text_response(text: impl Into<String>) -> CompletionResponse {
 }
 
 /// A **reasoning-only** terminal turn — the shape a DeepSeek reasoner produces when it
-/// returns `reasoning_content` with an empty/whitespace `content`. rig's deepseek
-/// converter drops the empty text block outright and keeps only
-/// `AssistantContent::Reasoning` (0.42: `providers/deepseek.rs`, the
-/// `NormalizeCompletionResponse` impl passing `text.trim().is_empty()` to
-/// `text_then_tool_calls`), so the choice
-/// carries no `Text` and no `ToolCall`. rig then treats it as a clean terminal turn and
-/// its text extraction (`assistant_text_from_choice`) filters to `Text`, yielding `""` —
-/// an `Ok` response with an empty `output`. The offline stand-in for the
-/// generated-but-undelivered answer.
+/// returns `reasoning_content` with an empty/whitespace `content`: the choice carries
+/// no `Text` and no `ToolCall`, so rig's text extraction yields `""` — an `Ok` response
+/// with an empty output. The offline stand-in for the generated-but-undelivered answer.
 pub fn reasoning_response(reasoning: impl AsRef<str>) -> CompletionResponse {
-    response(vec![AssistantContent::reasoning(reasoning)])
+    response(vec![AssistantContent::reasoning(reasoning.as_ref())])
 }
 
 /// A single tool call — drives one more loop turn.
@@ -339,7 +363,15 @@ pub fn tool_call_response(
     name: impl Into<String>,
     args: Value,
 ) -> CompletionResponse {
-    response(vec![AssistantContent::tool_call(id, name, args)])
+    response(vec![tool_call(id, name, args)])
+}
+
+fn tool_call(id: impl Into<String>, name: impl Into<String>, args: Value) -> AssistantContent {
+    AssistantContent::tool_call(
+        id,
+        ToolName::new(name).expect("a scripted tool call names a tool"),
+        args,
+    )
 }
 
 /// Several tool calls in *one* assistant turn — the co-tool-call case (e.g. a turn
@@ -349,7 +381,7 @@ pub fn tool_call_response(
 pub fn tool_calls_response(calls: Vec<(&str, &str, Value)>) -> CompletionResponse {
     let contents: Vec<AssistantContent> = calls
         .into_iter()
-        .map(|(id, name, args)| AssistantContent::tool_call(id, name, args))
+        .map(|(id, name, args)| tool_call(id, name, args))
         .collect();
     response(contents)
 }
@@ -358,12 +390,17 @@ fn response(choice: Vec<AssistantContent>) -> CompletionResponse {
     // `raw` starts `Value::Null` — nothing reported, the default a test that doesn't
     // care about the provider's own payload gets. Shape one with [`with_raw`] when the
     // payload is the point.
-    CompletionResponse::new(choice, Usage::new(), "scripted")
+    CompletionResponse::new(
+        choice,
+        Usage::new(),
+        Origin::new(MOCK_API, "scripted", ""),
+        Value::Null,
+    )
 }
 
 /// Stamp a **raw provider payload** onto a scripted response — the untouched JSON a
 /// real provider would return alongside the parsed choice. This is what
-/// [`Watched`](crate::completion_watch::Watched) reads, so a test that cares how a
+/// [`Watch`](crate::completion_watch::Watch) reads, so a test that cares how a
 /// turn *ended* (`finish_reason` / `stop_reason` / `finishReason`) shapes it here.
 pub fn with_raw(mut resp: CompletionResponse, raw: Value) -> CompletionResponse {
     resp.raw = raw;
@@ -373,13 +410,11 @@ pub fn with_raw(mut resp: CompletionResponse, raw: Value) -> CompletionResponse 
 /// Stamp a scripted response as **cut off at the output limit**, the way a real
 /// OpenAI-shaped provider (DeepSeek, OpenRouter) delivers it: rig's *normalized*
 /// `FinishReason::Length`, which rig-agent acts on, and the provider's own `"length"` in
-/// the raw payload, which [`Watched`](crate::completion_watch::Watched) reads.
+/// the raw payload, which [`Watch`](crate::completion_watch::Watch) reads.
 ///
-/// [`with_raw`] sets only the raw half. That was enough before rig 0.42, which never
-/// read the reason; since 0.42 the agent loop raises an error on a truncated turn that
-/// delivered no answer (`rig-agent` `run/mod.rs`, the `truncating_finish_reason` check).
-/// A double carrying only the raw half never reaches that branch, so a loop-path test
-/// that means "truncated" uses this helper.
+/// [`with_raw`] sets only the raw half. The agent loop raises an error on a truncated
+/// turn that delivered no answer, and a double carrying only the raw half never
+/// reaches that branch, so a loop-path test that means "truncated" uses this helper.
 pub fn truncated(resp: CompletionResponse) -> CompletionResponse {
     with_raw(
         resp.with_finish_reason(rig_core::completion::FinishReason::Length),
@@ -387,19 +422,27 @@ pub fn truncated(resp: CompletionResponse) -> CompletionResponse {
     )
 }
 
+/// Stamp a scripted response with the finish reason a provider states, whatever it is —
+/// `Other("MALFORMED_FUNCTION_CALL")` for a Gemini fumble, `ContentFilter` for a refusal.
+/// [`truncated`] is the `Length` case with its raw payload to match.
+pub fn with_finish_reason(
+    resp: CompletionResponse,
+    reason: rig_core::completion::FinishReason,
+) -> CompletionResponse {
+    resp.with_finish_reason(reason)
+}
+
 /// A [`Usage`] a scripted provider "reports" for one completion, `input`/`output`
 /// tokens (with `total` filled to match, the way a real provider does). Lets a test
 /// prove kaibo threads and sums the token counts rig hands back — rig aggregates
 /// `usage += resp.usage` across a run, so this is the real accounting path, not a
-/// mocked-out one. Zero on both is indistinguishable from "provider reported nothing"
-/// (rig's sentinel), so pass a non-zero count when a test means to observe usage.
+/// mocked-out one. A zero on both is a reported zero; leave a response at
+/// `Usage::new()` for "the provider reported nothing".
 pub fn usage(input: u64, output: u64) -> Usage {
-    Usage {
-        input_tokens: input,
-        output_tokens: output,
-        total_tokens: input + output,
-        ..Usage::new()
-    }
+    Usage::new()
+        .input_tokens(input)
+        .output_tokens(output)
+        .total_tokens(input + output)
 }
 
 /// Stamp a reported [`usage`] onto a scripted response. `text_response`/`tool_call_response`
@@ -411,31 +454,26 @@ pub fn with_usage(mut resp: CompletionResponse, usage: Usage) -> CompletionRespo
 
 /// A provider-side error — drives `run_phase`'s failure arm (the model loop fails
 /// before it concludes). Return `Err(provider_error(..))` from a responder.
-pub fn provider_error(msg: impl Into<String>) -> CompletionError {
-    CompletionError::ProviderError(msg.into())
+pub fn provider_error(msg: impl Into<String>) -> ProviderError {
+    ProviderError::Provider(msg.into())
 }
 
 /// A **response-parse** error — what rig returns when the provider answered but rig
-/// could not turn the answer into a turn. Gemini's malformed function call arrives
-/// this way (`providers/gemini/completion.rs::function_call_finish_reason_error`), so
-/// this is how a test drives [`Retried`](crate::completion_retry::Retried) and the
-/// malformed-generation classification. Distinct from [`provider_error`], which is the
+/// could not turn the answer into a turn. Distinct from [`provider_error`], which is the
 /// provider's own error body.
-pub fn response_error(msg: impl Into<String>) -> CompletionError {
-    CompletionError::ResponseError(msg.into())
+pub fn response_error(msg: impl Into<String>) -> ProviderError {
+    ProviderError::Response(msg.into())
 }
 
 /// A provider error carrying an HTTP status and body — the shape
-/// `CompletionError::from_http_response` builds from a real non-success response.
-/// This is the only way to construct a status-bearing [`CompletionError`] offline, so
-/// it is what drives [`Retried`](crate::completion_retry::Retried)'s
-/// transient-transport classification and its delay-hint parsing in tests. `status`
-/// must be a valid three-digit HTTP status (100-999); anything else is a test bug, so
-/// this panics rather than silently degrading to a status-less error.
-pub fn status_error(status: u16, body: impl Into<String>) -> CompletionError {
+/// `ProviderError::from_http_response` builds from a real non-success response. This is
+/// the way to construct a status-bearing error offline. `status` must be a valid
+/// three-digit HTTP status (100-999); anything else is a test bug, so this panics
+/// rather than silently degrading to a status-less error.
+pub fn status_error(status: u16, body: impl Into<String>) -> ProviderError {
     let status = http::StatusCode::from_u16(status)
         .unwrap_or_else(|_| panic!("{status} is not a valid HTTP status code"));
-    CompletionError::from_http_response(status, body)
+    ProviderError::from_http_response(status, body)
 }
 
 // ---- request accessors -----------------------------------------------------
@@ -446,7 +484,7 @@ pub fn status_error(status: u16, body: impl Into<String>) -> CompletionError {
 pub fn user_text(req: &CompletionRequest) -> String {
     req.chat_history
         .iter()
-        .filter_map(|m| match m {
+        .filter_map(|m| match &**m {
             Message::User { content } => Some(
                 content
                     .iter()
@@ -463,13 +501,10 @@ pub fn user_text(req: &CompletionRequest) -> String {
         .join("\n")
 }
 
-/// The agent's role framing, wherever rig put it: the legacy `preamble` field if set,
-/// else a leading `System` message in the history (rig 0.34 prefers the latter).
+/// The agent's role framing: the leading `System` message of the history, where rig
+/// 0.46 puts a preamble.
 pub fn preamble(req: &CompletionRequest) -> Option<String> {
-    if let Some(p) = &req.preamble {
-        return Some(p.clone());
-    }
-    req.chat_history.iter().find_map(|m| match m {
+    req.chat_history.iter().find_map(|m| match &**m {
         Message::System { content } => Some(content.clone()),
         _ => None,
     })
@@ -482,7 +517,7 @@ pub fn preamble(req: &CompletionRequest) -> Option<String> {
 pub fn transcript_text(req: &CompletionRequest) -> String {
     req.chat_history
         .iter()
-        .filter_map(|m| match m {
+        .filter_map(|m| match &**m {
             Message::User { content } => Some(
                 content
                     .iter()
@@ -511,7 +546,7 @@ pub fn transcript_text(req: &CompletionRequest) -> String {
 
 /// True if the request declares a tool named `name`.
 pub fn has_tool(req: &CompletionRequest, name: &str) -> bool {
-    req.tools.iter().any(|t| t.name == name)
+    req.tools.iter().any(|t| &*t.name == name)
 }
 
 /// True on the forced finalize turn (`run_phase` sets `ToolChoice::None` after the

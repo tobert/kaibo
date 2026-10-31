@@ -29,38 +29,46 @@ async-trait = "0.1"
 anyhow = "1"
 
 # LLM providers + the wire types. `default-features = false` drops rig's default
-# `rustls` feature, which would pull `reqwest/rustls` → the aws-lc-rs crypto provider
-# (C + cmake, the one thing that makes a static musl build painful). We re-add the
-# other defaults rig needs (`reqwest`, `derive`) and let TLS come from our own
-# `rustls`+ring wiring below.
-# `image` gates rig's `image_generation` module — the `ImageGenerationModel` trait and
-# its request/response types. It is a pure-Rust, dependency-free feature flag (enabling
-# it added ZERO crates to Cargo.lock, verified 2026-07-25), and it buys more than the
-# provider we hand-write: rig already ships openai / xai / azure / huggingface impls of
-# that trait, so an `image` cast slot can reach them for free. Turned off by 986806f
-# when image generation was removed; back on with the media CAS.
-rig-core = { version = "0.42", default-features = false, features = ["reqwest", "derive", "image"] }
+# `rustls` feature, which forwards to `rig-reqwest?/rustls` → `reqwest/rustls` → the
+# aws-lc-rs crypto provider (C + cmake, the one thing that makes a static musl build
+# painful). TLS comes from our own `rustls`+ring wiring below, and the transport from
+# `rig-reqwest` (next entry), not from rig-core's `reqwest` feature, whose shared client
+# is the one built with the bundled-roots TLS feature.
+#
+# The `image` feature (rig's `image_generation` module) is off: rig 0.46 dropped the
+# `ImageGenerationModel` trait kaibo once adapted Stability to, and the media seam is
+# kaibo's own (`src/media.rs`).
+rig-core = { version = "0.46", default-features = false, features = ["derive"] }
+# FOURTH aws-lc route (rig 0.46), beside the three named in this file: rig-core splits its
+# transport into `rig-reqwest`, whose own default feature `rustls` enables `reqwest/rustls`
+# (aws-lc) and `webpki-root-certs` (the bundled-roots crate behind RUSTSEC-2026-0381).
+# rig-core's default `rustls` feature forwards to it too. Both are off here; we build the
+# `reqwest::Client` ourselves (src/tls.rs) and hand it over via
+# `impl From<reqwest::Client> for ReqwestClient`. The platform's root certificates are what
+# kaibo trusts. Verify with `cargo tree -i aws-lc-rs`, `cargo tree -i openssl-sys` and
+# `cargo tree -i webpki-root-certs` (all three empty).
+rig-reqwest = { version = "0.46", default-features = false }
 # The agent/tool loop, which rig ships as its own crate beside `rig-core`.
 #
 # DO NOT collapse these two onto the `rig` facade crate. It looks tidier and it is a
 # trap: the facade's `rustls` feature fans out to the vector-store companions
 # (`rig-fastembed?/hf-hub-rustls-tls`, `rig-helixdb?/rustls`, `rig-lancedb?/rig-rustls`,
-# `rig-milvus?/rustls`) — a *fourth* route for aws-lc into the tree, beside the three
+# `rig-milvus?/rustls`) — one more route for aws-lc into the tree, beside those
 # named in this file, and one that breaks the static musl build silently. Depending on
 # the two crates we actually use keeps the TLS surface exactly as documented above:
 # `rig-agent` takes `rig-core` with `default-features = false`, so the "drop rig's
 # default rustls" reasoning still covers the whole tree. Verify with
 # `cargo tree -i aws-lc-rs` on host *and* musl; both must be empty.
 #
-# `rmcp` is off (kaibo wraps kaish as an in-process rig Tool, not over MCP); `image` is
-# forwarded so a tool can return image content.
-rig-agent = { version = "0.42", default-features = false, features = ["derive", "image"] }
+# `rmcp` is off (kaibo wraps kaish as an in-process rig Tool, not over MCP). rig's harness,
+# TUI, cassette and MCP-client crates, and `rig-claude-cloak`, are not adopted.
+rig-agent = { version = "0.46", default-features = false, features = ["derive"] }
 # We construct the HTTP backend ourselves (a `reqwest::Client` carrying a
-# per-request timeout) and hand it to rig via `.http_client(..)` — rig has no
+# per-request timeout) and hand it to rig as the provider's transport — rig has no
 # native timeout knob, and its prompt loop is non-streaming, so a wedged provider
 # would otherwise hang a tool call forever (see consult.rs and the regression test
 # in tests/llm_timeout.rs).
-# Match rig's own reqwest: version 0.13, rustls TLS, no default-tls.
+# Match rig-reqwest's reqwest: version 0.13, rustls TLS, no default-tls.
 #
 # `rustls-no-provider` (not `rustls`): reqwest's plain `rustls` feature hard-wires
 # the aws-lc-rs crypto provider (C/cmake — the static-musl footgun). `-no-provider`
@@ -81,7 +89,14 @@ rig-agent = { version = "0.42", default-features = false, features = ["derive", 
 # authenticates via a `?key=` query param, not a header, so `RequestBuilder::query` is
 # how that GET is built. It pulls in exactly one new dependency, `serde_urlencoded`
 # (pure Rust, no C/TLS), so the aws-lc-free tree stays untouched.
-reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider", "multipart", "query"] }
+#
+# `http2`, `charset` and `system-proxy` are what rig's own `rustls` feature bundle switched
+# on for reqwest while rig-core carried the transport (0.42). With rig-reqwest's default
+# features off they are ours to name: HTTP/2 to the hosted providers, response charset
+# decoding, and the proxy environment (`HTTPS_PROXY`, and the macOS/Windows system
+# settings), which an operator behind a proxy relies on. All three are pure Rust, so the
+# aws-lc-free tree is untouched (re-verify with `cargo tree -i aws-lc-rs`).
+reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider", "multipart", "query", "http2", "charset", "system-proxy"] }
 # The crypto provider behind rustls, chosen explicitly: ring, not aws-lc-rs. ring
 # builds with no C toolchain or cmake, so `x86_64-unknown-linux-musl` (and friends)
 # link fully static out of the box. reqwest pins rustls `default-features = false`,
@@ -98,10 +113,14 @@ serde_json = "1"
 # use at `0.23` merges it into the reqwest/rmcp group instead of adding a third
 # copy (confirm with `cargo tree -i base64@0.22.1` / `@0.23.1`).
 base64 = "0.23"
-# rig's `HttpClientExt` is typed in `bytes::Bytes`, so `wire_repair`'s transport
-# wrapper needs the type by name. Already in the tree via reqwest/rig-core — zero new
-# crates; named here so the dep is ours, not implicit.
+# rig's `HttpClientExt` is typed in `bytes::Bytes`, so the transport wrapper
+# (`completion_retry`) needs the type by name. Already in the tree via reqwest/rig-core —
+# zero new crates; named here so the dep is ours, not implicit.
 bytes = "1"
+# Header and status types for the transport middleware (`src/completion_retry.rs`, the
+# OpenRouter app-identity stamp in `src/consult/engine.rs`). rig-http speaks `http`; already
+# in the tree, named here so the dep is ours, not implicit.
+http = "1"
 # XDG config.toml: named provider profiles + tunables. `deny_unknown_fields` on the
 # raw structs turns a typo'd key into a startup error rather than a silent no-op.
 # Default features (`std`, `serde`, `parse`, `display`) cover exactly what we use:
@@ -246,10 +265,7 @@ rmcp = { version = "3.4.0", default-features = false, features = [
     "client",
     "transport-child-process",
 ] }
-# `http::StatusCode`, to build a status-bearing `CompletionError` offline
-# (`test_support::status_error`) — the only way to drive
-# `completion_retry::is_transient_transport_failure`'s status branch without a live
-# provider. Already in the tree transitively via rig-core/reqwest; named here so the
-# dep is ours, not implicit. Dev-only: production code reads the status rig hands back
-# through `provider_response_status()` and never names the type itself.
-http = "1"
+# The scripted completion transport (`rig_core::test_utils::MockScript`) the offline consult-loop
+# tests drive. Dev-only; `cargo tree -e normal` stays free of it.
+rig-core = { version = "0.46", default-features = false, features = ["derive", "test-utils"] }
+futures = "0.3"

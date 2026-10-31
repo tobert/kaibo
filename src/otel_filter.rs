@@ -12,8 +12,8 @@
 //! dependency. kaibo cannot decline to set them; it can only decline to export them.
 //!
 //! So the guard goes at the export step, which kaibo does own: a transparent wrapper
-//! around the `SpanExporter`, the same shape `completion_watch::Watched` and
-//! `wire_repair::Repaired` take around their traits. Every span the SDK produces
+//! around the `SpanExporter`, the same shape `completion_retry::RetryingHttp` takes around
+//! its trait. Every span the SDK produces
 //! passes through [`Filtered::export`] before it leaves.
 //!
 //! # An allowlist, because the failure directions are not symmetric
