@@ -14,7 +14,7 @@
 # 65532), and ships CA certificates at /etc/ssl/certs — which rustls-native-certs
 # finds for kaibo's outbound provider calls. Pinned by manifest-list digest, same
 # discipline as the workflow's action pins.
-FROM gcr.io/distroless/static:nonroot@sha256:d29e660cc75a5b6b1334e03c5c81ccf9bc0884a002c6000dbf0fb96034814478
+FROM gcr.io/distroless/static:nonroot@sha256:18f4cc26c9ffa7f20a359298be7deadac5c607c8e03a02b8119f1a5fc2f82c99
 
 # Links the ghcr package to the repo (README, visibility inheritance) even for a
 # manual build; the workflow's metadata-action adds the full OCI label set on top.
