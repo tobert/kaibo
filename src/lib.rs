@@ -17,6 +17,12 @@
 //! store and the media CAS, refuse to resolve into any allowed tree) — and cannot
 //! shell out to external commands.
 
+// rig 0.46's `ProviderError` (224 bytes) and `PromptError` (304 bytes) are large by design
+// (they carry the provider's whole reply and the run's transcript). kaibo returns them
+// from the seams that wrap rig's calls, and boxing them there would only move the
+// allocation, so the lint is off for the crate.
+#![allow(clippy::result_large_err)]
+
 pub mod artifact;
 pub mod attach;
 pub mod batch;

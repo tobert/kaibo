@@ -1,6 +1,9 @@
 //! Consult over resolved arms: offline prompt/shape tests, a mixed-cast routing
 //! e2e over two scripted clients, and the `#[ignore]`d live probes.
 
+// The scripted responders return rig's (large) `ProviderError`, as rig's own seams do.
+#![allow(clippy::result_large_err)]
+
 use std::sync::{Arc, Mutex};
 
 use kaibo::config::{default_models, Config, Defaults, ModelRole, ModelSlot};
@@ -822,7 +825,7 @@ type Responder = Arc<
             &rig_core::completion::CompletionRequest,
         ) -> Result<
             rig_core::completion::CompletionResponse,
-            rig_core::completion::CompletionError,
+            rig_core::error::ProviderError,
         > + Send
         + Sync,
 >;
@@ -837,7 +840,7 @@ struct Seen {
 }
 
 /// A scripted client that serves exactly ONE model. If the consult loop ever
-/// routes another model id here, `completion` panics — the teeth of the
+/// routes another model id here, the call panics — the teeth of the
 /// mixed-cast routing test: two of these stand in for two distinct backends.
 #[derive(Clone)]
 struct ScriptedClient {
@@ -853,7 +856,7 @@ impl ScriptedClient {
                 &rig_core::completion::CompletionRequest,
             ) -> Result<
                 rig_core::completion::CompletionResponse,
-                rig_core::completion::CompletionError,
+                rig_core::error::ProviderError,
             > + Send
             + Sync
             + 'static,
@@ -871,29 +874,32 @@ impl ScriptedClient {
     }
 }
 
+/// The transport of one scripted model: rig's scripted wire over a responder, the same
+/// seam `src/test_support.rs` uses in the lib's unit tests.
 #[derive(Clone)]
-struct ScriptedModel {
+struct ScriptedTransport {
     id: String,
     client: ScriptedClient,
 }
 
-impl rig_core::client::CompletionClient for ScriptedClient {
-    type CompletionModel = ScriptedModel;
-
-    fn completion_model(&self, model: impl Into<String>) -> ScriptedModel {
-        ScriptedModel {
-            id: model.into(),
-            client: self.clone(),
-        }
+impl kaibo::consult::ModelSource for ScriptedClient {
+    fn completion_model(&self, id: &str) -> kaibo::consult::Llm {
+        kaibo::consult::Llm::new(rig_core::Model::new(
+            rig_core::test_utils::MockScript::default().with_id(id),
+            ScriptedTransport {
+                id: id.to_string(),
+                client: self.clone(),
+            },
+        ))
     }
 }
 
-impl rig_core::completion::CompletionModel for ScriptedModel {
-    async fn completion(
+impl rig_core::driver::Transport<rig_core::test_utils::MockScript> for ScriptedTransport {
+    fn send(
         &self,
         request: rig_core::completion::CompletionRequest,
-    ) -> Result<rig_core::completion::CompletionResponse, rig_core::completion::CompletionError>
-    {
+        _exchange: rig_core::driver::Exchange,
+    ) -> rig_core::driver::Opening<rig_core::test_utils::MockFrame> {
         assert_eq!(
             self.id, self.client.expect_model,
             "this client serves only {:?} — the loop routed a phase to the wrong client",
@@ -904,38 +910,55 @@ impl rig_core::completion::CompletionModel for ScriptedModel {
             .lock()
             .expect("scripted log poisoned")
             .push(Seen {
-                preamble: request.preamble.clone().or_else(|| {
-                    request.chat_history.iter().find_map(|m| match m {
-                        rig_core::completion::message::Message::System { content } => {
-                            Some(content.clone())
-                        }
-                        _ => None,
-                    })
+                preamble: request.chat_history.iter().find_map(|m| match &**m {
+                    rig_core::completion::message::Message::System { content } => {
+                        Some(content.clone())
+                    }
+                    _ => None,
                 }),
                 max_tokens: request.max_tokens,
                 additional_params: request.additional_params.clone(),
             });
-        (self.client.responder)(&request)
+        let responder = self.client.responder.clone();
+        rig_core::driver::Opening::new(async move {
+            let response = responder(&request)?;
+            let document = response.raw.clone();
+            Ok(rig_core::driver::Opened::new(futures::stream::iter([Ok(
+                rig_core::test_utils::MockFrame::Response(Box::new(response)),
+            )]))
+            .with_document(document))
+        })
     }
+}
 
-    async fn stream(
-        &self,
-        _request: rig_core::completion::CompletionRequest,
-    ) -> Result<
-        rig_core::streaming::StreamingCompletionResponse,
-        rig_core::completion::CompletionError,
-    > {
-        unimplemented!("kaibo drives the non-streaming prompt loop; the mock never streams")
-    }
+fn scripted_response(
+    choice: Vec<rig_core::completion::message::AssistantContent>,
+) -> rig_core::completion::CompletionResponse {
+    rig_core::completion::CompletionResponse::new(
+        choice,
+        rig_core::completion::Usage::new(),
+        rig_core::message::Origin::new(rig_core::test_utils::MOCK_API, "scripted", ""),
+        Value::Null,
+    )
+}
+
+fn scripted_call(
+    id: &str,
+    name: &str,
+    args: Value,
+) -> rig_core::completion::message::AssistantContent {
+    rig_core::completion::message::AssistantContent::tool_call(
+        id,
+        rig_core::message::ToolName::new(name).expect("a scripted call names a tool"),
+        args,
+    )
 }
 
 /// A final text answer — ends the tool loop.
 fn text_response(text: impl Into<String>) -> rig_core::completion::CompletionResponse {
-    rig_core::completion::CompletionResponse::new(
-        vec![rig_core::completion::message::AssistantContent::text(text)],
-        rig_core::completion::Usage::new(),
-        "scripted",
-    )
+    scripted_response(vec![rig_core::completion::message::AssistantContent::text(
+        text,
+    )])
 }
 
 /// A single tool call — drives one more loop turn.
@@ -944,34 +967,24 @@ fn tool_call_response(
     name: &str,
     args: Value,
 ) -> rig_core::completion::CompletionResponse {
-    rig_core::completion::CompletionResponse::new(
-        vec![rig_core::completion::message::AssistantContent::tool_call(
-            id, name, args,
-        )],
-        rig_core::completion::Usage::new(),
-        "scripted",
-    )
+    scripted_response(vec![scripted_call(id, name, args)])
 }
 
 /// Several tool calls in ONE assistant turn — the co-tool-call case (`view_image`
 /// alongside `run_kaish`). rig runs them together and folds both results into a single
 /// user turn, exactly the shape the view_image turn-boundary break must tolerate.
 fn tool_calls_response(calls: &[(&str, &str, Value)]) -> rig_core::completion::CompletionResponse {
-    use rig_core::completion::message::AssistantContent;
-    let contents: Vec<AssistantContent> = calls
-        .iter()
-        .map(|(id, name, args)| AssistantContent::tool_call(*id, *name, args.clone()))
-        .collect();
-    rig_core::completion::CompletionResponse::new(
-        contents,
-        rig_core::completion::Usage::new(),
-        "scripted",
+    scripted_response(
+        calls
+            .iter()
+            .map(|(id, name, args)| scripted_call(id, name, args.clone()))
+            .collect(),
     )
 }
 
 /// True if the request declares a tool named `name`.
 fn has_tool(req: &rig_core::completion::CompletionRequest, name: &str) -> bool {
-    req.tools.iter().any(|t| t.name == name)
+    req.tools.iter().any(|t| &*t.name == name)
 }
 
 /// Everything the model was shown in user turns — `User` text *and* tool-result
@@ -980,7 +993,7 @@ fn transcript_text(req: &rig_core::completion::CompletionRequest) -> String {
     use rig_core::completion::message::{Message, ToolResultContent, UserContent};
     req.chat_history
         .iter()
-        .filter_map(|m| match m {
+        .filter_map(|m| match &**m {
             Message::User { content } => Some(
                 content
                     .iter()
@@ -1146,7 +1159,7 @@ async fn mixed_cast_consult_routes_each_phase_to_its_own_client() {
 /// is exactly what a base64 tool envelope must become to reach model context.
 fn request_has_tool_result_image(req: &rig_core::completion::CompletionRequest) -> bool {
     use rig_core::completion::message::{Message, ToolResultContent, UserContent};
-    req.chat_history.iter().any(|m| match m {
+    req.chat_history.iter().any(|m| match &**m {
         Message::User { content } => content.iter().any(|c| {
             matches!(
                 c,
@@ -1164,7 +1177,7 @@ fn request_has_tool_result_image(req: &rig_core::completion::CompletionRequest) 
 /// captures only text, so the assertion has to walk `req.chat_history` here.
 fn request_has_user_image(req: &rig_core::completion::CompletionRequest) -> bool {
     use rig_core::completion::message::{Message, UserContent};
-    req.chat_history.iter().any(|m| match m {
+    req.chat_history.iter().any(|m| match &**m {
         Message::User { content } => content.iter().any(|c| matches!(c, UserContent::Image(_))),
         _ => false,
     })
@@ -2397,8 +2410,8 @@ async fn openrouter_top_rungs_reach_deeper_live() {
 /// `openai_effort_ceiling_is_per_model_live`, which pins the other half).
 ///
 /// So OpenRouter is NOT a passthrough for this field — it normalizes onto each
-/// upstream's native knob. That is the sentence `docs/config.md` and
-/// `EffortWire::Passthrough`'s doc now carry, and the operator-facing consequence is
+/// upstream's native knob. That is the sentence `docs/config.md` now
+/// carries, and the operator-facing consequence is
 /// that the same `effort = "max"` is portable on the openrouter kind and model-gated on
 /// the gpt kind.
 #[tokio::test]

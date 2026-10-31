@@ -5681,7 +5681,7 @@ mod tests {
         let client = crate::test_support::ScriptedClient::builder()
             .on_model("scripted-synth", |req| {
                 let carries_image = req.chat_history.iter().any(|m| {
-                    matches!(m, rig_core::completion::Message::User { content }
+                    matches!(&**m, rig_core::completion::Message::User { content }
                     if content.iter().any(|c| matches!(
                         c,
                         rig_core::completion::message::UserContent::Image(_)
@@ -9501,12 +9501,10 @@ enabled = false
 
         // The dossier build's real explorer spend — the batch lane must surface it in
         // the ack rather than drop it (its synth cost lands later on the batch result).
-        let dossier_usage = Usage {
-            input_tokens: 200,
-            output_tokens: 20,
-            total_tokens: 220,
-            ..Usage::new()
-        };
+        let dossier_usage = Usage::new()
+            .input_tokens(200)
+            .output_tokens(20)
+            .total_tokens(220);
         let out = h
             .deliberate_batch(
                 &cast,

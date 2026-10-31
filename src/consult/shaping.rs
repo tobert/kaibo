@@ -19,11 +19,18 @@ pub const THINKING_BUDGET: u64 = 8192;
 /// lands without a kaibo release. Default for both roles unless a slot or the
 /// per-role `[defaults]` tunes it.
 ///
-/// **kaibo keeps no allowlist.** Two of the six wire paths *do* have a closed ladder,
-/// but it belongs to rig's typed request builder, not to the provider — see
-/// [`EffortWire`] and [`accepted_efforts`], which read that ladder back out of rig
-/// itself rather than restating it here.
+/// **kaibo keeps no allowlist**, with one exception it owns on purpose: Gemini's
+/// `thinkingLevel` is a closed protobuf enum that Google itself enforces, and
+/// [`ModelShape::check_effort`] refuses a rung outside it at arm construction (rig 0.46
+/// carries the blob as raw JSON, so it no longer reports that ceiling for us).
 pub const DEFAULT_EFFORT: &str = "high";
+
+/// The `thinkingLevel` values Google's API takes, lowest first. A closed protobuf enum
+/// enforced by Google, not a rig limit: `none`, `xhigh` and `max` are refused with an enum
+/// error (`gemini_thinking_level_ladder_live`, 2026-08-01). `minimal` is Google's
+/// off-switch and is itself per-model: gemini-pro-latest refuses even that
+/// (`gemini_pro_rejects_minimal_live`).
+const GEMINI_THINKING_LEVELS: [&str; 4] = ["minimal", "low", "medium", "high"];
 
 /// The reasoning **depths** kaibo knows how to order, shallow → deep. Used for exactly
 /// one thing: comparing two efforts when a lane needs a floor
@@ -469,13 +476,26 @@ impl ModelShape {
         )
     }
 
-    /// Refuse an effort this shape cannot put on the wire. Today that is the reasoning
+    /// Refuse an effort this shape cannot put on the wire. Today that is a rung outside
+    /// Google's `thinkingLevel` enum on Gemini, and the reasoning
     /// off-switch ([`EFFORT_OFF`]) on Anthropic's adaptive tier: Opus 5.5 and Sonnet 5.5
     /// reject `thinking:{type:"disabled"}`, and `none` is not an `output_config.effort`
     /// rung, so there is nothing truthful to send. Sending it anyway is a provider 400
     /// mid-call; dropping it would quietly bill reasoning the operator switched off.
     /// The error names the fixes. Every other style answers `none` by shape.
     pub fn check_effort(&self, effort: &str) -> std::result::Result<(), String> {
+        if self.thinking == ThinkingStyle::GeminiLevel
+            && !GEMINI_THINKING_LEVELS.contains(&effort.trim().to_ascii_lowercase().as_str())
+        {
+            return Err(format!(
+                "effort {effort:?} is not a Gemini thinking level: Google's `thinkingLevel` \
+                 takes {} only (it has no `none`, `xhigh` or `max`), and a request \
+                 carrying anything else fails on every call. Set the slot's `effort` (or \
+                 `[defaults]`) to one of those, or point the slot at a backend whose wire \
+                 passes effort through",
+                GEMINI_THINKING_LEVELS.join(" | "),
+            ));
+        }
         if self.thinking == ThinkingStyle::AnthropicAdaptive && is_effort_off(effort) {
             return Err(
                 "effort \"none\" (reasoning off) has no wire form on this Anthropic model: \
@@ -581,16 +601,13 @@ impl ModelShape {
                 // gemini-cli's investigator). Dropping it for a hardcoded "high" would
                 // silently ignore a slot's `effort = "low"`.
                 //
-                // Unlike the other effort sinks this one is NOT a passthrough string: rig
-                // models the level as a closed enum (`minimal|low|medium|high`), so
-                // `xhigh`/`max`/`none` are refused by rig's own converter before the
-                // request leaves the process. [`EffortWire::Gemini`] names that, and
-                // `Arm::from_slot` turns it into a legible error rather than a mid-call
-                // surprise. Here rig's enum is *correct*, not a stale cap: Google's own
-                // schema refuses those three rungs too (`gemini_thinking_level_ladder_live`,
-                // 2026-08-01, protobuf enum error). `minimal` is Google's off-switch, and
-                // is itself per-model — gemini-pro-latest refuses even that
-                // (`gemini_pro_rejects_minimal_live`).
+                // Unlike the other effort sinks this one is NOT a passthrough string:
+                // Google's `thinkingLevel` is a closed enum (`minimal|low|medium|high`) that
+                // refuses `xhigh`/`max`/`none` (`gemini_thinking_level_ladder_live`,
+                // 2026-08-01, protobuf enum error), so [`ModelShape::check_effort`] turns a
+                // bad rung into a legible error at arm construction rather than a mid-call
+                // surprise. `minimal` is Google's off-switch, and is itself per-model —
+                // gemini-pro-latest refuses even that (`gemini_pro_rejects_minimal_live`).
                 obj.insert(
                     "generationConfig".into(),
                     json!({ "thinkingConfig": { "thinkingLevel": effort, "includeThoughts": true } }),
@@ -686,8 +703,7 @@ pub fn request_params(
 /// and plain `gpt-5`'s bottom rung is `minimal` where 5.1+ have `none` instead. kaibo
 /// deliberately encodes none of that: an operator gets to reach a rung OpenAI shipped
 /// this morning, and a wrong one comes back as OpenAI's own error naming the model's
-/// supported values. (rig's enum is a separate, *lower* ceiling that kaibo does report
-/// up front — see [`EffortWire`].) Measured and re-checkable:
+/// supported values. Measured and re-checkable:
 /// `openai_effort_ceiling_is_per_model_live` in `tests/consult.rs`, which also pins the
 /// trap that an off-schema sentinel reports the API's superset for every model — so the
 /// table can only be re-derived by posting the real rungs.
@@ -768,112 +784,6 @@ pub fn effort_sinks(
         return style != ThinkingStyleOverride::Off && hosted_openai_accepts_reasoning(model);
     }
     ModelShape::resolve(kind, model, style).sinks_effort()
-}
-
-/// Which of rig's request builders this arm's `additional_params` blob has to survive.
-///
-/// kaibo hands rig a JSON blob; most providers `#[serde(flatten)]` it straight into the
-/// body, so whatever an operator writes reaches the provider and the *provider* decides.
-/// Two paths don't: rig deserializes the blob into a typed struct first, and a typed
-/// struct has a closed set of reasoning rungs. That ceiling belongs to **rig's client**,
-/// not the provider's API, and the two can disagree in either direction — rig has
-/// trailed OpenAI's own ladder by a rung before. Gemini's is the exception: its
-/// `ThinkingLevel` mirrors a limit Google actually enforces.
-///
-/// Naming the wire lets kaibo ask rig *before* the call (see [`preflight_params`]) and
-/// report the ceiling honestly instead of surfacing a bare serde message mid-consult.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum EffortWire {
-    /// `gemini::completion::create_request_body` parses the blob as
-    /// `gemini_api_types::AdditionalParameters`, whose `ThinkingLevel` is a closed enum.
-    Gemini,
-    /// OpenAI's Responses builder parses the blob as `responses_api::AdditionalParameters`,
-    /// whose `ReasoningEffort` is a closed enum.
-    OpenaiResponses,
-    /// rig flattens the blob into the body verbatim (Anthropic, DeepSeek, OpenRouter, and
-    /// the generic OpenAI `/chat/completions` shape). kaibo can express anything here; who
-    /// answers for it is the *provider's* business, and they differ — DeepSeek validates
-    /// strictly against its own seven rungs and runs them on three (`low`/`high`/`max`),
-    /// OpenRouter accepts all seven and normalizes
-    /// each onto the upstream's native knob (proven 2026-08-01: `xhigh`/`max` reach
-    /// `openai/gpt-5.1` through the gateway with reasoning billed, on ids that 400 those
-    /// rungs on OpenAI's direct API — the two halves are
-    /// `openrouter_clamps_rungs_the_direct_backend_refuses_live` and
-    /// `openai_effort_ceiling_is_per_model_live`), and the toggle-less chat shape has no
-    /// field to put it in at all. "Passthrough" is a statement about *rig*, not about the
-    /// far end.
-    Passthrough,
-}
-
-impl EffortWire {
-    /// The wire an arm built from `kind` (with its resolved `responses_wire` flag) runs on.
-    pub fn resolve(kind: ProviderKind, responses_wire: bool) -> Self {
-        if responses_wire {
-            return Self::OpenaiResponses;
-        }
-        // Media kinds carry no effort at all — no arm is ever built from one — so the
-        // do-nothing wire is the truthful answer, resolved once here instead of as an
-        // arm in the completion match below.
-        let Some(wire) = kind.wire() else {
-            return Self::Passthrough;
-        };
-        match wire {
-            WireKind::Gemini => Self::Gemini,
-            WireKind::Anthropic | WireKind::DeepSeek | WireKind::OpenRouter | WireKind::Openai => {
-                Self::Passthrough
-            }
-        }
-    }
-
-    /// How an operator would name this wire in a config conversation.
-    pub fn label(&self) -> &'static str {
-        match self {
-            Self::Gemini => "gemini",
-            Self::OpenaiResponses => "openai responses",
-            Self::Passthrough => "passthrough",
-        }
-    }
-}
-
-/// Run `params` through rig's own converter for `wire`, exactly as the live call will.
-/// `Ok(())` means the request builder accepts this blob; `Err` carries rig's own message.
-///
-/// This is a *preflight*, not a policy: it asks rig, it doesn't hold a list. A rung rig
-/// starts accepting after a version bump starts working here the same day, with no kaibo
-/// change — which is the whole reason effort stayed a passthrough string.
-pub fn preflight_params(
-    wire: EffortWire,
-    params: Option<&Value>,
-) -> std::result::Result<(), String> {
-    let Some(params) = params else {
-        return Ok(());
-    };
-    match wire {
-        EffortWire::Passthrough => Ok(()),
-        EffortWire::Gemini | EffortWire::OpenaiResponses => Ok(()),
-    }
-}
-
-/// The effort values `wire` accepts today, read back out of rig by probing each of
-/// [`known_efforts`] through [`preflight_params`]. Derived, never declared — so the list
-/// an error message shows an operator is rig's current truth even after a rig bump, and
-/// kaibo never grows a second ladder to drift from it.
-pub fn accepted_efforts(wire: EffortWire) -> Vec<&'static str> {
-    if wire == EffortWire::Passthrough {
-        return known_efforts();
-    }
-    known_efforts()
-        .into_iter()
-        .filter(|rung| {
-            let probe = match wire {
-                EffortWire::Gemini => {
-                    json!({ "generationConfig": { "thinkingConfig": { "thinkingLevel": rung } } })
-                }
-                _ => json!({ "reasoning": { "effort": rung } }),
-            };
-            preflight_params(wire, Some(&probe)).is_ok()
-        })
-        .collect()
 }
 
 /// Fold the backend's upstream-host data policy into `params`. **OpenRouter only**:
@@ -975,8 +885,25 @@ mod tests {
         assert!(err.contains("`low`"), "names the fix: {err}");
         assert!(adaptive.check_effort(" NONE ").is_err(), "spelling-insensitive");
         assert!(adaptive.check_effort("high").is_ok());
+        // Gemini's `thinkingLevel` is a closed enum with no `none` either; its own off-switch
+        // is `minimal`, which the refusal names.
+        let gemini = ModelShape::resolve(
+            ProviderKind::Gemini,
+            "gemini-3.5-flash",
+            ThinkingStyleOverride::Auto,
+        );
+        let err = gemini
+            .check_effort("none")
+            .expect_err("Gemini's thinking level has no none");
+        assert!(err.contains("minimal"), "names the nearest rung: {err}");
+        assert!(gemini.check_effort("xhigh").is_err());
+        assert!(gemini.check_effort("max").is_err());
+        assert!(gemini.check_effort("ludicrous").is_err());
+        for rung in ["minimal", "low", "medium", "high", " HIGH "] {
+            assert!(gemini.check_effort(rung).is_ok(), "Gemini takes {rung:?}");
+        }
         for style in ALL_STYLES {
-            if style == ThinkingStyle::AnthropicAdaptive {
+            if style == ThinkingStyle::AnthropicAdaptive || style == ThinkingStyle::GeminiLevel {
                 continue;
             }
             let (kind, model, ovr) = representative(style);

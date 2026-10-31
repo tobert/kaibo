@@ -56,6 +56,31 @@ use super::shaping::{ModelCaps, ModelShape};
 /// loop, again for the turn-cap finalize turn — see [`run_phase`]).
 type ToolFactory<'a> = &'a (dyn Fn() -> Result<Vec<DynamicTool>> + Send + Sync);
 
+/// rig's DeepSeek dialect, with image input switched on.
+///
+/// rig 0.46 reads DeepSeek's API as text-only: its `DeepSeek` body rewrite turns off
+/// content-part arrays, so an image attached to a user turn is replaced by the text
+/// "(image omitted: model does not support images)" before the request leaves. kaibo
+/// measured the opposite for `deepseek-flash` (live probe 2026-09-21: a red PNG answered
+/// "Red"), and classifies that model as sighted (`ModelCaps`), so the dialect keeps every
+/// other DeepSeek quirk (the `reasoning_content` field, the strict-tools route) and drops
+/// only that rewrite. The rewrite's one other job is removing a *forced* tool choice
+/// while the model thinks; kaibo sends `auto` or `none`, never a forced one.
+///
+/// The dialect needs a name of its own: rig decides which models read images by
+/// dialect name, and the name `deepseek` is hard-wired to "none do".
+/// `a_deepseek_image_reaches_the_wire_as_an_image_url_part` is the test that fails the day
+/// this stops working.
+fn deepseek_dialect() -> openai::wire::Dialect {
+    let mut quirks = openai::wire::DEEPSEEK.quirks;
+    quirks.rewrite = openai::wire::BodyRewrite::None;
+    openai::wire::Dialect {
+        name: "deepseek-sighted",
+        quirks,
+        ..openai::wire::DEEPSEEK
+    }
+}
+
 /// Stamps an app's name and URL on every request, the two headers OpenRouter reads to
 /// attribute traffic to an app in its dashboard.
 struct AppIdentity {
@@ -110,6 +135,11 @@ impl Llm {
     pub fn with_cache(mut self, retention: CacheRetention) -> Self {
         self.cache = Some(retention);
         self
+    }
+
+    /// The erased model itself, for callers that talk to rig's `DynModel` directly.
+    pub fn dyn_model(&self) -> &DynModel<Completion> {
+        &self.model
     }
 
     /// An agent builder over this model, carrying the arm's request options.
@@ -330,31 +360,6 @@ impl Arm {
         // config opt-in. A no-op for every other kind.
         let params =
             super::shaping::inject_provider_prefs(backend.kind, params, backend.data_collection);
-        // Preflight the blob through rig's OWN request builder for this wire. Two of the
-        // six wires parse it into a typed struct whose reasoning rungs are a closed enum,
-        // so an effort rig can't name dies *inside rig* at call time with a bare serde
-        // line ("unknown variant `max`") that says nothing about which slot of which cast
-        // asked for it. Asking here — the single live construction point — turns that into
-        // a boundary error naming the slot and the rungs that wire does take. It stays a
-        // preflight, not a policy: the accepted list is read back out of rig, so a rig bump
-        // that adds a rung needs no kaibo change, and effort stays a passthrough string
-        // everywhere rig lets it be one.
-        let wire = super::shaping::EffortWire::resolve(backend.kind, responses_wire);
-        if let Err(detail) = super::shaping::preflight_params(wire, params.as_ref()) {
-            return Err(anyhow!(
-                "model {:?} (backend {:?}, {} slot): effort {:?} is refused by rig's {} \
-                 request builder before the request leaves kaibo. That ceiling is \
-                 rig-core's typed client, not the provider's API — this wire accepts {}. \
-                 Set the slot's `effort` (or `[defaults]`) to one of those, or point the \
-                 slot at a backend whose wire passes effort through. (rig: {detail})",
-                slot.id,
-                backend.name,
-                role.key(),
-                t.effort,
-                wire.label(),
-                super::shaping::accepted_efforts(wire).join(" | "),
-            ));
-        }
         let caps = ModelCaps::resolve(backend.kind, &slot.id, slot.vision);
 
         // One HTTP backend carrying the per-request deadline, built by the shared
@@ -400,7 +405,7 @@ impl Arm {
             }
             WireKind::DeepSeek => {
                 let key = backend.resolve_key()?;
-                let model = openai::OpenAIConfig::with_key(&openai::wire::DEEPSEEK, key)
+                let model = openai::OpenAIConfig::with_key(&deepseek_dialect(), key)
                     .connect(http)
                     .chat(&slot.id);
                 Ok(Self::from_model(Llm::new(model), &slot.id, t.max_tokens, params, caps))
@@ -2817,7 +2822,7 @@ mod tests {
         tool_call_response, transcript_text, truncated, usage, with_raw, with_usage, CaptureHttp,
         RecordingSink, ScriptedClient,
     };
-    use rig_core::completion::CompletionRequest;
+    use rig_core::message::{AssistantMessage, CallId, ToolName};
     use std::fs;
     use std::num::NonZeroUsize;
     use std::path::Path;
@@ -3193,7 +3198,7 @@ mod tests {
         let flag = saw_image.clone();
         let client = ScriptedClient::builder()
             .on_model(MODEL, move |req| {
-                let has_image = req.chat_history.iter().any(|m| match m {
+                let has_image = req.chat_history.iter().any(|m| match &**m {
                     Message::User { content } => {
                         content.iter().any(|c| matches!(c, UserContent::Image(_)))
                     }
@@ -3260,7 +3265,7 @@ mod tests {
         let flag = saw_image.clone();
         let client = ScriptedClient::builder()
             .on_model(MODEL, move |req| {
-                let has_image = req.chat_history.iter().any(|m| match m {
+                let has_image = req.chat_history.iter().any(|m| match &**m {
                     Message::User { content } => {
                         content.iter().any(|c| matches!(c, UserContent::Image(_)))
                     }
@@ -3307,7 +3312,7 @@ mod tests {
                 let n = req
                     .chat_history
                     .iter()
-                    .find_map(|m| match m {
+                    .find_map(|m| match &**m {
                         Message::User { content } => Some(
                             content
                                 .iter()
@@ -3404,8 +3409,18 @@ mod tests {
             "oneshot is exactly ONE upstream request, got {}",
             direct.len()
         );
+        // rig 0.46 resolves the addressed model into the request itself, so each raw
+        // request names its own scripted id; that field differs by construction here.
+        let without_model = |raw: &Value| {
+            let mut raw = raw.clone();
+            raw.as_object_mut()
+                .expect("a serialized request is an object")
+                .remove("model");
+            raw
+        };
         assert_eq!(
-            direct[0].raw, looped[0].raw,
+            without_model(&direct[0].raw),
+            without_model(&looped[0].raw),
             "the direct completion must be request-for-request what the agent built"
         );
     }
@@ -3499,13 +3514,14 @@ mod tests {
     /// A malformed tool call mid-loop costs one extra request, not the investigation.
     ///
     /// The live shape (a Gemini Flash explorer inside a `deliberate`): the model
-    /// fumbles one function call, the provider refuses to shape the response, and rig
-    /// hands back a `PromptError::CompletionError` carrying **no transcript** — so a
-    /// phase-level retry could only start over from the first prompt. The retry lives
-    /// under the loop ([`crate::completion_retry`]), where the request still holds every
-    /// turn. The proof that the investigation survived is in the third request: it still
-    /// carries the tool result the first two attempts were built on, and the answer is
-    /// written from it.
+    /// fumbles one function call and the provider ends the turn with
+    /// `finishReason: MALFORMED_FUNCTION_CALL` and no usable content. rig 0.46 carries
+    /// that as `FinishReason::Other`, which fails the run with **no transcript** — so a
+    /// phase-level retry could only start over from the first prompt.
+    /// [`crate::completion_retry::MalformedGenerationHook`] rejects the turn from
+    /// `on_model_turn_finished`, where the run still holds every turn. The proof that the
+    /// investigation survived is in the third request: it still carries the tool result
+    /// the first two attempts were built on, and the answer is written from it.
     #[tokio::test]
     async fn a_malformed_tool_call_mid_loop_is_retried_and_the_investigation_survives() {
         use std::sync::atomic::AtomicBool;
@@ -3525,9 +3541,9 @@ mod tests {
                     ));
                 }
                 if !fumbled.swap(true, Ordering::SeqCst) {
-                    return Err(crate::test_support::response_error(
-                        "Gemini stopped with finish_reason=MalformedFunctionCall: \
-                         malformed function call: default_api",
+                    return Ok(crate::test_support::with_finish_reason(
+                        reasoning_response("planning the call"),
+                        rig_core::completion::FinishReason::Other("MALFORMED_FUNCTION_CALL".into()),
                     ));
                 }
                 Ok(text_response("ANSWER: built on EVIDENCE"))
@@ -3644,8 +3660,8 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(answer, "done");
-        assert_eq!(reported.input_tokens, 321);
-        assert_eq!(reported.output_tokens, 21);
+        assert_eq!(reported.input_tokens, Some(321));
+        assert_eq!(reported.output_tokens, Some(21));
     }
 
     /// The recovery this whole hook exists for: a model names a tool that was never
@@ -4077,18 +4093,18 @@ mod tests {
 
         assert_eq!(
             out.usage.input_tokens,
-            ns * 100 + ne * 50,
+            Some(ns * 100 + ne * 50),
             "input tokens must sum synth + explorer completions"
         );
         assert_eq!(
             out.usage.output_tokens,
-            ns * 10 + ne * 5,
+            Some(ns * 10 + ne * 5),
             "output tokens must sum synth + explorer completions"
         );
         // And the explorer's share is genuinely included — the total strictly exceeds
         // the synth's own tokens, so dropping the nested sink would fail here.
         assert!(
-            out.usage.input_tokens > ns * 100,
+            out.usage.input_tokens > Some(ns * 100),
             "the delegated explorer's tokens must be folded into the consult total"
         );
     }
@@ -4599,7 +4615,7 @@ mod tests {
 
         let client = ScriptedClient::builder()
             .on_model(SYNTH, |req| {
-                let history: Vec<Message> = req.chat_history.clone();
+                let history: Vec<Message> = req.chat_history.iter().map(|m| (**m).clone()).collect();
                 if any_tool_result_image(&history) {
                     Ok(text_response("ANSWER: saw the diagram"))
                 } else {
@@ -4661,7 +4677,7 @@ mod tests {
 
         let client = ScriptedClient::builder()
             .on_model(SYNTH, |req| {
-                let history: Vec<Message> = req.chat_history.clone();
+                let history: Vec<Message> = req.chat_history.iter().map(|m| (**m).clone()).collect();
                 if user_image_messages(&history) > 0 {
                     Ok(text_response("ANSWER: saw the diagram"))
                 } else {
@@ -5154,7 +5170,7 @@ mod tests {
 
         let client = ScriptedClient::builder()
             .on_model(SYNTH, |req| {
-                let history: Vec<Message> = req.chat_history.clone();
+                let history: Vec<Message> = req.chat_history.iter().map(|m| (**m).clone()).collect();
                 assert!(
                     user_image_messages(&history) > 0,
                     "the single turn must carry the routed image"
@@ -5750,11 +5766,10 @@ mod tests {
 
         // The retry's usage is ADDED to what was already spent, never substituted —
         // the caller paid for both, so the footer must say so. (16,801 + 3,971.)
-        assert_eq!(
-            out.usage.output_tokens, 20_772,
+        assert_eq!(out.usage.output_tokens, Some(20_772),
             "the pre-retry spend must survive into the returned usage"
         );
-        assert_eq!(out.usage.input_tokens, 1_201_062);
+        assert_eq!(out.usage.input_tokens, Some(1_201_062));
     }
 
     /// **Gate direction 2 of 2: no evidence ⇒ error, and no forced turn is even attempted.**
@@ -5877,7 +5892,11 @@ mod tests {
         use rig_core::completion::message::Reasoning;
         let text = |t: &str| AssistantContent::text(t);
         let reasoning = AssistantContent::Reasoning(Reasoning::new("thinking"));
-        let call = AssistantContent::tool_call("c1", "run_kaish", serde_json::json!({}));
+        let call = AssistantContent::tool_call(
+            "c1",
+            rig_core::message::ToolName::new("run_kaish").unwrap(),
+            serde_json::json!({}),
+        );
         assert!(turn_wrote_nothing(&[]));
         assert!(turn_wrote_nothing(std::slice::from_ref(&reasoning)));
         assert!(turn_wrote_nothing(&[text("  \n"), reasoning.clone()]));
@@ -5909,10 +5928,7 @@ mod tests {
                     // The evidence is in; this turn reasons until it is cut off.
                     Ok(truncated(with_usage(
                         reasoning_response("Now weighing each function against the tests..."),
-                        Usage {
-                            reasoning_tokens: 32_768,
-                            ..usage(64_688, 32_768)
-                        },
+                        usage(64_688, 32_768).reasoning_tokens(32_768),
                     )))
                 } else {
                     Ok(with_usage(
@@ -5967,8 +5983,8 @@ mod tests {
         );
 
         // The cut-off turn was billed; it stays on the record (17,158 + 32,768 + 4,000).
-        assert_eq!(out.usage.output_tokens, 53_926);
-        assert_eq!(out.usage.reasoning_tokens, 32_768);
+        assert_eq!(out.usage.output_tokens, Some(53_926));
+        assert_eq!(out.usage.reasoning_tokens, Some(32_768));
     }
 
     /// The effort a recorded request carried, read from DeepSeek's `reasoning_effort`.
@@ -6009,19 +6025,20 @@ mod tests {
         sink
     }
 
-    /// The write-up effort must pass rig's own request builder on each wire that checks
-    /// effort against a closed list. `Arm::from_slot` preflights only the slot's effort,
-    /// so a write-up effort rig refused would fail inside the call, mid-recovery, as a
-    /// bare serde error that names no slot.
+    /// The write-up effort must pass the one effort check kaibo owns: Gemini's closed
+    /// `thinkingLevel` enum. A write-up effort Google refused would fail inside the call,
+    /// mid-recovery, as a provider error that names no slot.
     #[test]
-    fn the_cut_off_write_up_effort_passes_every_closed_effort_wire() {
-        use super::super::shaping::{accepted_efforts, EffortWire};
-        for wire in [EffortWire::Gemini, EffortWire::OpenaiResponses] {
-            assert!(
-                accepted_efforts(wire).contains(&CUT_OFF_WRITE_UP_EFFORT),
-                "{wire:?} must accept {CUT_OFF_WRITE_UP_EFFORT:?}"
-            );
-        }
+    fn the_cut_off_write_up_effort_passes_the_gemini_check() {
+        let gemini = ModelShape::resolve(
+            ProviderKind::Gemini,
+            "gemini-3.5-flash",
+            ThinkingStyleOverride::Auto,
+        );
+        assert!(
+            gemini.check_effort(CUT_OFF_WRITE_UP_EFFORT).is_ok(),
+            "Gemini must accept {CUT_OFF_WRITE_UP_EFFORT:?}"
+        );
     }
 
     /// The write-up after a cut-off thinks at [`CUT_OFF_WRITE_UP_EFFORT`], not at the
@@ -6038,10 +6055,7 @@ mod tests {
                 } else if transcript_text(req).contains("target_marker") {
                     Ok(truncated(with_usage(
                         reasoning_response("Now weighing each function against the tests..."),
-                        Usage {
-                            reasoning_tokens: 32_768,
-                            ..usage(64_688, 32_768)
-                        },
+                        usage(64_688, 32_768).reasoning_tokens(32_768),
                     )))
                 } else {
                     Ok(tool_call_response(
@@ -6090,10 +6104,7 @@ mod tests {
                 if is_finalize_turn(req) || transcript_text(req).contains("target_marker") {
                     Ok(truncated(with_usage(
                         reasoning_response("Still weighing..."),
-                        Usage {
-                            reasoning_tokens: 16_384,
-                            ..usage(64_688, 16_384)
-                        },
+                        usage(64_688, 16_384).reasoning_tokens(16_384),
                     )))
                 } else {
                     Ok(tool_call_response(
@@ -6178,10 +6189,7 @@ mod tests {
             .on_model(SYNTH, |_req| {
                 Ok(truncated(with_usage(
                     reasoning_response("Twenty-five cases; start with the first..."),
-                    Usage {
-                        reasoning_tokens: 16_384,
-                        ..usage(8_000, 16_384)
-                    },
+                    usage(8_000, 16_384).reasoning_tokens(16_384),
                 )))
             })
             .build();
@@ -6421,10 +6429,7 @@ mod tests {
             .on_model(MODEL, |_req| {
                 let resp = with_usage(
                     reasoning_response("Weighing each row..."),
-                    Usage {
-                        reasoning_tokens: 16384,
-                        ..usage(2_000, 16384)
-                    },
+                    usage(2_000, 16384).reasoning_tokens(16384),
                 );
                 Ok(with_raw(
                     resp,
@@ -6541,10 +6546,7 @@ mod tests {
             .on_model(EXPLORER, |_req| {
                 Ok(truncated(with_usage(
                     reasoning_response("surveying..."),
-                    Usage {
-                        reasoning_tokens: 16384,
-                        ..usage(2_000, 16384)
-                    },
+                    usage(2_000, 16384).reasoning_tokens(16384),
                 )))
             })
             .build();
@@ -7215,20 +7217,18 @@ mod tests {
         );
     }
 
-    /// An effort rig's typed request builder can't name fails **here**, at arm
-    /// construction, with a message an operator can act on — not mid-consult as a bare
-    /// `unknown variant \`max\``.
+    /// An effort Google's `thinkingLevel` enum can't name fails **here**, at arm
+    /// construction, with a message an operator can act on — not mid-consult as a
+    /// provider 400.
     ///
-    /// Two wires parse kaibo's blob into a typed struct with a closed rung set (rig's
-    /// Gemini `ThinkingLevel`, its Responses `ReasoningEffort`), and that ceiling is
-    /// rig's client rather than the provider's API — OpenAI's own endpoint takes `"max"`.
-    /// kaibo keeps no allowlist of its own, so the refusal comes from asking rig's
-    /// converter, and the rungs it offers are read back out of rig too
-    /// (`tests/effort_wire.rs` pins both against real request bodies). What this test
-    /// owns is the *message*: the model, the backend, the role, the value that failed,
-    /// whose ceiling it is, and what to type instead.
+    /// Gemini's level is a closed enum that Google itself enforces (`xhigh`, `max` and
+    /// `none` are refused, verified live), and rig 0.46 carries kaibo's blob as raw JSON,
+    /// so kaibo owns this one check ([`ModelShape::check_effort`]). It is not a global
+    /// allowlist: every other wire still passes an unknown rung through. What this test
+    /// owns is the *message*: the model, the backend, the role, the value that failed, and
+    /// what to type instead.
     #[test]
-    fn a_rig_refused_effort_fails_at_arm_construction_with_an_actionable_message() {
+    fn a_gemini_effort_google_refuses_fails_at_arm_construction_with_an_actionable_message() {
         let defaults = crate::config::Defaults::default();
         let backend = crate::config::Backend {
             name: "google".into(),
@@ -7249,24 +7249,18 @@ mod tests {
             ..ModelSlot::bare("google", "gemini-3.5-flash")
         };
         let err = Arm::from_slot(&backend, &slot, ModelRole::Synth, &defaults)
-            .expect_err("rig's Gemini builder refuses xhigh")
+            .expect_err("Gemini's thinking level has no xhigh")
             .to_string();
         assert!(err.contains("gemini-3.5-flash"), "names the model: {err}");
         assert!(err.contains("google"), "names the backend: {err}");
         assert!(err.contains("synth"), "names the role: {err}");
         assert!(err.contains("xhigh"), "names the value that failed: {err}");
         assert!(
-            err.contains("rig-core"),
-            "says whose ceiling this is, so the operator doesn't go hunting in \
-             Google's docs for a limit that isn't theirs: {err}"
-        );
-        assert!(
             err.contains("minimal | low | medium | high"),
             "offers the rungs this wire does take: {err}"
         );
 
-        // A rung the wire accepts builds normally — the preflight adds no ceiling of
-        // its own, it only reports rig's.
+        // A rung the wire accepts builds normally.
         let slot = ModelSlot {
             effort: Some("low".into()),
             ..ModelSlot::bare("google", "gemini-3.5-flash")
@@ -7279,7 +7273,7 @@ mod tests {
             "low"
         );
 
-        // And a passthrough wire keeps passing anything through — the preflight must not
+        // And a passthrough wire keeps passing anything through — the check must not
         // quietly become a global allowlist.
         let backend = crate::config::Backend {
             name: "deepseek".into(),
@@ -7670,37 +7664,22 @@ mod tests {
     #[tokio::test]
     async fn a_deepseek_image_reaches_the_wire_as_an_image_url_part() {
         let http = CaptureHttp::default();
-        let client = deepseek::Client::builder()
-            .api_key("sk-test")
-            .http_client(http.clone())
-            .build()
-            .expect("offline deepseek client construction");
+        let model = openai::OpenAIConfig::with_key(&deepseek_dialect(), "sk-test")
+            .connect(http.clone())
+            .chat("deepseek-flash");
         let image = Attachment::Image {
             path: "shot.png".into(),
             mime: "image/png",
             data_b64: "ZmFrZQ==".into(),
         };
-        let request = CompletionRequest {
-            model: None,
-            preamble: Some("describe it".into()),
-            chat_history: vec![user_turn_with_attachments(
-                std::slice::from_ref(&image),
-                "what color?".into(),
-            )],
-            documents: Vec::new(),
-            tools: Vec::new(),
-            temperature: None,
-            max_tokens: Some(64),
-            tool_choice: None,
-            additional_params: None,
-            output_schema: None,
-            record_telemetry_content: false,
-        };
+        let request = CompletionRequest::new(user_turn_with_attachments(
+            std::slice::from_ref(&image),
+            "what color?".into(),
+        ))
+        .preamble("describe it")
+        .max_tokens(64);
         // The capture transport always errors; the body is already built by then.
-        let _ = client
-            .completion_model("deepseek-flash")
-            .completion(request)
-            .await;
+        let _ = model.call(request).await;
         let body = http.recorded().expect("rig serialized a request body");
         let user = body["messages"]
             .as_array()
@@ -7733,28 +7712,14 @@ mod tests {
     #[tokio::test]
     async fn openrouter_completion_sends_max_tokens_natively() {
         let http = CaptureHttp::default();
-        let client = openrouter::Client::builder()
-            .api_key("sk-or-test")
-            .http_client(http.clone())
-            .build()
-            .expect("offline openrouter client construction");
-        let request = CompletionRequest {
-            model: None,
-            preamble: Some("ground every claim".into()),
-            chat_history: vec![Message::user("hi")],
-            documents: Vec::new(),
-            tools: Vec::new(),
-            temperature: None,
-            max_tokens: Some(4096),
-            tool_choice: None,
-            additional_params: Some(json!({ "reasoning": { "effort": "high" } })),
-            output_schema: None,
-            record_telemetry_content: false,
-        };
+        let llm = Arm::openrouter_completion_model(http.clone(), "sk-or-test".into(), "qwen/qwen3.7-max");
+        let request = llm
+            .request(Message::user("hi"))
+            .preamble("ground every claim")
+            .max_tokens(4096)
+            .additional_params(json!({ "reasoning": { "effort": "high" } }));
         // The capture transport always errors; the body is already built by then.
-        let _ = Arm::openrouter_completion_model(&client, "qwen/qwen3.7-max")
-            .completion(request)
-            .await;
+        let _ = llm.dyn_model().call(request).await;
         let body = http.recorded().expect("rig serialized a request body");
         assert_eq!(
             body["max_tokens"], 4096,
@@ -7778,68 +7743,54 @@ mod tests {
     /// short of the body would stay green through that.
     #[tokio::test]
     async fn openrouter_arm_enables_prompt_caching() {
-        async fn system_block(
-            model: openrouter::CompletionModel<CaptureHttp>,
-            http: &CaptureHttp,
-        ) -> Value {
-            let request = CompletionRequest {
-                model: None,
-                preamble: Some("ground every claim".into()),
-                chat_history: vec![Message::user("hi")],
-                documents: Vec::new(),
-                tools: Vec::new(),
-                temperature: None,
-                max_tokens: Some(4096),
-                tool_choice: None,
-                additional_params: None,
-                output_schema: None,
-                record_telemetry_content: false,
-            };
+        /// The serialized request body one arm sends for a one-turn prompt.
+        async fn body_sent_by(llm: &Llm, http: &CaptureHttp) -> Value {
+            let request = llm
+                .request(Message::user("hi"))
+                .preamble("ground every claim")
+                .max_tokens(4096);
             // The capture transport always errors; the body is already built by then.
-            let _ = model.completion(request).await;
-            http.recorded()
-                .expect("rig serialized a request body")
-                .pointer("/messages/0")
-                .cloned()
-                .expect("the system message leads the body")
+            let _ = llm.dyn_model().call(request).await;
+            http.recorded().expect("rig serialized a request body")
         }
 
-        let http = CaptureHttp::default();
-        let client = openrouter::Client::builder()
-            .api_key("sk-or-test")
-            .http_client(http.clone())
-            .build()
-            .expect("offline openrouter client construction");
-
         let plain_http = CaptureHttp::default();
-        let plain_client = openrouter::Client::builder()
-            .api_key("sk-or-test")
-            .http_client(plain_http.clone())
-            .build()
-            .expect("offline openrouter client construction");
-        let plain = system_block(
-            plain_client.completion_model("~anthropic/claude-sonnet-latest"),
-            &plain_http,
-        )
-        .await;
+        let plain_llm = Llm::new(
+            openai::OpenAIConfig::with_key(&openai::wire::OPENROUTER, "sk-or-test")
+                .connect(plain_http.clone())
+                .chat("~anthropic/claude-sonnet-latest"),
+        );
+        let plain = body_sent_by(&plain_llm, &plain_http).await;
         assert!(
             !plain.to_string().contains("cache_control"),
             "rig marks no breakpoint by default — the arm constructor is load-bearing: \
              {plain}"
         );
 
-        let armed = system_block(
-            Arm::openrouter_completion_model(&client, "~anthropic/claude-sonnet-latest"),
-            &http,
-        )
-        .await;
-        assert!(
-            armed.to_string().contains(r#""cache_control""#),
-            "the OpenRouter arm must put a cache breakpoint on the system prompt: {armed}"
+        let http = CaptureHttp::default();
+        let armed_llm = Arm::openrouter_completion_model(
+            http.clone(),
+            "sk-or-test".into(),
+            "~anthropic/claude-sonnet-latest",
         );
-        assert!(
-            armed.to_string().contains("ephemeral"),
-            "the breakpoint is the ephemeral kind OpenRouter bills against: {armed}"
+        let armed = body_sent_by(&armed_llm, &http).await;
+        assert_eq!(
+            armed.pointer("/cache_control/type"),
+            Some(&json!("ephemeral")),
+            "the OpenRouter arm must send the ephemeral cache marker OpenRouter bills \
+             against: {armed}"
+        );
+
+        // The app identity rides every request, so kaibo's traffic is attributable in the
+        // OpenRouter dashboard.
+        let headers = http.recorded_headers().expect("a request was sent");
+        assert_eq!(
+            headers.get("x-openrouter-title").and_then(|v| v.to_str().ok()),
+            Some("kaibo")
+        );
+        assert_eq!(
+            headers.get("http-referer").and_then(|v| v.to_str().ok()),
+            Some("https://github.com/tobert/kaibo")
         );
     }
 
@@ -8743,28 +8694,43 @@ mod tests {
 
     /// An assistant turn calling `view_image` by `id`.
     fn vi_call(id: &str) -> Message {
-        Message::Assistant {
-            id: None,
-            content: vec![AssistantContent::tool_call(
-                id,
-                ViewImage::NAME,
-                json!({ "path": "shot.png" }),
-            )],
+        assistant_calling(vec![tc(id, ViewImage::NAME, json!({ "path": "shot.png" }))])
+    }
+
+    /// A tool call block, naming its tool as rig 0.46 requires (a non-empty `ToolName`).
+    fn tc(id: &str, name: &str, args: Value) -> AssistantContent {
+        AssistantContent::tool_call(id, ToolName::new(name).expect("a non-empty tool name"), args)
+    }
+
+    /// An assistant turn holding `content`.
+    fn assistant_calling(content: Vec<AssistantContent>) -> Message {
+        Message::Assistant(AssistantMessage::new(content))
+    }
+
+    /// A tool result answering `id`, as the tool `name` returned `content`.
+    fn tool_result(id: &str, name: &str, content: Vec<ToolResultContent>) -> ToolResult {
+        ToolResult {
+            call: CallId::from_wire(id),
+            name: ToolName::new(name).expect("a non-empty tool name"),
+            content,
+            is_error: false,
         }
     }
 
     /// A `view_image` tool result: the load note (text) *and* the image part — the
     /// two typed content blocks `ViewImage` returns.
     fn vi_result(id: &str) -> UserContent {
-        UserContent::ToolResult(ToolResult {
-            call: rig_core::completion::message::ToolCallId::new_or_mint(id.to_string()),
-            provider: None,
-            name: ViewImage::NAME.to_string(),
-            content: vec![
+        UserContent::ToolResult(tool_result(
+            id,
+            ViewImage::NAME,
+            vec![
                 ToolResultContent::text("Loaded image shot.png (image/png, 1.0 KiB)."),
-                ToolResultContent::image_base64("ZmFrZQ==", None, None),
+                ToolResultContent::Image(Image {
+                    data: DocumentSourceKind::Base64("ZmFrZQ==".into()),
+                    ..Image::default()
+                }),
             ],
-        })
+        ))
     }
 
     /// True if any tool result anywhere still carries an image part.
@@ -8791,19 +8757,20 @@ mod tests {
     /// stays answered (now by text). The separate message is load-bearing — rig's
     /// openai converter drops non-tool parts from a mixed user turn.
     /// The rewrite rebuilds each image-bearing tool result, so it must carry the whole
-    /// identity across: `provider` is the id the wire echoes back to pair the result
-    /// with its call, and `name` is what name-keyed wires replay. Dropping either
-    /// would still pass the call-id checks in the other rewrite tests.
+    /// identity across: `call` is the id the wire echoes back to pair the result with its
+    /// call (a provider-issued id in rig 0.46), `name` is what name-keyed wires replay,
+    /// and `is_error` says whether the tool failed. Dropping any would still pass the
+    /// call-id checks in the other rewrite tests.
     #[test]
-    fn rewrite_keeps_the_tool_results_provider_id_and_name() {
-        use rig_core::completion::message::ProviderCallId;
+    fn rewrite_keeps_the_tool_results_provider_id_name_and_error_flag() {
         let UserContent::ToolResult(mut tr) = vi_result("call-1") else {
             unreachable!("vi_result builds a tool result")
         };
-        tr.provider = ProviderCallId::new("call_wire_1");
+        tr.call = CallId::from_wire("call_wire_1");
+        tr.is_error = true;
         let history = vec![
             Message::user("look at shot.png"),
-            vi_call("call-1"),
+            vi_call("call_wire_1"),
             Message::User {
                 content: vec![UserContent::ToolResult(tr)],
             },
@@ -8823,13 +8790,13 @@ mod tests {
             !any_tool_result_image(&out),
             "the rewrite ran on this result: {out:?}"
         );
-        assert_eq!(rewritten.call.as_str(), "call-1");
         assert_eq!(
-            rewritten.provider.as_ref().map(|p| p.call_id.as_str()),
+            rewritten.call.provider().map(|p| p.as_str()),
             Some("call_wire_1"),
             "the provider-issued id survives: {rewritten:?}"
         );
-        assert_eq!(rewritten.name, ViewImage::NAME, "the tool name survives");
+        assert_eq!(&*rewritten.name, ViewImage::NAME, "the tool name survives");
+        assert!(rewritten.is_error, "the failure flag survives");
     }
 
     #[test]
@@ -8857,7 +8824,7 @@ mod tests {
         assert!(
             out.iter().any(|m| matches!(m, Message::User { content }
                 if content.iter().any(|c| matches!(c, UserContent::ToolResult(tr)
-                    if tr.call.as_str() == "call-1"
+                    if &*tr.call.wire() == "call-1"
                     && tr.content.iter().all(|rc| matches!(rc, ToolResultContent::Text(_))))))),
             "the view_image tool_use stays answered by a text result: {out:?}"
         );
@@ -8907,21 +8874,18 @@ mod tests {
     /// proven separately in the driven loop test.)
     #[test]
     fn rewrite_leaves_a_co_tool_call_result_intact() {
-        let assistant = Message::Assistant {
-            id: None,
-            content: vec![
-                AssistantContent::tool_call("vi", ViewImage::NAME, json!({ "path": "shot.png" })),
-                AssistantContent::tool_call("rk", "run_kaish", json!({ "script": "ls" })),
-            ],
-        };
+        let assistant = assistant_calling(vec![
+            tc("vi", ViewImage::NAME, json!({ "path": "shot.png" })),
+            tc("rk", "run_kaish", json!({ "script": "ls" })),
+        ]);
         let results = Message::User {
             content: vec![
                 vi_result("vi"),
-                UserContent::tool_result(
+                UserContent::ToolResult(tool_result(
                     "rk",
                     "run_kaish",
                     vec![ToolResultContent::text("exit:0\nshot.png")],
-                ),
+                )),
             ],
         };
         let out = rewrite_tool_image_history(vec![Message::user("q"), assistant, results]);
@@ -8931,7 +8895,7 @@ mod tests {
         assert!(
             out.iter().any(|m| matches!(m, Message::User { content }
                 if content.iter().any(|c| matches!(c, UserContent::ToolResult(tr)
-                    if tr.call.as_str() == "rk"
+                    if &*tr.call.wire() == "rk"
                     && tr.content.iter().any(|rc| matches!(rc,
                         ToolResultContent::Text(t) if t.text.contains("shot.png"))))))),
             "the run_kaish tool_result is preserved verbatim: {out:?}"
@@ -8945,26 +8909,23 @@ mod tests {
     /// not the tool's name.
     #[test]
     fn rewrite_moves_an_explore_result_image_onto_a_separate_user_image_turn() {
-        let assistant = Message::Assistant {
-            id: None,
-            content: vec![AssistantContent::tool_call(
+        let assistant = assistant_calling(vec![tc(
+            "explore-1",
+            "explore",
+            json!({ "question": "what does the diagram show?" }),
+        )]);
+        let result = Message::User {
+            content: vec![UserContent::ToolResult(tool_result(
                 "explore-1",
                 "explore",
-                json!({ "question": "what does the diagram show?" }),
-            )],
-        };
-        let result = Message::User {
-            content: vec![UserContent::ToolResult(ToolResult {
-                call: rig_core::completion::message::ToolCallId::new_or_mint(
-                    "explore-1".to_string(),
-                ),
-                provider: None,
-                name: "explore".to_string(),
-                content: vec![
+                vec![
                     ToolResultContent::text("attached: docs/arch.png (image/png, 4.0 KiB)"),
-                    ToolResultContent::image_base64("ZmFrZQ==", None, None),
+                    ToolResultContent::Image(Image {
+                        data: DocumentSourceKind::Base64("ZmFrZQ==".into()),
+                        ..Image::default()
+                    }),
                 ],
-            })],
+            ))],
         };
         let out = rewrite_tool_image_history(vec![Message::user("q"), assistant, result]);
 
@@ -8980,7 +8941,7 @@ mod tests {
         assert!(
             out.iter().any(|m| matches!(m, Message::User { content }
                 if content.iter().any(|c| matches!(c, UserContent::ToolResult(tr)
-                    if tr.call.as_str() == "explore-1"
+                    if &*tr.call.wire() == "explore-1"
                     && tr.content.iter().all(|rc| matches!(rc, ToolResultContent::Text(_))))))),
             "the explore tool_use stays answered by a text-only result: {out:?}"
         );
@@ -8992,25 +8953,24 @@ mod tests {
     /// second on a channel the transport rejects. (DeepSeek review gap, 2026-07-26.)
     #[test]
     fn rewrite_moves_both_images_when_two_tools_carry_them() {
-        let assistant = Message::Assistant {
-            id: None,
-            content: vec![
-                AssistantContent::tool_call("vi", ViewImage::NAME, json!({ "path": "shot.png" })),
-                AssistantContent::tool_call("ex", "explore", json!({ "question": "diagram?" })),
-            ],
-        };
+        let assistant = assistant_calling(vec![
+            tc("vi", ViewImage::NAME, json!({ "path": "shot.png" })),
+            tc("ex", "explore", json!({ "question": "diagram?" })),
+        ]);
         let results = Message::User {
             content: vec![
                 vi_result("vi"),
-                UserContent::ToolResult(ToolResult {
-                    call: rig_core::completion::message::ToolCallId::new_or_mint("ex".to_string()),
-                    provider: None,
-                    name: "explore".to_string(),
-                    content: vec![
+                UserContent::ToolResult(tool_result(
+                    "ex",
+                    "explore",
+                    vec![
                         ToolResultContent::text("attached: docs/arch.png (image/png, 4.0 KiB)"),
-                        ToolResultContent::image_base64("ZmFrZTI=", None, None),
+                        ToolResultContent::Image(Image {
+                            data: DocumentSourceKind::Base64("ZmFrZTI=".into()),
+                            ..Image::default()
+                        }),
                     ],
-                }),
+                )),
             ],
         };
         let out = rewrite_tool_image_history(vec![Message::user("q"), assistant, results]);
@@ -9028,7 +8988,7 @@ mod tests {
             assert!(
                 out.iter().any(|m| matches!(m, Message::User { content }
                     if content.iter().any(|c| matches!(c, UserContent::ToolResult(tr)
-                        if tr.call.as_str() == id
+                        if &*tr.call.wire() == id
                         && tr.content.iter().all(|rc| matches!(rc, ToolResultContent::Text(_))))))),
                 "tool_use `{id}` stays answered by a text-only result: {out:?}"
             );
@@ -9061,7 +9021,7 @@ src/view_image.rs:177: json!({"response": note, "parts": [{"type":"image", "data
                 data: DocumentSourceKind::Base64("ZmFrZQ==".into()),
                 media_type: ImageMediaType::from_mime_type("image/png"),
                 detail: None,
-                additional_params: None,
+                native: None,
             }),
         ])
         .expect("two parts");

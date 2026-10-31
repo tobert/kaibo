@@ -354,7 +354,7 @@ pub fn text_response(text: impl Into<String>) -> CompletionResponse {
 /// no `Text` and no `ToolCall`, so rig's text extraction yields `""` — an `Ok` response
 /// with an empty output. The offline stand-in for the generated-but-undelivered answer.
 pub fn reasoning_response(reasoning: impl AsRef<str>) -> CompletionResponse {
-    response(vec![AssistantContent::reasoning(reasoning)])
+    response(vec![AssistantContent::reasoning(reasoning.as_ref())])
 }
 
 /// A single tool call — drives one more loop turn.
@@ -420,6 +420,16 @@ pub fn truncated(resp: CompletionResponse) -> CompletionResponse {
         resp.with_finish_reason(rig_core::completion::FinishReason::Length),
         serde_json::json!({"choices": [{"index": 0, "finish_reason": "length"}]}),
     )
+}
+
+/// Stamp a scripted response with the finish reason a provider states, whatever it is —
+/// `Other("MALFORMED_FUNCTION_CALL")` for a Gemini fumble, `ContentFilter` for a refusal.
+/// [`truncated`] is the `Length` case with its raw payload to match.
+pub fn with_finish_reason(
+    resp: CompletionResponse,
+    reason: rig_core::completion::FinishReason,
+) -> CompletionResponse {
+    resp.with_finish_reason(reason)
 }
 
 /// A [`Usage`] a scripted provider "reports" for one completion, `input`/`output`

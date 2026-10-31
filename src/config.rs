@@ -68,7 +68,7 @@ pub struct Defaults {
     /// Gemini's `thinkingLevel`, OpenRouter's unified `reasoning.effort`). A passthrough
     /// string — kaibo keeps no allowlist. Default `"high"` both roles; bump a synth
     /// slot's `effort` for heavier synth runs. **The ladder is per-provider**, not
-    /// universal — see `docs/config.md` and [`crate::consult::EffortWire`].
+    /// universal — see `docs/config.md` and [`crate::consult::ModelShape::check_effort`].
     pub explorer_effort: String,
     pub synth_effort: String,
     /// Did the operator *write* the per-role effort (config file, `KAIBO_*_EFFORT`), or
@@ -514,10 +514,10 @@ pub enum EffortFate {
     /// "Ships" means kaibo puts it in the params blob — it does *not* promise the wire
     /// takes it. On DeepSeek and OpenRouter it becomes a structural disable
     /// (`thinking:{"type":"disabled"}` / `reasoning:{"enabled":false}`); on Gemini,
-    /// whose `thinkingLevel` has no off variant at all, it is refused by the preflight
-    /// (`consult::preflight_params`) before a request is built, naming the slot and the
+    /// whose `thinkingLevel` has no off variant at all, it is refused by
+    /// `ModelShape::check_effort` before a request is built, naming the slot and the
     /// rungs that wire does take. This fate answers "what did kaibo do with the value",
-    /// and the preflight answers "will this wire accept it" — two questions on purpose.
+    /// and the check answers "will this wire accept it" — two questions on purpose.
     SentAsOff,
     /// Ships as configured, but kaibo can't rank it — a rung newer than
     /// [`crate::consult::EFFORT_LADDER`], or a typo. Passed through on purpose (kaibo

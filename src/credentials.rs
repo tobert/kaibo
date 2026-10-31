@@ -299,7 +299,7 @@ impl ProviderKind {
 
     /// The completion wire behind this kind, or `None` for a media kind — the
     /// convenience form of [`class`](Self::class) for the completion entry points
-    /// (`ModelShape::resolve`, `ModelCaps::resolve`, `EffortWire::resolve`,
+    /// (`ModelShape::resolve`, `ModelCaps::resolve`,
     /// `batch_supported`), each of which answers the media case once at its top
     /// instead of growing a media arm in every internal match.
     pub fn wire(self) -> Option<WireKind> {

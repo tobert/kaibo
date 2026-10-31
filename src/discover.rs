@@ -91,7 +91,7 @@ pub struct DiscoveredModel {
     /// ladder, and it moves per model (Crusoe takes `max` on DeepSeek-V4-Flash and
     /// caps at `high` on Nemotron-Omni-Reasoning). A rung a model refuses comes back
     /// as the provider's own error naming what it accepts, which is why kaibo keeps
-    /// no allowlist — see [`crate::consult::EffortWire`].
+    /// no allowlist — see [`crate::consult::ModelShape::check_effort`].
     pub reasoning: Option<bool>,
 }
 

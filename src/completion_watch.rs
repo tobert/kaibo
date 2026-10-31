@@ -47,6 +47,7 @@ use rig_core::completion::{CompletionRequest, CompletionResponse, Usage};
 use rig_core::effect::{Answered, EffectId, EffectKind};
 use rig_core::error::{ErrorReport, ProviderError};
 use rig_core::operation::Completion;
+
 use rig_core::DynModel;
 use serde_json::Value;
 
@@ -458,12 +459,11 @@ impl AgentHook for Watch {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::consult::Llm;
     use crate::test_support::{
         provider_error, response_error, text_response, tool_call_response, usage, with_raw,
-        with_usage, ScriptedClient, ScriptedModel,
+        with_usage, ScriptedClient,
     };
-    use rig_core::client::CompletionClient;
-    use rig_core::message::Message;
     use serde_json::json;
 
     /// The beat is the one place a caller learns how long a call took, so it must carry
@@ -475,26 +475,22 @@ mod tests {
         use crate::progress::PhaseEvent;
         use crate::test_support::RecordingSink;
         let sink = Arc::new(RecordingSink::default());
-        let model = ScriptedClient::builder()
-            .on_model("m", |req| {
-                std::thread::sleep(std::time::Duration::from_millis(30));
-                // The second call fails: `max_tokens` is the switch.
-                if req.max_tokens == Some(1) {
-                    Err(provider_error("boom"))
-                } else {
-                    Ok(text_response("hi"))
-                }
-            })
-            .build()
-            .completion_model("m");
-        let watched =
-            Watched::new(model, CompletionLog::new(), None, "m").with_beat(sink.clone(), "synth");
+        let model = model(|req| {
+            std::thread::sleep(std::time::Duration::from_millis(30));
+            // The second call fails: `max_tokens` is the switch.
+            if req.max_tokens == Some(1) {
+                Err(provider_error("boom"))
+            } else {
+                Ok(text_response("hi"))
+            }
+        });
+        let watch = Watch::new(CompletionLog::new(), None, "m").with_beat(sink.clone(), "synth");
 
-        watched.completion(req()).await.expect("first call answers");
+        watch.call(model.dyn_model(), req()).await.expect("first call answers");
         let mut failing = req();
         failing.max_tokens = Some(1);
-        watched
-            .completion(failing)
+        watch
+            .call(model.dyn_model(), failing)
             .await
             .expect_err("second call fails");
 
@@ -518,36 +514,32 @@ mod tests {
         }
     }
 
-    /// The watcher sits inside the retry wrapper, so a turn the provider fumbles once
-    /// beats twice — one per attempt, each timed on its own — and the attempt counter
-    /// says two. Neither number ever includes kaibo's wait between attempts.
+    /// A malformed generation sent again beats twice — one per attempt, each timed on
+    /// its own — and the attempt counter says two, while one response is recorded. Neither
+    /// number ever includes a wait between attempts.
     #[tokio::test]
     async fn a_retried_turn_beats_and_counts_once_per_attempt() {
-        use crate::completion_retry::retried;
+        use crate::completion_retry::retry_malformed;
         use crate::progress::PhaseEvent;
         use crate::test_support::RecordingSink;
         use std::sync::atomic::{AtomicUsize, Ordering};
         let sink = Arc::new(RecordingSink::default());
         let calls = Arc::new(AtomicUsize::new(0));
         let seen = calls.clone();
-        let model = ScriptedClient::builder()
-            .on_model("m", move |_| {
-                std::thread::sleep(std::time::Duration::from_millis(20));
-                if seen.fetch_add(1, Ordering::SeqCst) == 0 {
-                    Err(provider_error("MALFORMED_FUNCTION_CALL"))
-                } else {
-                    Ok(text_response("hi"))
-                }
-            })
-            .build()
-            .completion_model("m");
+        let model = model(move |_| {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            if seen.fetch_add(1, Ordering::SeqCst) == 0 {
+                Err(provider_error("MALFORMED_FUNCTION_CALL"))
+            } else {
+                Ok(text_response("hi"))
+            }
+        });
         let log = CompletionLog::new();
-        let stack = retried(
-            Watched::new(model, log.clone(), None, "m").with_beat(sink.clone(), "synth"),
-            "m",
-        );
+        let watch = Watch::new(log.clone(), None, "m").with_beat(sink.clone(), "synth");
 
-        stack.completion(req()).await.expect("the retry answers");
+        retry_malformed("m", || watch.call(model.dyn_model(), req()))
+            .await
+            .expect("the retry answers");
 
         assert_eq!(calls.load(Ordering::SeqCst), 2, "one fumble, one answer");
         assert_eq!(log.attempts(), 2, "the counter sees each attempt");
@@ -572,76 +564,113 @@ mod tests {
         }
     }
 
-    /// The bare wrapper — the single-shot lanes' shape — emits nothing.
+    /// A watcher without a beat — the single-shot lanes' shape — emits nothing.
     #[tokio::test]
-    async fn a_wrapper_without_a_beat_emits_nothing() {
+    async fn a_watcher_without_a_beat_emits_nothing() {
         use crate::test_support::RecordingSink;
         let sink = Arc::new(RecordingSink::default());
         let model = model(|_| Ok(text_response("hi")));
-        let watched = Watched::new(model, CompletionLog::new(), None, "m");
-        watched.completion(req()).await.expect("answers");
+        let watch = Watch::new(CompletionLog::new(), None, "m");
+        watch.call(model.dyn_model(), req()).await.expect("answers");
         assert!(sink.events().is_empty());
+    }
+
+    /// The hook seam: inside a real agent loop the watcher sees every completion the
+    /// loop makes, counts it, times it, and records what the response reported — with no
+    /// help from the loop's own code. A tool-call turn then a final answer is two
+    /// completions, two beats, two records.
+    #[tokio::test]
+    async fn the_hook_records_every_turn_of_a_real_agent_loop() {
+        use crate::progress::PhaseEvent;
+        use crate::test_support::{is_finalize_turn, RecordingSink};
+        let sink = Arc::new(RecordingSink::default());
+        let model = model(|req| {
+            if is_finalize_turn(req) || crate::test_support::transcript_text(req).contains("exit:")
+            {
+                Ok(with_raw(text_response("done"), openai_raw("stop")))
+            } else {
+                Ok(with_raw(
+                    tool_call_response("c1", "run_kaish", json!({"script": "echo hi"})),
+                    openai_raw("tool_calls"),
+                ))
+            }
+        });
+        let log = CompletionLog::new();
+        let watch = Watch::new(log.clone(), None, "m").with_beat(sink.clone(), "explorer");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let worker = crate::sandbox::KaishWorker::spawn(dir.path()).expect("kaish worker");
+        let agent = rig_agent::AgentBuilder::new(model_inner(&model))
+            .tool(crate::explorer::RunKaish::new(worker))
+            .build();
+        let response = agent
+            .prompt("go")
+            .add_hook(watch)
+            .max_turns(4)
+            .await
+            .expect("the loop answers");
+        assert_eq!(response.output(), "done");
+        assert_eq!(log.attempts(), 2, "two completions attempted");
+        let turns = log.turns();
+        assert_eq!(turns.len(), 2, "both responses recorded: {turns:?}");
+        assert_eq!(turns[0].tool_calls, 1);
+        assert_eq!(turns[1].text_chars, 4);
+        let beats = sink
+            .events()
+            .into_iter()
+            .filter(|e| matches!(e, PhaseEvent::ChatCompleted { agent: "explorer", .. }))
+            .count();
+        assert_eq!(beats, 2, "one beat per completion");
     }
 
     /// A one-turn request, the shape rig's agent builds for a toolless call.
     fn req() -> CompletionRequest {
-        CompletionRequest {
-            model: None,
-            preamble: None,
-            chat_history: vec![Message::user("q")],
-            documents: Vec::new(),
-            tools: Vec::new(),
-            temperature: None,
-            max_tokens: Some(64),
-            tool_choice: None,
-            additional_params: None,
-            output_schema: None,
-            record_telemetry_content: false,
-        }
+        CompletionRequest::new(rig_core::message::Message::user("q")).max_tokens(64)
     }
 
-    /// Each `CompletionError` variant maps to its own `error.type` label. The match is
-    /// exhaustive since rig 0.42 dropped `#[non_exhaustive]`, so a new variant fails the
-    /// build; this pins that the seven existing names are the right ones, since no
-    /// offline arm carries the identity that would reach the metric through `Watched`.
+    /// The model inside an [`Llm`], for builders that take rig's erased type directly.
+    fn model_inner(llm: &Llm) -> DynModel<Completion> {
+        llm.dyn_model().clone()
+    }
+
+    /// Each class of rig's error enum maps to its own `error.type` label. `ProviderError`
+    /// is `#[non_exhaustive]`, so a variant rig adds later falls under `other_error` until
+    /// someone names it; this pins the names the existing classes carry.
     #[test]
-    fn every_completion_error_variant_has_its_own_error_type() {
+    fn every_provider_error_class_has_its_own_error_type() {
         use crate::test_support::status_error;
-        let url = reqwest::Url::parse("not a url").unwrap_err();
         let json = serde_json::from_str::<Value>("{").unwrap_err();
-        let cases: Vec<(CompletionError, &str)> = vec![
+        let url = reqwest::Url::parse("not a url").unwrap_err();
+        let cases: Vec<(ProviderError, &str)> = vec![
             (
-                CompletionError::HttpError(rig_core::http_client::Error::StreamEnded),
+                ProviderError::Http(Arc::new(rig_core::http_client::Error::StreamEnded)),
                 "http_error",
             ),
-            (CompletionError::JsonError(json), "json_error"),
-            (CompletionError::UrlError(url), "url_error"),
+            (ProviderError::Json(Arc::new(json)), "json_error"),
+            (ProviderError::Url(url), "url_error"),
             (
-                CompletionError::RequestError(Box::new(std::io::Error::other("x"))),
+                ProviderError::request(std::io::Error::other("x")),
                 "request_error",
             ),
             (response_error("x"), "response_error"),
             (provider_error("x"), "provider_error"),
-            // `status_error` (rig's `from_http_response`) builds an `HttpError`; the
-            // `ProviderResponse` variant is a preserved provider body, built directly.
-            (status_error(503, "overloaded"), "http_error"),
-            (
-                CompletionError::ProviderResponse(rig_core::ProviderResponseError::new(
-                    http::StatusCode::OK,
-                    "{\"error\":\"envelope\"}",
-                )),
-                "provider_response_error",
-            ),
+            // A non-success status is a preserved provider reply, not a transport error.
+            (status_error(503, "overloaded"), "provider_response_error"),
         ];
         for (error, want) in cases {
             assert_eq!(completion_error_type(&error), want, "{error:?}");
         }
+        // An agent hook sees the same failure as an `ErrorReport`; the label is rig's own
+        // stable code for its kind.
+        assert_eq!(
+            report_error_type(&status_error(503, "overloaded").report()),
+            "provider_response"
+        );
     }
 
     /// A scripted model whose every call answers with `respond`.
-    fn model<F>(respond: F) -> ScriptedModel
+    fn model<F>(respond: F) -> Llm
     where
-        F: Fn(&CompletionRequest) -> Result<CompletionResponse, CompletionError>
+        F: Fn(&CompletionRequest) -> Result<CompletionResponse, ProviderError>
             + Send
             + Sync
             + 'static,
@@ -776,11 +805,11 @@ mod tests {
         assert_eq!(finish_reason(&deep), None);
     }
 
-    /// Drive the wrapper the way rig does — one `completion()` call — and prove it
-    /// changes nothing observable: same content, same usage, same `message_id`, same
-    /// raw response. Only the log is new.
+    /// Drive the watcher the way the single-shot lanes do — one call — and prove it
+    /// changes nothing observable: same content, same usage, same raw response. Only the
+    /// log is new.
     #[tokio::test]
-    async fn the_wrapper_is_a_pure_passthrough() {
+    async fn the_watcher_is_a_pure_passthrough() {
         let model = model(|_req| {
             Ok(with_raw(
                 with_usage(text_response("the answer"), usage(11, 7)),
@@ -788,25 +817,25 @@ mod tests {
             ))
         });
 
-        let bare = model.completion(req()).await.expect("bare completion");
-        let log = CompletionLog::new();
-        let wrapped = watched(model.clone(), log.clone(), None, "scripted")
-            .completion(req())
+        let bare = model
+            .dyn_model()
+            .call(req())
             .await
-            .expect("wrapped completion");
+            .expect("bare completion");
+        let log = CompletionLog::new();
+        let watched = Watch::new(log.clone(), None, "scripted")
+            .call(model.dyn_model(), req())
+            .await
+            .expect("watched completion");
 
         assert_eq!(
-            serde_json::to_value(&wrapped.choice).unwrap(),
+            serde_json::to_value(&watched.choice).unwrap(),
             serde_json::to_value(&bare.choice).unwrap(),
-            "the wrapper must not touch the content"
+            "the watcher must not touch the content"
         );
-        assert_eq!(wrapped.usage, bare.usage, "usage passes through");
+        assert_eq!(watched.usage, bare.usage, "usage passes through");
         assert_eq!(
-            wrapped.message_id, bare.message_id,
-            "message id passes through"
-        );
-        assert_eq!(
-            wrapped.raw, bare.raw,
+            watched.raw, bare.raw,
             "the raw provider response is handed back untouched"
         );
         assert_eq!(
@@ -828,13 +857,13 @@ mod tests {
         let model = model(|_req| Err(provider_error("overloaded_error")));
         let log = CompletionLog::new();
 
-        let bare = model.completion(req()).await;
-        let wrapped = watched(model.clone(), log.clone(), None, "scripted")
-            .completion(req())
+        let bare = model.dyn_model().call(req()).await;
+        let watched = Watch::new(log.clone(), None, "scripted")
+            .call(model.dyn_model(), req())
             .await;
 
         assert_eq!(
-            format!("{:?}", wrapped.unwrap_err()),
+            format!("{:?}", watched.unwrap_err()),
             format!("{:?}", bare.unwrap_err()),
             "the provider's error reaches the caller unchanged"
         );
@@ -848,8 +877,7 @@ mod tests {
     }
 
     /// A tool-call turn is recorded too — no text, one call, and whatever the
-    /// provider said about stopping. This is the turn a hook could see only in a
-    /// medium-neutral form, and the loop's inner turns are all this shape.
+    /// provider said about stopping. The loop's inner turns are all this shape.
     #[tokio::test]
     async fn a_tool_call_turn_is_recorded_with_no_text() {
         let model = model(|_req| {
@@ -859,8 +887,8 @@ mod tests {
             ))
         });
         let log = CompletionLog::new();
-        watched(model, log.clone(), None, "scripted")
-            .completion(req())
+        Watch::new(log.clone(), None, "scripted")
+            .call(model.dyn_model(), req())
             .await
             .expect("completion");
 
