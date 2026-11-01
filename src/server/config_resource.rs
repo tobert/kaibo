@@ -71,7 +71,8 @@ pub(crate) fn render_config_resource(
         /// Allowed path trees: a per-call path must be at-or-under one of these.
         allowed_paths: Vec<String>,
         /// The effective default root a call uses when it omits `path` — an explicit
-        /// `--root`, or the launch cwd kaibo inferred. Absent when neither applies.
+        /// `--root`, or the launch cwd kaibo inferred. Absent when neither applies,
+        /// including a launch cwd that holds the home directory.
         #[serde(skip_serializing_if = "Option::is_none")]
         default_root: Option<String>,
         /// True when `default_root` was inferred from the launch cwd rather than

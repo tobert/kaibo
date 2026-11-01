@@ -205,7 +205,8 @@ pub struct CommonArgs {
     pub allow_path: Vec<PathBuf>,
 
     /// Don't adopt the invocation cwd as an allowed tree and default root. By default
-    /// it is one (unless --root is given), and --allow-path only ever ADDS to that.
+    /// it is one (unless --root is given, or the cwd holds `$HOME` and no named tree
+    /// contains it), and --allow-path only ever ADDS to that.
     /// With this, the allowed set is exactly what you named and every call must pass
     /// its own path. Also KAIBO_NO_CWD.
     #[arg(long = "no-cwd", global = true)]
@@ -337,7 +338,7 @@ pub struct ConsultArgs {
     /// own words instead of pasting a diff.
     pub question: String,
 
-    /// Project to explore. Optional — defaults to the root/allowed cwd; must resolve
+    /// Project to explore. Optional when a default root exists (see `kaibo config`); must resolve
     /// to at-or-under an allowed tree.
     #[arg(long, value_name = "DIR")]
     pub path: Option<String>,
@@ -429,7 +430,7 @@ pub struct ExploreArgs {
     /// locates and reads the real, current code and reports back with citations.
     pub question: String,
 
-    /// Project to explore. Optional — defaults to the root/allowed cwd; must resolve
+    /// Project to explore. Optional when a default root exists (see `kaibo config`); must resolve
     /// to at-or-under an allowed tree.
     #[arg(long, value_name = "DIR")]
     pub path: Option<String>,
@@ -466,7 +467,7 @@ pub struct DeliberateArgs {
     /// offline synth then reasons over.
     pub question: String,
 
-    /// Project to investigate. Optional — defaults to the root/allowed cwd; must resolve
+    /// Project to investigate. Optional when a default root exists (see `kaibo config`); must resolve
     /// to at-or-under an allowed tree.
     #[arg(long, value_name = "DIR")]
     pub path: Option<String>,
@@ -519,7 +520,7 @@ pub struct KaishArgs {
     #[arg(short = 'c', value_name = "SCRIPT")]
     pub command: Option<String>,
 
-    /// Project to run against. Optional — defaults to the root/allowed cwd; must resolve
+    /// Project to run against. Optional when a default root exists (see `kaibo config`); must resolve
     /// to at-or-under an allowed tree. Each call starts fresh at this root.
     #[arg(long, value_name = "DIR")]
     pub path: Option<String>,
