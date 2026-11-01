@@ -1371,7 +1371,8 @@ pub struct Config {
     /// "launch kaibo in the workspace" just work.
     ///
     /// It holds *unless* `root` is set: naming a root is the operator choosing the
-    /// project, so the cwd is not quietly added beside it. It is deliberately
+    /// project, so the cwd is not quietly added beside it. It also skips a cwd that holds
+    /// the home directory (`$HOME`, an ancestor, or `/`) unless a named tree contains it. It is deliberately
     /// independent of `allow_paths`, which is **additive** — reaching one more tree
     /// must never cost you the workspace you started in. Set `false` (via `--no-cwd`,
     /// `KAIBO_NO_CWD`, or `[server] infer_cwd = false`) when the allowed set should be

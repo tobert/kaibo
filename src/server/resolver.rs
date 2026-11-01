@@ -49,14 +49,47 @@ pub struct Resolver {
     allowed_set: Arc<Vec<PathBuf>>,
     /// The effective default root a call uses when it omits `path` — the explicit
     /// `--root`/config value, else the inferred invocation cwd. Canonicalized. `None`
-    /// only when no root was configured *and* the cwd inference was turned off
-    /// (`--no-cwd`). `pub(super)` so the split containment `impl` in `containment.rs`
+    /// when no root was configured and either the cwd inference was turned off
+    /// (`--no-cwd`) or the cwd holds the home directory and no named tree contains it. `pub(super)` so the split containment `impl` in `containment.rs`
     /// reads it.
     pub(super) default_root: Arc<Option<PathBuf>>,
     /// True when [`default_root`](Self::default_root) was inferred from the cwd
     /// rather than configured explicitly. Surfaced in the scope section and
     /// `kaibo://config` so the boundary stays legible.
     default_root_inferred: bool,
+}
+
+/// The canonicalized home directory: `$HOME`, else `%USERPROFILE%` (Windows shells do not
+/// set `HOME`, and Git Bash sets a POSIX-shaped one that does not canonicalize). `None`
+/// when neither resolves; [`holds_home`] still catches a filesystem or drive root then, so
+/// the guard is best-effort past that.
+fn home_dir() -> Option<PathBuf> {
+    ["HOME", "USERPROFILE"].iter().find_map(|var| {
+        std::env::var_os(var)
+            .filter(|h| !h.is_empty())
+            .and_then(|h| std::fs::canonicalize(h).ok())
+    })
+}
+
+/// Whether `tree` holds the home directory: the home directory itself, an ancestor of it,
+/// or `/`. Such a tree puts every private file the user owns (mail, keys, documents) in
+/// reach of a configured model. Both paths are canonical.
+pub(crate) fn holds_home(tree: &Path, home: Option<&Path>) -> bool {
+    tree.parent().is_none() || home.is_some_and(|home| home.starts_with(tree))
+}
+
+/// Warn once at startup when an operator-named tree holds the home directory. Naming it is
+/// the operator's choice, so this does not refuse; it makes sure the choice was seen.
+fn warn_if_holds_home(tree: &Path, flag: &str) {
+    if holds_home(tree, home_dir().as_deref()) {
+        tracing::warn!(
+            tree = %tree.display(),
+            "{flag} {} holds the home directory, so every file under it may reach a \
+             configured model, including private files. If that was not the intent, narrow \
+             it to a workspace such as ~/src.",
+            tree.display()
+        );
+    }
 }
 
 impl Resolver {
@@ -69,7 +102,8 @@ impl Resolver {
     /// allowed tree *and* the inferred default root, so a call may omit `path` in the
     /// common single-workspace case. That holds regardless of `--allow-path`, which is
     /// purely additive — see the rationale at the resolution site below. `--no-cwd`
-    /// opts out, leaving the allowed set exactly what was named.
+    /// opts out, leaving the allowed set exactly what was named. A cwd that holds the
+    /// home directory is not adopted unless a named tree contains it.
     pub fn from_config(config: Arc<Config>) -> Result<Self> {
         // Build the canonicalized allowed set. Each entry is canonicalized now so
         // the `starts_with` containment check is sound (symlinks resolved, `..`
@@ -84,6 +118,7 @@ impl Resolver {
             if !canon.is_dir() {
                 anyhow::bail!("--root {} is not a directory", canon.display());
             }
+            warn_if_holds_home(&canon, "the root (--root, KAIBO_ROOT, or [server] root)");
             allowed.push(canon.clone());
             explicit_root = Some(canon);
         }
@@ -93,6 +128,10 @@ impl Resolver {
             if !canon.is_dir() {
                 anyhow::bail!("--allow-path {} is not a directory", canon.display());
             }
+            warn_if_holds_home(
+                &canon,
+                "an allowed tree (--allow-path, KAIBO_ALLOW_PATHS, or [server] allow_paths)",
+            );
             allowed.push(canon);
         }
 
@@ -113,6 +152,13 @@ impl Resolver {
         // The old rule — cwd only when nothing else was allowed — meant a single
         // `--allow-path` silently evicted the project from scope, turning every
         // path-less call into a parameter error. See `tests/containment.rs`.
+        //
+        // One exception: a launch directory that holds the home directory (`$HOME`, an
+        // ancestor of it, or `/`) is not adopted unless a tree the operator named already
+        // contains it. A host that starts kaibo from `~` did not choose to share every
+        // private file under it; inference is not consent. Naming the tree is consent:
+        // it enters the allowed set (with a startup warning), and a cwd inside it is the
+        // default root again.
         let (default_root, default_root_inferred): (Option<PathBuf>, bool) = match explicit_root {
             Some(root) => (Some(root), false),
             None if !config.infer_cwd => (None, false),
@@ -121,12 +167,26 @@ impl Resolver {
                     .context("could not determine current directory for the default root")?;
                 let cwd_canon = std::fs::canonicalize(&cwd)
                     .with_context(|| format!("canonicalizing cwd {}", cwd.display()))?;
-                // Push before the containment check so the cwd is judged against a set
-                // that includes itself — it is an allowed tree, not a guest of one.
-                if !allowed.iter().any(|tree| cwd_canon.starts_with(tree)) {
-                    allowed.push(cwd_canon.clone());
+                let named = allowed.iter().any(|tree| cwd_canon.starts_with(tree));
+                if !named && holds_home(&cwd_canon, home_dir().as_deref()) {
+                    tracing::warn!(
+                        cwd = %cwd_canon.display(),
+                        "kaibo did not adopt its launch directory {} as an allowed tree or \
+                         default root: it holds the home directory, and every file in scope \
+                         may reach a configured model. Set a workspace such as ~/src with \
+                         --root, KAIBO_ROOT, or [server] root in config.toml. Until then, \
+                         every call must pass `path` inside an allowed tree.",
+                        cwd_canon.display()
+                    );
+                    (None, false)
+                } else {
+                    // Push before the containment check so the cwd is judged against a set
+                    // that includes itself — it is an allowed tree, not a guest of one.
+                    if !named {
+                        allowed.push(cwd_canon.clone());
+                    }
+                    (Some(cwd_canon), true)
                 }
-                (Some(cwd_canon), true)
             }
         };
 
@@ -944,5 +1004,36 @@ mod tests {
         let t = slot.tunables(ModelRole::Synth, &defaults);
         assert_eq!(t.effort, "low");
         assert!(t.effort_explicit);
+    }
+
+    /// A tree holds the home directory when it is home, an ancestor of home, or `/`. A
+    /// workspace beneath home, or a sibling with a shared name prefix, does not.
+    #[test]
+    fn holds_home_matches_home_its_ancestors_and_root_only() {
+        let home = Path::new("/home/ada");
+        for tree in ["/home/ada", "/home", "/"] {
+            assert!(super::holds_home(Path::new(tree), Some(home)), "{tree}");
+        }
+        for tree in ["/home/ada/src", "/home/adam", "/srv/data"] {
+            assert!(!super::holds_home(Path::new(tree), Some(home)), "{tree}");
+        }
+        // With no home known, `/` still counts and an ordinary tree does not.
+        assert!(super::holds_home(Path::new("/"), None));
+        assert!(!super::holds_home(Path::new("/home/ada"), None));
+    }
+
+    /// On Windows a drive root has no parent, so it holds home like `/` does, in both the
+    /// plain and the verbatim (`\\?\`) form `canonicalize` returns.
+    #[cfg(windows)]
+    #[test]
+    fn holds_home_matches_a_windows_drive_root() {
+        let home = Path::new(r"\\?\C:\Users\ada");
+        for tree in [r"C:\", r"\\?\C:\", r"\\?\C:\Users"] {
+            assert!(super::holds_home(Path::new(tree), Some(home)), "{tree}");
+        }
+        assert!(!super::holds_home(
+            Path::new(r"\\?\C:\Users\ada\src"),
+            Some(home)
+        ));
     }
 }

@@ -6,7 +6,7 @@
 # Resolved settings: kaibo://config or `kaibo config`.
 
 [server]
-# Omit root to use launch cwd. Paths in config expand ~, $VAR, and ${VAR}.
+# Omit root to use launch cwd (not adopted when it is ~ or /). Paths expand ~, $VAR, ${VAR}.
 # root = "~/src/project"
 # allow_paths = ["~/shared/fixtures"] # additional trees; CLI --allow-path repeats
 # infer_cwd = true                  # false disables cwd inference (--no-cwd)

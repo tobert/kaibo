@@ -291,9 +291,9 @@ async fn serve(common: CommonArgs, gates: ServeGates) -> Result<()> {
             }
             // A special-cased arm, like `SingleProcessLocked` above: the generic message
             // below never mentions --root/--allow-path, which is actually the most natural
-            // fix for THIS error — the default allowed tree collides with the state db's
-            // default XDG path only when kaibo runs unscoped from (an ancestor of) the
-            // launch directory, so narrowing the mount is usually the right move, not
+            // fix for THIS error — an allowed tree collides with the state db's default XDG
+            // path only when a named tree holds the home directory (an inferred cwd that
+            // does is never adopted), so narrowing the mount is usually the right move, not
             // relocating the db or giving up persistence. Still a hard, loud `Err` — no
             // silent fallback here, unlike the one carve-out above.
             Err(e @ kaibo::store::StoreError::PathInAllowedTree(_)) => {

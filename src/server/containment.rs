@@ -15,13 +15,35 @@ use rmcp::ErrorData as McpError;
 
 use crate::sandbox::KaishWorker;
 
+/// The refusal for an omitted `path` with no default root. With no allowed tree at all
+/// (kaibo launched from a directory that holds the home directory, nothing named), "pass a
+/// `path` inside an allowed tree" would point at nothing, so that case names the setup fix
+/// first.
+pub(crate) fn no_default_root_text(allowed: &[PathBuf]) -> String {
+    const SET_ROOT: &str = "Set a workspace such as ~/src with --root, KAIBO_ROOT, or \
+        [server] root in config.toml, or ask the operator to. kaibo does not adopt a launch \
+        directory that holds the home directory.";
+    if allowed.is_empty() {
+        format!(
+            "no `path` given, and this kaibo has no allowed tree to read, so no `path` can \
+             work yet. {SET_ROOT}"
+        )
+    } else {
+        format!(
+            "no `path` given, and this kaibo has no default root. Pass `path` naming a \
+             project inside an allowed tree (`kaibo://config` lists them). If none fits: \
+             {SET_ROOT}"
+        )
+    }
+}
+
 impl super::Resolver {
     /// Resolve a call's project root with containment enforcement:
     ///
     /// 1. Select the raw path: the explicit `path` arg, else the effective default
-    ///    root (an explicit `--root`, or the launch cwd inferred when it falls inside
-    ///    the allowed set). An omitted `path` with no default root is a parameter
-    ///    error — not a silent default.
+    ///    root (an explicit `--root`, or the inferred launch cwd). An omitted `path`
+    ///    with no default root is a parameter error — not a silent default — and its
+    ///    text depends on whether any allowed tree exists to name a `path` in.
     /// 2. Canonicalize the selected path (resolves symlinks and `..`). A path that
     ///    doesn't exist is `invalid_params` with the canonicalize error.
     /// 3. Require the canonicalized path to be at-or-under one of the allowed trees.
@@ -37,12 +59,7 @@ impl super::Resolver {
         let raw = match path {
             Some(p) => PathBuf::from(p),
             None => (*self.default_root).clone().ok_or_else(|| {
-                McpError::invalid_params(
-                    "no `path` provided and the server has no default root \
-                     (configure one with --root, or launch kaibo with its cwd \
-                     inside the allowed set so the workspace is inferred)",
-                    None,
-                )
+                McpError::invalid_params(no_default_root_text(&self.allowed_set()), None)
             })?,
         };
 

@@ -179,15 +179,15 @@ pub type Result<T> = std::result::Result<T, StoreError>;
 /// says, never in weakening the containment check itself (that guard is the invariant this
 /// module's doc-comment describes, and stays exactly as strict).
 ///
-/// The likely cause: with no `--root`/`--allow-path`, kaibo's default allowed (read-only,
-/// model-reachable) tree is the launch directory, and the state db's default XDG path
-/// (`~/.local/state/kaibo/state.db`) sits inside `~` — so starting kaibo unscoped from home
-/// (or any ancestor of the state dir) collides the two.
+/// The likely cause: an operator-named tree (`--root`, `--allow-path`, or their config
+/// keys) holds the home directory, and the state db's default XDG path
+/// (`~/.local/state/kaibo/state.db`) sits inside `~`. An inferred launch cwd can no longer
+/// cause this: one that holds the home directory is not adopted.
 pub fn path_in_allowed_tree_hint(state_db_path: &Path) -> String {
     format!(
-        "This usually means kaibo ran with no --root/--allow-path, so its default allowed \
-         (read-only, model-reachable) tree is the launch directory — and that directory \
-         contains the state db's default XDG location. The db itself is fine; kaibo refused \
+        "This usually means a tree named with --root or --allow-path (or [server] root / \
+         allow_paths) holds the home directory, so it contains the state db's default XDG \
+         location. The db itself is fine; kaibo refused \
          to even open it, before touching disk, because the path lands inside a project it \
          must keep read-only. Three real fixes: narrow what kaibo mounts (--root \
          <project-dir> or --allow-path <dir>), move the state db elsewhere (--state-db \
