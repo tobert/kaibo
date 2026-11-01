@@ -44,8 +44,9 @@
 //! > to reject a mixed open **did not fire in turso 0.7.0** (empirically verified
 //! > 2026-07-17). turso 0.8.3 ships such a guard (it fails the open with a "Locking
 //! > error: ... already open [with|without] experimental multiprocess WAL" message);
-//! > kaibo has not verified that it fires, and [`is_lock_error`] keeps that error fatal
-//! > instead of mapping it to [`StoreError::SingleProcessLocked`]. This is precisely the
+//! > kaibo has not verified that it fires, and kaibo keeps that error fatal: on 64-bit
+//! > Unix [`MULTIPROCESS_WAL`] turns the lock mapping off entirely, and elsewhere
+//! > [`is_lock_error`] refuses to map it to [`StoreError::SingleProcessLocked`]. This is precisely the
 //! > silent-data-loss class kaibo's "crash over corrupt" principle exists to forbid.
 //!
 //! So the MP flag is hardwired here and this helper is the sole open site *by design*.
@@ -621,28 +622,48 @@ pub fn create_state_dir(dir: &Path) -> Result<()> {
 /// On 64-bit Unix, `experimental_multiprocess_wal(true)` is hardwired so the long-lived
 /// MCP server and short-lived CLI invocations share the file safely. On Windows and any
 /// non-64-bit-Unix target MP mode is unavailable, so we open default (single-process) and
-/// map turso's lock error into a clear [`StoreError::SingleProcessLocked`]. The lock-error
-/// mapping compiles on every platform (only the flag line is `cfg`-gated), so its behavior
-/// stays reviewable here rather than hiding in a Windows-only branch.
+/// map turso's lock error into a clear [`StoreError::SingleProcessLocked`]. The mapping is
+/// limited to those platforms by [`MULTIPROCESS_WAL`]: under MP-WAL a second process opens
+/// alongside the first instead of hitting a held lock, so a lock error on 64-bit Unix means
+/// something unexpected and stays a fatal open error. The guard is a `cfg!` value, not a
+/// `#[cfg]` arm, so [`is_lock_error`] compiles and is tested on every platform.
 async fn build_database(path: &Path) -> Result<Database> {
     let builder = Builder::new_local(&path.to_string_lossy());
+    // Must match `MULTIPROCESS_WAL` below: the flag and the carve-out gate are one decision.
     #[cfg(all(unix, target_pointer_width = "64"))]
     let builder = builder.experimental_multiprocess_wal(true);
 
     match builder.build().await {
         Ok(db) => Ok(db),
-        Err(e) if is_lock_error(&e) => {
+        Err(e) if degrades_on_lock_error(&e) => {
             Err(StoreError::SingleProcessLocked(path.display().to_string()))
         }
         Err(e) => Err(StoreError::Turso(e)),
     }
 }
 
+/// Whether [`build_database`] opens with turso's multiprocess WAL: 64-bit Unix only. Where
+/// it is on, a held lock is not a reason to degrade, so the single-process carve-out is off.
+/// Must match the `#[cfg]` on the `experimental_multiprocess_wal` line in
+/// [`build_database`], and the one on the 0.7.2-fixture test in `tests/store.rs`: drift one
+/// way degrades a lock under MP-WAL, drift the other way crash-loops a single-process open.
+const MULTIPROCESS_WAL: bool = cfg!(all(unix, target_pointer_width = "64"));
+
+/// Whether a turso open error takes the single-process carve-out (degrade to in-memory
+/// sessions). Off wherever [`MULTIPROCESS_WAL`] is on; elsewhere, only a held lock.
+fn degrades_on_lock_error(e: &turso::Error) -> bool {
+    if MULTIPROCESS_WAL {
+        return false;
+    }
+    is_lock_error(e)
+}
+
 /// Does this turso error mean the file is already locked by another process? turso has no
 /// dedicated lock variant: a held file lock surfaces as `Error::Error(msg)` whose text
 /// names the lock ("Locking error: Failed locking file '..'. File is locked by another
 /// process"), so we match on the message. Positive, narrow match: only a genuine lock
-/// message maps to the single-process refusal; anything else stays a raw turso error.
+/// message can map to the single-process refusal (and only where [`degrades_on_lock_error`]
+/// allows it); anything else stays a raw turso error.
 ///
 /// turso 0.8 added a guard that rejects a mixed multiprocess/non-multiprocess open, and it
 /// reports through the same "Locking error:" prefix ("... Database is already open with[out]
@@ -939,7 +960,8 @@ fn validate_local_filesystem(_dir: &Path) -> Result<()> {
 mod tests {
     use super::*;
 
-    /// The one carve-out from fatal open errors rests on this text match, so pin it: the
+    /// The one carve-out from fatal open errors rests on this text match (and the platform
+    /// gate, pinned below), so pin it: the
     /// message turso gives for a file another process holds maps to the lock refusal,
     /// and an unrelated open failure does not, so it stays fatal.
     #[test]
@@ -980,8 +1002,21 @@ mod tests {
         }
     }
 
+    /// Under MP-WAL a held lock is unexpected and stays fatal; only a single-process
+    /// platform degrades. On Linux CI this asserts the gate is in the guard: drop
+    /// `MULTIPROCESS_WAL` from `degrades_on_lock_error` and it fails.
+    #[test]
+    fn only_a_single_process_platform_degrades_on_a_held_lock() {
+        let locked = turso::Error::Error(
+            "Locking error: Failed locking file '/s/state.db'. File is locked by another process"
+                .into(),
+        );
+        assert_eq!(degrades_on_lock_error(&locked), !MULTIPROCESS_WAL);
+    }
+
     /// The genuine held-lock messages, from `turso_core-0.8.3/io/{unix,windows,windows_lock,
-    /// io_uring}.rs`, still map to the single-process refusal.
+    /// io_uring}.rs`, are all recognized as locks (whether one degrades is the platform
+    /// gate's call, see `only_a_single_process_platform_degrades_on_a_held_lock`).
     #[test]
     fn is_lock_error_accepts_every_genuine_held_lock_message() {
         for msg in [
