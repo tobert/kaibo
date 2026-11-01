@@ -4530,10 +4530,14 @@ The env source wins over file or command; file and command are mutually exclusiv
 kaibo assumes no source. Let me provide key values in the environment, file, or vault, \
 keeping them out of chat. A key command has stdin closed, a 30-second limit, and output \
 is never logged.
-5. Set read scope from the projects I authorized. kaibo keeps them read-only and follows \
-linked worktrees by default. Add `[server] allow_paths` only for the extra directories \
-I want the team to read; their content may reach a configured model. File paths expand \
-leading `~`, `$VAR`, and `${VAR}`. Confirm additions outside the existing scope.
+5. Set read scope to a workspace: the directory that holds my projects, such as \
+`~/src`, or the one project I named. kaibo keeps it read-only and follows linked worktrees \
+by default. Every file in scope may reach a configured model, so a workspace keeps my \
+private files (mail, keys, documents, browser profiles) out of reach. Add `[server] \
+allow_paths` only for the extra directories I want the team to read. Before you set scope \
+to my home directory (`~`, `$HOME`) or to `/`, stop, tell me what that would put in reach, \
+and wait for my clear yes. File paths expand leading `~`, `$VAR`, and `${VAR}`. Confirm \
+additions outside the existing scope.
 6. Host access. The host agent that launches kaibo may sandbox it. kaibo needs outbound \
 network access to the model APIs I configure, write access to the \
 `$XDG_STATE_HOME/kaibo` directory for durable sessions (`state.db` and its sidecar \

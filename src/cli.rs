@@ -187,16 +187,19 @@ pub struct CommonArgs {
     /// Default project root, and an allowed tree. A per-call `--path` must resolve to
     /// at-or-under `--root` or an `--allow-path` tree. With neither, the allowed set
     /// (and inferred default root) is the invocation cwd — so run kaibo from the
-    /// workspace and you configure nothing. Not repeatable: this names *the* project a
-    /// path-less call defaults to, and there can only be one — `--allow-path` is the
-    /// repeatable, additive knob. Setting it also means the cwd is NOT added.
+    /// workspace and you configure nothing. A cwd that is `$HOME`, an ancestor of it, or
+    /// `/` is not adopted; name a workspace such as `~/src` here instead. Not repeatable:
+    /// this names *the* project a path-less call defaults to, and there can only be one —
+    /// `--allow-path` is the repeatable, additive knob. Setting it also means the cwd is
+    /// NOT added.
     #[arg(long, value_name = "DIR", global = true)]
     pub root: Option<PathBuf>,
 
     /// Additional allowed path tree. Repeatable, and purely ADDITIVE — it widens the
     /// boundary and never narrows it, so without --root the invocation cwd stays
-    /// allowed alongside it (use --no-cwd to drop that). Use `--allow-path /` to lift
-    /// all limits. Also settable via KAIBO_ALLOW_PATHS (colon-separated) or
+    /// allowed alongside it (use --no-cwd to drop that). Name a workspace such as
+    /// `~/src`; a tree that holds `$HOME` puts private files in reach and logs a warning
+    /// at startup. Also settable via KAIBO_ALLOW_PATHS (colon-separated) or
     /// [server] allow_paths; a non-empty set of flags replaces that layer.
     #[arg(long = "allow-path", value_name = "DIR", action = clap::ArgAction::Append, global = true)]
     pub allow_path: Vec<PathBuf>,

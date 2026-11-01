@@ -38,9 +38,11 @@ impl super::Resolver {
             Some(p) => PathBuf::from(p),
             None => (*self.default_root).clone().ok_or_else(|| {
                 McpError::invalid_params(
-                    "no `path` provided and the server has no default root \
-                     (configure one with --root, or launch kaibo with its cwd \
-                     inside the allowed set so the workspace is inferred)",
+                    "no `path` given, and this kaibo has no default root. Pass `path` \
+                     naming a project inside an allowed tree (`kaibo://config` lists \
+                     them). If none fits, the operator sets --root (or [server] root) to \
+                     a workspace such as ~/src; kaibo does not adopt a launch directory \
+                     that holds the home directory.",
                     None,
                 )
             })?,

@@ -1153,8 +1153,12 @@ non-UTF-8 variables fail loading; `$$` represents a literal dollar sign. CLI pat
 on the caller's shell expansion. `KAIBO_ALLOW_PATHS` is colon-separated.
 
 Name only the projects and scratch directories the user wants models to read.
-`allow_paths = ["~/src"]` grants every project beneath that tree; `--allow-path /`
-removes the useful read boundary. Scratch access is opt-in, including `/tmp`.
+`allow_paths = ["~/src"]` grants every project beneath that tree and is the recommended
+shape: a workspace keeps private files (mail, keys, documents) out of reach. A tree that
+holds the home directory (`~`, an ancestor of it, or `/`) is allowed when named, and
+kaibo logs a warning at startup. A launch cwd that holds the home directory is never
+inferred: kaibo starts with no default root, and every call must pass `path` until
+`--root` names a workspace. Scratch access is opt-in, including `/tmp`.
 To let a model read files a workflow drops (a diff, a log, generated output), name a
 dedicated per-user directory rather than `/tmp`:
 

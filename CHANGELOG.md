@@ -17,6 +17,8 @@ record. Each later release appends a new section at the top.
 
 ### Security
 - `tokio` 1.54.1 fixes RUSTSEC-2026-0386 (`AsyncFd` constructors accepted any file descriptor); kaibo calls no `AsyncFd` itself.
+- A launch directory that holds `$HOME` (home, an ancestor, or `/`) is no longer inferred as an allowed tree; name a workspace such as `~/src` with `--root`.
+- Naming a tree that holds `$HOME` with `--root` or `--allow-path` logs a startup warning.
 
 ### Added
 - A cast's `consult = "solo" | "team"` key runs `consult` with the synth alone, keeping the explorer slot for `explore` and `deliberate`; `kaibo://config` shows each cast's mode.

@@ -1377,3 +1377,89 @@ async fn mount_layer_ancestors_synthesize_the_mount_path_and_nothing_else() {
         "the probe must be able to read the project it is pointed at, got: {inside}"
     );
 }
+
+// --- a launch directory that holds the home directory is not adopted ----------
+
+/// Run `kaibo config` from `cwd` with a blank environment whose `HOME` is `home`, and
+/// return what it prints. `kaibo config` reports `allowed_paths` and `default_root`, so
+/// it shows the scope the resolver chose without spawning a server.
+fn kaibo_config_from(cwd: &Path, home: &Path, args: &[&str]) -> String {
+    let xdg = tempdir().expect("temp XDG roots");
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_kaibo"))
+        .env_clear()
+        .env("HOME", home)
+        .env("XDG_CONFIG_HOME", xdg.path().join("config"))
+        .env("XDG_STATE_HOME", xdg.path().join("state"))
+        .env("XDG_DATA_HOME", xdg.path().join("data"))
+        .env("RUST_LOG", "error")
+        .current_dir(cwd)
+        .arg("config")
+        .args(args)
+        .output()
+        .expect("run kaibo config");
+    assert!(
+        out.status.success(),
+        "kaibo config failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8(out.stdout).expect("utf-8 output")
+}
+
+/// A host that launches kaibo from `~` did not choose to share every file under it, so
+/// the launch directory is neither an allowed tree nor the default root.
+#[test]
+fn a_launch_directory_at_home_is_not_adopted() {
+    let home = tempdir().expect("temp home");
+    let home_canon = fs::canonicalize(home.path()).unwrap();
+    let out = kaibo_config_from(&home_canon, &home_canon, &[]);
+    assert!(
+        !out.contains(&format!("\"{}\"", home_canon.display())),
+        "home must not be in scope when only inferred:\n{out}"
+    );
+    assert!(
+        !out.contains("default_root ="),
+        "no default root may be inferred from home:\n{out}"
+    );
+}
+
+/// An ancestor of home holds home too: launching from the parent of `$HOME` must not
+/// adopt it either.
+#[test]
+fn a_launch_directory_above_home_is_not_adopted() {
+    let base = tempdir().expect("temp base");
+    let home = base.path().join("ada");
+    fs::create_dir(&home).unwrap();
+    let base_canon = fs::canonicalize(base.path()).unwrap();
+    let out = kaibo_config_from(&base_canon, &home, &[]);
+    assert!(
+        !out.contains("default_root ="),
+        "no default root may be inferred from an ancestor of home:\n{out}"
+    );
+}
+
+/// The control: a workspace beneath home is an ordinary launch directory and is adopted.
+#[test]
+fn a_launch_directory_beneath_home_is_adopted() {
+    let home = tempdir().expect("temp home");
+    let src = home.path().join("src");
+    fs::create_dir(&src).unwrap();
+    let src_canon = fs::canonicalize(&src).unwrap();
+    let out = kaibo_config_from(&src_canon, home.path(), &[]);
+    assert!(
+        out.contains(&format!("default_root = \"{}\"", src_canon.display())),
+        "a workspace beneath home is the inferred default root:\n{out}"
+    );
+}
+
+/// Naming home explicitly is the operator's consent: `--allow-path ~` still works.
+#[test]
+fn naming_home_explicitly_still_allows_it() {
+    let home = tempdir().expect("temp home");
+    let home_canon = fs::canonicalize(home.path()).unwrap();
+    let home_arg = home_canon.to_str().unwrap();
+    let out = kaibo_config_from(&home_canon, &home_canon, &["--allow-path", home_arg]);
+    assert!(
+        out.contains(&format!("\"{}\"", home_canon.display())),
+        "an explicitly named home is in scope:\n{out}"
+    );
+}
