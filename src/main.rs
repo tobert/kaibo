@@ -272,8 +272,9 @@ async fn serve(common: CommonArgs, gates: ServeGates) -> Result<()> {
                 (handler.with_session_store(store), true)
             }
             // THE ONE CARVE-OUT (Windows / single-process platforms only): another kaibo
-            // already holds the db. MP-WAL is 64-bit-Unix-only, so a `SingleProcessLocked`
-            // can't arise on the Unix path — this is a Windows second-editor-window case.
+            // already holds the db. `store::build_database` returns `SingleProcessLocked`
+            // only where MP-WAL is off (not 64-bit Unix), so this is a Windows
+            // second-editor-window case; on Unix a lock error falls to the fatal arm below.
             // Crashing there would crash-LOOP under MCP clients that auto-restart servers, so
             // we WARN loudly and serve with in-memory sessions instead. Not silent: the
             // startup log says so, and `kaibo://config` shows `persistence.active = false`

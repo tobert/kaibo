@@ -621,9 +621,11 @@ pub fn create_state_dir(dir: &Path) -> Result<()> {
 /// On 64-bit Unix, `experimental_multiprocess_wal(true)` is hardwired so the long-lived
 /// MCP server and short-lived CLI invocations share the file safely. On Windows and any
 /// non-64-bit-Unix target MP mode is unavailable, so we open default (single-process) and
-/// map turso's lock error into a clear [`StoreError::SingleProcessLocked`]. The lock-error
-/// mapping compiles on every platform (only the flag line is `cfg`-gated), so its behavior
-/// stays reviewable here rather than hiding in a Windows-only branch.
+/// map turso's lock error into a clear [`StoreError::SingleProcessLocked`]. The mapping is
+/// limited to those platforms by [`MULTIPROCESS_WAL`]: under MP-WAL a second process opens
+/// alongside the first instead of hitting a held lock, so a lock error on 64-bit Unix means
+/// something unexpected and stays a fatal open error. The guard is a `cfg!` value, not a
+/// `#[cfg]` arm, so [`is_lock_error`] compiles and is tested on every platform.
 async fn build_database(path: &Path) -> Result<Database> {
     let builder = Builder::new_local(&path.to_string_lossy());
     #[cfg(all(unix, target_pointer_width = "64"))]
@@ -631,12 +633,16 @@ async fn build_database(path: &Path) -> Result<Database> {
 
     match builder.build().await {
         Ok(db) => Ok(db),
-        Err(e) if is_lock_error(&e) => {
+        Err(e) if !MULTIPROCESS_WAL && is_lock_error(&e) => {
             Err(StoreError::SingleProcessLocked(path.display().to_string()))
         }
         Err(e) => Err(StoreError::Turso(e)),
     }
 }
+
+/// Whether [`build_database`] opens with turso's multiprocess WAL: 64-bit Unix only. Where
+/// it is on, a held lock is not a reason to degrade, so the single-process carve-out is off.
+const MULTIPROCESS_WAL: bool = cfg!(all(unix, target_pointer_width = "64"));
 
 /// Does this turso error mean the file is already locked by another process? turso has no
 /// dedicated lock variant: a held file lock surfaces as `Error::Error(msg)` whose text
