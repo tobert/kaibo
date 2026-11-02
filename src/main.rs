@@ -52,6 +52,14 @@ async fn main() -> Result<()> {
         Some(Command::ConfigGuide) => {
             std::process::exit(kaibo::cli::run_config_guide());
         }
+        // A client's header helper runs this on every connect, under a 10-second limit,
+        // and parses its stdout: no telemetry, and config only for `--rotate`.
+        Some(Command::HttpGuide) => {
+            std::process::exit(kaibo::cli::run_http_guide());
+        }
+        Some(Command::HttpToken(args)) => {
+            std::process::exit(kaibo::cli::run_http_token(&cli.common, &args));
+        }
         Some(command) => {
             let otel_guard = kaibo::cli::init_cli_telemetry(&cli.common).await?;
             let code = run_command(cli.common, command).await;
@@ -82,7 +90,30 @@ async fn run_command(common: CommonArgs, command: Command) -> i32 {
         Command::Configure(args) => kaibo::cli::run_configure(args.goal),
         Command::ExampleConfig => kaibo::cli::run_example_config(),
         Command::ConfigGuide => kaibo::cli::run_config_guide(),
+        Command::HttpToken(args) => kaibo::cli::run_http_token(&common, &args),
+        Command::HttpGuide => kaibo::cli::run_http_guide(),
     }
+}
+
+/// The HTTP front door (preview). Refuses to start with nothing to read, refuses a token
+/// path inside an allowed tree, then creates the token file if it is missing.
+async fn serve_http(
+    handler: kaibo::server::KaiboHandler,
+    listen: std::net::SocketAddr,
+) -> Result<()> {
+    let allowed = handler.allowed_set();
+    anyhow::ensure!(
+        !allowed.is_empty(),
+        "the HTTP server has no allowed tree to read. A server started by a service manager \
+         has no meaningful launch directory, and kaibo does not adopt one that holds the home \
+         directory. Set a workspace with --root, KAIBO_ROOT, or [server] root in config.toml, \
+         for example root = \"~/src\"."
+    );
+    let token_path = kaibo::http_token::default_token_path()?;
+    let allowed_refs: Vec<&std::path::Path> = allowed.iter().map(PathBuf::as_path).collect();
+    kaibo::http_token::check_containment(&token_path, &allowed_refs)?;
+    kaibo::http_token::ensure(&token_path)?;
+    kaibo::server::http::serve(handler, listen, token_path).await
 }
 
 /// Run the MCP server on stdio. The body of a bare `kaibo` / `kaibo serve` — behavior
@@ -136,6 +167,10 @@ async fn serve(common: CommonArgs, gates: ServeGates) -> Result<()> {
         gates.allow_save_artifact,
         common.max_attachments,
     );
+    if let Err(e) = config.apply_http_cli(gates.http, gates.listen.as_deref()) {
+        eprintln!("kaibo: config error: {e:#}");
+        std::process::exit(2);
+    }
 
     // Logs MUST go to stderr; stdout carries the MCP protocol. RUST_LOG wins, else
     // the config's `server.log`. The bridge layer additionally mirrors kaibo-target
@@ -207,7 +242,8 @@ async fn serve(common: CommonArgs, gates: ServeGates) -> Result<()> {
         backends = ?config.backends.keys().collect::<Vec<_>>(),
         casts = ?config.casts.keys().collect::<Vec<_>>(),
         gating = ?config.tools,
-        "starting kaibo MCP server on stdio"
+        transport = if config.http.enabled { "http" } else { "stdio" },
+        "starting kaibo MCP server"
     );
     // A fresh install (no key, no config) starts fine but can't reach a model — say so
     // loudly here so an operator watching stderr sees it, not just the client model in
@@ -224,8 +260,9 @@ async fn serve(common: CommonArgs, gates: ServeGates) -> Result<()> {
         );
     }
 
-    // Capture the persistence settings before `config` moves into the handler.
+    // Capture the persistence and HTTP settings before `config` moves into the handler.
     let persistence = config.persistence.clone();
+    let http = config.http.clone();
     let session_capacity = config.defaults.session_capacity;
     let handler = KaiboHandler::new(config)?.with_notifications(notifications);
 
@@ -335,6 +372,9 @@ async fn serve(common: CommonArgs, gates: ServeGates) -> Result<()> {
         allowed_set = ?handler.allowed_set().iter().map(|p| p.display().to_string()).collect::<Vec<_>>(),
         "containment boundary"
     );
+    if http.enabled {
+        return serve_http(handler, http.listen).await;
+    }
     // Grab the shared log floor before `serve` consumes the handler; the drain task
     // reads it so a client `setLevel` retunes verbosity live.
     let log_level = handler.mcp_log_level();

@@ -3338,3 +3338,47 @@ fn a_misspelled_decision_role_is_a_load_error() {
     .expect_err("`decisions` is not a role");
     assert!(format!("{err:#}").contains("decisions"), "{err:#}");
 }
+
+// --- [server.http] ------------------------------------------------------------
+
+/// HTTP is off by default and binds the loopback default when turned on.
+#[test]
+fn http_is_off_by_default_on_loopback() {
+    let c = Config::builtin();
+    assert!(!c.http.enabled);
+    assert_eq!(
+        c.http.listen.to_string(),
+        kaibo::config::DEFAULT_HTTP_LISTEN
+    );
+    assert!(c.http.listen.ip().is_loopback());
+}
+
+/// `KAIBO_HTTP` turns it on and `KAIBO_HTTP_LISTEN` moves it, still on loopback.
+#[test]
+fn http_env_overrides() {
+    let c = load_env(&[("KAIBO_HTTP", "1"), ("KAIBO_HTTP_LISTEN", "[::1]:9100")]);
+    assert!(c.http.enabled);
+    assert_eq!(c.http.listen.to_string(), "[::1]:9100");
+}
+
+/// A listen address off loopback is a load error naming the key, wherever it came from.
+#[test]
+fn a_non_loopback_http_listen_is_refused_naming_the_key() {
+    let err = Config::from_toml_str("[server.http]\nlisten = \"0.0.0.0:52426\"\n")
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("[server.http] listen"), "{err}");
+    assert!(err.contains("not a loopback address"), "{err}");
+
+    let mut c = Config::builtin();
+    let err = c
+        .apply_http_cli(true, Some("192.168.1.5:80"))
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("--listen"), "{err}");
+
+    let err = Config::from_toml_str("[server.http]\nlisten = \"localhost:80\"\n")
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("not an ip:port address"), "{err}");
+}

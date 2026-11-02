@@ -41,6 +41,11 @@
 //! this front door serves them, visibly and countably (Amy, 2026-08-07: "we do know when
 //! we might output binary and the caller likely knows they're gonna get binary").
 //!
+//! **Blessed site 4** (2026-11-02): the HTTP transport's bearer token (`src/http_token.rs`),
+//! one file at a fixed XDG state path, refused if it resolves into an allowed tree. Three
+//! lines: an owner-only `create_new` open, its `write_all`, and the `rename` that makes
+//! rotation atomic. The file name is fixed, so no model and no caller can aim it.
+//!
 //! The carve-out is deliberately narrow, and this test keeps its teeth:
 //! - a blessed line is exempted **only** when its file is one of the blessed files
 //!   *and* the line's own raw text carries that file's marker *and* the call is one that
@@ -104,6 +109,13 @@ const BLESSED: &[Blessed] = &[
         needles: &["create_dir_all(", "OpenOptions::", ".write(", ".write_all("],
     },
     Blessed {
+        file: "http_token.rs",
+        marker: "http-token-write: blessed by the HTTP token invariant amendment (AGENTS.md)",
+        // One owner-only `create_new` open, its bytes, and the rename that makes rotation
+        // atomic. No delete, no truncate: a stray temp file stays for the operator.
+        needles: &["OpenOptions::", ".write(", ".write_all(", "fs::rename("],
+    },
+    Blessed {
         file: "cli.rs",
         marker: "cas-stdout-bytes: blessed by the media CAS invariant amendment (AGENTS.md)",
         // Handing bytes to an already-open descriptor, and nothing else. A path-taking
@@ -131,9 +143,10 @@ struct Blessed {
 /// (`create_state_dir`'s `create_dir_all`) + 3 in `cas.rs` (the shard-dir `create_dir_all`,
 /// the `create_new` open, and the `write_all` of the bytes — see `src/cas.rs`'s module
 /// doc and the count breakdown in this file's module doc) + 1 in `cli.rs` (`kaibo cas
-/// read` handing an artifact's bytes to stdout). Pinned so a new write site can't
-/// silently ride in behind an existing marker.
-const EXPECTED_BLESSED_LINES: usize = 5;
+/// read` handing an artifact's bytes to stdout) + 3 in `http_token.rs` (the owner-only
+/// `create_new` open, the `write_all` of the token, and the `rename` that rotates it).
+/// Pinned so a new write site can't silently ride in behind an existing marker.
+const EXPECTED_BLESSED_LINES: usize = 8;
 
 fn rs_files(dir: &Path, out: &mut Vec<PathBuf>) {
     for entry in std::fs::read_dir(dir).expect("read src dir") {
@@ -230,8 +243,8 @@ fn no_handler_side_write_path_in_production_code() {
 
     assert!(
         violations.is_empty(),
-        "kaibo writes nothing in production but the two blessed sites (store.rs's state dir, \
-         cas.rs's media CAS) — read-only is unconditional. Found a filesystem-mutating call in \
+        "kaibo writes nothing in production but the blessed sites in `BLESSED` (the state dir, \
+         the media CAS, the HTTP token file) — read-only is unconditional. Found a filesystem-mutating call in \
          non-test code:\n  {}\nIf this is a deliberate, individually-mediated capability, update \
          this guard's carve-out in the same change (and its review).",
         violations.join("\n  ")
@@ -318,7 +331,7 @@ fn teeth_other_write_in_store_fails() {
 fn teeth_cli_stdout_bytes_line_is_exempt() {
     let src = format!(
         "            out.write_all(&bytes[start..end]) // {}\n",
-        BLESSED[2].marker
+        BLESSED[CLI].marker
     );
     assert!(
         scan_source("cli.rs", &src).is_empty(),
@@ -338,17 +351,44 @@ fn teeth_cli_writes_without_the_marker_fail() {
     );
     let marked = format!(
         "    std::fs::write(out_path, &bytes) // {}\n",
-        BLESSED[2].marker
+        BLESSED[CLI].marker
     );
     assert!(
         !scan_source("cli.rs", &marked).is_empty(),
         "cli.rs's marker blesses the stdout needle only — it must not launder an \
          fs::write onto a caller-named path"
     );
-    let elsewhere = format!("    out.write_all(&bytes) // {}\n", BLESSED[2].marker);
+    let elsewhere = format!("    out.write_all(&bytes) // {}\n", BLESSED[CLI].marker);
     assert!(
         !scan_source("server.rs", &elsewhere).is_empty(),
         "cli.rs's marker must not exempt a write in another file"
+    );
+}
+
+/// Index of each blessed entry, so a teeth test names the entry it means.
+const HTTP_TOKEN: usize = 2;
+const CLI: usize = 3;
+
+/// The token file's marker excuses its own open, write, and rename, and nothing else: not
+/// a delete in the same file, and not any write in another file.
+#[test]
+fn teeth_http_token_marker_is_narrow() {
+    let marker = BLESSED[HTTP_TOKEN].marker;
+    assert_eq!(BLESSED[HTTP_TOKEN].file, "http_token.rs");
+    let rename = format!("    std::fs::rename(&tmp, path)?; // {marker}\n");
+    assert!(scan_source("http_token.rs", &rename).is_empty());
+    let delete = format!("    std::fs::remove_file(path)?; // {marker}\n");
+    assert!(
+        !scan_source("http_token.rs", &delete).is_empty(),
+        "the token marker must not excuse a delete"
+    );
+    assert!(
+        !scan_source("http_token.rs", "    std::fs::rename(&tmp, path)?;\n").is_empty(),
+        "an unmarked rename in http_token.rs must fail"
+    );
+    assert!(
+        !scan_source("server.rs", &rename).is_empty(),
+        "the token marker must not exempt a write in another file"
     );
 }
 

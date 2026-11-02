@@ -21,6 +21,9 @@ record. Each later release appends a new section at the top.
 - Naming a tree that holds `$HOME` with `--root` or `--allow-path` logs a startup warning.
 
 ### Added
+- Preview: `kaibo serve --http` serves MCP on a loopback socket (default `127.0.0.1:52426`) behind a bearer token; off by default. Setup: `kaibo://config/http`.
+- `kaibo http-token` prints the token file's path, the token, or a header helper's JSON, and `--rotate` replaces the token with no server restart.
+- `kaibo://config` shows `[http]`: enabled, listen address, and token file path, never the token.
 - A cast's `consult = "solo" | "team"` key runs `consult` with the synth alone, keeping the explorer slot for `explore` and `deliberate`; `kaibo://config` shows each cast's mode.
 - `batch_submit` and `deliberate` run on `openrouter` backends via `/api/v1/batches`, stripping any `:batch` suffix from `list_models` ids.
 - OpenRouter slots on `google/gemini-*` and `~google/gemini-*` classify as vision-capable without an explicit `vision = true` pin.

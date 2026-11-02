@@ -40,6 +40,7 @@ pub mod decide;
 pub mod discover;
 pub mod explorer;
 pub mod gemini_media;
+pub mod http_token;
 pub mod jobs;
 pub mod kaish_syntax;
 pub mod mcp_log;

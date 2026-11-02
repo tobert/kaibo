@@ -27,6 +27,11 @@ generate = true                     # requires image or audio slot + CAS
 decide = true                       # requires decision slot
 # job_* tools follow enabled producers; read_cas/write_cas follow cas.enabled.
 
+# Preview: serve over loopback HTTP with a bearer token. Setup: kaibo://config/http.
+# [server.http]
+# enabled = false                   # KAIBO_HTTP; kaibo serve --http
+# listen = "127.0.0.1:52426"        # loopback only
+
 [defaults]
 explorer_max_turns = 100            # per survey; final answer turn follows the cap
 synth_max_turns = 200               # per consult driver

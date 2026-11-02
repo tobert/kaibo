@@ -1378,6 +1378,8 @@ pub struct Config {
     /// `KAIBO_NO_CWD`, or `[server] infer_cwd = false`) when the allowed set should be
     /// exactly what you named; every call must then pass `path` explicitly.
     pub infer_cwd: bool,
+    /// `[server.http]`: the loopback HTTP transport preview. Off by default.
+    pub http: HttpConfig,
     /// Default cast name when a call omits `cast`.
     pub default_cast: String,
     /// `EnvFilter` directive used when `RUST_LOG` is unset.
@@ -2316,6 +2318,7 @@ impl Config {
             .collect::<anyhow::Result<Vec<_>>>()?;
         let follow_worktrees = server.follow_worktrees.unwrap_or(true);
         let infer_cwd = server.infer_cwd.unwrap_or(true);
+        let http = merge_http(server.http.unwrap_or_default())?;
         let telemetry = merge_telemetry(raw.telemetry.unwrap_or_default())?;
         let persistence = merge_persistence(raw.persistence.unwrap_or_default())?;
         let cas = merge_cas(raw.cas.unwrap_or_default())?;
@@ -2349,6 +2352,7 @@ impl Config {
             allow_paths,
             follow_worktrees,
             infer_cwd,
+            http,
             default_cast,
             log,
             tools,
@@ -2376,6 +2380,18 @@ impl Config {
             )
         })?;
         Ok(cfg)
+    }
+
+    /// Apply `kaibo serve --http` / `--listen` (highest precedence). `--listen` alone
+    /// does not turn HTTP on; it sets the address an enabled server binds.
+    pub fn apply_http_cli(&mut self, enable: bool, listen: Option<&str>) -> Result<()> {
+        if enable {
+            self.http.enabled = true;
+        }
+        if let Some(listen) = listen {
+            self.http.listen = parse_http_listen(listen, "--listen")?;
+        }
+        Ok(())
     }
 
     /// Apply CLI overrides (highest precedence). Called from `main` after load.
@@ -2966,6 +2982,19 @@ struct RawServer {
     cast: Option<String>,
     log: Option<String>,
     tools: Option<RawTools>,
+    /// `[server.http]`, the loopback HTTP transport preview.
+    http: Option<RawHttp>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawHttp {
+    /// Serve MCP over HTTP instead of stdio. Default `false`. Env: `KAIBO_HTTP`. CLI:
+    /// `kaibo serve --http`.
+    enabled: Option<bool>,
+    /// `ip:port` to listen on. Loopback only during the preview. Default
+    /// `127.0.0.1:52426`. Env: `KAIBO_HTTP_LISTEN`. CLI: `--listen`.
+    listen: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -3575,6 +3604,12 @@ fn apply_raw_env(raw: &mut RawConfig, get: &impl Fn(&str) -> Option<String>) -> 
     if let Some(v) = get("KAIBO_CAST") {
         server.cast = Some(v);
     }
+    if env_flag(get, "KAIBO_HTTP") {
+        server.http.get_or_insert_with(Default::default).enabled = Some(true);
+    }
+    if let Some(v) = get("KAIBO_HTTP_LISTEN") {
+        server.http.get_or_insert_with(Default::default).listen = Some(v);
+    }
     if let Some(v) = get("KAIBO_LOG") {
         server.log = Some(v);
     }
@@ -3915,6 +3950,62 @@ fn parse_env_int<T: TryFrom<u64>>(name: &str, v: &str) -> Result<T> {
 }
 
 /// A `KAIBO_NO_*` flag is on for any non-empty, non-"0"/"false" value.
+/// The default HTTP listen address: loopback, port 52426 ("kaibo" on a phone keypad).
+pub const DEFAULT_HTTP_LISTEN: &str = "127.0.0.1:52426";
+
+/// `[server.http]`: serve MCP over streamable HTTP on a loopback socket, guarded by the
+/// bearer token in `src/http_token.rs`. A preview: off by default, loopback only.
+#[derive(Debug, Clone)]
+pub struct HttpConfig {
+    /// Serve over HTTP instead of stdio.
+    pub enabled: bool,
+    /// The socket address to bind. Always a loopback address (checked at load).
+    pub listen: std::net::SocketAddr,
+}
+
+impl Default for HttpConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            listen: DEFAULT_HTTP_LISTEN
+                .parse()
+                .expect("the default listen address parses"),
+        }
+    }
+}
+
+/// Parse and check an HTTP listen address. The preview binds loopback only: kaibo reads
+/// your files and spends your provider keys, and a token on a plain-HTTP socket that other
+/// hosts can reach would cross the network unencrypted.
+pub fn parse_http_listen(raw: &str, source: &str) -> Result<std::net::SocketAddr> {
+    let addr: std::net::SocketAddr = raw.trim().parse().map_err(|e| {
+        anyhow::anyhow!(
+            "{source} = {raw:?} is not an ip:port address ({e}). Use a loopback address \
+             such as {DEFAULT_HTTP_LISTEN} or [::1]:52426."
+        )
+    })?;
+    if !addr.ip().is_loopback() {
+        bail!(
+            "{source} = {raw:?} is not a loopback address. The HTTP transport preview binds \
+             loopback only (127.0.0.0/8 or ::1), so nothing off this machine can reach it. \
+             Use {DEFAULT_HTTP_LISTEN}, and reach kaibo from another machine through SSH \
+             port forwarding."
+        );
+    }
+    Ok(addr)
+}
+
+fn merge_http(raw: RawHttp) -> Result<HttpConfig> {
+    let mut http = HttpConfig {
+        enabled: raw.enabled.unwrap_or(false),
+        ..HttpConfig::default()
+    };
+    if let Some(listen) = raw.listen {
+        http.listen = parse_http_listen(&listen, "[server.http] listen")?;
+    }
+    Ok(http)
+}
+
 fn env_flag(get: &impl Fn(&str) -> Option<String>, name: &str) -> bool {
     match get(name) {
         Some(v) => {

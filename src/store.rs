@@ -838,7 +838,7 @@ fn row_to_handle(row: &turso::Row) -> Result<BatchHandle> {
 /// not-yet-created tail lexically. This gives the guard teeth a lexical compare lacks: a
 /// symlink whose target is inside a project is caught, because the existing-ancestor
 /// canonicalization follows it.
-fn resolve_existing_parent(path: &Path) -> PathBuf {
+pub(crate) fn resolve_existing_parent(path: &Path) -> PathBuf {
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     // Absolutize a relative path against cwd first, so `starts_with` compares like-for-like.
     let parent = if parent.as_os_str().is_empty() {

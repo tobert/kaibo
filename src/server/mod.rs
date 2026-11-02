@@ -56,6 +56,7 @@ mod cas_read;
 mod config_resource;
 mod containment;
 mod dossier;
+pub mod http;
 pub(crate) mod render;
 mod resolver;
 
@@ -113,6 +114,9 @@ const CONFIG_EXAMPLE_URI: &str = "kaibo://config/example";
 /// this repo's `docs/`, so without it every explanation had to be smuggled into the
 /// example's comments, where it costs bytes on every read and drifts from the code.
 const CONFIG_GUIDE_URI: &str = "kaibo://config/guide";
+/// The HTTP transport guide (`docs/http.md`): turning it on, scope, the token, client
+/// stanzas per host, and service-manager units.
+const HTTP_GUIDE_URI: &str = "kaibo://config/http";
 /// Long-form "how to wield the tools well" guidance — attachments, cast/model
 /// selection, the sync↔async pairs and their handles, and the read-only shell's
 /// idioms. The tool schemas stay terse and point here, so the repetition and positive
@@ -157,6 +161,9 @@ pub(crate) const CONFIG_EXAMPLE_TOML: &str = include_str!("../../docs/config.exa
 /// kaibo` lays down no docs, so a runtime file read would 404 exactly when someone is
 /// trying to configure the thing.
 pub(crate) const CONFIG_GUIDE_MD: &str = include_str!("../../docs/config.md");
+
+/// `docs/http.md`, embedded like the guide above.
+pub(crate) const HTTP_GUIDE_MD: &str = include_str!("../../docs/http.md");
 
 /// Slack added above a `deliberate`-direct job's synth `request_timeout` when sizing
 /// its wall-clock backstop: the per-request reqwest deadline should fire first (a
@@ -4441,6 +4448,13 @@ fn kaibo_resources() -> Vec<rmcp::model::Resource> {
              this when kaibo://config/example's comments leave a question open.",
         ),
         markdown_resource(
+            HTTP_GUIDE_URI,
+            "kaibo: HTTP transport (preview)",
+            "Serve kaibo over loopback HTTP with a bearer token: turning it on, choosing a \
+             workspace scope, the token file and rotation, client setup for Claude Code, \
+             Codex, OpenCode, Gemini CLI, and Claude Desktop, and systemd and launchd units.",
+        ),
+        markdown_resource(
             SANDBOX_URI,
             "kaibo read-only sandbox",
             "kaibo's read-only boundary: line-number browsing idioms and the exit-code contract.",
@@ -4984,6 +4998,9 @@ fn render_resource(uri: &str, schemas: &[ToolSchema]) -> Option<String> {
     if uri == CONFIG_GUIDE_URI {
         // Static and config-independent — the embedded manual verbatim.
         return Some(CONFIG_GUIDE_MD.to_string());
+    }
+    if uri == HTTP_GUIDE_URI {
+        return Some(HTTP_GUIDE_MD.to_string());
     }
     if uri == TOOLS_URI {
         return Some(TOOLS_DOC.to_string());

@@ -1241,6 +1241,16 @@ Followed worktrees are recomputed on each resource read. Configured `enabled` an
 runtime `active`/`mode` differ when persistence degrades; read both before relying on
 durability.
 
+## HTTP transport (preview)
+
+`[server.http] enabled = true` (or `kaibo serve --http`) serves MCP on a loopback socket,
+default `127.0.0.1:52426`, instead of stdio. A listen address off loopback is a load
+error. Every request needs `Authorization: Bearer <token>`; the token is the file at
+`$XDG_STATE_HOME/kaibo/http-token`, created on first start and re-read on every request,
+so `kaibo http-token --rotate` takes effect without a restart. The HTTP server refuses to
+start with no allowed tree. Setup, client stanzas, and service units: `kaibo://config/http`
+or `kaibo http-guide`.
+
 ## Host agents
 
 Each host agent launches and limits kaibo in its own way. This section lists only the
