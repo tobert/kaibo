@@ -152,26 +152,30 @@ OpenCode reads `{file:...}` when it loads its config, so after a rotation, touch
 `{file:...}` reference instead (`kaibo http-token` prints it). `oauth: false` keeps a `401` from starting an OAuth
 flow. `codemode: false` lists kaibo's tools as native tools.
 
-### Gemini CLI
+### Antigravity CLI (`agy`)
+
+```sh
+agy mcp add --header "Authorization: Bearer $(kaibo http-token --print)" \
+  kaibo http://127.0.0.1:52426/mcp
+```
+
+That writes `~/.gemini/config/mcp_config.json`:
 
 ```json
-// ~/.gemini/settings.json, or: gemini mcp add -s user -t http kaibo http://127.0.0.1:52426/mcp
 {
   "mcpServers": {
     "kaibo": {
-      "url": "http://127.0.0.1:52426/mcp",
-      "type": "http",
-      "headers": { "Authorization": "Bearer $KAIBO_BEARER" }
+      "serverUrl": "http://127.0.0.1:52426/mcp",
+      "headers": { "Authorization": "Bearer <token>" },
+      "disabled": false
     }
   }
 }
 ```
 
-Start Gemini CLI with the variable set: `KAIBO_BEARER=$(kaibo http-token --print) gemini`.
-Gemini CLI has no header helper, so a rotation needs a restart. Keep `TOKEN`, `KEY`, and
-`AUTH` out of the variable's name: Gemini CLI strips such variables. In a Docker or Podman
-sandbox, `127.0.0.1` is the container, not your machine, so kaibo is unreachable; use the
-stdio setup there.
+agy has no header helper, so the token is stored in that file. After a rotation, run the
+same `agy mcp add` command again (it updates the entry) and restart agy. Checked against
+agy 1.4.9's `agy mcp add` on 2026-11-02.
 
 ### Claude Desktop
 

@@ -9,7 +9,7 @@
 //!    cross-origin request, so a page on another site cannot drive kaibo. (A same-origin
 //!    request after DNS rebinding carries no `Origin`; the token and check 4 stop that.)
 //! 2. **Path `/mcp`.** Everything else is a 404, including the OAuth discovery paths
-//!    (`/.well-known/...`) that Codex, OpenCode, and Gemini CLI probe. A 404 there tells
+//!    (`/.well-known/...`) that Codex and OpenCode probe. A 404 there tells
 //!    them kaibo speaks bearer tokens, not OAuth.
 //! 3. **`Authorization: Bearer <token>`** matching the token file, re-read per request
 //!    (`crate::http_token`). A miss is a 401 with `WWW-Authenticate: Bearer`, which is what
