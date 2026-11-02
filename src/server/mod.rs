@@ -56,6 +56,7 @@ mod cas_read;
 mod config_resource;
 mod containment;
 mod dossier;
+pub(crate) mod hosts;
 pub mod http;
 pub(crate) mod render;
 mod resolver;
@@ -117,6 +118,14 @@ const CONFIG_GUIDE_URI: &str = "kaibo://config/guide";
 /// The HTTP transport guide (`docs/http.md`): turning it on, scope, the token, client
 /// stanzas per host, and service-manager units.
 const HTTP_GUIDE_URI: &str = "kaibo://config/http";
+/// The configure walkthrough as a resource, for hosts with no MCP prompt support (Codex)
+/// and hosts whose prompt support is unconfirmed (agy). Same body as the `configure`
+/// prompt with no goal.
+pub(crate) const CONFIGURE_URI: &str = "kaibo://configure";
+/// The index of per-host setup guides, and the template for one guide.
+pub(crate) const HOSTS_URI: &str = "kaibo://hosts";
+const HOSTS_PREFIX: &str = "kaibo://hosts/";
+const HOSTS_URI_TEMPLATE: &str = "kaibo://hosts/{name}";
 /// Long-form "how to wield the tools well" guidance — attachments, cast/model
 /// selection, the sync↔async pairs and their handles, and the read-only shell's
 /// idioms. The tool schemas stay terse and point here, so the repetition and positive
@@ -4443,9 +4452,23 @@ fn kaibo_resources() -> Vec<rmcp::model::Resource> {
             "kaibo: configuration guide",
             "The full configuration reference: precedence across call/CLI/env/file, the \
              backend + cast model, tool gating (why a tool may not be advertised), path \
-             containment, persistence, telemetry, house rules, prompt overrides, and \
-             host-agent setup such as Codex. Read \
-             this when kaibo://config/example's comments leave a question open.",
+             containment, persistence, telemetry, house rules, and prompt overrides. \
+             Per-host setup is in kaibo://hosts. Read this when kaibo://config/example's \
+             comments leave a question open.",
+        ),
+        markdown_resource(
+            CONFIGURE_URI,
+            "kaibo: configure walkthrough",
+            "The guided setup for kaibo's models, keys, scope, and host: the same steps as \
+             the `configure` prompt, for a host that has no MCP prompts (Codex). Read it, then \
+             tell the user what you will change before writing config.toml.",
+        ),
+        markdown_resource(
+            HOSTS_URI,
+            "kaibo: host setup guides",
+            "Index of per-host setup guides: Claude Code, Codex, OpenCode, agy (Antigravity \
+             CLI), and Claude Desktop. Each covers the stdio and HTTP stanzas, timeouts, \
+             approvals, sandbox, and supported MCP features. One guide: kaibo://hosts/{name}.",
         ),
         markdown_resource(
             HTTP_GUIDE_URI,
@@ -4504,6 +4527,11 @@ Work through these steps:
    • `kaibo://config` — the resolved live state: the casts and backends that exist now, \
 and where each key is sourced from.
    • `kaibo://config/guide` — the full reference manual, if a question stays open.
+   • `kaibo://hosts/<host>` — setup for the host you are running in: `claude-code`, \
+`codex`, `opencode`, `agy`, or `claude-desktop` (`kaibo://hosts` lists them). It has the \
+config stanza, timeouts, approvals, and sandbox notes for that host.
+   • `kaibo://config/http` — only if I want one shared kaibo over loopback HTTP instead \
+of one per client.
 ";
 
 /// Steps 2-7, channel-neutral (which provider, what roster shape, keeping secrets out
@@ -4561,8 +4589,8 @@ files), and write access to `$XDG_DATA_HOME/kaibo/cas` for disk artifacts (under
 `~/.local/share` when the XDG variables are unset). Keep both stores outside the allowed \
 project trees. Offer per-client stores if I want separate history and artifacts in \
 Codex, Claude Code, or other clients. Some hosts give MCP servers and shell commands \
-different access: the reference's Host agents section covers Codex. Ask me before \
-opening access or changing the host's tool approval settings.
+different access, or clear the server's environment: the host guide from step 1 says \
+which. Ask me before opening access or changing the host's tool approval settings.
 7. Staff every tool my keys allow, not only `consult`. Model-backed tools need cast slots, and \
 `runtime.unstaffable_tools` in the resolved config names each gap. Any text-provider key \
 (DeepSeek, Anthropic, Gemini, OpenRouter, or a local endpoint) staffs `consult`, `explore`, \
@@ -4602,6 +4630,11 @@ Work through these steps:
    • `kaibo config-guide` — the full reference manual, if a question stays open.
    • `kaibo config` — the resolved live state: the casts and backends that exist now, \
 and where each key is sourced from.
+   • `kaibo host-guide <host>` — setup for the host you are running in: `claude-code`, \
+`codex`, `opencode`, `agy`, or `claude-desktop` (`kaibo host-guide` lists them). It has \
+the config stanza, timeouts, approvals, and sandbox notes for that host.
+   • `kaibo http-guide` — only if I want one shared kaibo over loopback HTTP instead of \
+one per client.
 ";
 
 const CONFIGURE_PROMPT_OUTRO_CLI: &str = "\
@@ -4718,7 +4751,13 @@ fn kaibo_resource_templates() -> Vec<rmcp::model::ResourceTemplate> {
     // as ambient context to prefetch or attach, which is the wrong posture for
     // model-authored bytes, and `resources/read` is whole-blob with no way to ask what an
     // object is before pulling all of it. See `cas_read`'s module doc.
-    vec![builtin, prompts]
+    let hosts = ResourceTemplate::new(HOSTS_URI_TEMPLATE, "kaibo: one host's setup guide")
+        .with_description(
+            "Setup for one agent host: claude-code, codex, opencode, agy, or claude-desktop. \
+             e.g. kaibo://hosts/codex",
+        )
+        .with_mime_type("text/markdown");
+    vec![builtin, prompts, hosts]
 }
 
 /// Render the markdown body for a kaibo resource URI, or `None` if the URI isn't
@@ -5001,6 +5040,16 @@ fn render_resource(uri: &str, schemas: &[ToolSchema]) -> Option<String> {
     }
     if uri == HTTP_GUIDE_URI {
         return Some(HTTP_GUIDE_MD.to_string());
+    }
+    if uri == CONFIGURE_URI {
+        return Some(configure_prompt_text(None));
+    }
+    if uri == HOSTS_URI {
+        return Some(hosts::host_index(|name| format!("`{HOSTS_PREFIX}{name}`")));
+    }
+    if let Some(name) = uri.strip_prefix(HOSTS_PREFIX) {
+        // An unknown host is a miss (not-found), like an unknown builtin.
+        return hosts::host_guide(name).map(str::to_string);
     }
     if uri == TOOLS_URI {
         return Some(TOOLS_DOC.to_string());
@@ -10369,7 +10418,7 @@ enabled = false
         };
         let text = t.text.as_str();
         for needle in [
-            "Host agents",
+            "the host guide from step 1",
             "$XDG_STATE_HOME/kaibo` directory",
             "$XDG_DATA_HOME/kaibo/cas",
             "per-client stores",
@@ -10432,7 +10481,7 @@ enabled = false
                 "kaibo configure should mention {needle:?}; body:\n{text}"
             );
         }
-        for unreachable in [CONFIG_EXAMPLE_URI, CONFIG_URI] {
+        for unreachable in [CONFIG_EXAMPLE_URI, CONFIG_URI, HOSTS_URI, HTTP_GUIDE_URI] {
             assert!(
                 !text.contains(unreachable),
                 "kaibo configure must not point a CLI-only caller at an MCP resource \
@@ -11087,6 +11136,55 @@ enabled = false
         );
         crate::config::Config::from_toml_str(&body)
             .expect("the embedded config example must parse as a valid Config");
+    }
+
+    // --- kaibo://configure and kaibo://hosts resource tests ---------------------
+
+    /// Codex has no MCP prompts, so the configure walkthrough must also be a resource, with
+    /// the same body as the prompt.
+    #[test]
+    fn the_configure_walkthrough_is_a_resource_too() {
+        let uris: Vec<String> = kaibo_resources().iter().map(|r| r.uri.clone()).collect();
+        assert!(uris.iter().any(|u| u == CONFIGURE_URI), "{uris:?}");
+        assert_eq!(
+            render_resource(CONFIGURE_URI, &[]).as_deref(),
+            Some(configure_prompt_text(None).as_str())
+        );
+    }
+
+    /// The host index and every guide resolve; an unknown host is a miss.
+    #[test]
+    fn host_guides_are_resources() {
+        let uris: Vec<String> = kaibo_resources().iter().map(|r| r.uri.clone()).collect();
+        assert!(uris.iter().any(|u| u == HOSTS_URI), "{uris:?}");
+        assert!(
+            kaibo_resource_templates()
+                .iter()
+                .any(|t| t.uri_template == HOSTS_URI_TEMPLATE)
+        );
+        let index = render_resource(HOSTS_URI, &[]).expect("the index renders");
+        for g in hosts::HOST_GUIDES {
+            let uri = format!("{HOSTS_PREFIX}{}", g.name);
+            assert!(index.contains(&uri), "the index links {uri}");
+            assert_eq!(render_resource(&uri, &[]).as_deref(), Some(g.body));
+        }
+        assert_eq!(render_resource("kaibo://hosts/gemini-cli", &[]), None);
+    }
+
+    /// The configure prompt sends the agent to its own host's guide, in the form its
+    /// channel can reach.
+    #[test]
+    fn configure_points_at_the_host_guides() {
+        let mcp = configure_prompt_text(None);
+        assert!(mcp.contains("kaibo://hosts/<host>"), "{mcp}");
+        assert!(mcp.contains(HTTP_GUIDE_URI), "{mcp}");
+        let cli = configure_prompt_text_cli(None);
+        assert!(cli.contains("kaibo host-guide <host>"), "{cli}");
+        assert!(cli.contains("kaibo http-guide"), "{cli}");
+        for g in hosts::HOST_GUIDES {
+            assert!(mcp.contains(&format!("`{}`", g.name)), "{}", g.name);
+            assert!(cli.contains(&format!("`{}`", g.name)), "{}", g.name);
+        }
     }
 
     // --- kaibo://config/guide resource tests ----------------------------------

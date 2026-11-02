@@ -21,6 +21,8 @@ record. Each later release appends a new section at the top.
 - Naming a tree that holds `$HOME` with `--root` or `--allow-path` logs a startup warning.
 
 ### Added
+- `kaibo://configure` serves the configure walkthrough as a resource, for hosts without MCP prompts such as Codex.
+- `kaibo://hosts/{name}` and `kaibo host-guide <name>`: setup guides for Claude Code, Codex, OpenCode, agy, and Claude Desktop.
 - Preview: `kaibo serve --http` serves MCP on a loopback socket (default `127.0.0.1:52426`) behind a bearer token; off by default. Setup: `kaibo://config/http`.
 - `kaibo http-token` prints the token file's path, the token, or a header helper's JSON, and `--rotate` replaces the token with no server restart.
 - `kaibo://config` shows `[http]`: enabled, listen address, and token file path, never the token.
@@ -32,6 +34,7 @@ record. Each later release appends a new section at the top.
 - `prompt_cache = "short" | "long" | "off"` on an `anthropic` or `openrouter` backend sets the cache retention; `short` is the default.
 
 ### Changed
+- The `configure` prompt points the agent at its own host's guide and at the HTTP guide.
 - The `configure` prompt recommends a workspace root such as `~/src` and asks for the user's clear yes before scoping to `~`, `$HOME`, or `/`.
 - The built-in `anthropic` cast sets `consult = "solo"`: the Sonnet reads the code itself, and the Haiku explorer serves `explore` only.
 - The built-in `gemini` cast's synth is `gemini/gemini-pro-latest` (explorer stays `gemini/gemini-flash-latest`).

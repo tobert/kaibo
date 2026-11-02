@@ -281,7 +281,9 @@ kaibo consult "does anything still busy-poll in job_wait?" --cast deepseek
 ```
 
 Setup that differs by host agent, such as Codex's separate MCP and shell network access,
-is under [Host agents](docs/config.md#host-agents).
+has a guide per host in [docs/hosts/](docs/hosts/): Claude Code, Codex, OpenCode, agy, and
+Claude Desktop. kaibo serves them as `kaibo://hosts/<host>` and prints them with
+`kaibo host-guide <host>`.
 
 **Bare `kaibo` with no subcommand is the stdio MCP server.** `kaibo serve` is the
 explicit spelling for the same thing, and may become required in the future.

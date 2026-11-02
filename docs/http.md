@@ -88,100 +88,16 @@ the state directory, put it in the command:
 ## Connect a client
 
 Each host passes the token its own way. Prefer a header helper: it follows rotation with
-no restart. The client stanzas below were checked against each host's docs on 2026-11-02;
-confirm against your version before copying.
+no restart. Each host's guide has the full stanza: `kaibo://hosts/<host>`, or
+`kaibo host-guide <host>` from a shell.
 
-### Claude Code
-
-User scope, so every project sees it and the helper runs without a folder-trust prompt:
-
-```json
-// ~/.claude.json, or: claude mcp add --scope user --transport http kaibo http://127.0.0.1:52426/mcp
-{
-  "mcpServers": {
-    "kaibo": {
-      "type": "http",
-      "url": "http://127.0.0.1:52426/mcp",
-      "headersHelper": "kaibo http-token --header",
-      "timeout": 600000
-    }
-  }
-}
-```
-
-The helper runs at session start and on every reconnect, and again once after a `401`.
-An HTTP request times out after 60 seconds unless `timeout` (or `MCP_TOOL_TIMEOUT`)
-raises it; a `consult` often runs longer.
-
-### Codex
-
-```toml
-# ~/.codex/config.toml
-[mcp_servers.kaibo]
-url = "http://127.0.0.1:52426/mcp"
-http_headers_helper = "kaibo http-token --header"
-tool_timeout_sec = 600
-```
-
-Codex runs the helper when it connects and again after a `401`, with a cleared
-environment (see the `XDG_STATE_HOME` note above). It has no CLI flag for the helper; edit
-`config.toml`. Do not also set `bearer_token_env_var`: an explicit bearer token wins over
-the helper. Codex's command sandbox does not apply to MCP servers.
-
-### OpenCode
-
-```json
-// ~/.config/opencode/opencode.json
-{
-  "mcp": {
-    "servers": {
-      "kaibo": {
-        "type": "remote",
-        "url": "http://127.0.0.1:52426/mcp",
-        "headers": { "Authorization": "Bearer {file:~/.local/state/kaibo/http-token}" },
-        "oauth": false,
-        "codemode": false
-      }
-    }
-  }
-}
-```
-
-OpenCode reads `{file:...}` when it loads its config, so after a rotation, touch
-`opencode.json` or restart OpenCode. If you set `XDG_STATE_HOME`, write that path into the
-`{file:...}` reference instead (`kaibo http-token` prints it). `oauth: false` keeps a `401` from starting an OAuth
-flow. `codemode: false` lists kaibo's tools as native tools.
-
-### Antigravity CLI (`agy`)
-
-```sh
-agy mcp add --header "Authorization: Bearer $(kaibo http-token --print)" \
-  kaibo http://127.0.0.1:52426/mcp
-```
-
-That writes `~/.gemini/config/mcp_config.json`:
-
-```json
-{
-  "mcpServers": {
-    "kaibo": {
-      "serverUrl": "http://127.0.0.1:52426/mcp",
-      "headers": { "Authorization": "Bearer <token>" },
-      "disabled": false
-    }
-  }
-}
-```
-
-agy has no header helper, so the token is stored in that file. After a rotation, run the
-same `agy mcp add` command again (it updates the entry) and restart agy. Checked against
-agy 1.4.9's `agy mcp add` on 2026-11-02.
-
-### Claude Desktop
-
-Use stdio. Desktop's custom connectors connect from Anthropic's cloud and cannot reach a
-loopback address. Pass `--root` and an absolute command path, because Desktop's launch
-directory is not documented.
+| Host | Token | After `--rotate` |
+|---|---|---|
+| `claude-code` | `"headersHelper": "kaibo http-token --header"` | nothing to do |
+| `codex` | `http_headers_helper = "kaibo http-token --header"` | nothing to do |
+| `opencode` | `"Bearer {file:~/.local/state/kaibo/http-token}"` | touch the config or restart |
+| `agy` | `agy mcp add --header "Authorization: Bearer $(kaibo http-token --print)" ...` | re-run the add, restart |
+| `claude-desktop` | none: its connectors cannot reach loopback; use stdio | |
 
 ## Run it as a service
 

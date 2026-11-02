@@ -59,6 +59,9 @@ async fn main() -> Result<()> {
         Some(Command::HttpGuide) => {
             std::process::exit(kaibo::cli::run_http_guide());
         }
+        Some(Command::HostGuide(args)) => {
+            std::process::exit(kaibo::cli::run_host_guide(&args));
+        }
         Some(Command::HttpToken(args)) => {
             std::process::exit(kaibo::cli::run_http_token(&cli.common, &args));
         }
@@ -94,6 +97,7 @@ async fn run_command(common: CommonArgs, command: Command) -> i32 {
         Command::ConfigGuide => kaibo::cli::run_config_guide(),
         Command::HttpToken(args) => kaibo::cli::run_http_token(&common, &args),
         Command::HttpGuide => kaibo::cli::run_http_guide(),
+        Command::HostGuide(args) => kaibo::cli::run_host_guide(&args),
     }
 }
 
