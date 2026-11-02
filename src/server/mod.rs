@@ -4452,7 +4452,7 @@ fn kaibo_resources() -> Vec<rmcp::model::Resource> {
             "kaibo: HTTP transport (preview)",
             "Serve kaibo over loopback HTTP with a bearer token: turning it on, choosing a \
              workspace scope, the token file and rotation, client setup for Claude Code, \
-             Codex, OpenCode, Gemini CLI, and Claude Desktop, and systemd and launchd units.",
+             Codex, OpenCode, agy, and Claude Desktop, and systemd and launchd units.",
         ),
         markdown_resource(
             SANDBOX_URI,
