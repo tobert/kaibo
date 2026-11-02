@@ -43,6 +43,15 @@ pub enum TokenError {
          them before enabling [server.http]."
     )]
     NoStateDir,
+    /// The path is a symlink or not a regular file, or (on Unix) another user owns it or
+    /// it grants group or other access. kaibo did not create such a file, so it does not
+    /// trust it as the token.
+    #[error(
+        "refused the HTTP token file {path}: {why}. kaibo trusts only an owner-only regular \
+         file it can vouch for. Check who created it, then delete it and run `kaibo \
+         http-token --rotate` to write a fresh one."
+    )]
+    Untrusted { path: String, why: &'static str },
     /// The file exists but holds no token.
     #[error(
         "the HTTP token file {0} is empty. Run `kaibo http-token --rotate` to write a new token."
@@ -67,8 +76,12 @@ fn io_err(path: &Path, source: std::io::Error) -> TokenError {
 /// The fixed token path: `$XDG_STATE_HOME/kaibo/http-token`, else
 /// `~/.local/state/kaibo/http-token`.
 pub fn default_token_path() -> Result<PathBuf, TokenError> {
-    if let Some(xdg) = std::env::var_os("XDG_STATE_HOME").filter(|s| !s.is_empty()) {
-        return Ok(PathBuf::from(xdg).join("kaibo").join(TOKEN_FILE));
+    // The XDG spec says to ignore a relative value, so a relative one falls through to HOME.
+    if let Some(xdg) = std::env::var_os("XDG_STATE_HOME")
+        .map(PathBuf::from)
+        .filter(|p| p.is_absolute())
+    {
+        return Ok(xdg.join("kaibo").join(TOKEN_FILE));
     }
     std::env::var_os("HOME")
         .filter(|s| !s.is_empty())
@@ -153,8 +166,11 @@ pub fn rotate(path: &Path) -> Result<String, TokenError> {
 }
 
 /// Read the current token. Whitespace around it is ignored, so a hand-edited file with a
-/// trailing newline still matches.
+/// trailing newline still matches. The file must be one kaibo can vouch for (see
+/// [`check_provenance`]); this runs on every read, so a file loosened later is refused too.
 pub fn read(path: &Path) -> Result<String, TokenError> {
+    let meta = std::fs::symlink_metadata(path).map_err(|e| io_err(path, e))?;
+    check_provenance(path, &meta)?;
     let raw = std::fs::read_to_string(path).map_err(|e| io_err(path, e))?;
     let token = raw.trim();
     if token.is_empty() {
@@ -167,13 +183,49 @@ pub fn read(path: &Path) -> Result<String, TokenError> {
 /// in time independent of where the strings differ; only the length can leak, and every
 /// minted token has the same length. A token file that cannot be read fails closed.
 pub fn authorizes(path: &Path, header: Option<&str>) -> bool {
-    let Some(presented) = header.and_then(|h| h.strip_prefix("Bearer ")) else {
+    // The scheme name is case-insensitive (RFC 7235 section 2.1); the token is not.
+    let Some(presented) = header
+        .and_then(|h| h.trim().split_once(' '))
+        .filter(|(scheme, _)| scheme.eq_ignore_ascii_case("bearer"))
+        .map(|(_, token)| token)
+    else {
         return false;
     };
     let Ok(expected) = read(path) else {
         return false;
     };
     constant_time_eq(presented.trim().as_bytes(), expected.as_bytes())
+}
+
+/// Refuse a token file kaibo would not have written: a symlink (whose target someone else
+/// may control), anything but a regular file, and on Unix a file another user owns or one
+/// with any group or other permission bit. Where `XDG_STATE_HOME` lands in a directory
+/// another user can write, this keeps a planted file from becoming the token.
+fn check_provenance(path: &Path, meta: &std::fs::Metadata) -> Result<(), TokenError> {
+    let untrusted = |why| TokenError::Untrusted {
+        path: path.display().to_string(),
+        why,
+    };
+    if meta.file_type().is_symlink() {
+        return Err(untrusted("it is a symlink"));
+    }
+    if !meta.is_file() {
+        return Err(untrusted("it is not a regular file"));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        // SAFETY: geteuid has no preconditions and cannot fail.
+        if meta.uid() != unsafe { libc::geteuid() } {
+            return Err(untrusted("another user owns it"));
+        }
+        if meta.mode() & 0o077 != 0 {
+            return Err(untrusted(
+                "it grants group or other access (it must be mode 0600)",
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
@@ -232,9 +284,50 @@ mod tests {
         assert!(!authorizes(&path, Some(&token)), "no Bearer scheme");
         assert!(!authorizes(&path, Some(&format!("Basic {token}"))));
         assert!(!authorizes(&path, Some("Bearer ")));
+        assert!(
+            authorizes(&path, Some(&format!("bearer {token}"))),
+            "the scheme name is case-insensitive"
+        );
+        assert!(
+            !authorizes(
+                &path,
+                Some(&format!("Bearer {}", token.to_ascii_uppercase()))
+            ),
+            "the token is not"
+        );
         let mut wrong = token.clone();
         wrong.replace_range(0..1, if token.starts_with('A') { "B" } else { "A" });
         assert!(!authorizes(&path, Some(&format!("Bearer {wrong}"))));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_planted_or_loosened_token_file_is_not_trusted() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().unwrap();
+
+        // A symlink at the token path, aimed at a file someone else wrote.
+        let planted = dir.path().join("planted");
+        std::fs::write(&planted, "attacker-token\n").unwrap();
+        std::fs::set_permissions(&planted, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let link = dir.path().join("linked").join(TOKEN_FILE);
+        std::fs::create_dir(link.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(&planted, &link).unwrap();
+        assert!(matches!(read(&link), Err(TokenError::Untrusted { .. })));
+        assert!(matches!(ensure(&link), Err(TokenError::Untrusted { .. })));
+        assert!(!authorizes(&link, Some("Bearer attacker-token")));
+
+        // A readable-by-others file, even with the right content.
+        let path = dir.path().join(TOKEN_FILE);
+        let token = ensure(&path).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(matches!(read(&path), Err(TokenError::Untrusted { .. })));
+        assert!(!authorizes(&path, Some(&format!("Bearer {token}"))));
+
+        // A directory where the file should be.
+        let not_file = dir.path().join("dir-token");
+        std::fs::create_dir(&not_file).unwrap();
+        assert!(matches!(read(&not_file), Err(TokenError::Untrusted { .. })));
     }
 
     #[test]

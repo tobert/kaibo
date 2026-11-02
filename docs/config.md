@@ -1243,7 +1243,8 @@ durability.
 
 ## HTTP transport (preview)
 
-`[server.http] enabled = true` (or `kaibo serve --http`) serves MCP on a loopback socket,
+`[server.http] enabled = true` (or `kaibo serve --http`; `--no-http` and `KAIBO_HTTP=0`
+turn it off for a run) serves MCP on a loopback socket,
 default `127.0.0.1:52426`, instead of stdio. A listen address off loopback is a load
 error. Every request needs `Authorization: Bearer <token>`; the token is the file at
 `$XDG_STATE_HOME/kaibo/http-token`, created on first start and re-read on every request,

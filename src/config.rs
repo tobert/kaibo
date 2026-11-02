@@ -2382,11 +2382,20 @@ impl Config {
         Ok(cfg)
     }
 
-    /// Apply `kaibo serve --http` / `--listen` (highest precedence). `--listen` alone
-    /// does not turn HTTP on; it sets the address an enabled server binds.
-    pub fn apply_http_cli(&mut self, enable: bool, listen: Option<&str>) -> Result<()> {
+    /// Apply `kaibo serve --http` / `--no-http` / `--listen` (highest precedence). clap
+    /// keeps the first two exclusive. `--listen` alone does not turn HTTP on; it sets the
+    /// address an enabled server binds.
+    pub fn apply_http_cli(
+        &mut self,
+        enable: bool,
+        disable: bool,
+        listen: Option<&str>,
+    ) -> Result<()> {
         if enable {
             self.http.enabled = true;
+        }
+        if disable {
+            self.http.enabled = false;
         }
         if let Some(listen) = listen {
             self.http.listen = parse_http_listen(listen, "--listen")?;
@@ -3604,8 +3613,10 @@ fn apply_raw_env(raw: &mut RawConfig, get: &impl Fn(&str) -> Option<String>) -> 
     if let Some(v) = get("KAIBO_CAST") {
         server.cast = Some(v);
     }
-    if env_flag(get, "KAIBO_HTTP") {
-        server.http.get_or_insert_with(Default::default).enabled = Some(true);
+    // Both directions: `KAIBO_HTTP=0` must be able to close a socket the file opened.
+    if get("KAIBO_HTTP").is_some() {
+        server.http.get_or_insert_with(Default::default).enabled =
+            Some(env_flag(get, "KAIBO_HTTP"));
     }
     if let Some(v) = get("KAIBO_HTTP_LISTEN") {
         server.http.get_or_insert_with(Default::default).listen = Some(v);

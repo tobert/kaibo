@@ -1,4 +1,4 @@
-//! The read-only invariant, guarded at the source — now with three blessed exceptions.
+//! The read-only invariant, guarded at the source, with a few blessed exceptions.
 //!
 //! kaibo writes essentially nothing: no write path through kaish (enforced structurally —
 //! see `tests/sandbox.rs`/`tests/worker.rs`, where a kaish write is refused), and no
@@ -56,7 +56,7 @@
 //!   fails everywhere, including inside the blessed files, on any line lacking that
 //!   file's own marker;
 //! - the total number of blessed marker lines tree-wide is pinned to an **exact count**
-//!   (`EXPECTED_BLESSED_LINES`, currently 5), so a new write site — in an existing blessed
+//!   (`EXPECTED_BLESSED_LINES`), so a new write site — in an existing blessed
 //!   file or a new one — can't quietly ride in behind an existing marker without this test
 //!   failing (`blessed_marker_count_matches_exactly`).
 //!

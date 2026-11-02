@@ -2,8 +2,10 @@
 //!
 //! Bare `kaibo` (and `kaibo serve`) is the MCP server: ask `consult` a question about
 //! a codebase; kaibo explores it read-only through kaish and returns a cited answer.
-//! stdio only, by design — kaibo can read a filesystem, so it must never bind a
-//! network socket. Logs go to stderr; stdout carries the MCP transport.
+//! stdio by default. kaibo can read a filesystem, so a socket is a door to it: the one
+//! socket is the opt-in loopback HTTP transport (`kaibo serve --http`, see
+//! `kaibo::server::http`), behind a bearer token. Logs go to stderr; on stdio, stdout
+//! carries the MCP transport.
 //!
 //! `kaibo consult "…"` and `kaibo config` are the CLI front door (see `kaibo::cli`),
 //! for CLI-first agents, scripts, and humans without an MCP client. Every existing
@@ -167,7 +169,7 @@ async fn serve(common: CommonArgs, gates: ServeGates) -> Result<()> {
         gates.allow_save_artifact,
         common.max_attachments,
     );
-    if let Err(e) = config.apply_http_cli(gates.http, gates.listen.as_deref()) {
+    if let Err(e) = config.apply_http_cli(gates.http, gates.no_http, gates.listen.as_deref()) {
         eprintln!("kaibo: config error: {e:#}");
         std::process::exit(2);
     }
@@ -373,7 +375,15 @@ async fn serve(common: CommonArgs, gates: ServeGates) -> Result<()> {
         "containment boundary"
     );
     if http.enabled {
-        return serve_http(handler, http.listen).await;
+        // Nothing forwards MCP log notifications over HTTP yet, so close the channel: the
+        // bridge's sends then fail and drop, instead of piling up in an unbounded queue
+        // for the life of the server. `job_wait`'s ring is separate and still fills.
+        drop(log_rx);
+        let result = serve_http(handler, http.listen).await;
+        if let Some(guard) = otel_guard {
+            guard.shutdown();
+        }
+        return result;
     }
     // Grab the shared log floor before `serve` consumes the handler; the drain task
     // reads it so a client `setLevel` retunes verbosity live.

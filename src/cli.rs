@@ -186,8 +186,8 @@ pub struct HttpTokenArgs {
     pub rotate: bool,
 }
 
-/// Run `kaibo http-token`. Exit 0 on success, 3 when the token file cannot be read,
-/// created, or rotated.
+/// Run `kaibo http-token`. Exit 0 on success, 2 when `--rotate` cannot load config, 3
+/// when the token file cannot be read, created, or rotated.
 pub fn run_http_token(common: &CommonArgs, args: &HttpTokenArgs) -> i32 {
     use crate::http_token;
     let fail = |e: &dyn std::fmt::Display| {
@@ -409,8 +409,12 @@ pub struct ServeGates {
     /// needs `Authorization: Bearer <token>`; `kaibo http-token` prints the token file's
     /// path. Needs `--root` or an allowed tree, because a server started by a service
     /// manager has no meaningful launch directory. Also KAIBO_HTTP / [server.http] enabled.
-    #[arg(long)]
+    #[arg(long, conflicts_with = "no_http")]
     pub http: bool,
+
+    /// Serve on stdio even when KAIBO_HTTP or [server.http] enabled turns HTTP on.
+    #[arg(long)]
+    pub no_http: bool,
 
     /// The `ip:port` the HTTP server binds, loopback only (default `127.0.0.1:52426`).
     /// Also KAIBO_HTTP_LISTEN / [server.http] listen.

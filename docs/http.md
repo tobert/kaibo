@@ -22,7 +22,8 @@ enabled = true
 ```
 
 Then run `kaibo serve`. The same switches exist as `kaibo serve --http --listen ADDR` and
-`KAIBO_HTTP=1` / `KAIBO_HTTP_LISTEN`. The startup log prints the URL,
+`KAIBO_HTTP=1` / `KAIBO_HTTP_LISTEN`. `kaibo serve --no-http` or `KAIBO_HTTP=0` serves
+stdio for one run without editing the file. The startup log prints the URL,
 `http://127.0.0.1:52426/mcp`.
 
 A listen address off loopback is refused at startup. To reach kaibo from another machine,
@@ -58,10 +59,15 @@ directory, so set `root`.
 ## The token
 
 kaibo creates the token the first time the HTTP server starts:
-`$XDG_STATE_HOME/kaibo/http-token`, else `~/.local/state/kaibo/http-token`. The file is
-owner-only (mode `0600`) and holds 32 random bytes as base64url. It lives in the state
-directory, not the config directory, so a dotfiles repo does not pick it up. Neither the
-log nor `kaibo://config` shows the token; both show the path.
+`$XDG_STATE_HOME/kaibo/http-token`, else `~/.local/state/kaibo/http-token`. It holds 32
+random bytes as base64url. It lives in the state directory, not the config directory, so a
+dotfiles repo does not pick it up. Neither the log nor `kaibo://config` shows the token;
+both show the path.
+
+On Unix the file is owner-only (mode `0600`), and kaibo trusts it only while it is a
+regular file, not a symlink, owned by kaibo's user with no group or other access. Anything
+else is refused on every request, so a file someone else planted never becomes the token.
+On Windows the file takes the permissions of its directory under your user profile.
 
 | Command | Prints |
 |---|---|
@@ -142,7 +148,8 @@ the helper. Codex's command sandbox does not apply to MCP servers.
 ```
 
 OpenCode reads `{file:...}` when it loads its config, so after a rotation, touch
-`opencode.json` or restart OpenCode. `oauth: false` keeps a `401` from starting an OAuth
+`opencode.json` or restart OpenCode. If you set `XDG_STATE_HOME`, write that path into the
+`{file:...}` reference instead (`kaibo http-token` prints it). `oauth: false` keeps a `401` from starting an OAuth
 flow. `codemode: false` lists kaibo's tools as native tools.
 
 ### Gemini CLI
@@ -182,7 +189,9 @@ directory is not documented.
 Description=kaibo MCP server (HTTP)
 
 [Service]
-ExecStart=%h/.cargo/bin/kaibo serve --http
+# --root: systemd starts a user service in your home directory, which kaibo does not
+# adopt as scope. Drop it if config.toml sets [server] root.
+ExecStart=%h/.cargo/bin/kaibo serve --http --root %h/src
 Restart=on-failure
 # Provider keys: api_key_file / api_key_cmd in config.toml need nothing here. For env
 # keys, use an owner-only file:
@@ -201,7 +210,8 @@ loginctl enable-linger "$USER"       # optional: keep it running while logged ou
 
 ### launchd (macOS)
 
-launchd does not expand `~`; use absolute paths.
+launchd does not expand `~`; use absolute paths. launchd starts an agent in `/`, so pass
+`--root` (or set `[server] root` in `config.toml`).
 
 ```xml
 <!-- ~/Library/LaunchAgents/dev.kaibo.serve.plist -->
@@ -215,6 +225,8 @@ launchd does not expand `~`; use absolute paths.
     <string>/opt/homebrew/bin/kaibo</string>
     <string>serve</string>
     <string>--http</string>
+    <string>--root</string>
+    <string>/Users/YOU/src</string>
   </array>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><true/>
@@ -241,7 +253,11 @@ reach it at the same URL.
 | carries an `Origin` header (a browser) | `403` |
 | any path other than `/mcp`, including OAuth discovery under `/.well-known/` | `404` |
 | no `Authorization: Bearer`, or not the current token | `401` with `WWW-Authenticate: Bearer` |
-| a `Host` header that is not a loopback name or the bound address | rejected by the MCP layer |
+| a `Host` header that is not a loopback name or the bound address | `4xx`, even with the token |
+
+Each refusal is logged with its reason, never with a header value. At most 64 connections
+are served at once, a client gets 30 seconds to send its request headers, and on SIGINT or
+SIGTERM the server lets open requests finish for up to 30 seconds before it exits.
 
 ## Preview limits
 

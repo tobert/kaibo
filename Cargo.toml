@@ -136,7 +136,8 @@ toml = "1"
 # tree transitively via kaish-kernel, named here so the dep is ours, not implicit.
 regex = "1"
 
-# MCP server (stdio only — never bind a socket; the FS is the boundary).
+# MCP server: stdio by default; the opt-in HTTP transport binds loopback only, behind a
+# bearer token (AGENTS.md, "stdio by default; loopback HTTP only behind a token").
 rmcp = { version = "3.4.0", features = ["server", "transport-io", "macros", "transport-streamable-http-server"] }
 # The HTTP transport preview (`src/server/http.rs`): hyper serves rmcp's streamable-HTTP
 # service on a loopback socket. hyper, hyper-util, and http-body-util are already in the

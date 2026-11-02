@@ -111,10 +111,12 @@ impl Server {
             .set_read_timeout(Some(Duration::from_secs(10)))
             .unwrap();
         let mut req = format!(
-            "{method} {path} HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nContent-Length: {}\r\n",
-            self.port,
+            "{method} {path} HTTP/1.1\r\nContent-Length: {}\r\n",
             body.len()
         );
+        if !headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("host")) {
+            req.push_str(&format!("Host: 127.0.0.1:{}\r\n", self.port));
+        }
         for (k, v) in headers {
             req.push_str(&format!("{k}: {v}\r\n"));
         }
@@ -271,5 +273,117 @@ fn an_http_server_with_nothing_to_read_refuses_to_start() {
     assert!(
         !env.token_path().exists(),
         "a refused start writes no token file"
+    );
+}
+
+/// The path check is equality, not a prefix: near misses are 404, even with a token.
+#[test]
+fn only_the_exact_mcp_path_is_served() {
+    let server = Server::start();
+    let bearer = format!("Bearer {}", server.env.token());
+    for path in ["/mcp/", "//mcp", "/%6dcp", "/mcp/../mcp", "/"] {
+        let head = server.request(
+            "POST",
+            path,
+            &[
+                ("Authorization", &bearer),
+                ("Content-Type", "application/json"),
+                ("Accept", "application/json, text/event-stream"),
+            ],
+            INITIALIZE,
+        );
+        assert_eq!(status(&head), "404", "{path}: {head}");
+    }
+}
+
+/// A rebound name is refused even with the right token: the Host allowlist is what stops
+/// a same-origin request after DNS rebinding, which carries no Origin header.
+#[test]
+fn a_rebound_host_name_is_refused_even_with_the_token() {
+    let server = Server::start();
+    let bearer = format!("Bearer {}", server.env.token());
+    let head = server.request(
+        "POST",
+        "/mcp",
+        &[
+            ("Host", "evil.example"),
+            ("Authorization", &bearer),
+            ("Content-Type", "application/json"),
+            ("Accept", "application/json, text/event-stream"),
+        ],
+        INITIALIZE,
+    );
+    let code = status(&head);
+    assert!(
+        code.starts_with('4'),
+        "a non-loopback Host must be refused: {head}"
+    );
+}
+
+/// The auth scheme name is case-insensitive.
+#[test]
+fn a_lowercase_bearer_scheme_is_accepted() {
+    let server = Server::start();
+    let bearer = format!("bearer {}", server.env.token());
+    let head = server.request(
+        "POST",
+        "/mcp",
+        &[
+            ("Authorization", &bearer),
+            ("Content-Type", "application/json"),
+            ("Accept", "application/json, text/event-stream"),
+        ],
+        INITIALIZE,
+    );
+    assert_eq!(status(&head), "200", "{head}");
+}
+
+/// SIGTERM stops the server cleanly and promptly when no request is in flight.
+#[cfg(unix)]
+#[test]
+fn sigterm_shuts_the_server_down_cleanly() {
+    let mut server = Server::start();
+    let pid = server.child.id() as libc::pid_t;
+    // SAFETY: sending a signal to our own child process.
+    assert_eq!(unsafe { libc::kill(pid, libc::SIGTERM) }, 0);
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Some(status) = server.child.try_wait().unwrap() {
+            assert!(status.success(), "a clean shutdown exits 0: {status}");
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the server did not exit within 10 seconds of SIGTERM"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// A token path inside the allowed tree is refused before anything is written.
+#[test]
+fn a_state_dir_inside_the_allowed_tree_refuses_to_start() {
+    let env = Env::new();
+    let state_in_project = env.project.join("state");
+    let out = env
+        .command()
+        .env("XDG_STATE_HOME", &state_in_project)
+        .args([
+            "serve",
+            "--http",
+            "--no-persistence",
+            "--listen",
+            "127.0.0.1:0",
+            "--root",
+        ])
+        .arg(&env.project)
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("inside an allowed tree"), "{stderr}");
+    assert!(
+        !state_in_project.exists(),
+        "nothing is written into the project"
     );
 }
