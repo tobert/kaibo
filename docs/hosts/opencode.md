@@ -2,11 +2,11 @@
 
 Checked against OpenCode 2.2.5 (released 2026-10-30), its V2 MCP docs, and its source on
 2026-11-02. OpenCode still reads the older V1 shape (servers directly under `mcp`); the
-stanzas below use V2.
+entries below use V2.
 
 ## stdio (the default)
 
-```json
+```jsonc
 // opencode.json in the project, or ~/.config/opencode/opencode.json
 {
   "mcp": {

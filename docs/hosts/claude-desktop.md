@@ -1,7 +1,7 @@
 # kaibo in Claude Desktop
 
 Checked against the MCP local-server quickstart and Anthropic's connector docs on
-2026-11-02.
+2026-11-02 (Desktop's docs name no version).
 
 ## stdio (the only route)
 
@@ -20,9 +20,9 @@ Open Settings, then Developer, then Edit Config, and add:
 
 - The file is `~/Library/Application Support/Claude/claude_desktop_config.json` on macOS
   and `%APPDATA%\Claude\claude_desktop_config.json` on Windows.
-- Use absolute paths for the command and for `--root`. Desktop's launch directory is not
-  documented, and kaibo does not adopt `~` or `/` as its scope, so without `--root` every
-  call must pass `path`.
+- Use absolute paths for the command and for `--root`, and always pass `--root`.
+  Desktop's launch directory is not documented. If it is `~` or `/`, kaibo adopts no scope
+  at all, and every call fails until `--root` names a workspace.
 - Provider keys: `api_key_file` or `api_key_cmd` in kaibo's `config.toml`, or `env` in
   this entry.
 - Logs: `~/Library/Logs/Claude/mcp*.log` on macOS, `%APPDATA%\Claude\logs` on Windows.

@@ -26,7 +26,7 @@ without asking.
 
 One shared kaibo, set up with `kaibo://config/http` (`kaibo http-guide`), then:
 
-```json
+```jsonc
 // ~/.claude.json, user scope
 {
   "mcpServers": {

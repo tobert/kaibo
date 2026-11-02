@@ -115,8 +115,8 @@ const CONFIG_EXAMPLE_URI: &str = "kaibo://config/example";
 /// this repo's `docs/`, so without it every explanation had to be smuggled into the
 /// example's comments, where it costs bytes on every read and drifts from the code.
 const CONFIG_GUIDE_URI: &str = "kaibo://config/guide";
-/// The HTTP transport guide (`docs/http.md`): turning it on, scope, the token, client
-/// stanzas per host, and service-manager units.
+/// The HTTP transport guide (`docs/http.md`): turning it on, scope, the token, how each
+/// host passes it, and service-manager units.
 const HTTP_GUIDE_URI: &str = "kaibo://config/http";
 /// The configure walkthrough as a resource, for hosts with no MCP prompt support (Codex)
 /// and hosts whose prompt support is unconfirmed (agy). Same body as the `configure`
@@ -4467,15 +4467,16 @@ fn kaibo_resources() -> Vec<rmcp::model::Resource> {
             HOSTS_URI,
             "kaibo: host setup guides",
             "Index of per-host setup guides: Claude Code, Codex, OpenCode, agy (Antigravity \
-             CLI), and Claude Desktop. Each covers the stdio and HTTP stanzas, timeouts, \
-             approvals, sandbox, and supported MCP features. One guide: kaibo://hosts/{name}.",
+             CLI), and Claude Desktop. Each covers the config entry to copy (stdio, and HTTP \
+             where the host can reach it), timeouts, approvals, sandbox, and supported MCP \
+             features. One guide: kaibo://hosts/{name}.",
         ),
         markdown_resource(
             HTTP_GUIDE_URI,
             "kaibo: HTTP transport (preview)",
             "Serve kaibo over loopback HTTP with a bearer token: turning it on, choosing a \
-             workspace scope, the token file and rotation, client setup for Claude Code, \
-             Codex, OpenCode, agy, and Claude Desktop, and systemd and launchd units.",
+             workspace scope, the token file and rotation, how each host passes the token, \
+             and systemd and launchd units. Each host's config entry is in kaibo://hosts.",
         ),
         markdown_resource(
             SANDBOX_URI,
@@ -4522,14 +4523,14 @@ models it uses.
 
 Work through these steps:
 
-1. Read kaibo's config resources first (they're MCP resources — no tool turn spent):
+1. Read kaibo's config resources first:
    • `kaibo://config/example` — the copyable config.toml template.
    • `kaibo://config` — the resolved live state: the casts and backends that exist now, \
 and where each key is sourced from.
    • `kaibo://config/guide` — the full reference manual, if a question stays open.
    • `kaibo://hosts/<host>` — setup for the host you are running in: `claude-code`, \
 `codex`, `opencode`, `agy`, or `claude-desktop` (`kaibo://hosts` lists them). It has the \
-config stanza, timeouts, approvals, and sandbox notes for that host.
+config entry to copy, timeouts, approvals, and sandbox notes for that host.
    • `kaibo://config/http` — only if I want one shared kaibo over loopback HTTP instead \
 of one per client.
 ";
@@ -4632,7 +4633,7 @@ Work through these steps:
 and where each key is sourced from.
    • `kaibo host-guide <host>` — setup for the host you are running in: `claude-code`, \
 `codex`, `opencode`, `agy`, or `claude-desktop` (`kaibo host-guide` lists them). It has \
-the config stanza, timeouts, approvals, and sandbox notes for that host.
+the config entry to copy, timeouts, approvals, and sandbox notes for that host.
    • `kaibo http-guide` — only if I want one shared kaibo over loopback HTTP instead of \
 one per client.
 ";

@@ -88,7 +88,7 @@ the state directory, put it in the command:
 ## Connect a client
 
 Each host passes the token its own way. Prefer a header helper: it follows rotation with
-no restart. Each host's guide has the full stanza: `kaibo://hosts/<host>`, or
+no restart. Each host's guide has the config entry to copy: `kaibo://hosts/<host>`, or
 `kaibo host-guide <host>` from a shell.
 
 | Host | Token | After `--rotate` |

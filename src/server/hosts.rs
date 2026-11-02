@@ -1,7 +1,7 @@
 //! Per-host setup guides, served as `kaibo://hosts/{name}` and printed by
 //! `kaibo host-guide <name>`. Each guide is a markdown file under `docs/hosts/`, embedded
 //! so `cargo install kaibo` carries it. One file per host is the single source: the HTTP
-//! guide and the configuration guide link here instead of repeating client stanzas.
+//! guide and the configuration guide link here instead of repeating client config entries.
 
 /// One host's guide.
 pub(crate) struct HostGuide {
@@ -61,8 +61,8 @@ pub(crate) fn host_index(link: impl Fn(&str) -> String) -> String {
     let mut out = String::from(
         "# Host setup guides\n\n\
          Setup for the agent host that launches kaibo or connects to it: the config \
-         stanza, how it starts kaibo, its timeouts, approvals, and sandbox, and which MCP \
-         features it supports. Each guide says what version it was checked against.\n\n",
+         entry to copy, how it starts kaibo, its timeouts, approvals, and sandbox, and which \
+         MCP features it supports. Each guide says what it was checked against and when.\n\n",
     );
     for g in HOST_GUIDES {
         out.push_str(&format!("- {}: {}\n", link(g.name), g.summary));
@@ -90,6 +90,22 @@ mod tests {
             );
         }
         assert_eq!(host_guide("gemini-cli"), None, "Gemini CLI is retired");
+        // The prose lists of hosts must not drift from this table.
+        let config_guide = include_str!("../../docs/config.md");
+        let readme = include_str!("../../README.md");
+        for g in HOST_GUIDES {
+            let tick = format!("`{}`", g.name);
+            assert!(
+                config_guide.contains(&tick),
+                "docs/config.md lists {}",
+                g.name
+            );
+            assert!(
+                readme.contains(&format!("docs/hosts/{}.md", g.name)),
+                "README.md links {}",
+                g.name
+            );
+        }
         let index = host_index(|n| format!("`kaibo://hosts/{n}`"));
         for g in HOST_GUIDES {
             assert!(index.contains(&format!("`kaibo://hosts/{}`", g.name)));

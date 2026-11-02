@@ -9,7 +9,8 @@ A missing default config file uses built-in defaults.
 | Current settings | `kaibo://config` | `kaibo config` |
 | Copyable TOML | `kaibo://config/example` | `kaibo example-config` |
 | This reference | `kaibo://config/guide` | `kaibo config-guide` |
-| Guided setup | `configure` prompt | `kaibo configure [goal]` |
+| Guided setup | `configure` prompt, or `kaibo://configure` | `kaibo configure [goal]` |
+| Per-host setup | `kaibo://hosts/<host>` | `kaibo host-guide <host>` |
 
 Hosted models receive your prompt, supplied context, and the source kaibo reads for
 the call. Agree on projects and providers during setup. kaibo keeps the project
@@ -1249,8 +1250,8 @@ default `127.0.0.1:52426`, instead of stdio. A listen address off loopback is a 
 error. Every request needs `Authorization: Bearer <token>`; the token is the file at
 `$XDG_STATE_HOME/kaibo/http-token`, created on first start and re-read on every request,
 so `kaibo http-token --rotate` takes effect without a restart. The HTTP server refuses to
-start with no allowed tree. Setup, client stanzas, and service units: `kaibo://config/http`
-or `kaibo http-guide`.
+start with no allowed tree. Setup and service units: `kaibo://config/http` or
+`kaibo http-guide`; each host's config entry: `kaibo://hosts/<host>`.
 
 ## Host agents
 

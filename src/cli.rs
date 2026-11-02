@@ -276,9 +276,9 @@ pub fn run_host_guide(args: &HostGuideArgs) -> i32 {
         }
         None => {
             eprintln!(
-                "kaibo: no setup guide for host {name:?}. kaibo has guides for: {}. Run \
-                 `kaibo host-guide` to list them; a host not listed takes the stdio or HTTP \
-                 setup closest to it.",
+                "kaibo: no setup guide for host {name:?}. kaibo has guides for {}. For \
+                 another host, follow the closest guide: every host takes either a stdio \
+                 command with arguments or an HTTP URL with a token.",
                 hosts::host_names()
             );
             EXIT_USAGE
