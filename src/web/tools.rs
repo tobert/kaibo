@@ -16,6 +16,7 @@ use rig_agent::tool::{Tool, ToolContext, ToolExecutionError};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
+use super::native::{NativeTally, NativeWeb};
 use super::{check_fetch_url, SearchRequest, SearchResult, WebApi, WebError};
 use crate::progress::{PhaseEvent, ProgressSink};
 
@@ -31,7 +32,10 @@ pub const MAX_PAGE_CHARS: usize = 40_000;
 /// fetch is cut to what remains and then refused.
 pub const MAX_CALL_PAGE_CHARS: usize = 160_000;
 
-/// One page the team fetched.
+/// The most sources a Sources block lists.
+pub const MAX_LISTED_SOURCES: usize = 12;
+
+/// One page the team fetched, or a result a provider's own search cited.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WebSource {
     pub url: String,
@@ -64,7 +68,13 @@ impl WebUsage {
 /// `Arc`.
 #[derive(Debug)]
 pub struct WebSession {
-    api: WebApi,
+    /// The kaibo-run search provider, or `None` when every phase of this call runs on an
+    /// arm with native web tools and no `[web]` backend key resolved.
+    api: Option<WebApi>,
+    /// `[web] native`: whether an arm whose provider has its own web tools uses them.
+    native: bool,
+    /// Native web activity per provider label, in first-use order, for the footer.
+    native_usage: Mutex<Vec<(&'static str, WebUsage)>>,
     /// The backend name that served the calls, for the footer.
     provider: String,
     max_searches: usize,
@@ -83,8 +93,22 @@ impl WebSession {
         max_searches: usize,
         max_fetches: usize,
     ) -> Arc<Self> {
+        Self::with(Some(api), true, provider, max_searches, max_fetches)
+    }
+
+    /// The full constructor: `api` may be absent when every web phase is native, and
+    /// `native` is `[web] native`.
+    pub fn with(
+        api: Option<WebApi>,
+        native: bool,
+        provider: impl Into<String>,
+        max_searches: usize,
+        max_fetches: usize,
+    ) -> Arc<Self> {
         Arc::new(Self {
             api,
+            native,
+            native_usage: Mutex::new(Vec::new()),
             provider: provider.into(),
             max_searches,
             max_fetches,
@@ -100,12 +124,116 @@ impl WebSession {
         &self.provider
     }
 
+    /// Whether the kaibo-run tools can serve this session.
+    pub fn has_api(&self) -> bool {
+        self.api.is_some()
+    }
+
+    /// The native web tools a phase on an arm with `capability` should use, or `None`
+    /// to use kaibo's own.
+    pub fn native_for(&self, capability: Option<NativeWeb>) -> Option<NativeWeb> {
+        capability.filter(|_| self.native)
+    }
+
+    /// Searches and fetches left in the budget, counting native use too.
+    pub fn remaining(&self) -> (usize, usize) {
+        let used = self.total_usage();
+        (
+            self.max_searches.saturating_sub(used.searches),
+            self.max_fetches.saturating_sub(used.fetches),
+        )
+    }
+
+    /// Fold one native phase's activity into the record: its counts under `provider`,
+    /// and its pages into the sources.
+    pub fn record_native(&self, provider: NativeWeb, tally: NativeTally) {
+        if tally.searches == 0 && tally.fetches == 0 && tally.sources.is_empty() {
+            return;
+        }
+        // The kaibo-run counters are shared with native use so one budget holds: a
+        // native phase's spend leaves less for the next phase of either kind.
+        self.searches.fetch_add(tally.searches, Ordering::SeqCst);
+        self.fetches.fetch_add(tally.fetches, Ordering::SeqCst);
+        {
+            let mut native = self.native_usage.lock().expect("web native usage poisoned");
+            let label = provider.label();
+            match native.iter_mut().find(|(l, _)| *l == label) {
+                Some((_, u)) => {
+                    u.searches += tally.searches;
+                    u.fetches += tally.fetches;
+                }
+                None => native.push((
+                    label,
+                    WebUsage {
+                        searches: tally.searches,
+                        fetches: tally.fetches,
+                    },
+                )),
+            }
+        }
+        for (url, title) in tally.sources {
+            self.record(&url, &title);
+        }
+    }
+
+    fn total_usage(&self) -> WebUsage {
+        WebUsage {
+            searches: self.searches.load(Ordering::SeqCst),
+            fetches: self.fetches.load(Ordering::SeqCst),
+        }
+    }
+
+    /// The footer line: kaibo-run use under the `[web]` backend, then each native
+    /// provider's own, e.g. `web: 2 searches, 1 fetch via deepseek; 3 searches, 0 fetches
+    /// via anthropic (native)`. A session with no use at all still renders the kaibo
+    /// line at zero.
+    pub fn footer(&self) -> String {
+        let native = self
+            .native_usage
+            .lock()
+            .expect("web native usage poisoned")
+            .clone();
+        let native_total = native
+            .iter()
+            .fold(WebUsage::default(), |a, (_, u)| WebUsage {
+                searches: a.searches + u.searches,
+                fetches: a.fetches + u.fetches,
+            });
+        let total = self.usage();
+        let kaibo = WebUsage {
+            searches: total.searches.saturating_sub(native_total.searches),
+            fetches: total.fetches.saturating_sub(native_total.fetches),
+        };
+        let mut parts = Vec::new();
+        if native.is_empty() || kaibo != WebUsage::default() {
+            parts.push(kaibo.footer(&self.provider)["web: ".len()..].to_string());
+        }
+        for (label, u) in native {
+            parts.push(format!("{} (native)", &u.footer(label)["web: ".len()..]));
+        }
+        format!("web: {}", parts.join("; "))
+    }
+
     /// Requests sent so far, counting failed ones: a failure still used a turn of the
     /// budget, and counting it keeps a model that retries a dead page from looping.
+    /// Native use is included; a native phase can pass the cap by what one provider turn
+    /// spent, so its counts are not clamped.
     pub fn usage(&self) -> WebUsage {
+        let native = self
+            .native_usage
+            .lock()
+            .expect("web native usage poisoned")
+            .iter()
+            .fold(WebUsage::default(), |a, (_, u)| WebUsage {
+                searches: a.searches + u.searches,
+                fetches: a.fetches + u.fetches,
+            });
+        let total = self.total_usage();
+        let clamp =
+            |all: usize, native: usize, max: usize| all.saturating_sub(native).min(max) + native;
         WebUsage {
-            searches: self.searches.load(Ordering::SeqCst).min(self.max_searches),
-            fetches: self.fetches.load(Ordering::SeqCst).min(self.max_fetches),
+            searches: clamp(total.searches, native.searches, self.max_searches),
+            fetches: clamp(total.fetches, native.fetches, self.max_fetches),
         }
     }
 
@@ -114,21 +242,31 @@ impl WebSession {
         self.sources.lock().expect("web sources poisoned").clone()
     }
 
-    /// The Sources block kaibo appends to an answer, or `None` when nothing was fetched.
+    /// The Sources block kaibo appends to an answer, or `None` when the record is empty.
+    /// Lists at most [`MAX_LISTED_SOURCES`]; a provider that cites every search result
+    /// (OpenRouter annotates them all) would otherwise bury the pages that mattered.
     pub fn sources_block(&self) -> Option<String> {
         let sources = self.sources();
         if sources.is_empty() {
             return None;
         }
-        let mut out =
-            String::from("\n\n**Sources fetched** (kaibo's record of pages the team read):\n");
-        for (i, s) in sources.iter().enumerate() {
+        let mut out = String::from(
+            "\n\n**Sources** (kaibo's record of the pages the team fetched, and of the results \
+             a provider's own search cited):\n",
+        );
+        for (i, s) in sources.iter().take(MAX_LISTED_SOURCES).enumerate() {
             let title = if s.title.trim().is_empty() {
                 "untitled"
             } else {
                 s.title.trim()
             };
             out.push_str(&format!("{}. {title} — {}\n", i + 1, s.url));
+        }
+        if sources.len() > MAX_LISTED_SOURCES {
+            out.push_str(&format!(
+                "+{} more not listed\n",
+                sources.len() - MAX_LISTED_SOURCES
+            ));
         }
         Some(out.trim_end().to_string())
     }
@@ -166,10 +304,11 @@ impl WebSession {
                 self.max_searches
             )));
         }
+        let api = self.api.as_ref().ok_or_else(no_api)?;
         progress.emit(PhaseEvent::WebSearched {
             query: req.query.clone(),
         });
-        let results = self.api.search(&req).await?;
+        let results = api.search(&req).await?;
         Ok(format_results(&req.query, &results))
     }
 
@@ -191,8 +330,9 @@ impl WebSession {
                 self.max_fetches
             )));
         }
+        let api = self.api.as_ref().ok_or_else(no_api)?;
         progress.emit(PhaseEvent::WebFetched { url: url.clone() });
-        let page = self.api.fetch(&url).await?;
+        let page = api.fetch(&url).await?;
         self.record(&url, &page.title);
         let remaining = MAX_CALL_PAGE_CHARS.saturating_sub(self.page_chars.load(Ordering::SeqCst));
         let limit = MAX_PAGE_CHARS.min(remaining);
@@ -200,6 +340,18 @@ impl WebSession {
         self.page_chars.fetch_add(shown, Ordering::SeqCst);
         Ok(format_page(&url, &page.title, &page.content, limit))
     }
+}
+
+/// The refusal for a kaibo-run web call on a session that has no `[web]` backend key.
+/// kaibo builds these tools only for an arm that is not native, and opens such a session
+/// only when every web phase is native, so reaching this is a kaibo bug, said plainly.
+fn no_api() -> WebError {
+    WebError::Refused(
+        "this call's web access runs on the provider's own web tools, and kaibo's search \
+         API is not configured. Use the evidence you have and say this tool was \
+         unavailable."
+            .into(),
+    )
 }
 
 /// Search results as a numbered list a model can cite from.
@@ -538,6 +690,12 @@ mod tests {
         assert!(block.contains("1. B — https://b"), "{block}");
         assert!(block.contains("2. untitled — https://a"), "{block}");
         assert!(!block.contains("B again"), "{block}");
+        for i in 0..20 {
+            s.record(&format!("https://x/{i}"), "X");
+        }
+        let block = s.sources_block().unwrap();
+        assert!(block.contains("12. X — https://x/9"), "{block}");
+        assert!(block.ends_with("+10 more not listed"), "{block}");
     }
 
     #[test]

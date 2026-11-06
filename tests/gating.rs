@@ -586,3 +586,32 @@ fn research_needs_live_web_access() {
         );
     }
 }
+
+/// With no `[web]` key, `research` is still live when a usable cast researches on a
+/// native arm (Anthropic here), and drops again with `[web] native = false`.
+#[test]
+fn research_is_live_on_a_native_cast_without_a_web_key() {
+    let keyless = FULLY_STAFFED.replace(
+        "kind = \"deepseek\"\n    key_optional = true",
+        "kind = \"deepseek\"\n    api_key_file = \"/nonexistent-kaibo-test/dsweb\"",
+    );
+    let native = format!(
+        "{keyless}\n    [backends.claudeish]\n    kind = \"anthropic\"\n    key_optional = true\n\n    \
+         [casts.native]\n    explorer = \"claudeish/haiku\"\n    synth = \"claudeish/sonnet\"\n"
+    );
+    let tools_for = |toml: &str| {
+        KaiboHandler::new_with_env(Config::from_toml_str(toml).unwrap(), |_| None)
+            .unwrap()
+            .advertised_tools()
+    };
+    assert!(
+        tools_for(&native).contains(&"research".to_string()),
+        "a native cast serves research without a web key"
+    );
+    let native_off = native.replace(
+        "backend = \"dsweb\"",
+        "backend = \"dsweb\"\n    native = false",
+    );
+    assert_ne!(native_off, native);
+    assert!(!tools_for(&native_off).contains(&"research".to_string()));
+}

@@ -251,7 +251,7 @@ pub(crate) fn dossier_web_record(web: &crate::web::WebSession) -> String {
 /// access, zero counts included, so "offered and unused" reads differently from "never
 /// requested". Searches are billed, so the caller sees how many ran.
 pub(crate) fn with_web_usage(text: String, web: Option<&crate::web::WebSession>) -> String {
-    match web.map(|w| w.usage().footer(w.provider())) {
+    match web.map(|w| w.footer()) {
         Some(line) => format!("{text}\n{line}"),
         None => text,
     }

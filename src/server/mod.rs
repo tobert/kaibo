@@ -401,9 +401,10 @@ pub struct ConsultInput {
 
     /// Let this call search and read the web for what the project cannot answer — a
     /// dependency's docs or changelog, an advisory, a spec. Off by default: a code review
-    /// stays on the code. The explorer searches (on a solo cast, the synth does); DeepSeek
-    /// reads each page on its servers, so nothing on your network is opened. Pages fetched
-    /// are listed after the answer. See `kaibo://tools`.
+    /// stays on the code. The explorer searches (on a solo cast, the synth does), with its
+    /// provider's own web tools or DeepSeek's; the provider reads each page on its servers,
+    /// so nothing on your network is opened. Sources are listed after the answer. See
+    /// `kaibo://tools`.
     #[serde(default)]
     pub web: bool,
 }
@@ -529,8 +530,8 @@ pub struct DeliberateInput {
     pub dossier: Option<String>,
 
     /// Let the dossier-building explorer search and read the web for what the project
-    /// cannot answer; DeepSeek reads each page on its servers, so nothing on your network
-    /// is opened. Off by default. Refused with `dossier`, which runs no explorer.
+    /// cannot answer; the provider reads each page on its servers, so nothing on your
+    /// network is opened. Off by default. Refused with `dossier`, which runs no explorer.
     #[serde(default)]
     pub web: bool,
 }
@@ -1423,13 +1424,14 @@ impl KaiboHandler {
         // Which tools actually survive: the operator's flags AND a cast that can staff
         // each. `live_tools` is the single source — `kaibo://config` reports the same
         // decision, so the resource can never describe a surface this router doesn't serve.
-        let web_live = config.web_usable(&get_env);
+        let web_live = config.web_live(&get_env, &usable);
         if gating.research && config.web.enabled && !web_live {
             tracing::warn!(
                 tools = "research",
-                "disabled: the [web] backend `{}` has no API key, so web search and fetch \
-                 cannot run, and `web: true` will be refused. Declare a key source on \
-                 [backends.{}] in config.toml (`kaibo example-config` shows the shapes).",
+                "disabled: the [web] backend `{}` has no API key and no usable cast runs on a \
+                 backend with native web tools (anthropic, openrouter), so web search \
+                 cannot run and `web: true` will be refused. Declare a key source on [backends.{}] in config.toml \
+                 (`kaibo example-config` shows the shapes).",
                 config.web.backend,
                 config.web.backend
             );
@@ -1812,13 +1814,23 @@ impl KaiboHandler {
     }
 
     /// Shim over [`Resolver::web_session`], shared with the CLI front door.
-    fn web_session(&self, tool: &str, instead: &str) -> Result<Arc<WebSession>, McpError> {
-        self.resolver.web_session(tool, instead)
+    fn web_session(
+        &self,
+        tool: &str,
+        instead: &str,
+        all_native: bool,
+    ) -> Result<Arc<WebSession>, McpError> {
+        self.resolver.web_session(tool, instead, all_native)
     }
 
     /// Shim over [`Resolver::web_if_asked`].
-    fn web_if_asked(&self, asked: bool, tool: &str) -> Result<Option<Arc<WebSession>>, McpError> {
-        self.resolver.web_if_asked(asked, tool)
+    fn web_if_asked(
+        &self,
+        asked: bool,
+        tool: &str,
+        all_native: bool,
+    ) -> Result<Option<Arc<WebSession>>, McpError> {
+        self.resolver.web_if_asked(asked, tool, all_native)
     }
 
     /// Shim over [`Resolver::require_batch_cast`] — the resolution glue lives on the
@@ -2072,7 +2084,11 @@ impl KaiboHandler {
                 explorer_max_turns: defaults.explorer_max_turns,
                 sandbox: self.config.sandbox.clone(),
                 max_attachments: defaults.max_attachments,
-                web: self.web_if_asked(input.web, "consult")?,
+                web: self.web_if_asked(
+                    input.web,
+                    "consult",
+                    Arm::all_native(explorer.iter().chain([&synth])),
+                )?,
             },
             synth_max_turns: defaults.synth_max_turns,
             attachments,
@@ -2226,7 +2242,11 @@ impl KaiboHandler {
                 sandbox: self.config.sandbox.clone(),
                 max_attachments: defaults.max_attachments,
                 // Refused here, before a job exists, like `save_artifacts` below.
-                web: self.web_if_asked(input.web, "consult_submit")?,
+                web: self.web_if_asked(
+                    input.web,
+                    "consult_submit",
+                    Arm::all_native(explorer.iter().chain([&synth])),
+                )?,
             },
             synth_max_turns: defaults.synth_max_turns,
             attachments,
@@ -2394,8 +2414,9 @@ impl KaiboHandler {
     #[tool(
         description = "Research a question on the web and get back a cited report: what \
             reliable sources say, each claim tied to its URL. A fast model searches and reads \
-            pages through DeepSeek's Search and Fetch APIs, which fetch each page on \
-            DeepSeek's servers, so nothing on your network is opened. It returns a summary \
+            pages with its provider's own web tools on an Anthropic or OpenRouter cast, and \
+            through DeepSeek's Search and Fetch APIs on any other. Either way the provider \
+            fetches each page on its servers, so nothing on your network is opened. It returns a summary \
             of findings, the sources with dates and quotes, and the searches it ran, then \
             kaibo's own list of the pages fetched. Reads no project. Use it for what a \
             codebase cannot tell you: a dependency's changelog or known bugs, a security \
@@ -2422,6 +2443,7 @@ impl KaiboHandler {
         let web = self.web_session(
             "research",
             "Use `consult` or `explore` to answer from the project instead.",
+            arm.has_native_web(),
         )?;
         let progress = progress_sink(peer, &meta);
         let defaults = &self.config.defaults;
@@ -2576,7 +2598,7 @@ impl KaiboHandler {
                 explorer_max_turns: defaults.explorer_max_turns,
                 sandbox: self.config.sandbox.clone(),
                 max_attachments: defaults.max_attachments,
-                web: self.web_if_asked(input.web, "deliberate")?,
+                web: self.web_if_asked(input.web, "deliberate", explorer.has_native_web())?,
             };
             // The offline synth's resolved caps, without building a network client — pure
             // and key-free, so this can run before the (bounded but real) dossier sweep,
@@ -4999,11 +5021,14 @@ line in the dossier and in its acknowledgment. A `web: true` call always carries
 `web:` line, `0 searches, 0 fetches` included, so an unused web reads differently from an
 absent one.
 
-The searches run on DeepSeek's Search and Fetch APIs, billed to the `[web]` backend's key
-($0.75 per 1,000 calls per endpoint), whatever model the cast runs. DeepSeek reads each
+A phase on an Anthropic or OpenRouter arm uses that provider's own web tools (`[web]
+native`, on by default; Anthropic search is $10 per 1,000), and the `web:` line marks it
+`(native)`. Every other arm uses DeepSeek's Search and Fetch APIs, billed to the `[web]`
+backend's key ($0.75 per 1,000 calls per endpoint). Either way the provider reads each
 page on its own servers, so kaibo never opens a URL a model chose. One call has 10
-searches, 10 fetches, and 160,000 characters of page text by default, shared by every
-phase in it; a request past a cap is refused with a message the model reads. Both
+searches, 10 fetches, and 160,000 characters of kaibo-fetched page text by default, shared
+by every phase in it; a request past a cap is refused with a message the model reads. A
+native phase is capped with the provider's `max_uses` at what remains when it starts. Both
 `research` and `web: true` need live web access: `kaibo://config` `[web]` shows `live` and,
 when false, `why_not`.
 
@@ -6232,22 +6257,34 @@ mod tests {
     #[test]
     fn web_true_is_refused_with_the_reason_and_a_next_step() {
         let off = hermetic_handler_from_toml("[web]\nenabled = false\n");
-        let err = off.web_if_asked(true, "consult").unwrap_err();
+        let err = off.web_if_asked(true, "consult", false).unwrap_err();
         assert!(err.message.contains("`consult` was asked to use the web"), "{err:?}");
         assert!(err.message.contains("`[web] enabled = false`"), "{err:?}");
         assert!(err.message.contains("Re-run without `web`"), "{err:?}");
-        assert!(off.web_if_asked(false, "consult").unwrap().is_none());
+        assert!(off.web_if_asked(false, "consult", false).unwrap().is_none());
 
         let keyless = hermetic_handler_from_toml(
             "[backends.deepseek]\napi_key_file = \"/nonexistent-kaibo-test/deepseek\"\n",
         );
-        let err = keyless.web_session("research", "Use `consult` instead.").unwrap_err();
+        let err = keyless.web_session("research", "Use `consult` instead.", false).unwrap_err();
         assert!(err.message.contains("has no usable API key"), "{err:?}");
         assert!(err.message.ends_with("Use `consult` instead."), "{err:?}");
 
         let ok = hermetic_handler_from_toml("[backends.deepseek]\nkey_optional = true\n");
-        let web = ok.web_if_asked(true, "consult").unwrap().expect("a session");
+        let web = ok.web_if_asked(true, "consult", false).unwrap().expect("a session");
         assert_eq!(web.provider(), "deepseek");
+
+        // A call whose every web phase is native needs no `[web]` key: the session opens
+        // with no kaibo API. With `[web] native = false` the key is required again.
+        let web = keyless
+            .web_session("research", "x", true)
+            .expect("native-only opens without a key");
+        assert!(!web.has_api());
+        let off_native = hermetic_handler_from_toml(
+            "[backends.deepseek]\napi_key_file = \"/nonexistent-kaibo-test/deepseek\"\n\
+             [web]\nnative = false\n",
+        );
+        assert!(off_native.web_session("research", "x", true).is_err());
     }
 
     /// `handler_from_toml` with an EMPTY credential environment, so the usable-cast

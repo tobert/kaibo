@@ -197,8 +197,14 @@ async fn research_searches_fetches_and_reports() {
 async fn a_team_consult_gives_search_to_the_sweep_and_fetch_to_the_driver() {
     let client = ScriptedClient::builder()
         .on_model(SYNTH, |req| {
-            assert!(!has_tool(req, "web_search"), "searching stays with the sweep");
-            assert!(has_tool(req, "web_fetch"), "the driver can read one known page");
+            assert!(
+                !has_tool(req, "web_search"),
+                "searching stays with the sweep"
+            );
+            assert!(
+                has_tool(req, "web_fetch"),
+                "the driver can read one known page"
+            );
             assert!(
                 preamble(req)
                     .unwrap()
@@ -340,4 +346,175 @@ async fn a_dossier_survey_with_the_web_gets_the_tools() {
     .await
     .unwrap();
     assert_eq!(dossier, "DOSSIER");
+}
+
+// --- provider-native web tools ----------------------------------------------
+
+use crate::test_support::with_raw;
+use crate::web::native::NativeWeb;
+
+/// The native tool definitions on a request's `additional_params.tools`, by `type`.
+fn native_types(req: &rig_core::completion::CompletionRequest) -> Vec<String> {
+    req.additional_params
+        .as_ref()
+        .and_then(|p| p.get("tools"))
+        .and_then(|t| t.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|d| d["type"].as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn native_arm(client: &ScriptedClient, model: &str) -> Arm {
+    let mut a = arm(client, model);
+    a.native_web = Some(NativeWeb::Anthropic);
+    a
+}
+
+/// A native research arm declares the provider's tools instead of kaibo's, and its use
+/// is tallied off the raw response into the one session: counts, footer, and sources.
+#[tokio::test]
+async fn native_research_declares_provider_tools_and_tallies_the_response() {
+    let client = ScriptedClient::builder()
+        .on_model(EXPLORER, |req| {
+            assert_eq!(
+                native_types(req),
+                vec!["web_search_20250305", "web_fetch_20250910"]
+            );
+            assert!(!has_tool(req, "web_search") && !has_tool(req, "web_fetch"));
+            Ok(with_raw(
+                text_response("REPORT per https://a"),
+                json!({
+                    "stop_reason": "end_turn",
+                    "content": [
+                        {"type": "web_fetch_tool_result", "tool_use_id": "s", "content": {
+                            "type": "web_fetch_result", "url": "https://a",
+                            "content": {"title": "A"}}}
+                    ],
+                    "usage": {"server_tool_use": {"web_search_requests": 2, "web_fetch_requests": 1}}
+                }),
+            ))
+        })
+        .build();
+    let web = idle_session();
+    let cfg = ResearchConfig {
+        phase: PhaseContext::default(),
+        max_turns: 5,
+        web: Arc::clone(&web),
+    };
+    let (report, _) = research_with("q", None, &native_arm(&client, EXPLORER), &cfg)
+        .await
+        .unwrap();
+    assert_eq!(report, "REPORT per https://a");
+    assert_eq!(
+        (web.usage().searches, web.usage().fetches),
+        (2, 1),
+        "native use counts against the one budget"
+    );
+    assert_eq!(web.remaining(), (8, 9));
+    assert_eq!(web.sources()[0].url, "https://a");
+    assert_eq!(
+        web.footer(),
+        "web: 2 searches, 1 fetch via anthropic (native)"
+    );
+}
+
+/// `[web] native = false` keeps a native-capable arm on kaibo's tools.
+#[tokio::test]
+async fn native_off_keeps_kaibo_tools() {
+    let client = ScriptedClient::builder()
+        .on_model(EXPLORER, |req| {
+            assert!(native_types(req).is_empty());
+            assert!(has_tool(req, "web_search") && has_tool(req, "web_fetch"));
+            Ok(text_response("REPORT"))
+        })
+        .build();
+    let api = crate::web::WebApi::DeepSeek(
+        WebClient::new(
+            "http://127.0.0.1:9/s",
+            "http://127.0.0.1:9/f",
+            "k",
+            Duration::from_millis(100),
+        )
+        .unwrap(),
+    );
+    let web = WebSession::with(Some(api), false, "deepseek", 10, 10);
+    let cfg = ResearchConfig {
+        phase: PhaseContext::default(),
+        max_turns: 5,
+        web,
+    };
+    research_with("q", None, &native_arm(&client, EXPLORER), &cfg)
+        .await
+        .unwrap();
+}
+
+/// A team consult with a native synth and a kaibo-run explorer: the driver declares the
+/// provider's fetch tool alone, the sweep gets kaibo's two tools.
+#[tokio::test]
+async fn a_native_team_driver_gets_only_the_provider_fetch_tool() {
+    let client = ScriptedClient::builder()
+        .on_model(SYNTH, |req| {
+            assert_eq!(native_types(req), vec!["web_fetch_20250910"]);
+            assert!(
+                !has_tool(req, "web_fetch"),
+                "no kaibo fetch beside the native one"
+            );
+            if !transcript_text(req).contains("REPORT") {
+                Ok(tool_call_response(
+                    "e1",
+                    "explore",
+                    json!({ "question": "q" }),
+                ))
+            } else {
+                Ok(text_response("ANSWER"))
+            }
+        })
+        .on_model(EXPLORER, |req| {
+            assert!(native_types(req).is_empty());
+            assert!(has_tool(req, "web_search") && has_tool(req, "web_fetch"));
+            Ok(text_response("REPORT"))
+        })
+        .build();
+    let dir = tempdir().unwrap();
+    let out = consult_with(
+        "q",
+        dir.path(),
+        Some(&arm(&client, EXPLORER)),
+        &native_arm(&client, SYNTH),
+        &consult_cfg(Some(idle_session())),
+    )
+    .await
+    .unwrap();
+    assert_eq!(out.answer, "ANSWER");
+}
+
+/// An Anthropic `pause_turn` (a server-tool turn the provider stopped early) does not end
+/// the phase on its fragment: the loop asks the model to continue.
+#[tokio::test]
+async fn a_paused_turn_is_continued_not_returned() {
+    let client = ScriptedClient::builder()
+        .on_model(EXPLORER, |req| {
+            if transcript_text(req).contains("Your web search paused") {
+                Ok(text_response("FULL REPORT"))
+            } else {
+                Ok(with_raw(
+                    text_response("partial"),
+                    json!({"stop_reason": "pause_turn", "content": []}),
+                ))
+            }
+        })
+        .build();
+    let cfg = ResearchConfig {
+        phase: PhaseContext::default(),
+        max_turns: 5,
+        web: idle_session(),
+    };
+    let (report, _) = research_with("q", None, &native_arm(&client, EXPLORER), &cfg)
+        .await
+        .unwrap();
+    assert_eq!(report, "FULL REPORT");
+    assert_eq!(client.requests_for(EXPLORER).len(), 2);
 }
