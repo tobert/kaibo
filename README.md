@@ -274,14 +274,19 @@ human at a terminal can drive kaibo directly:
 | `kaibo://config` resource | `kaibo config` |
 | `kaibo://config/example` resource | `kaibo example-config` |
 | `kaibo://config/guide` resource | `kaibo config-guide` |
-| `configure` prompt | `kaibo configure [goal]` |
+| `configure` prompt, `kaibo://configure` resource | `kaibo configure [goal]` |
+| `kaibo://hosts/<host>` resource | `kaibo host-guide <host>` |
+| `kaibo://config/http` resource | `kaibo http-guide` |
 
 ```sh
 kaibo consult "does anything still busy-poll in job_wait?" --cast deepseek
 ```
 
 Setup that differs by host agent, such as Codex's separate MCP and shell network access,
-is under [Host agents](docs/config.md#host-agents).
+has a guide per host: [Claude Code](docs/hosts/claude-code.md),
+[Codex](docs/hosts/codex.md), [OpenCode](docs/hosts/opencode.md), [agy](docs/hosts/agy.md),
+and [Claude Desktop](docs/hosts/claude-desktop.md). kaibo serves them as `kaibo://hosts/<host>` and prints them with
+`kaibo host-guide <host>`.
 
 **Bare `kaibo` with no subcommand is the stdio MCP server.** `kaibo serve` is the
 explicit spelling for the same thing, and may become required in the future.
@@ -421,6 +426,10 @@ The prompt leans on MCP resources kaibo serves, which you can also read directly
   live, what's gated, where each key is sourced from.
 - **`kaibo://config/guide`** — the full configuration reference (`docs/config.md`),
   also embedded, for when the template's comments leave a question open.
+- **`kaibo://hosts/<host>`** — setup for one agent host: `claude-code`, `codex`,
+  `opencode`, `agy`, or `claude-desktop`.
+- **`kaibo://configure`** — the walkthrough itself, for a host with no MCP prompts
+  (Codex).
 
 Prompts and resources are plain MCP — any client that surfaces them can use them. If
 yours doesn't render `configure` as a command, or you're driving kaibo purely through

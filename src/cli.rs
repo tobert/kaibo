@@ -161,8 +161,19 @@ pub enum Command {
     /// Print the HTTP bearer token's file path, or the token itself, or rotate it
     HttpToken(HttpTokenArgs),
     /// Print the HTTP transport guide (the `kaibo://config/http` document): setup,
-    /// scope, the token, client stanzas, and service units. Reads no config.
+    /// scope, the token, and service units. Reads no config.
     HttpGuide,
+    /// Print the setup guide for one agent host, or the list of hosts with no name (the
+    /// `kaibo://hosts` documents). Reads no config.
+    HostGuide(HostGuideArgs),
+}
+
+/// `kaibo host-guide [name]`.
+#[derive(clap::Args, Debug)]
+pub struct HostGuideArgs {
+    /// The host: `claude-code`, `codex`, `opencode`, `agy`, or `claude-desktop`. Omit it
+    /// to list them.
+    pub name: Option<String>,
 }
 
 /// `kaibo http-token`: the bearer token that guards `kaibo serve --http`. With no flag, it
@@ -246,6 +257,33 @@ pub fn run_http_token(common: &CommonArgs, args: &HttpTokenArgs) -> i32 {
         println!("{token}");
     }
     0
+}
+
+/// Print one host's setup guide, or the list of hosts. Exit 2 for an unknown host.
+pub fn run_host_guide(args: &HostGuideArgs) -> i32 {
+    use crate::server::hosts;
+    let Some(name) = args.name.as_deref() else {
+        print!(
+            "{}",
+            hosts::host_index(|name| format!("`kaibo host-guide {name}`"))
+        );
+        return 0;
+    };
+    match hosts::host_guide(name) {
+        Some(body) => {
+            print!("{body}");
+            0
+        }
+        None => {
+            eprintln!(
+                "kaibo: no setup guide for host {name:?}. kaibo has guides for {}. For \
+                 another host, follow the closest guide: every host takes either a stdio \
+                 command with arguments or an HTTP URL with a token.",
+                hosts::host_names()
+            );
+            EXIT_USAGE
+        }
+    }
 }
 
 /// Print the embedded HTTP transport guide.

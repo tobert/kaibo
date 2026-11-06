@@ -9,7 +9,8 @@ A missing default config file uses built-in defaults.
 | Current settings | `kaibo://config` | `kaibo config` |
 | Copyable TOML | `kaibo://config/example` | `kaibo example-config` |
 | This reference | `kaibo://config/guide` | `kaibo config-guide` |
-| Guided setup | `configure` prompt | `kaibo configure [goal]` |
+| Guided setup | `configure` prompt, or `kaibo://configure` | `kaibo configure [goal]` |
+| Per-host setup | `kaibo://hosts/<host>` | `kaibo host-guide <host>` |
 
 Hosted models receive your prompt, supplied context, and the source kaibo reads for
 the call. Agree on projects and providers during setup. kaibo keeps the project
@@ -1249,49 +1250,18 @@ default `127.0.0.1:52426`, instead of stdio. A listen address off loopback is a 
 error. Every request needs `Authorization: Bearer <token>`; the token is the file at
 `$XDG_STATE_HOME/kaibo/http-token`, created on first start and re-read on every request,
 so `kaibo http-token --rotate` takes effect without a restart. The HTTP server refuses to
-start with no allowed tree. Setup, client stanzas, and service units: `kaibo://config/http`
-or `kaibo http-guide`.
+start with no allowed tree. Setup and service units: `kaibo://config/http` or
+`kaibo http-guide`; each host's config entry: `kaibo://hosts/<host>`.
 
 ## Host agents
 
-Each host agent launches and limits kaibo in its own way. This section lists only the
-differences that change setup or troubleshooting.
+Each host agent launches and limits kaibo in its own way: where its config lives, the
+directory it starts kaibo in, what environment it passes, its timeouts and approvals, and
+whether its sandbox covers MCP servers. Each host has its own guide, which says what
+version it was checked against: `kaibo://hosts/<host>`, or `kaibo host-guide <host>`.
+Guides exist for `claude-code`, `codex`, `opencode`, `agy`, and `claude-desktop`;
+`kaibo://hosts` lists them.
 
-### Codex
+After changing launch settings, restart the MCP server, then read `kaibo://config` to
+confirm `allowed_paths`, the default cast, and key sources.
 
-Checked against Codex CLI 0.154.0 on 2026-09-13. Confirm with `codex --version` and
-Codex's [MCP](https://learn.chatgpt.com/docs/extend/mcp) and
-[permissions](https://learn.chatgpt.com/docs/permissions) documentation before copying.
-
-```toml
-# Codex's config.toml
-[mcp_servers.kaibo]
-command = "/absolute/path/to/kaibo"
-args = ["--root", "/absolute/path/to/project"]
-default_tools_approval_mode = "prompt"
-
-[mcp_servers.kaibo.tools.list_models]
-approval_mode = "approve"
-```
-
-- **The MCP server and shell commands have different network access.** Codex's command
-  sandbox rules do not apply to a stdio MCP server. So the kaibo MCP tools can reach a
-  provider while `kaibo consult` run from Codex's shell fails with a connection error.
-  Use the MCP tools, or give the command sandbox network access to the provider hosts.
-  A wrapper or container around Codex can still limit the MCP server.
-- **Forward environment keys.** List each variable an `api_key_env` names in
-  `mcp_servers.kaibo.env_vars`, or declare `api_key_file`, which needs no forwarding.
-- **The MCP tool timeout is 60 seconds by default** (`tool_timeout_sec`). A `consult`
-  often runs longer: use `consult_submit`, then `job_get`, or `job_wait` with a
-  `timeout_secs` below the tool timeout (`job_wait` also defaults to 60 seconds). A
-  client timeout does not stop the call at the provider.
-- **Tool approval.** The snippet asks before every kaibo tool call except
-  `list_models`; a per-tool `approval_mode` wins over the server default. Tool approval
-  does not cover `kaibo` run from Codex's shell.
-- **Shell-run `kaibo` needs write access to its own stores.** Durable sessions write
-  the state directory (`~/.local/state/kaibo` by default, including the database's
-  sidecar files); disk artifacts write the CAS directory (`~/.local/share/kaibo/cas`).
-  `--state-db` and `--cas-dir` give Codex its own stores. `--no-persistence` gives up
-  durable sessions and moves the CAS into memory.
-- **After changing launch settings,** restart the MCP server, then read `kaibo://config`
-  to confirm `allowed_paths`, the default cast, and key sources.
