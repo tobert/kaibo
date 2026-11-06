@@ -760,6 +760,7 @@ No built-in cast has a media slot or pairs an explorer with an offline synth, so
 | any of the above | also `deliberate` | a cast pairing an `explorer` with an offline synth: `lane = "batch"` on the four keys above, or `lane = "direct"` on any backend |
 | OpenRouter | also `decide` | a cast with a `decision` slot |
 | DeepSeek, as the `[web]` backend | `research`, and `web: true` on any cast | none; `[web] backend = "deepseek"` is the default |
+| Anthropic or OpenRouter | `research`, and `web: true`, on their own casts | none; `[web] native = true` is the default |
 | a key for a `stability`, `gemini-media`, `bfl`, `openai-images`, or `dashscope` backend | `generate` | an `image` slot, or an `audio` slot on `stability` and `gemini-media` only; `[cas]` on |
 
 OpenRouter does not staff `generate`. `kaibo configure` covers `consult`, `batch_submit`,
@@ -1063,12 +1064,21 @@ max_searches = 10       # default, per call
 max_fetches = 10        # default, per call
 ```
 
-The model team searches and reads the web through DeepSeek's Search and Fetch APIs
-(`/v1/tools/search`, `/v1/tools/fetch`), billed to the web backend's key at $0.75 per
-1,000 successful calls per endpoint. DeepSeek fetches each page on its own servers:
-kaibo sends the URL as a JSON field and never opens it, so a model cannot aim a request
-at the operator's network. Any cast can use the web this way; the model does not have
-to be DeepSeek's.
+The model team searches and reads the web one of two ways, chosen per arm:
+
+- **Native** (`[web] native = true`, the default): an arm on an `anthropic` or
+  `openrouter` backend declares that provider's own server tools. Anthropic gets
+  `web_search_20250305` and `web_fetch_20250910`, billed by Anthropic ($10 per 1,000
+  searches; fetch is free beyond tokens). OpenRouter gets `openrouter:web_search` and
+  `openrouter:web_fetch`, billed by OpenRouter per its engine. kaibo reads the counts and
+  sources off each response.
+- **kaibo-run**: every other arm, or every arm with `native = false`, gets kaibo's
+  `web_search` and `web_fetch`, which call DeepSeek's Search and Fetch APIs
+  (`/v1/tools/search`, `/v1/tools/fetch`), billed to the `[web]` backend's key at $0.75 per
+  1,000 successful calls per endpoint.
+
+Either way the provider fetches each page on its own servers: kaibo never opens a URL a
+model chose, so a model cannot aim a request at the operator's network.
 
 The operator key is on by default because it spends nothing by itself. A call reaches
 the web only when it asks:
@@ -1077,8 +1087,10 @@ the web only when it asks:
 - `consult`, `consult_submit`, and `deliberate` take `web: true`, off by default, so a
   code review never reaches the web unless its caller said so.
 
-Web access is live when `[web] enabled` is true and the web backend has a key source
-that resolves. Otherwise `research` is not advertised and `web: true` is refused. A
+Web access is live when `[web] enabled` is true and either the web backend has a key
+source that resolves or a usable cast runs `research` on a native arm. A call whose every
+web phase is native needs no `[web]` key. Otherwise `research` is not advertised and
+`web: true` is refused. A
 `[web] backend` that names no backend, or a backend of another kind, is a load error
 even while `enabled = false`.
 
@@ -1087,9 +1099,10 @@ phase in it: a consult driver that delegates five surveys has one budget, not fi
 request over a cap is refused with a message the model reads. Both caps at 0 with
 `enabled = true` is a load error; use `enabled = false`.
 
-An answer from a call with web access ends with a sources list of the pages fetched,
-taken from kaibo's own record of the calls, and a `web:` footer line that counts the
-searches and fetches, zero included. `deliberate` puts both in the dossier and in its
+An answer from a call with web access ends with a sources list, taken from kaibo's own
+record of the calls (the pages fetched, and the results a native search cited, at most
+12 listed), and a `web:` footer line that counts the searches and fetches per provider,
+zero included. `deliberate` puts both in the dossier and in its
 acknowledgment. One call may also bring at most 160,000 characters of page text into
 context (each page is cut at 40,000), because the transcript is re-sent each turn.
 
