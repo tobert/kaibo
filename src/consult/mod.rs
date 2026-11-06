@@ -24,9 +24,11 @@ mod config;
 mod engine;
 mod prompts;
 mod shaping;
+#[cfg(test)]
+mod web_tests;
 
-pub use config::{ConsultConfig, ExploreConfig, PhaseContext};
-pub(crate) use engine::explore_with;
+pub use config::{ConsultConfig, ExploreConfig, PhaseContext, ResearchConfig};
+pub(crate) use engine::{explore_with, research_with};
 pub use engine::{
     consult, deliberate_direct, oneshot, Arm, ConsultOutput, Llm, ModelSource, RunExplore,
     RunExploreArgs, RunExploreError, Session,

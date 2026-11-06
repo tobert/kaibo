@@ -155,6 +155,7 @@ pub(crate) fn inert_explorer_args(args: ExplorerArgs<'_>) -> Option<String> {
         (!args.attach.is_empty()).then_some("attach"),
         args.model.is_some().then_some("explorer_model"),
         args.backend.is_some().then_some("explorer_backend"),
+        args.web.then_some("web"),
     ]
     .into_iter()
     .flatten()
@@ -186,6 +187,8 @@ pub(crate) struct ExplorerArgs<'a> {
     pub attach: &'a [String],
     pub model: Option<&'a str>,
     pub backend: Option<&'a str>,
+    /// `web: true` gives the dossier sweep the web; with no sweep it has nothing to do.
+    pub web: bool,
 }
 
 /// Load a dossier the caller supplied by address, for a second synth to reason over.
@@ -534,6 +537,7 @@ mod tests {
             attach: if attach.is_empty() { &none } else { &one },
             model: None,
             backend: None,
+            web: false,
         };
 
         assert_eq!(
@@ -566,6 +570,7 @@ mod tests {
                 attach: &one,
                 model: Some("m"),
                 backend: Some("b"),
+                web: true,
             }),
             None,
             "a sweeping call is what the explorer arguments are for"

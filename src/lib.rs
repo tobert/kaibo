@@ -61,6 +61,7 @@ pub mod tool_span;
 pub mod upload;
 pub mod view_image;
 pub mod wav;
+pub mod web;
 pub mod worktree;
 
 /// A scripted, offline stand-in for a provider client, for driving the consult loop

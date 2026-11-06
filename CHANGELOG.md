@@ -21,6 +21,9 @@ record. Each later release appends a new section at the top.
 - Naming a tree that holds `$HOME` with `--root` or `--allow-path` logs a startup warning.
 
 ### Added
+- `research` (and `kaibo research`) searches the web through DeepSeek's Search and Fetch APIs and returns a URL-cited report with kaibo's list of pages fetched.
+- `web: true` on `consult`, `consult_submit`, and `deliberate` (`--web` in the CLI) adds web search to a code question; off by default.
+- `[web]` sets the search backend and per-call caps (`max_searches`, `max_fetches`, 10 each); `--no-research` drops the tool; `kaibo://config` reports `[web]` with `live`.
 - A cast's `consult = "solo" | "team"` key runs `consult` with the synth alone, keeping the explorer slot for `explore` and `deliberate`; `kaibo://config` shows each cast's mode.
 - `batch_submit` and `deliberate` run on `openrouter` backends via `/api/v1/batches`, stripping any `:batch` suffix from `list_models` ids.
 - OpenRouter slots on `google/gemini-*` and `~google/gemini-*` classify as vision-capable without an explicit `vision = true` pin.

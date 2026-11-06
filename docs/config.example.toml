@@ -25,6 +25,7 @@ batch = true                       # batch_submit; requires batch synth
 list_models = true
 generate = true                     # requires image or audio slot + CAS
 decide = true                       # requires decision slot
+research = true                     # requires live [web] access
 # job_* tools follow enabled producers; read_cas/write_cas follow cas.enabled.
 
 [defaults]
@@ -97,6 +98,14 @@ scratch_limit_bytes = 67108864      # in-memory root scratch; a write past it is
 # Permit consult's model to save text. Caller must also set save_artifacts=true.
 # [artifacts]
 # enabled = false                   # default; --allow-save-artifact enables in serve
+
+# Web search and fetch for the model team, through DeepSeek's Search and Fetch APIs.
+# Spends nothing until a call asks: `research`, or `web: true` on consult/deliberate.
+# [web]
+# enabled = true                    # false turns off every web route
+# backend = "deepseek"              # a deepseek-kind backend; its key is billed
+# max_searches = 10                 # per call, shared by every phase in it
+# max_fetches = 10
 
 # Credentials: declare sources explicitly; built-ins assume none.
 # env wins over file OR command. api_key_file and api_key_cmd are mutually exclusive.
@@ -282,3 +291,4 @@ synth = { backend = "gemma", id = "Big-Local-70B-GGUF", lane = "direct" }
 # consult = "You are the synthesis agent. Read the evidence and give a cited answer."
 # oneshot = "You are the synthesis agent. Answer from the supplied context."
 # batch = "You are the synthesis agent. Reason from the supplied dossier."
+# research = "You are the explorer, on the web. Cite every claim by its URL."

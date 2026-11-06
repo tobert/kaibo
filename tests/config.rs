@@ -3338,3 +3338,62 @@ fn a_misspelled_decision_role_is_a_load_error() {
     .expect_err("`decisions` is not a role");
     assert!(format!("{err:#}").contains("decisions"), "{err:#}");
 }
+
+// --- [web]: the team's web search and fetch --------------------------------
+
+/// On by default at the operator level, with the built-in `deepseek` backend and the
+/// per-call caps. The per-call key (`web` on a tool) is what keeps a code review off the
+/// web, so this default spends nothing until a call asks.
+#[test]
+fn web_defaults_to_on_with_the_deepseek_backend() {
+    let c = Config::from_toml_str("").unwrap();
+    assert!(c.web.enabled);
+    assert_eq!(c.web.backend, "deepseek");
+    assert_eq!((c.web.max_searches, c.web.max_fetches), (10, 10));
+    assert_eq!(c.web_backend().unwrap().kind, ProviderKind::DeepSeek);
+}
+
+#[test]
+fn web_reads_its_stanza() {
+    let c = Config::from_toml_str(
+        "[web]\nenabled = false\nmax_searches = 3\nmax_fetches = 0\n",
+    )
+    .unwrap();
+    assert!(!c.web.enabled);
+    assert_eq!((c.web.max_searches, c.web.max_fetches), (3, 0));
+}
+
+#[test]
+fn a_web_backend_without_search_apis_is_refused_at_load() {
+    let err = Config::from_toml_str("[web]\nbackend = \"anthropic\"\n")
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("only a `deepseek` backend"), "{err}");
+    assert!(err.contains("[web] enabled = false"), "{err}");
+    // Checked even while web is off, so the typo shows when it is written.
+    let err = Config::from_toml_str("[web]\nenabled = false\nbackend = \"nope\"\n")
+        .unwrap_err();
+    assert!(format!("{err:#}").contains("names no backend"), "{err:#}");
+}
+
+#[test]
+fn web_caps_of_zero_and_zero_are_refused_while_enabled() {
+    let err = Config::from_toml_str("[web]\nmax_searches = 0\nmax_fetches = 0\n")
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("allows no web call"), "{err}");
+    assert!(Config::from_toml_str("[web]\nenabled = false\nmax_searches = 0\nmax_fetches = 0\n").is_ok());
+}
+
+#[test]
+fn web_is_usable_only_with_a_key_and_the_flag() {
+    // Built-in backends declare no key source, so the test declares one.
+    const KEYED: &str = "[backends.deepseek]\napi_key_env = \"DEEPSEEK_API_KEY\"\n";
+    let keyed = |k: &str| (k == "DEEPSEEK_API_KEY").then(|| "sk-test".to_string());
+    let none = |_: &str| None;
+    let c = Config::from_toml_str(KEYED).unwrap();
+    assert!(c.web_usable(keyed));
+    assert!(!c.web_usable(none), "no key, no web");
+    let off = Config::from_toml_str(&format!("{KEYED}[web]\nenabled = false\n")).unwrap();
+    assert!(!off.web_usable(keyed), "the operator's off switch wins over a key");
+}

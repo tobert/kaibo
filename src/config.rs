@@ -1292,6 +1292,39 @@ pub struct ArtifactsConfig {
     pub enabled: bool,
 }
 
+/// `[web]` — the model team's web search and fetch.
+///
+/// Two keys, like `[artifacts]`, but the other way round. This one is the operator's
+/// standing permission and is **on** by default, because using it costs nothing until a
+/// call asks: the per-call key (`web` on `consult` and `deliberate`) is off by default,
+/// so a code review never reaches the web unless its caller said so, and the `research`
+/// tool exists only to search. `enabled = false` turns every web route off at once.
+///
+/// The searches run on a `deepseek` backend's Search and Fetch APIs (`src/web`), billed
+/// to that backend's key. The caps are per kaibo call and shared by every phase in it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WebConfig {
+    /// `[web] enabled`. Default `true`.
+    pub enabled: bool,
+    /// `[web] backend` — a `deepseek`-kind backend. Default `"deepseek"`.
+    pub backend: String,
+    /// Searches one call may make. Default 10.
+    pub max_searches: usize,
+    /// Page fetches one call may make. Default 10.
+    pub max_fetches: usize,
+}
+
+impl Default for WebConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            backend: "deepseek".to_string(),
+            max_searches: 10,
+            max_fetches: 10,
+        }
+    }
+}
+
 /// Which media store a running server holds — the three-way state `kaibo://config`
 /// reports and `main` builds from. Derived in exactly one place
 /// ([`Config::cas_mode`]) so the store `main` constructs, the mode the resource
@@ -1394,6 +1427,8 @@ pub struct Config {
     /// `[artifacts]` — whether the inner model team may save what it writes. Off by
     /// default; see [`ArtifactsConfig`].
     pub artifacts: ArtifactsConfig,
+    /// `[web]` — the team's web search and fetch; see [`WebConfig`].
+    pub web: WebConfig,
     /// House-rules files spliced into each consultation tool's preamble (the
     /// `[context]` table). Defaults to reading `AGENTS.md` when present.
     pub context: ContextConfig,
@@ -1535,6 +1570,13 @@ impl Config {
     /// evaluating the explorer or for a stronger sweep than the caller's own. A synth-only
     /// cast (no explorer — `gemini-batch`/`oneshot`-only casts) can't, and is correctly
     /// left out (it would fault at the explorer-arm resolve).
+    /// Whether canonical cast `name` can staff a `research` call: it runs on the explorer
+    /// slot, or on an interactive synth when the cast has no explorer. Live web access is
+    /// the tool's other gate, applied in `live_tools`.
+    pub fn cast_can_research(&self, name: &str) -> bool {
+        self.cast_can_explore(name) || self.cast_is_interactive(name)
+    }
+
     pub fn cast_can_explore(&self, name: &str) -> bool {
         self.casts
             .get(name)
@@ -1577,6 +1619,44 @@ impl Config {
     /// Resolve a backend by name or alias (the seam slot refs and per-call
     /// qualified overrides go through). An unknown name is a loud error naming
     /// the known backends.
+    /// The backend `[web] backend` names, checked to be one whose kind has a Search and
+    /// Fetch route. Checked at load even with `[web] enabled = false`, so a typo surfaces
+    /// when it is written rather than the day web access is turned on.
+    pub fn web_backend(&self) -> Result<&Backend> {
+        let backend = self.resolve_backend(&self.web.backend).with_context(|| {
+            format!(
+                "[web] backend = {:?} names no backend. Set it to a `deepseek`-kind \
+                 backend, such as the built-in `deepseek` (`kaibo example-config` shows \
+                 the shape)",
+                self.web.backend
+            )
+        })?;
+        if backend.kind != ProviderKind::DeepSeek {
+            bail!(
+                "[web] backend = {:?} is a `{}` backend, and only a `deepseek` backend has \
+                 the Search and Fetch APIs kaibo's web tools call. Set [web] backend to a \
+                 `deepseek` backend, or set [web] enabled = false.",
+                self.web.backend,
+                backend.kind.canonical_name()
+            );
+        }
+        Ok(backend)
+    }
+
+    fn check_web_backend(&self) -> Result<()> {
+        self.web_backend().map(|_| ())
+    }
+
+    /// Whether this server can serve web calls: `[web] enabled` and the web backend's key
+    /// is present. Same key test the cast roster uses (`key_status`), so the `research`
+    /// tool and the `web` argument appear exactly when a call could use them.
+    pub fn web_usable(&self, get_env: impl Fn(&str) -> Option<String>) -> bool {
+        self.web.enabled
+            && self
+                .web_backend()
+                .is_ok_and(|b| b.key_status(get_env) != KeyStatus::Missing)
+    }
+
     pub fn resolve_backend(&self, name: &str) -> Result<&Backend> {
         if let Some(b) = self.backends.get(name) {
             return Ok(b);
@@ -2324,6 +2404,7 @@ impl Config {
         let artifacts = ArtifactsConfig {
             enabled: raw.artifacts.unwrap_or_default().enabled.unwrap_or(false),
         };
+        let web = merge_web(raw.web.unwrap_or_default())?;
         let context = merge_context(raw.context.unwrap_or_default())?;
         let prompts = merge_prompts(raw.prompts.unwrap_or_default())?;
         let orientation = merge_orientation(raw.orientation.unwrap_or_default())?;
@@ -2357,6 +2438,7 @@ impl Config {
             persistence,
             cas,
             artifacts,
+            web,
             context,
             prompts,
             orientation,
@@ -2366,6 +2448,8 @@ impl Config {
             backend_aliases,
             cast_aliases,
         };
+
+        cfg.check_web_backend()?;
 
         // default_cast must resolve now (CLI may still override it; main
         // re-validates the final choice). Catch a typo in the file early.
@@ -2478,6 +2562,9 @@ impl Config {
         if disable.decide {
             self.tools.decide = false;
         }
+        if disable.research {
+            self.tools.research = false;
+        }
         // Non-empty CLI allow_paths replaces lower layers (env/file).
         if !allow_paths.is_empty() {
             self.allow_paths = allow_paths;
@@ -2509,6 +2596,7 @@ pub struct ToolDisables {
     pub list_models: bool,
     pub generate: bool,
     pub decide: bool,
+    pub research: bool,
 }
 
 /// Register `alias → target` at one level (backend or cast), rejecting a clash
@@ -2785,6 +2873,7 @@ struct RawConfig {
     persistence: Option<RawPersistence>,
     cas: Option<RawCas>,
     artifacts: Option<RawArtifacts>,
+    web: Option<RawWeb>,
     context: Option<RawContext>,
     prompts: Option<RawPrompts>,
     orientation: Option<RawOrientation>,
@@ -2847,6 +2936,16 @@ struct RawCas {
 #[serde(deny_unknown_fields)]
 struct RawArtifacts {
     enabled: Option<bool>,
+}
+
+/// `[web]` as written in the file. See [`WebConfig`].
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawWeb {
+    enabled: Option<bool>,
+    backend: Option<String>,
+    max_searches: Option<usize>,
+    max_fetches: Option<usize>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -2930,6 +3029,8 @@ struct RawPrompts {
     oneshot: Option<String>,
     /// Replaces the offline, max-thinking `batch_submit` preamble.
     batch: Option<String>,
+    /// Replaces the web-only `research` survey preamble.
+    research: Option<String>,
 }
 
 /// The `[orientation]` stanza — the static repo-map injected into the exploring
@@ -2980,6 +3081,7 @@ struct RawTools {
     list_models: Option<bool>,
     generate: Option<bool>,
     decide: Option<bool>,
+    research: Option<bool>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -3383,6 +3485,23 @@ fn merge_persistence(raw: RawPersistence) -> Result<PersistenceConfig> {
 /// than a store that refuses every write — a zero ceiling is never what anyone means,
 /// and silently accepting it would produce a CAS that fails on first use with a
 /// capacity error nobody could explain.
+fn merge_web(raw: RawWeb) -> Result<WebConfig> {
+    let d = WebConfig::default();
+    let web = WebConfig {
+        enabled: raw.enabled.unwrap_or(d.enabled),
+        backend: raw.backend.unwrap_or(d.backend),
+        max_searches: raw.max_searches.unwrap_or(d.max_searches),
+        max_fetches: raw.max_fetches.unwrap_or(d.max_fetches),
+    };
+    if web.max_searches == 0 && web.max_fetches == 0 && web.enabled {
+        bail!(
+            "[web] max_searches and max_fetches are both 0, which allows no web call at \
+             all. Set [web] enabled = false to turn web access off, or raise one of them."
+        );
+    }
+    Ok(web)
+}
+
 fn merge_cas(raw: RawCas) -> Result<CasConfig> {
     let dir = match raw.dir {
         Some(d) => Some(expand_path(&d)?),
@@ -3442,6 +3561,7 @@ fn merge_prompts(raw: RawPrompts) -> Result<PromptOverrides> {
         consult: non_empty("consult", raw.consult)?,
         oneshot: non_empty("oneshot", raw.oneshot)?,
         batch: non_empty("batch", raw.batch)?,
+        research: non_empty("research", raw.research)?,
     })
 }
 
@@ -3526,6 +3646,7 @@ fn merge_tools(raw: RawTools) -> ToolGating {
         list_models: raw.list_models.unwrap_or(d.list_models),
         generate: raw.generate.unwrap_or(d.generate),
         decide: raw.decide.unwrap_or(d.decide),
+        research: raw.research.unwrap_or(d.research),
     }
 }
 
@@ -3605,6 +3726,9 @@ fn apply_raw_env(raw: &mut RawConfig, get: &impl Fn(&str) -> Option<String>) -> 
     }
     if env_flag(get, "KAIBO_NO_DECIDE") {
         tools.decide = Some(false);
+    }
+    if env_flag(get, "KAIBO_NO_RESEARCH") {
+        tools.research = Some(false);
     }
 
     let defaults = raw.defaults.get_or_insert_with(Default::default);
@@ -6351,6 +6475,7 @@ mod tests {
         check("RawPersistence", serde_fields::<RawPersistence>());
         check("RawCas", serde_fields::<RawCas>());
         check("RawArtifacts", serde_fields::<RawArtifacts>());
+        check("RawWeb", serde_fields::<RawWeb>());
         check("RawContext", serde_fields::<RawContext>());
         check("RawPrompts", serde_fields::<RawPrompts>());
         check("RawOrientation", serde_fields::<RawOrientation>());
