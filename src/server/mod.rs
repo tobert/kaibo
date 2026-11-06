@@ -5028,7 +5028,8 @@ backend's key ($0.75 per 1,000 calls per endpoint). Either way the provider read
 page on its own servers, so kaibo never opens a URL a model chose. One call has 10
 searches, 10 fetches, and 160,000 characters of kaibo-fetched page text by default, shared
 by every phase in it; a request past a cap is refused with a message the model reads. A
-native phase is capped with the provider's `max_uses` at what remains when it starts. Both
+native phase is capped with the provider's `max_uses` on every request, at what the call
+has left. Both
 `research` and `web: true` need live web access: `kaibo://config` `[web]` shows `live` and,
 when false, `why_not`.
 

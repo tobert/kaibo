@@ -518,3 +518,64 @@ async fn a_paused_turn_is_continued_not_returned() {
     assert_eq!(report, "FULL REPORT");
     assert_eq!(client.requests_for(EXPLORER).len(), 2);
 }
+
+/// The native cap follows the budget request by request. Turn one spends 3 searches;
+/// turn two's request is capped at what the call has left, which OpenRouter counts per
+/// request (7) and Anthropic counts per provider turn, so its cap adds back this phase's
+/// own 3 (10).
+#[tokio::test]
+async fn the_native_cap_follows_the_shared_budget_across_turns() {
+    for (kind, second_cap) in [(NativeWeb::OpenRouter, 7), (NativeWeb::Anthropic, 10)] {
+        let client = ScriptedClient::builder()
+            .on_model(EXPLORER, move |req| {
+                let tools = req
+                    .additional_params
+                    .as_ref()
+                    .and_then(|p| p.get("tools"))
+                    .cloned()
+                    .unwrap_or_default();
+                let cap = |t: &serde_json::Value| {
+                    t.get("max_uses")
+                        .or_else(|| t["parameters"].get("max_uses"))
+                        .and_then(|v| v.as_u64())
+                };
+                let search_cap = tools.as_array().and_then(|a| a.first()).and_then(cap);
+                if !transcript_text(req).contains("hi") {
+                    assert_eq!(search_cap, Some(10), "{kind:?} first request");
+                    Ok(with_raw(
+                        tool_call_response("k1", "run_kaish", json!({ "script": "echo hi" })),
+                        json!({
+                            "usage": {
+                                "server_tool_use": {"web_search_requests": 3},
+                                "server_tool_use_details": {"web_search_requests": 0}
+                            }
+                        }),
+                    ))
+                } else {
+                    assert_eq!(search_cap, Some(second_cap), "{kind:?} second request");
+                    Ok(text_response("DOSSIER"))
+                }
+            })
+            .build();
+        let mut a = arm(&client, EXPLORER);
+        a.native_web = Some(kind);
+        let web = idle_session();
+        let dir = tempdir().unwrap();
+        let cfg = ExploreConfig {
+            web: Some(Arc::clone(&web)),
+            ..ExploreConfig::default()
+        };
+        explore_with(
+            "q",
+            dir.path().to_path_buf(),
+            &a,
+            &cfg,
+            &[],
+            None,
+            ReportReader::SynthesisAgent,
+        )
+        .await
+        .unwrap();
+        assert_eq!(web.remaining(), (7, 10), "{kind:?}");
+    }
+}

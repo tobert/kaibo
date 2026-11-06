@@ -6,8 +6,10 @@
 //! native by default). The trust property is the same as the DeepSeek route: the
 //! provider reads each page on its own servers, and kaibo opens nothing.
 //!
-//! The tool definitions ride the arm's `additional_params.tools`, which every rig wire
-//! merges with the function tools (`raw_tools`), so no rig seam is needed. What kaibo
+//! The tool definitions ride each request's `additional_params.tools` (a rig
+//! `RequestPatch` set per turn by the engine's `NativeWebHook`), which every rig wire
+//! merges with the function tools (`raw_tools`). Setting them per request is what lets
+//! the cap follow the call's shared budget as it is spent. What kaibo
 //! must do itself is account for them: the searches happen inside the provider's
 //! response, never through a kaibo tool call. [`NativeTally::read`] takes them off each
 //! raw response, provider-agnostic by spelling the way `completion_watch` reads a finish
@@ -56,10 +58,15 @@ impl NativeWeb {
         }
     }
 
-    /// The tool definitions for one phase, capped at `searches` and `fetches` uses. A
-    /// cap of 0 omits that tool. The caps are `max_uses`, which both providers count
-    /// per turn, and a kaibo phase is one provider turn (its later requests carry only
-    /// tool results), so the cap holds for the phase.
+    /// Whether this provider counts `max_uses` across a whole provider turn (Anthropic:
+    /// a request whose last message holds only tool results continues the turn) rather
+    /// than per request (OpenRouter). The per-request cap kaibo sends follows it.
+    pub fn counts_per_turn(self) -> bool {
+        matches!(self, Self::Anthropic)
+    }
+
+    /// The tool definitions for one request, capped at `searches` and `fetches` uses. A
+    /// cap of 0 omits that tool.
     pub fn tool_defs(self, searches: usize, fetches: usize) -> Vec<Value> {
         let mut defs = Vec::new();
         match self {

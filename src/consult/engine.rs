@@ -13,6 +13,7 @@ use rig_agent::agent::hook::{
     InvalidToolCallContext, ModelTurnAction, ModelTurnFinished, OutcomeAction, OutcomeEvent,
 };
 use rig_agent::agent::AgentBuilder;
+use rig_agent::run::RequestPatch;
 use rig_agent::completion::PromptError;
 use rig_agent::tool::{DynamicTool, Tool, ToolExecutionError, ToolOutput};
 use rig_core::completion::message::{
@@ -572,33 +573,11 @@ impl Arm {
         arms.into_iter().all(Arm::has_native_web)
     }
 
-    /// This arm with `defs` (provider-native tool definitions) added to its request
-    /// params' `tools`, which every rig wire merges with the function tools.
-    pub(crate) fn with_native_tools(&self, defs: Vec<Value>) -> Arm {
-        let mut arm = self.clone();
-        if defs.is_empty() {
-            return arm;
-        }
-        let mut params = match arm.params.take() {
-            Some(Value::Object(map)) => map,
-            _ => serde_json::Map::new(),
-        };
-        let mut tools = match params.remove("tools") {
-            Some(Value::Array(existing)) => existing,
-            _ => Vec::new(),
-        };
-        tools.extend(defs);
-        params.insert("tools".to_string(), Value::Array(tools));
-        arm.params = Some(Value::Object(params));
-        arm
-    }
-
-    /// [`run`](Self::run) with the per-turn completion record kept in `log`, so the
-    /// caller can read what the provider did inside each response (native web use).
-    #[allow(clippy::too_many_arguments)] // `run`'s inputs plus the log
-    pub(crate) async fn run_logged(
+    /// [`run`](Self::run) with a phase's native web tools.
+    #[allow(clippy::too_many_arguments)] // `run`'s inputs plus the hook
+    pub(crate) async fn run_native(
         &self,
-        log: &CompletionLog,
+        native: MaybeNativeWeb,
         preamble: &str,
         initial_prompt: Message,
         max_turns: usize,
@@ -606,8 +585,9 @@ impl Arm {
         role: ModelRole,
         make_tools: ToolFactory<'_>,
     ) -> Result<(String, Usage)> {
-        run_phase_logged(
-            log,
+        run_phase_native(
+            &CompletionLog::new(),
+            native,
             &self.llm,
             &self.model,
             preamble,
@@ -811,6 +791,115 @@ impl AgentHook for CutOffStopHook {
             ModelTurnAction::stop(CUT_OFF_STOP)
         } else {
             ModelTurnAction::continue_run()
+        }
+    }
+}
+
+/// The provider-native web tools of one phase, enforced against the call's budget.
+///
+/// Declared per request rather than once on the arm: a [`RequestPatch`] sets
+/// `additional_params.tools` on every turn, capped with `max_uses` at what the shared
+/// [`WebSession`] has left *now*, so concurrent sweeps and later turns cannot spend past
+/// the cap. The two providers count `max_uses` differently, and the cap follows each:
+/// Anthropic counts the whole provider turn (a kaibo phase, whose later requests carry
+/// only tool results), so its cap adds back what this phase already spent; OpenRouter
+/// counts one request, so its cap is the remainder alone. Each turn's use is read off
+/// its raw response and recorded into the session as it happens.
+#[derive(Clone)]
+pub(crate) struct NativeWebHook {
+    inner: Arc<NativeWebState>,
+}
+
+struct NativeWebState {
+    web: Arc<WebSession>,
+    kind: NativeWeb,
+    wanted: WebTools,
+    /// This phase's own native use so far.
+    used: Mutex<crate::web::WebUsage>,
+}
+
+impl NativeWebHook {
+    fn new(web: Arc<WebSession>, kind: NativeWeb, wanted: WebTools) -> Self {
+        Self {
+            inner: Arc::new(NativeWebState {
+                web,
+                kind,
+                wanted,
+                used: Mutex::new(crate::web::WebUsage::default()),
+            }),
+        }
+    }
+
+    /// The tool definitions for the next request.
+    fn defs(&self) -> Vec<Value> {
+        let st = &self.inner;
+        let (left_s, left_f) = st.web.remaining();
+        let used = *st.used.lock().expect("native web hook poisoned");
+        let (mut searches, fetches) = if st.kind.counts_per_turn() {
+            (left_s + used.searches, left_f + used.fetches)
+        } else {
+            (left_s, left_f)
+        };
+        if st.wanted == WebTools::FetchOnly {
+            searches = 0;
+        }
+        st.kind.tool_defs(searches, fetches)
+    }
+}
+
+impl AgentHook for NativeWebHook {
+    async fn on_completion_call(
+        &self,
+        _ctx: &HookContext,
+        _event: CompletionCallEvent<'_>,
+    ) -> CompletionCallAction {
+        CompletionCallAction::Patch(RequestPatch {
+            additional_params: Some(json!({ "tools": self.defs() })),
+            ..RequestPatch::default()
+        })
+    }
+
+    async fn on_model_turn_finished(
+        &self,
+        _ctx: &HookContext,
+        event: ModelTurnFinished<'_>,
+    ) -> ModelTurnAction {
+        let tally = crate::web::native::NativeTally::read(event.raw);
+        {
+            let mut used = self.inner.used.lock().expect("native web hook poisoned");
+            used.searches += tally.searches;
+            used.fetches += tally.fetches;
+        }
+        self.inner.web.record_native(self.inner.kind, tally);
+        ModelTurnAction::continue_run()
+    }
+}
+
+/// [`NativeWebHook`] when the phase has native web tools, else a hook that does nothing,
+/// so the loop's hook chain keeps one type.
+#[derive(Clone, Default)]
+pub(crate) struct MaybeNativeWeb(Option<NativeWebHook>);
+
+impl AgentHook for MaybeNativeWeb {
+    async fn on_completion_call(
+        &self,
+        ctx: &HookContext,
+        event: CompletionCallEvent<'_>,
+    ) -> CompletionCallAction {
+        match &self.0 {
+            Some(h) => h.on_completion_call(ctx, event).await,
+            None => CompletionCallAction::continue_run(),
+        }
+    }
+
+    async fn on_model_turn_finished(
+        &self,
+        ctx: &HookContext,
+        event: ModelTurnFinished<'_>,
+    ) -> ModelTurnAction {
+        match &self.0 {
+            Some(h) => h.on_model_turn_finished(ctx, event).await,
+            None => ModelTurnAction::continue_run(),
         }
     }
 }
@@ -1672,6 +1761,48 @@ pub(crate) async fn run_phase_logged<F>(
 where
     F: Fn() -> Result<Vec<DynamicTool>>,
 {
+    run_phase_native(
+        log,
+        MaybeNativeWeb::default(),
+        model,
+        model_name,
+        preamble,
+        max_tokens,
+        temperature,
+        initial_prompt,
+        max_turns,
+        thinking,
+        progress,
+        role,
+        make_tools,
+        break_on_tool_images,
+        identity,
+    )
+    .await
+}
+
+/// [`run_phase_logged`] with a phase's native web hook in the loop.
+#[allow(clippy::too_many_arguments)]
+async fn run_phase_native<F>(
+    log: &CompletionLog,
+    native: MaybeNativeWeb,
+    model: &Llm,
+    model_name: &str,
+    preamble: &str,
+    max_tokens: u64,
+    temperature: Option<f64>,
+    initial_prompt: Message,
+    max_turns: usize,
+    thinking: Option<&Value>,
+    progress: Arc<dyn ProgressSink>,
+    role: ModelRole,
+    make_tools: F,
+    break_on_tool_images: bool,
+    identity: Option<crate::metrics::PhaseIdentity>,
+) -> Result<(String, Usage)>
+where
+    F: Fn() -> Result<Vec<DynamicTool>>,
+{
     // Surface the exact reasoning/sampling params this phase ships (constant across the
     // resume loop), so a trace shows whether — and at what depth — thinking was on: the
     // wire truth behind the `chat` spans' `reasoning_tokens`. Inert with no exporter.
@@ -1695,6 +1826,7 @@ where
     let result = run_phase_loop(
         model,
         &watch,
+        &native,
         model_name,
         preamble,
         max_tokens,
@@ -1744,6 +1876,7 @@ where
 async fn run_phase_loop<F>(
     model: &Llm,
     watch: &Watch,
+    native: &MaybeNativeWeb,
     model_name: &str,
     preamble: &str,
     max_tokens: u64,
@@ -1838,6 +1971,7 @@ where
             // `Arm::complete` and can raise no tool call at all.
             .add_hook(UnknownToolFeedbackHook::new(model_name))
             .add_hook(PauseTurnHook)
+            .add_hook(native.clone())
             .add_hook(cut_off.clone())
             .max_turns(remaining)
             .run()
@@ -2255,16 +2389,12 @@ async fn run_with_web(
         return arm.run(preamble, prompt, max_turns, progress, role, base).await;
     };
     if let Some(native) = web.native_for(arm.native_web) {
-        let (searches, fetches) = web.remaining();
-        let searches = if wanted == WebTools::FetchOnly { 0 } else { searches };
-        let native_arm = arm.with_native_tools(native.tool_defs(searches, fetches));
-        let log = CompletionLog::new();
-        let result = native_arm
-            .run_logged(&log, preamble, prompt, max_turns, progress, role, base)
+        // The hook declares the tools per request and records each turn's use as it
+        // happens, so a phase that fails late has still recorded what it spent.
+        let hook = MaybeNativeWeb(Some(NativeWebHook::new(Arc::clone(web), native, wanted)));
+        return arm
+            .run_native(hook, preamble, prompt, max_turns, progress, role, base)
             .await;
-        // Recorded on every exit path: a phase that failed late still spent its searches.
-        web.record_native(native, log.native_web());
-        return result;
     }
     let with_web = || -> Result<Vec<DynamicTool>> {
         let mut tools = base()?;

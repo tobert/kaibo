@@ -137,7 +137,7 @@ impl WebSession {
 
     /// Searches and fetches left in the budget, counting native use too.
     pub fn remaining(&self) -> (usize, usize) {
-        let used = self.total_usage();
+        let used = self.usage();
         (
             self.max_searches.saturating_sub(used.searches),
             self.max_fetches.saturating_sub(used.fetches),
@@ -150,12 +150,13 @@ impl WebSession {
         if tally.searches == 0 && tally.fetches == 0 && tally.sources.is_empty() {
             return;
         }
-        // The kaibo-run counters are shared with native use so one budget holds: a
-        // native phase's spend leaves less for the next phase of either kind.
-        self.searches.fetch_add(tally.searches, Ordering::SeqCst);
-        self.fetches.fetch_add(tally.fetches, Ordering::SeqCst);
         {
+            // One lock over both writes: the kaibo-run counters are shared with native
+            // use (so one budget holds), and every reader takes this lock before reading
+            // them, so no reader sees one write without the other.
             let mut native = self.native_usage.lock().expect("web native usage poisoned");
+            self.searches.fetch_add(tally.searches, Ordering::SeqCst);
+            self.fetches.fetch_add(tally.fetches, Ordering::SeqCst);
             let label = provider.label();
             match native.iter_mut().find(|(l, _)| *l == label) {
                 Some((_, u)) => {
@@ -176,11 +177,29 @@ impl WebSession {
         }
     }
 
-    fn total_usage(&self) -> WebUsage {
-        WebUsage {
-            searches: self.searches.load(Ordering::SeqCst),
-            fetches: self.fetches.load(Ordering::SeqCst),
-        }
+    /// One consistent reading: kaibo-run use (clamped at the caps, since a refused
+    /// reservation still increments its counter) and each native provider's use.
+    fn snapshot(&self) -> (WebUsage, Vec<(&'static str, WebUsage)>) {
+        let native = self.native_usage.lock().expect("web native usage poisoned");
+        let native_total = native
+            .iter()
+            .fold(WebUsage::default(), |a, (_, u)| WebUsage {
+                searches: a.searches + u.searches,
+                fetches: a.fetches + u.fetches,
+            });
+        let kaibo = WebUsage {
+            searches: self
+                .searches
+                .load(Ordering::SeqCst)
+                .saturating_sub(native_total.searches)
+                .min(self.max_searches),
+            fetches: self
+                .fetches
+                .load(Ordering::SeqCst)
+                .saturating_sub(native_total.fetches)
+                .min(self.max_fetches),
+        };
+        (kaibo, native.clone())
     }
 
     /// The footer line: kaibo-run use under the `[web]` backend, then each native
@@ -188,22 +207,7 @@ impl WebSession {
     /// via anthropic (native)`. A session with no use at all still renders the kaibo
     /// line at zero.
     pub fn footer(&self) -> String {
-        let native = self
-            .native_usage
-            .lock()
-            .expect("web native usage poisoned")
-            .clone();
-        let native_total = native
-            .iter()
-            .fold(WebUsage::default(), |a, (_, u)| WebUsage {
-                searches: a.searches + u.searches,
-                fetches: a.fetches + u.fetches,
-            });
-        let total = self.usage();
-        let kaibo = WebUsage {
-            searches: total.searches.saturating_sub(native_total.searches),
-            fetches: total.fetches.saturating_sub(native_total.fetches),
-        };
+        let (kaibo, native) = self.snapshot();
         let mut parts = Vec::new();
         if native.is_empty() || kaibo != WebUsage::default() {
             parts.push(kaibo.footer(&self.provider)["web: ".len()..].to_string());
@@ -219,22 +223,11 @@ impl WebSession {
     /// Native use is included; a native phase can pass the cap by what one provider turn
     /// spent, so its counts are not clamped.
     pub fn usage(&self) -> WebUsage {
-        let native = self
-            .native_usage
-            .lock()
-            .expect("web native usage poisoned")
-            .iter()
-            .fold(WebUsage::default(), |a, (_, u)| WebUsage {
-                searches: a.searches + u.searches,
-                fetches: a.fetches + u.fetches,
-            });
-        let total = self.total_usage();
-        let clamp =
-            |all: usize, native: usize, max: usize| all.saturating_sub(native).min(max) + native;
-        WebUsage {
-            searches: clamp(total.searches, native.searches, self.max_searches),
-            fetches: clamp(total.fetches, native.fetches, self.max_fetches),
-        }
+        let (kaibo, native) = self.snapshot();
+        native.iter().fold(kaibo, |a, (_, u)| WebUsage {
+            searches: a.searches + u.searches,
+            fetches: a.fetches + u.fetches,
+        })
     }
 
     /// Pages fetched successfully, first fetch first, each URL once.
