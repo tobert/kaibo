@@ -18,13 +18,17 @@
 //! is not. Each successful call is billed ($0.75 per 1,000 per endpoint); an empty search
 //! result and a failure are not.
 //!
-//! The client is independent of the tools a model calls (`WebSearch`/`WebFetch` below)
-//! so a later route (an operator CLI, a different provider) can reuse it.
+//! The client is independent of the tools a model calls ([`WebSearch`]/[`WebFetch`], in
+//! `tools.rs`) so a later route (an operator CLI, a different provider) can reuse it.
+
+mod tools;
 
 use std::time::Duration;
 
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
+
+pub use tools::{WebFetch, WebSearch, WebSession, WebSource, WebUsage};
 
 /// DeepSeek's Search endpoint.
 pub const DEEPSEEK_SEARCH_URL: &str = "https://api.deepseek.com/v1/tools/search";
