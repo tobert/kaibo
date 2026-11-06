@@ -100,6 +100,9 @@ pub(crate) fn render_config_resource(
         /// Durable-store state (on by default): whether persistence is enabled, the
         /// resolved state-db path, and whether the store is actually open right now.
         persistence: PersistenceDoc,
+        /// `[server.http]`, the loopback HTTP transport preview: on or off, the listen
+        /// address, and the bearer token file's path. Never the token.
+        http: HttpDoc,
         /// The media CAS: the on/off knob, the runtime mode (disk / memory / off),
         /// and where disk mode writes.
         cas: CasDoc,
@@ -262,6 +265,14 @@ pub(crate) fn render_config_resource(
         #[serde(skip_serializing_if = "Option::is_none")]
         path: Option<String>,
         active: bool,
+    }
+
+    #[derive(Serialize)]
+    struct HttpDoc {
+        enabled: bool,
+        listen: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        token_file: Option<String>,
     }
 
     /// The media CAS as resolved. `mode` is runtime truth (`"disk"` / `"memory"` /
@@ -779,6 +790,13 @@ pub(crate) fn render_config_resource(
                 .as_ref()
                 .map(|p| p.display().to_string()),
             active: persistence_active,
+        },
+        http: HttpDoc {
+            enabled: config.http.enabled,
+            listen: config.http.listen.to_string(),
+            token_file: crate::http_token::default_token_path()
+                .ok()
+                .map(|p| p.display().to_string()),
         },
         cas: CasDoc {
             enabled: config.cas.enabled,
@@ -1611,6 +1629,30 @@ mod tests {
             !body.contains("super-secret-token") && !body.contains("Bearer"),
             "a header value must never render — it can be a bearer token:\n{body}"
         );
+    }
+
+    #[test]
+    fn config_resource_shows_http_state_and_never_the_token() {
+        let config =
+            Config::from_toml_str("[server.http]\nenabled = true\nlisten = \"127.0.0.1:9000\"\n")
+                .unwrap();
+        let body = render_config_resource(
+            &config,
+            &[],
+            None,
+            false,
+            vec![],
+            true,
+            crate::config::CasMode::Disk,
+            None,
+        );
+        let section = body
+            .split_once("[http]")
+            .expect("an [http] table renders")
+            .1;
+        assert!(section.contains("enabled = true"), "{section}");
+        assert!(section.contains("listen = \"127.0.0.1:9000\""), "{section}");
+        assert!(!section.contains("Bearer"), "the token never renders");
     }
 
     /// Persistence state is part of the resolved runtime: an operator must see whether

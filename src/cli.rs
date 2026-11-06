@@ -158,6 +158,138 @@ pub enum Command {
     /// Print the configuration reference (the `kaibo://config/guide` document). Reads no
     /// config, so it works when the config is broken.
     ConfigGuide,
+    /// Print the HTTP bearer token's file path, or the token itself, or rotate it
+    HttpToken(HttpTokenArgs),
+    /// Print the HTTP transport guide (the `kaibo://config/http` document): setup,
+    /// scope, the token, and service units. Reads no config.
+    HttpGuide,
+    /// Print the setup guide for one agent host, or the list of hosts with no name (the
+    /// `kaibo://hosts` documents). Reads no config.
+    HostGuide(HostGuideArgs),
+}
+
+/// `kaibo host-guide [name]`.
+#[derive(clap::Args, Debug)]
+pub struct HostGuideArgs {
+    /// The host: `claude-code`, `codex`, `opencode`, `agy`, or `claude-desktop`. Omit it
+    /// to list them.
+    pub name: Option<String>,
+}
+
+/// `kaibo http-token`: the bearer token that guards `kaibo serve --http`. With no flag, it
+/// prints the token file's path, `$XDG_STATE_HOME/kaibo/http-token` (else
+/// `~/.local/state/kaibo/http-token`). Only `--rotate` reads config, so a client's header
+/// helper stays fast and its stdout carries nothing but the header.
+#[derive(clap::Args, Debug)]
+pub struct HttpTokenArgs {
+    /// Print the token itself, for a client that takes a pasted value.
+    #[arg(long, conflicts_with_all = ["header", "rotate"])]
+    pub print: bool,
+    /// Print `{"Authorization":"Bearer <token>"}`, the JSON a client's header helper
+    /// prints: Claude Code `headersHelper`, Codex `http_headers_helper`. A helper that
+    /// runs this on each connect follows rotation with no restart. Codex clears the
+    /// helper's environment, so set `XDG_STATE_HOME` in the command if you moved it.
+    #[arg(long, conflicts_with = "rotate")]
+    pub header: bool,
+    /// Write a new token. The running server accepts only the new token from the next
+    /// request on; prints the file's path. Creates the file when it does not exist.
+    #[arg(long)]
+    pub rotate: bool,
+}
+
+/// Run `kaibo http-token`. Exit 0 on success, 2 when `--rotate` cannot load config, 3
+/// when the token file cannot be read, created, or rotated.
+pub fn run_http_token(common: &CommonArgs, args: &HttpTokenArgs) -> i32 {
+    use crate::http_token;
+    let fail = |e: &dyn std::fmt::Display| {
+        eprintln!("kaibo: {e}");
+        EXIT_SETUP
+    };
+    let path = match http_token::default_token_path() {
+        Ok(p) => p,
+        Err(e) => return fail(&e),
+    };
+    if args.rotate {
+        // A write: check the path against the allowed set first, as the server does.
+        let config = match load_config(common) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("kaibo: config error: {e:#}");
+                return EXIT_USAGE;
+            }
+        };
+        let resolver = match Resolver::from_config(Arc::new(config)) {
+            Ok(r) => r,
+            Err(e) => return fail(&format!("{e:#}")),
+        };
+        let allowed = resolver.allowed_set();
+        let refs: Vec<&std::path::Path> = allowed.iter().map(PathBuf::as_path).collect();
+        if let Err(e) = http_token::check_containment(&path, &refs) {
+            return fail(&e);
+        }
+        return match http_token::rotate(&path) {
+            Ok(_) => {
+                println!("{}", path.display());
+                0
+            }
+            Err(e) => fail(&e),
+        };
+    }
+    if !(args.print || args.header) {
+        println!("{}", path.display());
+        return 0;
+    }
+    let token = match http_token::read(&path) {
+        Ok(t) => t,
+        Err(e) => {
+            return fail(&format!(
+                "{e}. The file appears the first time `kaibo serve --http` starts, or run \
+                 `kaibo http-token --rotate` to create it now."
+            ));
+        }
+    };
+    if args.header {
+        println!(
+            "{}",
+            serde_json::json!({ "Authorization": format!("Bearer {token}") })
+        );
+    } else {
+        println!("{token}");
+    }
+    0
+}
+
+/// Print one host's setup guide, or the list of hosts. Exit 2 for an unknown host.
+pub fn run_host_guide(args: &HostGuideArgs) -> i32 {
+    use crate::server::hosts;
+    let Some(name) = args.name.as_deref() else {
+        print!(
+            "{}",
+            hosts::host_index(|name| format!("`kaibo host-guide {name}`"))
+        );
+        return 0;
+    };
+    match hosts::host_guide(name) {
+        Some(body) => {
+            print!("{body}");
+            0
+        }
+        None => {
+            eprintln!(
+                "kaibo: no setup guide for host {name:?}. kaibo has guides for {}. For \
+                 another host, follow the closest guide: every host takes either a stdio \
+                 command with arguments or an HTTP URL with a token.",
+                hosts::host_names()
+            );
+            EXIT_USAGE
+        }
+    }
+}
+
+/// Print the embedded HTTP transport guide.
+pub fn run_http_guide() -> i32 {
+    print!("{}", crate::server::HTTP_GUIDE_MD);
+    0
 }
 
 /// Print the embedded configuration reference without reading config or contacting providers.
@@ -310,6 +442,22 @@ pub struct ServeGates {
     /// [artifacts] enabled.
     #[arg(long = "allow-save-artifact")]
     pub allow_save_artifact: bool,
+
+    /// Serve MCP over HTTP on a loopback socket instead of stdio (preview). Every request
+    /// needs `Authorization: Bearer <token>`; `kaibo http-token` prints the token file's
+    /// path. Needs `--root` or an allowed tree, because a server started by a service
+    /// manager has no meaningful launch directory. Also KAIBO_HTTP / [server.http] enabled.
+    #[arg(long, conflicts_with = "no_http")]
+    pub http: bool,
+
+    /// Serve on stdio even when KAIBO_HTTP or [server.http] enabled turns HTTP on.
+    #[arg(long)]
+    pub no_http: bool,
+
+    /// The `ip:port` the HTTP server binds, loopback only (default `127.0.0.1:52426`).
+    /// Also KAIBO_HTTP_LISTEN / [server.http] listen.
+    #[arg(long, value_name = "ADDR")]
+    pub listen: Option<String>,
 }
 
 impl ServeGates {

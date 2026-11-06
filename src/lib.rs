@@ -13,9 +13,9 @@
 //!
 //! The load-bearing safety property lives in [`sandbox`]: kaibo can read the project
 //! but cannot mutate it — the project is untouchable from every path (the model-facing
-//! shell has no write mount; kaibo's own two blessed write surfaces, the persistence
-//! store and the media CAS, refuse to resolve into any allowed tree) — and cannot
-//! shell out to external commands.
+//! shell has no write mount; kaibo's own blessed write surfaces, the persistence
+//! store, the media CAS, and the HTTP token file, refuse to resolve into any allowed
+//! tree) — and cannot shell out to external commands.
 
 // rig 0.46's `ProviderError` (224 bytes) and `PromptError` (304 bytes) are large by design
 // (they carry the provider's whole reply and the run's transcript). kaibo returns them
@@ -40,6 +40,7 @@ pub mod decide;
 pub mod discover;
 pub mod explorer;
 pub mod gemini_media;
+pub mod http_token;
 pub mod jobs;
 pub mod kaish_syntax;
 pub mod mcp_log;

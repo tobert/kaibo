@@ -24,7 +24,10 @@ path = "src/main.rs"
 kaish-kernel = { version = "0.18.1", default-features = false, features = ["localfs"] }
 # `time` is used by the deferred `generate` job's poll cadence (sleep + Instant) —
 # named here rather than inherited from a transitive enabler.
-tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "sync", "time"] }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "sync", "time", "net", "signal"] }
+# Cancellation for the HTTP server's shutdown (`src/server/http.rs`); already in the tree
+# through rmcp, named here so the dep is ours, not implicit.
+tokio-util = "0.7"
 async-trait = "0.1"
 anyhow = "1"
 
@@ -133,8 +136,16 @@ toml = "1"
 # tree transitively via kaish-kernel, named here so the dep is ours, not implicit.
 regex = "1"
 
-# MCP server (stdio only — never bind a socket; the FS is the boundary).
-rmcp = { version = "3.4.0", features = ["server", "transport-io", "macros"] }
+# MCP server: stdio by default; the opt-in HTTP transport binds loopback only, behind a
+# bearer token (AGENTS.md, "stdio by default; loopback HTTP only behind a token").
+rmcp = { version = "3.4.0", features = ["server", "transport-io", "macros", "transport-streamable-http-server"] }
+# The HTTP transport preview (`src/server/http.rs`): hyper serves rmcp's streamable-HTTP
+# service on a loopback socket. hyper, hyper-util, and http-body-util are already in the
+# tree through reqwest; these add only their server halves (pure Rust, no TLS: the
+# listener is loopback-only and plain HTTP).
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http-body-util = "0.1"
 clap = { version = "4", features = ["derive"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
