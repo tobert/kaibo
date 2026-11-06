@@ -3018,6 +3018,8 @@ struct RawPrompts {
     oneshot: Option<String>,
     /// Replaces the offline, max-thinking `batch_submit` preamble.
     batch: Option<String>,
+    /// Replaces the web-only `research` survey preamble.
+    research: Option<String>,
 }
 
 /// The `[orientation]` stanza — the static repo-map injected into the exploring
@@ -3547,6 +3549,7 @@ fn merge_prompts(raw: RawPrompts) -> Result<PromptOverrides> {
         consult: non_empty("consult", raw.consult)?,
         oneshot: non_empty("oneshot", raw.oneshot)?,
         batch: non_empty("batch", raw.batch)?,
+        research: non_empty("research", raw.research)?,
     })
 }
 

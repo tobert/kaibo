@@ -1995,6 +1995,7 @@ impl KaiboHandler {
                 explorer_max_turns: defaults.explorer_max_turns,
                 sandbox: self.config.sandbox.clone(),
                 max_attachments: defaults.max_attachments,
+                web: None,
             },
             synth_max_turns: defaults.synth_max_turns,
             attachments,
@@ -2146,6 +2147,7 @@ impl KaiboHandler {
                 explorer_max_turns: defaults.explorer_max_turns,
                 sandbox: self.config.sandbox.clone(),
                 max_attachments: defaults.max_attachments,
+                web: None,
             },
             synth_max_turns: defaults.synth_max_turns,
             attachments,
@@ -2274,6 +2276,7 @@ impl KaiboHandler {
             explorer_max_turns: defaults.explorer_max_turns,
             sandbox: self.config.sandbox.clone(),
             max_attachments: defaults.max_attachments,
+            web: None,
         };
 
         let span =
@@ -2415,6 +2418,7 @@ impl KaiboHandler {
                 explorer_max_turns: defaults.explorer_max_turns,
                 sandbox: self.config.sandbox.clone(),
                 max_attachments: defaults.max_attachments,
+                web: None,
             };
             // The offline synth's resolved caps, without building a network client — pure
             // and key-free, so this can run before the (bounded but real) dossier sweep,

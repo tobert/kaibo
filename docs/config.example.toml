@@ -290,3 +290,4 @@ synth = { backend = "gemma", id = "Big-Local-70B-GGUF", lane = "direct" }
 # consult = "You are the synthesis agent. Read the evidence and give a cited answer."
 # oneshot = "You are the synthesis agent. Answer from the supplied context."
 # batch = "You are the synthesis agent. Reason from the supplied dossier."
+# research = "You are the explorer, on the web. Cite every claim by its URL."

@@ -1047,6 +1047,7 @@ async fn resolve_and_run(
             explorer_max_turns: default_explorer_turns,
             sandbox: sandbox.clone(),
             max_attachments: resolver.config.defaults.max_attachments,
+            web: None,
         },
         synth_max_turns: default_synth_turns,
         attachments,
@@ -1501,6 +1502,7 @@ async fn explore_inner(
         explorer_max_turns: resolver.config.defaults.explorer_max_turns,
         sandbox: resolver.config.sandbox.clone(),
         max_attachments: resolver.config.defaults.max_attachments,
+        web: None,
     };
     // `kaibo explore` prints the report to stdout — the person or script reading it is
     // the only reader there is.
@@ -1706,6 +1708,7 @@ async fn deliberate_inner(
             explorer_max_turns: resolver.config.defaults.explorer_max_turns,
             sandbox: resolver.config.sandbox.clone(),
             max_attachments: resolver.config.defaults.max_attachments,
+            web: None,
         };
         // The offline synth's caps decide what the sweep may route to it — resolved
         // key-free, before the sweep spends anything, exactly as the MCP handler does.
