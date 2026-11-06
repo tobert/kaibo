@@ -41,17 +41,19 @@ use crate::batch::{BatchItem, BatchPoll};
 use crate::config::{Config, Lane, ModelRole, ToolDisables};
 use crate::consult::{
     batch_system_prompt, consult, deliberation_prompt, explore_with, oneshot as run_oneshot_engine,
-    ConsultConfig, ConsultOutput, ExploreConfig, ModelCaps, PhaseContext, ReportReader,
+    research_with, ConsultConfig, ConsultOutput, ExploreConfig, ModelCaps, PhaseContext,
+    ReportReader, ResearchConfig,
 };
 use crate::progress::TerminalSink;
 use crate::sandbox::KaishWorker;
 use crate::server::{
     batch_within_window, configure_prompt_text_cli, consult_models, consultation_failure_text,
-    now_epoch_secs, render_config_resource, with_provenance, Resolver, BATCH_RECENCY_WINDOW_SECS,
-    CONFIG_EXAMPLE_TOML,
+    now_epoch_secs, render_config_resource, with_provenance, with_web_sources, with_web_usage,
+    Resolver, BATCH_RECENCY_WINDOW_SECS, CONFIG_EXAMPLE_TOML,
 };
 use crate::session::{SessionStore as MemSessionStore, Sessions};
 use crate::sweep_attach::{SweepAttachSink, SweepConsumer, SweepConsumerKind};
+use crate::web::WebSession;
 
 /// Exit codes, distinct so an agent caller branches without parsing prose.
 pub const EXIT_OK: i32 = 0;
@@ -131,6 +133,8 @@ pub enum Command {
     Oneshot(OneshotArgs),
     /// Survey the codebase and print a cited report (the evidence half of consult).
     Explore(ExploreArgs),
+    /// Research a question on the web and print a URL-cited report. Reads no project.
+    Research(ResearchArgs),
     /// Investigate the codebase, then send that evidence to an offline synth model. A
     /// batch-lane cast prints a durable handle and exits; a direct-lane cast waits for a
     /// local model and prints the answer.
@@ -386,6 +390,12 @@ pub struct ConsultArgs {
     #[arg(long)]
     pub include_report: bool,
 
+    /// Let the investigation search and read the web for what the project cannot
+    /// answer, such as a dependency's changelog or an advisory. Off by default. Uses the
+    /// `[web]` backend's key; the pages fetched are listed after the answer.
+    #[arg(long)]
+    pub web: bool,
+
     /// Emit a JSON envelope on stdout (answer + provenance + usage + warnings) instead
     /// of prose, for a script caller. A failure emits `{"error": …, "kind": …}` instead,
     /// where `kind` is one of `config`, `usage`, `setup`, `persistence`, or
@@ -456,6 +466,23 @@ pub struct ExploreArgs {
     pub json: bool,
 }
 
+/// `kaibo research` — a web survey. Runs the cast's explorer (or its synth, when the
+/// cast has no explorer) with web search and fetch, and no project.
+#[derive(Args, Debug)]
+pub struct ResearchArgs {
+    /// What to find out, e.g. "Which turso release fixes the MP-WAL data-loss bug?"
+    pub question: String,
+
+    /// Starting evidence to build on: a version pin, an error message, what you already
+    /// ruled out. The researcher extends it rather than re-checking it.
+    #[arg(long, value_name = "TEXT")]
+    pub context: Option<String>,
+
+    /// Emit a JSON envelope on stdout (report + provenance + usage + web) instead of prose.
+    #[arg(long)]
+    pub json: bool,
+}
+
 /// `kaibo deliberate` — investigate, then reason offline over the evidence.
 ///
 /// The two lanes end differently, and that is the whole shape of this command. A **batch**
@@ -489,6 +516,11 @@ pub struct DeliberateArgs {
     /// refused rather than ignored.
     #[arg(long, value_name = "DIGEST")]
     pub dossier: Option<String>,
+
+    /// Let the dossier-building explorer search and read the web for what the project
+    /// cannot answer. Off by default. Refused with --dossier, which runs no explorer.
+    #[arg(long)]
+    pub web: bool,
 
     /// Override the explorer (dossier-building) model id (verbatim; pair with
     /// --explorer-backend to also retarget).
@@ -1051,7 +1083,9 @@ async fn resolve_and_run(
             explorer_max_turns: default_explorer_turns,
             sandbox: sandbox.clone(),
             max_attachments: resolver.config.defaults.max_attachments,
-            web: None,
+            web: resolver
+                .web_if_asked(args.web, "consult")
+                .map_err(SetupError::setup)?,
         },
         synth_max_turns: default_synth_turns,
         attachments,
@@ -1073,7 +1107,14 @@ async fn resolve_and_run(
     {
         Ok(out) => {
             let explorer_model = explorer.as_ref().map(|a| a.model.as_str());
-            emit_answer(args, &out, &cast.name, explorer_model, &synth.model);
+            emit_answer(
+                args,
+                &out,
+                &cast.name,
+                explorer_model,
+                &synth.model,
+                cfg.explore.web.as_deref(),
+            );
             Ok(EXIT_OK)
         }
         // A provider/model-loop failure is its own exit code — the consultation ran and
@@ -1129,19 +1170,24 @@ fn emit_answer(
     cast: &str,
     explorer_model: Option<&str>,
     synth_model: &str,
+    web: Option<&WebSession>,
 ) {
     if args.json {
-        println!(
-            "{}",
-            consult_envelope(out, cast, explorer_model, synth_model, args.include_report)
-        );
+        let mut env = consult_envelope(out, cast, explorer_model, synth_model, args.include_report);
+        if let Some(web) = web {
+            env["web"] = web_json(web);
+        }
+        println!("{env}");
         return;
     }
-    let answer = with_provenance(
-        out.answer.clone(),
-        cast,
-        &consult_models(explorer_model, synth_model),
-        &out.usage,
+    let answer = with_web_usage(
+        with_provenance(
+            with_web_sources(out.answer.clone(), web),
+            cast,
+            &consult_models(explorer_model, synth_model),
+            &out.usage,
+        ),
+        web,
     );
     println!("{answer}");
     // Non-fatal warnings (a failed session record) go to STDERR, never stdout — stdout
@@ -1195,6 +1241,22 @@ fn consult_envelope(
         env["report"] = serde_json::Value::String(out.report.clone());
     }
     env
+}
+
+/// A web session as a stable JSON object: the provider, the request counts, and each
+/// page fetched. Rides `--json` as `web` whenever the call had web access.
+fn web_json(web: &WebSession) -> serde_json::Value {
+    let usage = web.usage();
+    serde_json::json!({
+        "provider": web.provider(),
+        "searches": usage.searches,
+        "fetches": usage.fetches,
+        "sources": web
+            .sources()
+            .iter()
+            .map(|s| serde_json::json!({ "url": s.url, "title": s.title }))
+            .collect::<Vec<_>>(),
+    })
 }
 
 /// The `--json` error envelope: `{ "error": …, "kind": … }`. Pure and testable.
@@ -1544,6 +1606,104 @@ async fn explore_inner(
     }
 }
 
+/// Run `kaibo research` — a URL-cited web report. Same conventions as explore; the
+/// payload is the report (`report` field under `--json`, with `web` beside it).
+pub async fn run_research(common: CommonArgs, args: ResearchArgs) -> i32 {
+    init_cli_logging();
+    let config = match load_config(&common) {
+        Ok(c) => c,
+        Err(e) => {
+            return fail_preflight(
+                args.json,
+                "config",
+                format!("config error: {e:#}"),
+                EXIT_USAGE,
+            )
+        }
+    };
+    let resolver = match Resolver::from_config(Arc::new(config)) {
+        Ok(r) => r,
+        Err(e) => return fail_preflight(args.json, "setup", format!("{e:#}"), EXIT_SETUP),
+    };
+    match research_inner(&common, &args, &resolver).await {
+        Ok(code) => code,
+        Err(SetupError {
+            kind,
+            message,
+            code,
+        }) => fail_preflight(args.json, kind, message, code),
+    }
+}
+
+async fn research_inner(
+    common: &CommonArgs,
+    args: &ResearchArgs,
+    resolver: &Resolver,
+) -> Result<i32, SetupError> {
+    let cast = resolver
+        .resolve_cast(common.cast.clone())
+        .map_err(SetupError::usage)?;
+    // The same slot choice as the MCP tool: the explorer when the cast has one, else an
+    // interactive synth.
+    let (role, label) = if resolver.config.cast_can_explore(&cast.name) {
+        (ModelRole::Explorer, "explorer")
+    } else {
+        resolver
+            .require_interactive_cast(&cast, "research")
+            .map_err(SetupError::usage)?;
+        (ModelRole::Synth, "synth")
+    };
+    let arm = resolver.arm(&cast, role).map_err(SetupError::setup)?;
+    let web = resolver
+        .web_session(
+            "research",
+            "Use `kaibo consult` or `kaibo explore` to answer from the project instead.",
+        )
+        .map_err(SetupError::setup)?;
+    let cfg = ResearchConfig {
+        phase: PhaseContext {
+            progress: Arc::new(TerminalSink),
+            house_rules: None,
+            prompts: resolver.resolved_prompts(&cast),
+            orientation: None,
+            call_deadline: resolver.config.defaults.call_deadline,
+        },
+        max_turns: resolver.config.defaults.explorer_max_turns,
+        web: Arc::clone(&web),
+    };
+    match research_with(&args.question, args.context.as_deref(), &arm, &cfg).await {
+        Ok((report, usage)) => {
+            if args.json {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "report": report,
+                        "cast": cast.name,
+                        "model": arm.model,
+                        "usage": usage_json(&usage),
+                        "web": web_json(&web),
+                    })
+                );
+            } else {
+                println!(
+                    "{}",
+                    with_web_usage(
+                        with_provenance(
+                            with_web_sources(report, Some(&web)),
+                            &cast.name,
+                            &[(label, &arm.model)],
+                            &usage,
+                        ),
+                        Some(&web),
+                    )
+                );
+            }
+            Ok(EXIT_OK)
+        }
+        Err(e) => Ok(fail_consultation(args.json, "research", &cast.name, e)),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // deliberate
 // ---------------------------------------------------------------------------
@@ -1621,7 +1781,7 @@ async fn deliberate_inner(
         attach: &args.attach,
         model: args.explorer_model.as_deref(),
         backend: args.explorer_backend.as_deref(),
-        web: false,
+        web: args.web,
     }) {
         return Err(SetupError {
             kind: "usage",
@@ -1713,7 +1873,9 @@ async fn deliberate_inner(
             explorer_max_turns: resolver.config.defaults.explorer_max_turns,
             sandbox: resolver.config.sandbox.clone(),
             max_attachments: resolver.config.defaults.max_attachments,
-            web: None,
+            web: resolver
+                .web_if_asked(args.web, "deliberate")
+                .map_err(SetupError::setup)?,
         };
         // The offline synth's caps decide what the sweep may route to it — resolved
         // key-free, before the sweep spends anything, exactly as the MCP handler does.
@@ -1763,6 +1925,10 @@ async fn deliberate_inner(
             Ok(out) => out,
             Err(e) => return Ok(fail_consultation(args.json, "deliberate", &cast.name, e)),
         };
+        // Same as the MCP handler: a web-enabled dossier carries the sources and usage.
+        if let Some(web) = cfg.web.as_deref() {
+            dossier = with_web_usage(with_web_sources(dossier, Some(web)), Some(web));
+        }
         let (images, kept) = crate::server::stitch_and_keep(
             &mut dossier,
             &consumer,
@@ -3618,6 +3784,34 @@ mod tests {
                 assert!(e.json);
             }
             other => panic!("expected explore, got {other:?}"),
+        }
+
+        let cli = Cli::parse_from([
+            "kaibo",
+            "research",
+            "which turso release fixes MP-WAL?",
+            "--context",
+            "we pin 0.8.1",
+        ]);
+        match cli.command {
+            Some(Command::Research(r)) => {
+                assert_eq!(r.question, "which turso release fixes MP-WAL?");
+                assert_eq!(r.context.as_deref(), Some("we pin 0.8.1"));
+                assert!(!r.json);
+            }
+            other => panic!("expected research, got {other:?}"),
+        }
+        match Cli::parse_from(["kaibo", "consult", "q", "--web"]).command {
+            Some(Command::Consult(c)) => assert!(c.web),
+            other => panic!("expected consult, got {other:?}"),
+        }
+        match Cli::parse_from(["kaibo", "consult", "q"]).command {
+            Some(Command::Consult(c)) => assert!(!c.web, "web is off by default"),
+            other => panic!("expected consult, got {other:?}"),
+        }
+        match Cli::parse_from(["kaibo", "deliberate", "q", "--web"]).command {
+            Some(Command::Deliberate(d)) => assert!(d.web),
+            other => panic!("expected deliberate, got {other:?}"),
         }
 
         let cli = Cli::parse_from(["kaibo", "kaish", "-c", "grep -rn TODO src"]);

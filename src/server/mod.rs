@@ -51,7 +51,7 @@ use crate::progress::{NullSink, PhaseEvent, ProgressLog, ProgressSink, TracingSi
 use crate::sandbox::{builtin_schemas, KaishWorker};
 use crate::session::{SessionStore, Sessions};
 use crate::sweep_attach::{SweepAttachSink, SweepConsumer, SweepConsumerKind};
-use crate::web::{WebClient, WebSession};
+use crate::web::WebSession;
 
 mod cas_read;
 mod config_resource;
@@ -82,11 +82,11 @@ use render::{
     batch_poll_brief, consult_answer_text, consult_result, consultation_failed,
     consultation_failed_with_artifacts, consultation_failure_text_with_artifacts, fmt_usage,
     is_batch_handle, parse_batch_handle, render_job, render_jobs_section, render_wait,
-    wait_level_floor, wait_level_label, with_web_sources, with_web_usage,
+    wait_level_floor, wait_level_label,
 };
 pub(crate) use render::{
     batch_within_window, consult_models, consultation_failure_text, now_epoch_secs,
-    with_provenance, BATCH_RECENCY_WINDOW_SECS,
+    with_provenance, with_web_sources, with_web_usage, BATCH_RECENCY_WINDOW_SECS,
 };
 
 /// kaibo's resource URI namespace. Everything kaish-related hangs off `kaibo://kaish/`.
@@ -1808,55 +1808,14 @@ impl KaiboHandler {
         self.resolver.require_interactive_cast(cast, tool)
     }
 
-    /// Open this call's web session: the `[web]` backend's key, the per-call caps, and a
-    /// fresh record. `tool` names the asking tool and `instead` the caller's next step in
-    /// the refusal, which differs between `research` (the web is the whole tool) and a
-    /// tool where `web` is an option.
+    /// Shim over [`Resolver::web_session`], shared with the CLI front door.
     fn web_session(&self, tool: &str, instead: &str) -> Result<Arc<WebSession>, McpError> {
-        let refuse = |why: String| {
-            McpError::invalid_params(
-                format!("`{tool}` was asked to use the web, but {why}. {instead}"),
-                None,
-            )
-        };
-        let web = &self.config.web;
-        if !web.enabled {
-            return Err(refuse(
-                "this kaibo has web access turned off (`[web] enabled = false` in \
-                 config.toml)"
-                    .to_string(),
-            ));
-        }
-        let backend = self
-            .config
-            .web_backend()
-            .map_err(|e| refuse(format!("the `[web] backend` is not usable ({e:#})")))?;
-        let key = backend.resolve_key().map_err(|e| {
-            refuse(format!(
-                "the `[web] backend` `{}` has no usable API key ({e:#})",
-                backend.name
-            ))
-        })?;
-        let client = WebClient::deepseek(key, backend.request_timeout)
-            .map_err(|e| McpError::internal_error(format!("web client: {e:#}"), None))?;
-        Ok(WebSession::new(
-            client,
-            backend.name.clone(),
-            web.max_searches,
-            web.max_fetches,
-        ))
+        self.resolver.web_session(tool, instead)
     }
 
-    /// The optional web session for a tool where `web` is a per-call choice.
+    /// Shim over [`Resolver::web_if_asked`].
     fn web_if_asked(&self, asked: bool, tool: &str) -> Result<Option<Arc<WebSession>>, McpError> {
-        asked
-            .then(|| {
-                self.web_session(
-                    tool,
-                    "Re-run without `web` to answer from the project alone.",
-                )
-            })
-            .transpose()
+        self.resolver.web_if_asked(asked, tool)
     }
 
     /// Shim over [`Resolver::require_batch_cast`] — the resolution glue lives on the
