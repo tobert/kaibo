@@ -25,6 +25,7 @@ batch = true                       # batch_submit; requires batch synth
 list_models = true
 generate = true                     # requires image or audio slot + CAS
 decide = true                       # requires decision slot
+research = true                     # requires live [web] access
 # job_* tools follow enabled producers; read_cas/write_cas follow cas.enabled.
 
 [defaults]

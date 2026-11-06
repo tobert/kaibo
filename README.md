@@ -262,10 +262,11 @@ human at a terminal can drive kaibo directly:
 
 | MCP tool | CLI equivalent |
 |---|---|
-| `consult` | `kaibo consult "question" [--cast … --attach … --session … --json]` |
+| `consult` | `kaibo consult "question" [--cast … --attach … --session … --web --json]` |
 | `oneshot` | `kaibo oneshot "prompt" [--attach … --json]` (context also via stdin: `oneshot "review this" < diff.txt`) |
 | `explore` | `kaibo explore "question" [--cast … --json]` |
-| `deliberate` | `kaibo deliberate "question" [--cast … --attach … --dossier … --json]` |
+| `research` | `kaibo research "question" [--context … --cast … --json]` |
+| `deliberate` | `kaibo deliberate "question" [--cast … --attach … --dossier … --web --json]` |
 | `run_kaish` | `kaibo kaish -c 'script'` |
 | `generate` | `kaibo generate "prompt" [--cast … --field k=v --json]` |
 | `read_cas` | `kaibo cas read <digest> [--offset … --length … --json]` |
@@ -453,8 +454,9 @@ conclusion. (For deeper tracing, kaibo emits per-tool OpenTelemetry spans; see
 [`docs/config.md`](docs/config.md).)
 
 *Args:* `question` (required), `context` (optional seed), `path` (project dir; optional
-with a default `--root`), `cast`, `session_id`, `include_report`, and per-call
-`explorer_model` / `synth_model` (+ `_backend`) overrides.
+with a default `--root`), `cast`, `session_id`, `include_report`, `web` (see
+[`research`](#research--the-web-not-the-repo)), and per-call `explorer_model` /
+`synth_model` (+ `_backend`) overrides.
 
 ### `oneshot` — a thin second opinion
 
@@ -470,6 +472,25 @@ general). Pick the model with `cast`; the answer carries the same provenance foo
 The same read-only investigation as `consult`, returning a structured, cited survey
 report — what's where, how it fits together — instead of an answer. Reach for it
 when you want the map.
+
+### `research` — the web, not the repo
+
+A web survey: the cast's explorer searches and reads pages through DeepSeek's Search and
+Fetch APIs and returns a report with every claim cited by its URL, followed by kaibo's
+own list of the pages it fetched and a footer counting searches and fetches. It reads no
+project. Reach for it when a codebase cannot answer: a dependency's changelog or known
+bugs, a security advisory, an API that moved after your model's training cutoff.
+
+`web: true` on `consult`, `consult_submit`, or `deliberate` brings the same tools into a
+code question. It is off by default, so a code review stays on the code. With it, each
+explorer survey can search, and the team `consult` driver reads only the survey's cited
+report. A solo cast's driver searches itself.
+
+DeepSeek fetches each page on its own servers, so kaibo never opens a URL a model chose.
+Any cast can use it; the searches bill the `[web]` backend's key ($0.75 per 1,000 calls
+per endpoint). See `[web]` in [`docs/config.md`](docs/config.md).
+
+*Args:* `question` (required), `context`, `cast`.
 
 ### `consult_submit` + `job_wait` / `job_get` / `job_list` / `job_cancel` — async
 
