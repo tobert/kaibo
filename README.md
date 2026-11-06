@@ -233,8 +233,9 @@ for you:
   "mcpServers": {
     "kaibo": {
       "command": "kaibo",
-      // No args needed — an MCP client launches kaibo with cwd = your workspace, and
-      // it scopes its read-only access there. Common overrides (pick what you need):
+      // No args needed when the client launches kaibo with cwd = your workspace: it
+      // scopes its read-only access there. A cwd of ~ or / is not adopted; pin a
+      // workspace with --root. Common overrides (pick what you need):
       //   "args": ["--root", "/path/to/project"]        // pin the project (not repeatable)
       //   "args": ["--allow-path", "/extra/tree"]        // ADD a tree; keeps the cwd too
       //   "args": ["--no-cwd"]                           // …unless you want only what you named

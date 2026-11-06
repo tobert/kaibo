@@ -187,22 +187,26 @@ pub struct CommonArgs {
     /// Default project root, and an allowed tree. A per-call `--path` must resolve to
     /// at-or-under `--root` or an `--allow-path` tree. With neither, the allowed set
     /// (and inferred default root) is the invocation cwd — so run kaibo from the
-    /// workspace and you configure nothing. Not repeatable: this names *the* project a
-    /// path-less call defaults to, and there can only be one — `--allow-path` is the
-    /// repeatable, additive knob. Setting it also means the cwd is NOT added.
+    /// workspace and you configure nothing. A cwd that is `$HOME`, an ancestor of it, or
+    /// `/` is not adopted; name a workspace such as `~/src` here instead. Not repeatable:
+    /// this names *the* project a path-less call defaults to, and there can only be one —
+    /// `--allow-path` is the repeatable, additive knob. Setting it also means the cwd is
+    /// NOT added.
     #[arg(long, value_name = "DIR", global = true)]
     pub root: Option<PathBuf>,
 
     /// Additional allowed path tree. Repeatable, and purely ADDITIVE — it widens the
     /// boundary and never narrows it, so without --root the invocation cwd stays
-    /// allowed alongside it (use --no-cwd to drop that). Use `--allow-path /` to lift
-    /// all limits. Also settable via KAIBO_ALLOW_PATHS (colon-separated) or
+    /// allowed alongside it (use --no-cwd to drop that). Name a workspace such as
+    /// `~/src`; a tree that holds `$HOME` puts private files in reach and logs a warning
+    /// at startup. Also settable via KAIBO_ALLOW_PATHS (colon-separated) or
     /// [server] allow_paths; a non-empty set of flags replaces that layer.
     #[arg(long = "allow-path", value_name = "DIR", action = clap::ArgAction::Append, global = true)]
     pub allow_path: Vec<PathBuf>,
 
     /// Don't adopt the invocation cwd as an allowed tree and default root. By default
-    /// it is one (unless --root is given), and --allow-path only ever ADDS to that.
+    /// it is one (unless --root is given, or the cwd holds `$HOME` and no named tree
+    /// contains it), and --allow-path only ever ADDS to that.
     /// With this, the allowed set is exactly what you named and every call must pass
     /// its own path. Also KAIBO_NO_CWD.
     #[arg(long = "no-cwd", global = true)]
@@ -334,7 +338,7 @@ pub struct ConsultArgs {
     /// own words instead of pasting a diff.
     pub question: String,
 
-    /// Project to explore. Optional — defaults to the root/allowed cwd; must resolve
+    /// Project to explore. Optional when a default root exists (see `kaibo config`); must resolve
     /// to at-or-under an allowed tree.
     #[arg(long, value_name = "DIR")]
     pub path: Option<String>,
@@ -426,7 +430,7 @@ pub struct ExploreArgs {
     /// locates and reads the real, current code and reports back with citations.
     pub question: String,
 
-    /// Project to explore. Optional — defaults to the root/allowed cwd; must resolve
+    /// Project to explore. Optional when a default root exists (see `kaibo config`); must resolve
     /// to at-or-under an allowed tree.
     #[arg(long, value_name = "DIR")]
     pub path: Option<String>,
@@ -463,7 +467,7 @@ pub struct DeliberateArgs {
     /// offline synth then reasons over.
     pub question: String,
 
-    /// Project to investigate. Optional — defaults to the root/allowed cwd; must resolve
+    /// Project to investigate. Optional when a default root exists (see `kaibo config`); must resolve
     /// to at-or-under an allowed tree.
     #[arg(long, value_name = "DIR")]
     pub path: Option<String>,
@@ -516,7 +520,7 @@ pub struct KaishArgs {
     #[arg(short = 'c', value_name = "SCRIPT")]
     pub command: Option<String>,
 
-    /// Project to run against. Optional — defaults to the root/allowed cwd; must resolve
+    /// Project to run against. Optional when a default root exists (see `kaibo config`); must resolve
     /// to at-or-under an allowed tree. Each call starts fresh at this root.
     #[arg(long, value_name = "DIR")]
     pub path: Option<String>,

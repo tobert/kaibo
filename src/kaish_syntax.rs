@@ -225,7 +225,7 @@ fn setup_section(config: &Config) -> String {
 }
 
 /// How many allowed trees `## Scope` lists before it summarizes the rest in one
-/// `+N more` line. The allowed set is the root, each `--allow-path`, and the launch cwd,
+/// `+N more` line. The allowed set is the root, each `--allow-path`, and the adopted launch cwd,
 /// with no cap, so a line per tree could push Scope itself past Claude Code's 2048-char
 /// cut. `kaibo://config` lists every tree. `lead_and_scope_fit_the_budget_at_any_
 /// allowed_tree_count` holds the bound.
