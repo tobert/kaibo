@@ -21,6 +21,7 @@
 //! The client is independent of the tools a model calls ([`WebSearch`]/[`WebFetch`], in
 //! `tools.rs`) so a later route (an operator CLI, a different provider) can reuse it.
 
+pub mod native;
 mod tools;
 
 use std::time::Duration;

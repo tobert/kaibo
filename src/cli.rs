@@ -1084,7 +1084,11 @@ async fn resolve_and_run(
             sandbox: sandbox.clone(),
             max_attachments: resolver.config.defaults.max_attachments,
             web: resolver
-                .web_if_asked(args.web, "consult")
+                .web_if_asked(
+                    args.web,
+                    "consult",
+                    crate::consult::Arm::all_native(explorer.iter().chain([&synth])),
+                )
                 .map_err(SetupError::setup)?,
         },
         synth_max_turns: default_synth_turns,
@@ -1658,6 +1662,7 @@ async fn research_inner(
         .web_session(
             "research",
             "Use `kaibo consult` or `kaibo explore` to answer from the project instead.",
+            arm.has_native_web(),
         )
         .map_err(SetupError::setup)?;
     let cfg = ResearchConfig {
@@ -1874,7 +1879,7 @@ async fn deliberate_inner(
             sandbox: resolver.config.sandbox.clone(),
             max_attachments: resolver.config.defaults.max_attachments,
             web: resolver
-                .web_if_asked(args.web, "deliberate")
+                .web_if_asked(args.web, "deliberate", explorer.has_native_web())
                 .map_err(SetupError::setup)?,
         };
         // The offline synth's caps decide what the sweep may route to it — resolved
