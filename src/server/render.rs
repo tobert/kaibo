@@ -235,10 +235,23 @@ pub(crate) fn with_web_sources(answer: String, web: Option<&crate::web::WebSessi
     }
 }
 
-/// Append the web-usage line under the provenance footer, when the call made any web
-/// request. Searches are billed, so the caller sees how many ran.
+/// The web record of a dossier build, for the `deliberate` caller: the stage-one
+/// spend and the pages read, which otherwise live only inside the stored dossier.
+pub(crate) fn dossier_web_record(web: &crate::web::WebSession) -> String {
+    with_web_usage(
+        with_web_sources(
+            "Web access while building the dossier:".to_string(),
+            Some(web),
+        ),
+        Some(web),
+    )
+}
+
+/// Append the web-usage line under the provenance footer whenever the call had web
+/// access, zero counts included, so "offered and unused" reads differently from "never
+/// requested". Searches are billed, so the caller sees how many ran.
 pub(crate) fn with_web_usage(text: String, web: Option<&crate::web::WebSession>) -> String {
-    match web.and_then(|w| w.usage().footer(w.provider())) {
+    match web.map(|w| w.usage().footer(w.provider())) {
         Some(line) => format!("{text}\n{line}"),
         None => text,
     }

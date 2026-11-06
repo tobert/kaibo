@@ -691,6 +691,7 @@ Everything else follows one naming rule:
 | consult system prompt | `prompts.consult` *(file-only — full replace)* | — | — |
 | oneshot system prompt | `prompts.oneshot` *(file-only — full replace)* | — | — |
 | batch system prompt | `prompts.batch` *(file-only — full replace)* | — | — |
+| research system prompt | `prompts.research` *(file-only — full replace)* | — | — |
 
 **Two exceptions to the naming rule:**
 
@@ -767,7 +768,8 @@ OpenRouter does not staff `generate`. `kaibo configure` covers `consult`, `batch
 ### Finding out why a tool is missing
 
 Read `runtime.advertised_tools` and `runtime.unstaffable_tools` in `kaibo://config`.
-The latter names the cast requirements for missing tools. It omits tools you disabled;
+The latter names the cast requirements for missing tools. `research` can also be missing
+for want of web access, which `[web]` reports as `live = false` with a `why_not`. It omits tools you disabled;
 those are visible under `[tools]`. Startup warnings report missing cast shapes too.
 
 ## File location & loading
@@ -1085,9 +1087,18 @@ phase in it: a consult driver that delegates five surveys has one budget, not fi
 request over a cap is refused with a message the model reads. Both caps at 0 with
 `enabled = true` is a load error; use `enabled = false`.
 
-Each answer that used the web ends with a sources list of the pages fetched, taken from
-kaibo's own record of the calls, and the provenance footer counts the searches and
-fetches.
+An answer from a call with web access ends with a sources list of the pages fetched,
+taken from kaibo's own record of the calls, and a `web:` footer line that counts the
+searches and fetches, zero included. `deliberate` puts both in the dossier and in its
+acknowledgment. One call may also bring at most 160,000 characters of page text into
+context (each page is cut at 40,000), because the transcript is re-sent each turn.
+
+On a team cast, delegated surveys search and the `consult` driver gets `web_fetch` alone,
+to read one page whose address it already has. On a solo cast the driver gets both
+tools.
+
+Each web request has a 60-second deadline, or the backend's `request_timeout` if that is
+shorter, and two retries on 408, 429, and 5xx.
 
 ## House rules: `[context]`
 

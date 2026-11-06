@@ -2,7 +2,7 @@
 //! bearer key and DeepSeek's documented body shapes, a retryable status is retried, a
 //! non-retryable one reaches the caller with the provider's own message, and an empty
 //! result list is a success. Wire shapes are from DeepSeek's reference (see the module
-//! doc in `src/web.rs`).
+//! doc in `src/web/mod.rs`).
 
 use std::time::Duration;
 
@@ -185,4 +185,39 @@ async fn a_404_reaches_the_caller_with_the_provider_message_and_no_retry() {
     // One request only: a 404 is not retried. The server task served its one reply and
     // exited, so the channel closes with nothing more.
     assert!(rx.recv().await.is_none());
+}
+
+/// The client carries the operator's key, so a redirect is never followed: a 302 reaches
+/// the caller as its status, and the second socket (where the redirect points) sees no
+/// request. With reqwest's default policy this would follow the hop and fail differently.
+#[tokio::test]
+async fn a_redirect_is_reported_not_followed() {
+    let (target, mut target_rx) = server(vec![(200, RESULTS)]).await;
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let location = format!("{target}/v1/tools/search");
+    tokio::spawn(async move {
+        let (mut sock, _) = listener.accept().await.unwrap();
+        let mut buf = [0u8; 4096];
+        let _ = sock.read(&mut buf).await;
+        let resp = format!(
+            "HTTP/1.1 302 Found\r\nlocation: {location}\r\ncontent-length: 0\r\n\
+             connection: close\r\n\r\n"
+        );
+        sock.write_all(resp.as_bytes()).await.unwrap();
+        sock.shutdown().await.ok();
+    });
+    let base = format!("http://{addr}");
+    let req = SearchRequest::new("q", 5, None).unwrap();
+    let err = client(&base).search(&req).await.unwrap_err();
+    assert!(
+        matches!(err, WebError::Provider { status: 302, .. }),
+        "{err:?}"
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(300), target_rx.recv())
+            .await
+            .is_err(),
+        "the redirect target must see no request"
+    );
 }

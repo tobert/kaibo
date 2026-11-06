@@ -45,7 +45,7 @@ use super::config::{ConsultConfig, ExploreConfig, PhaseContext, ResearchConfig};
 #[cfg(test)]
 use super::prompts::PromptOverrides;
 use super::prompts::{
-    consult_user_prompt, consult_web_note, deliberation_prompt, explorer_attach_directive,
+    closing_obligation, consult_user_prompt, consult_web_note, deliberation_prompt, explorer_attach_directive,
     research_user_prompt, resolve_phase_preamble, sweep_evidence_block, web_directive, Phase,
     ReportReader,
 };
@@ -2184,6 +2184,12 @@ pub(crate) async fn run_explore_phase(
     if web.is_some() {
         preamble.push_str(&web_directive("report"));
     }
+    if attach.is_some() || web.is_some() {
+        // A directive spliced after the composed preamble moves the deliverable into the
+        // middle; restate it last, as `phase_preamble` does for its own splices.
+        preamble.push_str("\n\n");
+        preamble.push_str(closing_obligation(Phase::Explorer(ReportReader::SynthesisAgent)));
+    }
     let preamble = preamble.as_str();
     arm.run(
         preamble,
@@ -2617,10 +2623,16 @@ fn consult_tools(
             cfg.explore.web.clone(),
         );
         tools.push(traced(explore));
+        // The team driver reads one known page itself rather than paying for a survey;
+        // searching, and the breadth of page text it brings, stays with the sweep.
+        if let Some(web) = &cfg.explore.web {
+            tools.push(traced(WebFetch::new(
+                Arc::clone(web),
+                cfg.explore.phase.progress.clone(),
+            )));
+        }
     } else if let Some(web) = &cfg.explore.web {
-        // A solo driver has no sweep to hold the web text, so it searches itself. With
-        // an explorer, the driver keeps no web tools: page text stays inside the sweep,
-        // and the driver reads only the sweep's cited report.
+        // A solo driver has no sweep to hold the web text, so it searches itself.
         tools.extend(web_tools(web, &cfg.explore.phase.progress));
     }
     // The driver loop runs on the *synth* arm, so view_image rides the synth's
@@ -2838,6 +2850,8 @@ fn consult_driver_preamble(has_explorer: bool, cfg: &ConsultConfig) -> String {
         } else {
             web_directive("answer")
         });
+        preamble.push_str("\n\n");
+        preamble.push_str(closing_obligation(Phase::Consult));
     }
     preamble
 }

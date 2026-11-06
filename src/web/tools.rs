@@ -1,4 +1,4 @@
-//! `web_search` and `web_fetch` — the [`WebClient`] wrapped as rig tools a phase can
+//! `web_search` and `web_fetch` — the [`WebApi`] wrapped as rig tools a phase can
 //! call, sharing one [`WebSession`] per kaibo call.
 //!
 //! The session is the call's budget and record. Every search and fetch any phase of one
@@ -16,14 +16,20 @@ use rig_agent::tool::{Tool, ToolContext, ToolExecutionError};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-use super::{check_fetch_url, SearchRequest, SearchResult, WebClient, WebError};
+use super::{check_fetch_url, SearchRequest, SearchResult, WebApi, WebError};
 use crate::progress::{PhaseEvent, ProgressSink};
 
 /// Results one search returns to the model.
 pub const RESULTS_PER_SEARCH: u32 = 8;
 
 /// A fetched page longer than this many characters is cut, with a note saying so.
-pub const MAX_PAGE_CHARS: usize = 60_000;
+pub const MAX_PAGE_CHARS: usize = 40_000;
+
+/// Page text one call may bring into context, across every fetch by every phase. A
+/// transcript is re-sent each turn, so page text is the cost that grows fastest: a live
+/// run that fetched ten whole pages sent close to a million input tokens. Past this, a
+/// fetch is cut to what remains and then refused.
+pub const MAX_CALL_PAGE_CHARS: usize = 160_000;
 
 /// One page the team fetched.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -40,18 +46,17 @@ pub struct WebUsage {
 }
 
 impl WebUsage {
-    /// The provenance-footer clause, or `None` when the call made no web request.
-    pub fn footer(&self, provider: &str) -> Option<String> {
-        if self.searches == 0 && self.fetches == 0 {
-            return None;
-        }
+    /// The provenance-footer clause. Rendered whenever the call had web access, zero
+    /// counts included: "the web was offered and not used" must read differently from
+    /// "the web was never requested".
+    pub fn footer(&self, provider: &str) -> String {
         let plural =
             |n: usize, one: &str, many: &str| format!("{n} {}", if n == 1 { one } else { many });
-        Some(format!(
+        format!(
             "web: {}, {} via {provider}",
             plural(self.searches, "search", "searches"),
             plural(self.fetches, "fetch", "fetches"),
-        ))
+        )
     }
 }
 
@@ -59,30 +64,33 @@ impl WebUsage {
 /// `Arc`.
 #[derive(Debug)]
 pub struct WebSession {
-    client: WebClient,
+    api: WebApi,
     /// The backend name that served the calls, for the footer.
     provider: String,
     max_searches: usize,
     max_fetches: usize,
     searches: AtomicUsize,
     fetches: AtomicUsize,
+    /// Page characters handed to models so far; see [`MAX_CALL_PAGE_CHARS`].
+    page_chars: AtomicUsize,
     sources: Mutex<Vec<WebSource>>,
 }
 
 impl WebSession {
     pub fn new(
-        client: WebClient,
+        api: WebApi,
         provider: impl Into<String>,
         max_searches: usize,
         max_fetches: usize,
     ) -> Arc<Self> {
         Arc::new(Self {
-            client,
+            api,
             provider: provider.into(),
             max_searches,
             max_fetches,
             searches: AtomicUsize::new(0),
             fetches: AtomicUsize::new(0),
+            page_chars: AtomicUsize::new(0),
             sources: Mutex::new(Vec::new()),
         })
     }
@@ -140,8 +148,15 @@ impl WebSession {
         }
     }
 
-    /// Run a search against the budget and format the results for a model.
-    pub async fn search(&self, query: &str, question: Option<&str>) -> Result<String, WebError> {
+    /// Run a search against the budget and format the results for a model. The progress
+    /// beat fires only once the request is valid and within budget, so a refusal never
+    /// shows as a search.
+    pub async fn search(
+        &self,
+        query: &str,
+        question: Option<&str>,
+        progress: &dyn ProgressSink,
+    ) -> Result<String, WebError> {
         let req = SearchRequest::new(query, RESULTS_PER_SEARCH, question)?;
         if !Self::reserve(&self.searches, self.max_searches) {
             return Err(WebError::Refused(format!(
@@ -151,13 +166,24 @@ impl WebSession {
                 self.max_searches
             )));
         }
-        let results = self.client.search(&req).await?;
+        progress.emit(PhaseEvent::WebSearched {
+            query: req.query.clone(),
+        });
+        let results = self.api.search(&req).await?;
         Ok(format_results(&req.query, &results))
     }
 
-    /// Fetch a page against the budget and format it for a model.
-    pub async fn fetch(&self, url: &str) -> Result<String, WebError> {
+    /// Fetch a page against the budget and format it for a model, cut to what remains
+    /// of the call's page-text budget.
+    pub async fn fetch(&self, url: &str, progress: &dyn ProgressSink) -> Result<String, WebError> {
         let url = check_fetch_url(url)?;
+        if self.page_chars.load(Ordering::SeqCst) >= MAX_CALL_PAGE_CHARS {
+            return Err(WebError::Refused(format!(
+                "web_fetch refused: this call has already read {MAX_CALL_PAGE_CHARS} \
+                 characters of web pages, its limit. Write your answer from the pages you \
+                 have read, and name what is still open."
+            )));
+        }
         if !Self::reserve(&self.fetches, self.max_fetches) {
             return Err(WebError::Refused(format!(
                 "web_fetch refused: this call has used all {} of its page fetches. Write \
@@ -165,9 +191,14 @@ impl WebSession {
                 self.max_fetches
             )));
         }
-        let page = self.client.fetch(&url).await?;
+        progress.emit(PhaseEvent::WebFetched { url: url.clone() });
+        let page = self.api.fetch(&url).await?;
         self.record(&url, &page.title);
-        Ok(format_page(&url, &page.title, &page.content))
+        let remaining = MAX_CALL_PAGE_CHARS.saturating_sub(self.page_chars.load(Ordering::SeqCst));
+        let limit = MAX_PAGE_CHARS.min(remaining);
+        let shown = page.content.chars().count().min(limit);
+        self.page_chars.fetch_add(shown, Ordering::SeqCst);
+        Ok(format_page(&url, &page.title, &page.content, limit))
     }
 }
 
@@ -216,19 +247,19 @@ fn format_results(query: &str, results: &[SearchResult]) -> String {
     out
 }
 
-/// A fetched page with its address, cut at [`MAX_PAGE_CHARS`].
-fn format_page(url: &str, title: &str, content: &str) -> String {
+/// A fetched page with its address, cut at `limit` characters.
+fn format_page(url: &str, title: &str, content: &str, limit: usize) -> String {
     let title = if title.trim().is_empty() {
         "untitled"
     } else {
         title.trim()
     };
     let total = content.chars().count();
-    let body: String = content.chars().take(MAX_PAGE_CHARS).collect();
+    let body: String = content.chars().take(limit).collect();
     let mut out = format!("Fetched {url}\nTitle: {title}\n\n{body}");
-    if total > MAX_PAGE_CHARS {
+    if total > limit {
         out.push_str(&format!(
-            "\n\n[kaibo cut this page at {MAX_PAGE_CHARS} of {total} characters. Search for \
+            "\n\n[kaibo cut this page at {limit} of {total} characters. Search for \
              the specific section if the part you need is not above.]"
         ));
     }
@@ -309,11 +340,12 @@ impl Tool for WebSearch {
         _ctx: &mut ToolContext,
         args: Self::Args,
     ) -> Result<Self::Output, Self::Error> {
-        self.progress.emit(PhaseEvent::WebSearched {
-            query: args.query.clone(),
-        });
         self.session
-            .search(&args.query, args.question.as_deref())
+            .search(
+                &args.query,
+                args.question.as_deref(),
+                self.progress.as_ref(),
+            )
             .await
             .map_err(WebToolError)
     }
@@ -371,16 +403,19 @@ impl Tool for WebFetch {
         _ctx: &mut ToolContext,
         args: Self::Args,
     ) -> Result<Self::Output, Self::Error> {
-        self.progress.emit(PhaseEvent::WebFetched {
-            url: args.url.clone(),
-        });
-        self.session.fetch(&args.url).await.map_err(WebToolError)
+        self.session
+            .fetch(&args.url, self.progress.as_ref())
+            .await
+            .map_err(WebToolError)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::progress::NullSink;
+    use crate::test_support::RecordingSink;
+    use crate::web::WebClient;
     use std::time::Duration;
 
     /// A session whose client points at a closed port: any request that leaves fails,
@@ -393,17 +428,26 @@ mod tests {
             Duration::from_millis(200),
         )
         .unwrap();
-        WebSession::new(client, "deepseek", max_searches, max_fetches)
+        WebSession::new(
+            WebApi::DeepSeek(client),
+            "deepseek",
+            max_searches,
+            max_fetches,
+        )
     }
 
     #[tokio::test]
     async fn a_spent_budget_is_refused_with_a_next_step() {
         let s = offline(0, 0);
-        let e = s.search("q", None).await.unwrap_err().to_string();
+        let e = s
+            .search("q", None, &NullSink)
+            .await
+            .unwrap_err()
+            .to_string();
         assert!(e.contains("used all 0 of its searches"), "{e}");
         assert!(e.contains("write your answer"), "{e}");
         let e = s
-            .fetch("https://example.com")
+            .fetch("https://example.com", &NullSink)
             .await
             .unwrap_err()
             .to_string();
@@ -414,21 +458,71 @@ mod tests {
     #[tokio::test]
     async fn a_bad_input_is_refused_without_spending_budget() {
         let s = offline(1, 1);
-        assert!(s.fetch("file:///etc/passwd").await.is_err());
-        assert!(s.search("  ", None).await.is_err());
+        assert!(s.fetch("file:///etc/passwd", &NullSink).await.is_err());
+        assert!(s.search("  ", None, &NullSink).await.is_err());
         assert_eq!(s.usage(), WebUsage::default());
     }
 
+    /// A refused call never shows as a search or a fetch on the progress stream.
+    #[tokio::test]
+    async fn a_refusal_emits_no_progress_beat() {
+        let sink = RecordingSink::default();
+        let s = offline(0, 0);
+        let _ = s.search("q", None, &sink).await;
+        let _ = s.fetch("https://example.com", &sink).await;
+        let _ = s.fetch("not a url", &sink).await;
+        assert!(sink.events().is_empty(), "{:?}", sink.events());
+        // Within budget, the beat fires before the request (which then fails offline).
+        let s = offline(1, 0);
+        let _ = s.search("q", None, &sink).await;
+        assert_eq!(
+            sink.events(),
+            vec![PhaseEvent::WebSearched { query: "q".into() }]
+        );
+    }
+
+    /// The budget is shared by concurrent sweeps: however many race, exactly `max` win.
+    #[tokio::test]
+    async fn concurrent_reservations_admit_exactly_the_cap() {
+        let counter = Arc::new(AtomicUsize::new(0));
+        let tasks: Vec<_> = (0..64)
+            .map(|_| {
+                let c = Arc::clone(&counter);
+                tokio::spawn(async move { WebSession::reserve(&c, 10) })
+            })
+            .collect();
+        let mut won = 0;
+        for t in tasks {
+            won += usize::from(t.await.unwrap());
+        }
+        assert_eq!(won, 10);
+    }
+
+    #[tokio::test]
+    async fn a_spent_page_budget_refuses_the_next_fetch() {
+        let s = offline(1, 5);
+        s.page_chars.store(MAX_CALL_PAGE_CHARS, Ordering::SeqCst);
+        let e = s
+            .fetch("https://example.com", &NullSink)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("characters of web pages, its limit"), "{e}");
+        assert_eq!(s.usage().fetches, 0, "refused before reserving a fetch");
+    }
+
     #[test]
-    fn the_footer_names_counts_and_provider() {
-        assert_eq!(WebUsage::default().footer("deepseek"), None);
+    fn the_footer_names_counts_and_provider_even_at_zero() {
+        assert_eq!(
+            WebUsage::default().footer("deepseek"),
+            "web: 0 searches, 0 fetches via deepseek"
+        );
         assert_eq!(
             WebUsage {
                 searches: 1,
                 fetches: 3
             }
-            .footer("deepseek")
-            .unwrap(),
+            .footer("deepseek"),
             "web: 1 search, 3 fetches via deepseek"
         );
     }
@@ -468,12 +562,13 @@ mod tests {
     #[test]
     fn a_long_page_is_cut_with_a_note() {
         let long = "a".repeat(MAX_PAGE_CHARS + 5);
-        let out = format_page("https://x", "", &long);
+        let out = format_page("https://x", "", &long, MAX_PAGE_CHARS);
         assert!(out.contains("Title: untitled"));
         assert!(out.contains(&format!(
             "cut this page at {MAX_PAGE_CHARS} of {}",
             MAX_PAGE_CHARS + 5
         )));
-        assert!(!format_page("https://x", "t", "short").contains("cut this page"));
+        assert!(!format_page("https://x", "t", "short", MAX_PAGE_CHARS).contains("cut this page"));
+        assert!(format_page("https://x", "t", "abcdef", 3).contains("cut this page at 3 of 6"));
     }
 }

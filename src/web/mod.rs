@@ -30,6 +30,39 @@ use serde::{Deserialize, Serialize};
 
 pub use tools::{WebFetch, WebSearch, WebSession, WebSource, WebUsage};
 
+/// The per-request deadline for a web call. A search or fetch answers in seconds, so it
+/// gets its own bound rather than the backend's `request_timeout`, which is sized for a
+/// thinking model (900 s by default). With two retries, one stalled call costs at most
+/// about three minutes of a call's `call_deadline`, not three quarters of an hour.
+pub const WEB_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// A provider error body longer than this many characters is cut before it reaches a
+/// model: a proxy's HTML error page is noise in a tool result.
+const MAX_ERROR_CHARS: usize = 500;
+
+/// The search provider a session calls. One variant today; another provider (Exa, say)
+/// is a new variant with its own client, and every phase, budget, and record above it
+/// stays the same. The rule each variant keeps: the provider reads the page on its own
+/// servers, so kaibo never opens a URL a model chose.
+#[derive(Debug)]
+pub enum WebApi {
+    DeepSeek(WebClient),
+}
+
+impl WebApi {
+    pub async fn search(&self, req: &SearchRequest) -> Result<Vec<SearchResult>, WebError> {
+        match self {
+            Self::DeepSeek(c) => c.search(req).await,
+        }
+    }
+
+    pub async fn fetch(&self, url: &str) -> Result<FetchedPage, WebError> {
+        match self {
+            Self::DeepSeek(c) => c.fetch(url).await,
+        }
+    }
+}
+
 /// DeepSeek's Search endpoint.
 pub const DEEPSEEK_SEARCH_URL: &str = "https://api.deepseek.com/v1/tools/search";
 /// DeepSeek's Fetch endpoint.
@@ -209,10 +242,15 @@ impl std::error::Error for WebError {}
 /// Pull the message out of the `{"error": {"message"}}` envelope, falling back to the raw
 /// body so nothing the provider said is dropped.
 fn provider_message(body: &str) -> String {
-    serde_json::from_str::<serde_json::Value>(body)
+    let message = serde_json::from_str::<serde_json::Value>(body)
         .ok()
         .and_then(|v| v["error"]["message"].as_str().map(str::to_string))
-        .unwrap_or_else(|| body.trim().to_string())
+        .unwrap_or_else(|| body.trim().to_string());
+    if message.chars().count() <= MAX_ERROR_CHARS {
+        return message;
+    }
+    let cut: String = message.chars().take(MAX_ERROR_CHARS).collect();
+    format!("{cut}… [cut at {MAX_ERROR_CHARS} characters]")
 }
 
 /// Check a fetch URL. DeepSeek dials it, not kaibo (see the module doc), so this exists
@@ -279,7 +317,7 @@ impl WebClient {
             search_url: search_url.into(),
             fetch_url: fetch_url.into(),
             key: key.into(),
-            http: crate::tls::https_client(timeout).context("web http client")?,
+            http: crate::tls::api_client_no_redirect(timeout).context("web http client")?,
         })
     }
 
@@ -421,6 +459,10 @@ mod tests {
             "bad key"
         );
         assert_eq!(provider_message(" plain text "), "plain text");
+        let page = "x".repeat(MAX_ERROR_CHARS * 3);
+        let cut = provider_message(&page);
+        assert!(cut.ends_with("[cut at 500 characters]"), "{cut}");
+        assert!(cut.chars().count() < MAX_ERROR_CHARS + 40);
     }
 
     #[test]

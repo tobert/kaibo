@@ -1928,6 +1928,9 @@ async fn deliberate_inner(
         // Same as the MCP handler: a web-enabled dossier carries the sources and usage.
         if let Some(web) = cfg.web.as_deref() {
             dossier = with_web_usage(with_web_sources(dossier, Some(web)), Some(web));
+            // The caller paid for these searches now. Stderr, like the explorer report,
+            // so stdout stays the handle or the answer for a pipe.
+            eprintln!("kaibo: {}", crate::server::render::dossier_web_record(web));
         }
         let (images, kept) = crate::server::stitch_and_keep(
             &mut dossier,

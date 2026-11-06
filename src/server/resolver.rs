@@ -33,7 +33,7 @@ use rmcp::ErrorData as McpError;
 
 use crate::config::{Cast, Config, ConsultMode, Lane, ModelRole, ModelSlot};
 use crate::consult::{Arm, PromptOverrides};
-use crate::web::{WebClient, WebSession};
+use crate::web::{WebApi, WebClient, WebSession};
 
 /// The resolution state shared by the MCP handler and the CLI: the resolved
 /// config plus the canonicalized containment boundary. Cheap to `Clone` (every
@@ -599,7 +599,7 @@ impl Resolver {
         if !web.enabled {
             return Err(refuse(
                 "this kaibo has web access turned off (`[web] enabled = false` in \
-                 config.toml)"
+                 config.toml; `kaibo example-config` shows the `[web]` stanza)"
                     .to_string(),
             ));
         }
@@ -613,10 +613,13 @@ impl Resolver {
                 backend.name
             ))
         })?;
-        let client = WebClient::deepseek(key, backend.request_timeout)
-            .map_err(|e| McpError::internal_error(format!("web client: {e:#}"), None))?;
+        let client = WebClient::deepseek(
+            key,
+            backend.request_timeout.min(crate::web::WEB_REQUEST_TIMEOUT),
+        )
+        .map_err(|e| McpError::internal_error(format!("web client: {e:#}"), None))?;
         Ok(WebSession::new(
-            client,
+            WebApi::DeepSeek(client),
             backend.name.clone(),
             web.max_searches,
             web.max_fetches,

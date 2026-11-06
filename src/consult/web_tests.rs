@@ -19,7 +19,7 @@ use super::shaping::ModelCaps;
 use crate::test_support::{
     has_tool, preamble, text_response, tool_call_response, transcript_text, ScriptedClient,
 };
-use crate::web::{WebClient, WebSession};
+use crate::web::{WebApi, WebClient, WebSession};
 
 const SYNTH: &str = "capable-synth";
 const EXPLORER: &str = "cheap-explorer";
@@ -105,7 +105,7 @@ async fn session() -> Arc<WebSession> {
         Duration::from_secs(10),
     )
     .unwrap();
-    WebSession::new(client, "deepseek", 10, 10)
+    WebSession::new(WebApi::DeepSeek(client), "deepseek", 10, 10)
 }
 
 /// An offline session for the toolset tests, which never call the web.
@@ -117,7 +117,7 @@ fn idle_session() -> Arc<WebSession> {
         Duration::from_millis(100),
     )
     .unwrap();
-    WebSession::new(client, "deepseek", 10, 10)
+    WebSession::new(WebApi::DeepSeek(client), "deepseek", 10, 10)
 }
 
 fn consult_cfg(web: Option<Arc<WebSession>>) -> ConsultConfig {
@@ -190,13 +190,21 @@ async fn research_searches_fetches_and_reports() {
     assert_eq!(web.sources()[0].url, "https://example.com/turso");
 }
 
-/// A team consult with the web: each delegated sweep gets the web tools and the
-/// directive; the driver gets neither tool, only the note that its explorer can search.
+/// A team consult with the web: each delegated sweep gets both web tools and the
+/// directive; the driver gets `web_fetch` alone (one known page) and the note that its
+/// explorer searches.
 #[tokio::test]
-async fn a_team_consult_gives_the_web_to_the_sweep_not_the_driver() {
+async fn a_team_consult_gives_search_to_the_sweep_and_fetch_to_the_driver() {
     let client = ScriptedClient::builder()
         .on_model(SYNTH, |req| {
-            assert!(!has_tool(req, "web_search") && !has_tool(req, "web_fetch"));
+            assert!(!has_tool(req, "web_search"), "searching stays with the sweep");
+            assert!(has_tool(req, "web_fetch"), "the driver can read one known page");
+            assert!(
+                preamble(req)
+                    .unwrap()
+                    .ends_with("your next turn is that answer, written out in full."),
+                "the obligation is restated after the web note"
+            );
             assert!(
                 preamble(req)
                     .unwrap()

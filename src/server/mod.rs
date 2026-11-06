@@ -82,7 +82,7 @@ use render::{
     batch_poll_brief, consult_answer_text, consult_result, consultation_failed,
     consultation_failed_with_artifacts, consultation_failure_text_with_artifacts, fmt_usage,
     is_batch_handle, parse_batch_handle, render_job, render_jobs_section, render_wait,
-    wait_level_floor, wait_level_label,
+    wait_level_floor, wait_level_label, dossier_web_record,
 };
 pub(crate) use render::{
     batch_within_window, consult_models, consultation_failure_text, now_epoch_secs,
@@ -401,7 +401,9 @@ pub struct ConsultInput {
 
     /// Let this call search and read the web for what the project cannot answer — a
     /// dependency's docs or changelog, an advisory, a spec. Off by default: a code review
-    /// stays on the code. The explorer searches; fetched pages are listed after the answer.
+    /// stays on the code. The explorer searches (on a solo cast, the synth does); DeepSeek
+    /// reads each page on its servers, so nothing on your network is opened. Pages fetched
+    /// are listed after the answer. See `kaibo://tools`.
     #[serde(default)]
     pub web: bool,
 }
@@ -527,7 +529,8 @@ pub struct DeliberateInput {
     pub dossier: Option<String>,
 
     /// Let the dossier-building explorer search and read the web for what the project
-    /// cannot answer. Off by default. Refused with `dossier`, which runs no explorer.
+    /// cannot answer; DeepSeek reads each page on its servers, so nothing on your network
+    /// is opened. Off by default. Refused with `dossier`, which runs no explorer.
     #[serde(default)]
     pub web: bool,
 }
@@ -2537,6 +2540,9 @@ impl KaiboHandler {
         // hundreds of thousands of tokens, and asking a second cast the same question over
         // the same evidence should cost only the second synth. It is also the honest way to
         // compare two synths — same evidence, so the answers differ by the model alone.
+        // The dossier build's web record, when it had web access, for the caller (see
+        // the end of this function).
+        let mut web_record: Option<String> = None;
         let (dossier, images, dossier_usage, kept, explorer_model) = if let Some(reference) =
             input.dossier.as_deref()
         {
@@ -2626,6 +2632,7 @@ impl KaiboHandler {
             // the caller would, and the web spend is named beside the evidence it bought.
             if let Some(web) = cfg.web.as_deref() {
                 dossier = with_web_usage(with_web_sources(dossier, Some(web)), Some(web));
+                web_record = Some(dossier_web_record(web));
             }
             // Stitch whatever the sweep routed via `attach` into the dossier text itself
             // (text bodies, notes, demotions), then keep the finished dossier — that
@@ -2646,7 +2653,7 @@ impl KaiboHandler {
 
         // Stage 2 — hand the dossier to the offline synth. Its lane picks the mechanism
         // and the handle.
-        match lane {
+        let result = match lane {
             Lane::Batch => {
                 self.deliberate_batch(
                     &cast,
@@ -2670,6 +2677,15 @@ impl KaiboHandler {
                 dossier_usage,
                 kept.as_ref(),
             ),
+        };
+        // The caller paid for the dossier's searches now, so it sees them now: the ack
+        // carries the web record beside the dossier cost, on either lane.
+        match (result, web_record) {
+            (Ok(mut r), Some(record)) if r.is_error != Some(true) => {
+                r.content.push(ContentBlock::text(record));
+                Ok(r)
+            }
+            (result, _) => result,
         }
     }
 
@@ -4457,6 +4473,7 @@ impl rmcp::ServerHandler for KaiboHandler {
             self.config
                 .default_cast_usability(|k| std::env::var(k).ok()),
             &self.config.usable_casts(|k| std::env::var(k).ok()),
+            self.tool_router.has_route("research"),
         ))
     }
 
@@ -4965,6 +4982,30 @@ same `path` / `cast` / `explorer_model` / `explorer_backend` arguments apply, pl
 `direct` casts: point it at one to run that team's (often smarter, slower) explorer
 standalone, when you want a stronger sweep than your own fast one, or to size the explorer up.
 When you want the conclusion rather than the map, use `consult`.
+
+## The web: `research`, and `web: true`
+
+`research` answers from the web instead of the repo: the cast's explorer (its synth, on a
+cast with no explorer) searches and reads pages, and returns a report citing every claim
+by its URL, then kaibo's own list of the pages fetched and a `web:` footer line counting
+searches and fetches. It reads no project and takes no `path`; pass `context` with what
+you already know (a version pin, an error message, what you ruled out).
+
+`web: true` on `consult`, `consult_submit`, or `deliberate` adds the web to a code
+question. It is off by default. On a team cast each delegated survey gets `web_search`
+and `web_fetch`, and the driver gets `web_fetch` alone, to read one page whose address it
+has. On a solo cast the driver gets both. `deliberate` puts the sources and the `web:`
+line in the dossier and in its acknowledgment. A `web: true` call always carries the
+`web:` line, `0 searches, 0 fetches` included, so an unused web reads differently from an
+absent one.
+
+The searches run on DeepSeek's Search and Fetch APIs, billed to the `[web]` backend's key
+($0.75 per 1,000 calls per endpoint), whatever model the cast runs. DeepSeek reads each
+page on its own servers, so kaibo never opens a URL a model chose. One call has 10
+searches, 10 fetches, and 160,000 characters of page text by default, shared by every
+phase in it; a request past a cap is refused with a message the model reads. Both
+`research` and `web: true` need live web access: `kaibo://config` `[web]` shows `live` and,
+when false, `why_not`.
 
 ## Deepest reasoning, offline: `deliberate`
 
@@ -11481,8 +11522,7 @@ enabled = false
             None,
             false,
             crate::config::CastUsability::Ready,
-            &[],
-        );
+            &[], true);
         // The scope section must name each allowed path.
         assert!(
             text.contains("/projects/myapp"),
@@ -11512,8 +11552,7 @@ enabled = false
             Some(&root),
             false,
             crate::config::CastUsability::Ready,
-            &[],
-        );
+            &[], true);
         assert!(
             text.contains("/projects/myapp"),
             "scope section must name the configured root:\n{text}"
@@ -11537,8 +11576,7 @@ enabled = false
             Some(&root),
             true,
             crate::config::CastUsability::Ready,
-            &[],
-        );
+            &[], true);
         assert!(
             text.contains("/work/space"),
             "scope section must name the inferred root:\n{text}"
@@ -11560,8 +11598,7 @@ enabled = false
             None,
             false,
             crate::config::CastUsability::Ready,
-            &[],
-        );
+            &[], true);
         // Must explain that every call must pass a path.
         assert!(
             text.to_lowercase().contains("every call") || text.contains("no default"),
