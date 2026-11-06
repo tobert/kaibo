@@ -98,6 +98,14 @@ scratch_limit_bytes = 67108864      # in-memory root scratch; a write past it is
 # [artifacts]
 # enabled = false                   # default; --allow-save-artifact enables in serve
 
+# Web search and fetch for the model team, through DeepSeek's Search and Fetch APIs.
+# Spends nothing until a call asks: `research`, or `web: true` on consult/deliberate.
+# [web]
+# enabled = true                    # false turns off every web route
+# backend = "deepseek"              # a deepseek-kind backend; its key is billed
+# max_searches = 10                 # per call, shared by every phase in it
+# max_fetches = 10
+
 # Credentials: declare sources explicitly; built-ins assume none.
 # env wins over file OR command. api_key_file and api_key_cmd are mutually exclusive.
 # Key values stay in the environment, file, or vault. Clients resolve fresh per role.

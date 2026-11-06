@@ -1048,6 +1048,44 @@ label, and disk path where available. Session turns persist the footer with the 
 Cancellation can abort before a footer is returned; allow a saving job to finish to
 retain its artifact addresses. Sidecars are first-writer-wins, as described under CAS.
 
+## Web search and fetch: `[web]`
+
+```toml
+[web]
+enabled = true          # default
+backend = "deepseek"    # default; must be a `deepseek`-kind backend
+max_searches = 10       # default, per call
+max_fetches = 10        # default, per call
+```
+
+The model team searches and reads the web through DeepSeek's Search and Fetch APIs
+(`/v1/tools/search`, `/v1/tools/fetch`), billed to the web backend's key at $0.75 per
+1,000 successful calls per endpoint. DeepSeek fetches each page on its own servers:
+kaibo sends the URL as a JSON field and never opens it, so a model cannot aim a request
+at the operator's network. Any cast can use the web this way; the model does not have
+to be DeepSeek's.
+
+The operator key is on by default because it spends nothing by itself. A call reaches
+the web only when it asks:
+
+- `research` searches by design.
+- `consult`, `consult_submit`, and `deliberate` take `web: true`, off by default, so a
+  code review never reaches the web unless its caller said so.
+
+Web access is live when `[web] enabled` is true and the web backend has a key source
+that resolves. Otherwise `research` is not advertised and `web: true` is refused. A
+`[web] backend` that names no backend, or a backend of another kind, is a load error
+even while `enabled = false`.
+
+`max_searches` and `max_fetches` count requests per kaibo call, shared across every
+phase in it: a consult driver that delegates five surveys has one budget, not five. A
+request over a cap is refused with a message the model reads. Both caps at 0 with
+`enabled = true` is a load error; use `enabled = false`.
+
+Each answer that used the web ends with a sources list of the pages fetched, taken from
+kaibo's own record of the calls, and the provenance footer counts the searches and
+fetches.
+
 ## House rules: `[context]`
 
 ```toml
