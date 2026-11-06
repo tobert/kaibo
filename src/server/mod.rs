@@ -38,8 +38,8 @@ use tracing::Instrument;
 
 use crate::config::{Backend, Cast, Config, Lane, ModelRole, ModelSlot};
 use crate::consult::{
-    consult, explore_with, oneshot, sweep_evidence_block, Arm, ConsultConfig, ExploreConfig,
-    ModelCaps, PhaseContext, PromptOverrides, ReportReader,
+    consult, explore_with, oneshot, research_with, sweep_evidence_block, Arm, ConsultConfig,
+    ExploreConfig, ModelCaps, PhaseContext, PromptOverrides, ReportReader, ResearchConfig,
 };
 use crate::explorer::format_output;
 use crate::jobs::{CancelOutcome, JobResult, JobState, JobStore};
@@ -51,6 +51,7 @@ use crate::progress::{NullSink, PhaseEvent, ProgressLog, ProgressSink, TracingSi
 use crate::sandbox::{builtin_schemas, KaishWorker};
 use crate::session::{SessionStore, Sessions};
 use crate::sweep_attach::{SweepAttachSink, SweepConsumer, SweepConsumerKind};
+use crate::web::{WebClient, WebSession};
 
 mod cas_read;
 mod config_resource;
@@ -81,7 +82,7 @@ use render::{
     batch_poll_brief, consult_answer_text, consult_result, consultation_failed,
     consultation_failed_with_artifacts, consultation_failure_text_with_artifacts, fmt_usage,
     is_batch_handle, parse_batch_handle, render_job, render_jobs_section, render_wait,
-    wait_level_floor, wait_level_label,
+    wait_level_floor, wait_level_label, with_web_sources, with_web_usage,
 };
 pub(crate) use render::{
     batch_within_window, consult_models, consultation_failure_text, now_epoch_secs,
@@ -260,6 +261,9 @@ pub struct ToolGating {
     /// The `decide` tool (typed questions answered with probabilities through a cast's
     /// `decision` slot) — its own gate; it also needs a cast that can staff it.
     pub decide: bool,
+    /// The `research` web survey — its own gate; it also needs a cast with an explorer or
+    /// interactive synth, and live web access (`[web]` on, and its backend keyed).
+    pub research: bool,
 }
 
 impl Default for ToolGating {
@@ -274,6 +278,7 @@ impl Default for ToolGating {
             list_models: true,
             generate: true,
             decide: true,
+            research: true,
         }
     }
 }
@@ -297,6 +302,7 @@ impl ToolGating {
             "list_models" => self.list_models,
             "generate" => self.generate,
             "decide" => self.decide,
+            "research" => self.research,
             _ => true,
         }
     }
@@ -312,6 +318,7 @@ impl ToolGating {
             && !self.list_models
             && !self.generate
             && !self.decide
+            && !self.research
     }
 }
 
@@ -391,6 +398,32 @@ pub struct ConsultInput {
     /// `kaibo://cas/<digest>` to read. Off by default, and the server must allow it.
     #[serde(default)]
     pub save_artifacts: bool,
+
+    /// Let this call search and read the web for what the project cannot answer — a
+    /// dependency's docs or changelog, an advisory, a spec. Off by default: a code review
+    /// stays on the code. The explorer searches; fetched pages are listed after the answer.
+    #[serde(default)]
+    pub web: bool,
+}
+
+/// Arguments to `research`: a web survey. No `path` — research reads no project.
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ResearchInput {
+    /// What to find out. A focused question gets a focused survey, e.g. "Does turso 0.8.x
+    /// have a known data-loss bug with multi-process WAL, and which release fixes it?"
+    pub question: String,
+
+    /// Optional starting evidence the researcher should build on — a version pin, an
+    /// error message, what you already ruled out. Trusted: it researches what this
+    /// leaves open.
+    #[serde(default)]
+    pub context: Option<String>,
+
+    /// Which cast (model team) runs this call; omit for the server's default. Pick from
+    /// this param's `enum`; `kaibo://config` lists every cast and backend.
+    #[serde(default)]
+    pub cast: Option<String>,
 }
 
 /// Arguments to the `explore` tool: a single-phase explorer sweep. Explorer-only —
@@ -492,6 +525,11 @@ pub struct DeliberateInput {
     /// rather than ignored.
     #[serde(default)]
     pub dossier: Option<String>,
+
+    /// Let the dossier-building explorer search and read the web for what the project
+    /// cannot answer. Off by default. Refused with `dossier`, which runs no explorer.
+    #[serde(default)]
+    pub web: bool,
 }
 
 /// The handle addressing one piece of async work — a durable batch or a
@@ -987,6 +1025,13 @@ const CAST_ENUM_RULES: &[CastEnumRule] = &[
         Config::cast_can_explore,
         "a cast with an `explorer` slot",
     ),
+    // `research` runs on the explorer slot, or on an interactive synth when the cast has
+    // no explorer. Live web access is its other gate, applied in `live_tools`.
+    (
+        &["research"],
+        Config::cast_can_research,
+        "a cast with an `explorer` slot, or a `synth` slot that answers interactively",
+    ),
     (
         &["batch_submit"],
         Config::cast_is_batch,
@@ -1114,6 +1159,7 @@ fn gating_key_for(name: &str) -> Option<&'static str> {
         "list_models" => Some("list_models"),
         "generate" => Some("generate"),
         "decide" => Some("decide"),
+        "research" => Some("research"),
         _ => None,
     }
 }
@@ -1121,7 +1167,7 @@ fn gating_key_for(name: &str) -> Option<&'static str> {
 /// Every `#[tool]` route name kaibo can advertise — the fixed universe [`live_tools`]
 /// filters. `KaiboHandler::new` asserts each really exists on the router, so a renamed
 /// tool method fails the build rather than leaving a gate quietly inert.
-pub(crate) const ALL_TOOL_NAMES: [&str; 16] = [
+pub(crate) const ALL_TOOL_NAMES: [&str; 17] = [
     "consult",
     "consult_submit",
     "explore",
@@ -1131,6 +1177,7 @@ pub(crate) const ALL_TOOL_NAMES: [&str; 16] = [
     "batch_submit",
     "generate",
     "decide",
+    "research",
     "read_cas",
     "write_cas",
     "job_get",
@@ -1174,7 +1221,7 @@ pub(crate) const FOLLOWER_TOOL_NAMES: &[&str] = &[
 /// third shape — castless too, but they exist only to collect handles, so they follow
 /// their *producers*: live while any of `consult_submit`, `batch_submit`, or
 /// `deliberate` is live, dropped once none is.
-pub(crate) fn live_tools(config: &Config, usable: &[String]) -> Vec<&'static str> {
+pub(crate) fn live_tools(config: &Config, usable: &[String], web_live: bool) -> Vec<&'static str> {
     let eligible = eligible_casts_by_tool(config, usable);
     let can_staff = |name: &str| eligible.get(name).is_none_or(|c| !c.is_empty());
     let gating = &config.tools;
@@ -1192,6 +1239,10 @@ pub(crate) fn live_tools(config: &Config, usable: &[String]) -> Vec<&'static str
     // `decide` writes nothing (the answers return inline), so unlike `generate` it needs no
     // CAS: its flag and a cast with a `decision` slot are the whole gate.
     let decide_live = gating.decide && can_staff("decide");
+    // `research` needs its flag, a cast to run it, AND live web access: a web survey with
+    // no web is not advertised. `web_live` is `Config::web_usable`, judged by the caller
+    // against the same environment the cast roster was.
+    let research_live = gating.research && can_staff("research") && web_live;
     // `read_cas` is the retrieval half of the artifact contract, keyed on the SAME
     // liveness the resource it replaces was keyed on: a live media CAS, nothing else. It
     // takes no cast (there is no model in a byte range) and it is deliberately NOT tied to
@@ -1226,6 +1277,8 @@ pub(crate) fn live_tools(config: &Config, usable: &[String]) -> Vec<&'static str
         // Typed questions answered with probabilities. One request, no handle: not a job
         // producer.
         (decide_live, "decide"),
+        // A web survey. One run, no handle: not a job producer.
+        (research_live, "research"),
         // Client-side retrieval by digest. Operator surface, like the resource it
         // replaces: the inner model team never carries it.
         (read_cas_live, "read_cas"),
@@ -1367,7 +1420,18 @@ impl KaiboHandler {
         // Which tools actually survive: the operator's flags AND a cast that can staff
         // each. `live_tools` is the single source — `kaibo://config` reports the same
         // decision, so the resource can never describe a surface this router doesn't serve.
-        let live = live_tools(&config, &usable);
+        let web_live = config.web_usable(&get_env);
+        if gating.research && config.web.enabled && !web_live {
+            tracing::warn!(
+                tools = "research",
+                "disabled: the [web] backend `{}` has no API key, so web search and fetch \
+                 cannot run, and `web: true` will be refused. Declare a key source on \
+                 [backends.{}] in config.toml (`kaibo example-config` shows the shapes).",
+                config.web.backend,
+                config.web.backend
+            );
+        }
+        let live = live_tools(&config, &usable, web_live);
 
         // `[server] cast` is validated to resolve, not to staff anything, so a default
         // that cannot run `consult` (image-only, synth-only, or an offline synth) starts
@@ -1744,6 +1808,57 @@ impl KaiboHandler {
         self.resolver.require_interactive_cast(cast, tool)
     }
 
+    /// Open this call's web session: the `[web]` backend's key, the per-call caps, and a
+    /// fresh record. `tool` names the asking tool and `instead` the caller's next step in
+    /// the refusal, which differs between `research` (the web is the whole tool) and a
+    /// tool where `web` is an option.
+    fn web_session(&self, tool: &str, instead: &str) -> Result<Arc<WebSession>, McpError> {
+        let refuse = |why: String| {
+            McpError::invalid_params(
+                format!("`{tool}` was asked to use the web, but {why}. {instead}"),
+                None,
+            )
+        };
+        let web = &self.config.web;
+        if !web.enabled {
+            return Err(refuse(
+                "this kaibo has web access turned off (`[web] enabled = false` in \
+                 config.toml)"
+                    .to_string(),
+            ));
+        }
+        let backend = self
+            .config
+            .web_backend()
+            .map_err(|e| refuse(format!("the `[web] backend` is not usable ({e:#})")))?;
+        let key = backend.resolve_key().map_err(|e| {
+            refuse(format!(
+                "the `[web] backend` `{}` has no usable API key ({e:#})",
+                backend.name
+            ))
+        })?;
+        let client = WebClient::deepseek(key, backend.request_timeout)
+            .map_err(|e| McpError::internal_error(format!("web client: {e:#}"), None))?;
+        Ok(WebSession::new(
+            client,
+            backend.name.clone(),
+            web.max_searches,
+            web.max_fetches,
+        ))
+    }
+
+    /// The optional web session for a tool where `web` is a per-call choice.
+    fn web_if_asked(&self, asked: bool, tool: &str) -> Result<Option<Arc<WebSession>>, McpError> {
+        asked
+            .then(|| {
+                self.web_session(
+                    tool,
+                    "Re-run without `web` to answer from the project alone.",
+                )
+            })
+            .transpose()
+    }
+
     /// Shim over [`Resolver::require_batch_cast`] — the resolution glue lives on the
     /// shared resolver so the CLI `batch submit` front door runs the same gate.
     fn require_batch_cast(&self, cast: &Cast) -> Result<(), McpError> {
@@ -1995,7 +2110,7 @@ impl KaiboHandler {
                 explorer_max_turns: defaults.explorer_max_turns,
                 sandbox: self.config.sandbox.clone(),
                 max_attachments: defaults.max_attachments,
-                web: None,
+                web: self.web_if_asked(input.web, "consult")?,
             },
             synth_max_turns: defaults.synth_max_turns,
             attachments,
@@ -2067,6 +2182,7 @@ impl KaiboHandler {
             &cast.name,
             &consult_models(explorer.as_ref().map(|a| a.model.as_str()), &synth.model),
             &out.usage,
+            cfg.explore.web.as_deref(),
         );
         Ok(consult_result(answer, out.report, input.include_report))
     }
@@ -2147,7 +2263,8 @@ impl KaiboHandler {
                 explorer_max_turns: defaults.explorer_max_turns,
                 sandbox: self.config.sandbox.clone(),
                 max_attachments: defaults.max_attachments,
-                web: None,
+                // Refused here, before a job exists, like `save_artifacts` below.
+                web: self.web_if_asked(input.web, "consult_submit")?,
             },
             synth_max_turns: defaults.synth_max_turns,
             attachments,
@@ -2201,6 +2318,7 @@ impl KaiboHandler {
                         &cast_name,
                         &consult_models(explorer_model.as_deref(), &synth_model),
                         &out.usage,
+                        cfg.explore.web.as_deref(),
                     );
                     Ok(JobResult {
                         answer,
@@ -2312,6 +2430,80 @@ impl KaiboHandler {
     }
 
     #[tool(
+        description = "Research a question on the web and get back a cited report: what \
+            reliable sources say, each claim tied to its URL. A fast model searches and reads \
+            pages through DeepSeek's Search and Fetch APIs, which fetch each page on \
+            DeepSeek's servers, so nothing on your network is opened. It returns a summary \
+            of findings, the sources with dates and quotes, and the searches it ran, then \
+            kaibo's own list of the pages fetched. Reads no project. Use it for what a \
+            codebase cannot tell you: a dependency's changelog or known bugs, a security \
+            advisory, an API that changed after your training cutoff. Pass `context` with \
+            what you already know. To bring the web into a code question, pass `web: true` \
+            to `consult` or `deliberate` instead."
+    )]
+    async fn research(
+        &self,
+        Parameters(input): Parameters<ResearchInput>,
+        peer: Peer<RoleServer>,
+        meta: RequestMetaObject,
+    ) -> Result<CallToolResult, McpError> {
+        let cast = self.resolve_cast(input.cast)?;
+        // The explorer slot runs research when the cast has one, as it runs `explore`; a
+        // cast without one runs it on its synth, which must then answer interactively.
+        let (role, label) = if self.config.cast_can_explore(&cast.name) {
+            (ModelRole::Explorer, "explorer")
+        } else {
+            self.require_interactive_cast(&cast, "research")?;
+            (ModelRole::Synth, "synth")
+        };
+        let arm = self.arm(&cast, role)?;
+        let web = self.web_session(
+            "research",
+            "Use `consult` or `explore` to answer from the project instead.",
+        )?;
+        let progress = progress_sink(peer, &meta);
+        let defaults = &self.config.defaults;
+        let cfg = ResearchConfig {
+            // Research reads no project, so no house rules and no file map: both describe
+            // a tree this phase never sees.
+            phase: PhaseContext {
+                progress: progress.clone(),
+                house_rules: None,
+                prompts: self.resolved_prompts(&cast),
+                orientation: None,
+                call_deadline: defaults.call_deadline,
+            },
+            max_turns: defaults.explorer_max_turns,
+            web: Arc::clone(&web),
+        };
+        let span = tracing::info_span!("research", cast = %cast.name, model = %arm.model);
+        progress.emit(PhaseEvent::PhaseStarted { phase: "research" });
+        let (report, usage) = match research_with(
+            &input.question,
+            input.context.as_deref(),
+            &arm,
+            &cfg,
+        )
+        .instrument(span)
+        .await
+        {
+            Ok(out) => out,
+            Err(e) => return Ok(consultation_failed("research", &cast.name, e)),
+        };
+        progress.emit(PhaseEvent::PhaseFinished { phase: "research" });
+        let report = with_web_usage(
+            with_provenance(
+                with_web_sources(report, Some(&web)),
+                &cast.name,
+                &[(label, &arm.model)],
+                &usage,
+            ),
+            Some(&web),
+        );
+        Ok(CallToolResult::success(vec![ContentBlock::text(report)]))
+    }
+
+    #[tool(
         description = "Put a top model's deepest reasoning on your codebase without holding \
             a session open. A fast model first investigates the project READ-ONLY and \
             assembles a cited dossier (you wait for this — minutes); a heavyweight synth \
@@ -2353,6 +2545,7 @@ impl KaiboHandler {
             attach: &input.attach,
             model: input.explorer_model.as_deref(),
             backend: input.explorer_backend.as_deref(),
+            web: input.web,
         }) {
             return Err(McpError::invalid_params(refusal, None));
         }
@@ -2418,7 +2611,7 @@ impl KaiboHandler {
                 explorer_max_turns: defaults.explorer_max_turns,
                 sandbox: self.config.sandbox.clone(),
                 max_attachments: defaults.max_attachments,
-                web: None,
+                web: self.web_if_asked(input.web, "deliberate")?,
             };
             // The offline synth's resolved caps, without building a network client — pure
             // and key-free, so this can run before the (bounded but real) dossier sweep,
@@ -2469,6 +2662,12 @@ impl KaiboHandler {
             progress.emit(PhaseEvent::PhaseFinished {
                 phase: "deliberate.dossier",
             });
+            // A web-enabled dossier carries kaibo's record of the pages its explorer read,
+            // so the offline synth (and a later reuse of this dossier) sees the same list
+            // the caller would, and the web spend is named beside the evidence it bought.
+            if let Some(web) = cfg.web.as_deref() {
+                dossier = with_web_usage(with_web_sources(dossier, Some(web)), Some(web));
+            }
             // Stitch whatever the sweep routed via `attach` into the dossier text itself
             // (text bodies, notes, demotions), then keep the finished dossier — that
             // order, so what is stored is what stage 2 receives. Routed images come back
@@ -6027,6 +6226,30 @@ mod tests {
             .expect("handler builds")
     }
 
+    /// `web: true` against a server that cannot serve it is refused before any model runs,
+    /// naming the config key and the caller's next step. `web: false` never opens a
+    /// session, whatever the server's state.
+    #[test]
+    fn web_true_is_refused_with_the_reason_and_a_next_step() {
+        let off = hermetic_handler_from_toml("[web]\nenabled = false\n");
+        let err = off.web_if_asked(true, "consult").unwrap_err();
+        assert!(err.message.contains("`consult` was asked to use the web"), "{err:?}");
+        assert!(err.message.contains("`[web] enabled = false`"), "{err:?}");
+        assert!(err.message.contains("Re-run without `web`"), "{err:?}");
+        assert!(off.web_if_asked(false, "consult").unwrap().is_none());
+
+        let keyless = hermetic_handler_from_toml(
+            "[backends.deepseek]\napi_key_file = \"/nonexistent-kaibo-test/deepseek\"\n",
+        );
+        let err = keyless.web_session("research", "Use `consult` instead.").unwrap_err();
+        assert!(err.message.contains("has no usable API key"), "{err:?}");
+        assert!(err.message.ends_with("Use `consult` instead."), "{err:?}");
+
+        let ok = hermetic_handler_from_toml("[backends.deepseek]\nkey_optional = true\n");
+        let web = ok.web_if_asked(true, "consult").unwrap().expect("a session");
+        assert_eq!(web.provider(), "deepseek");
+    }
+
     /// `handler_from_toml` with an EMPTY credential environment, so the usable-cast
     /// roster is exactly what the fixture declares. The built-in cast registry merges
     /// under every config, so without this a fixture's roster silently includes every
@@ -6065,6 +6288,7 @@ mod tests {
             include_report: false,
             attach: Vec::new(),
             save_artifacts,
+            web: false,
         };
         let sink = |h: &KaiboHandler, input: &ConsultInput| {
             h.artifact_sink(
@@ -8506,6 +8730,9 @@ enabled = false
 
             [casts.judge]                                      # decision slot → `decide`
             decision = "orx/typesafe/jev-1.13"
+
+            [backends.deepseek]                                # [web] backend → `research`
+            key_optional = true
             "#,
         );
         let enum_of = |tool: &str| -> Vec<String> {
@@ -8543,6 +8770,11 @@ enabled = false
                 }
                 // `decide` runs the `decision` slot alone; its call-time gate is that slot.
                 "decide" => cast.slot(crate::config::ModelRole::Decision).is_some(),
+                // `research` runs the explorer, else an interactive synth.
+                "research" => {
+                    h.config.cast_can_explore(&cast.name)
+                        || h.require_interactive_cast(cast, tool).is_ok()
+                }
                 other => panic!("unmapped cast-taking tool `{other}` — add its gate here"),
             }
         };
@@ -9366,6 +9598,7 @@ enabled = false
                 list_models: true,
                 generate: false,
                 decide: false,
+                research: false,
             };
             KaiboHandler::new(config).expect("handler builds")
         };
@@ -9729,6 +9962,7 @@ enabled = false
                     synth_model: None,
                     synth_backend: None,
                     dossier: Some(kept.digest.clone()),
+                    web: false,
                 },
                 Arc::new(NullSink),
             )
@@ -9781,6 +10015,7 @@ enabled = false
             synth_model: None,
             synth_backend: None,
             dossier: Some(digest.to_string()),
+            web: false,
         };
 
         let err = h

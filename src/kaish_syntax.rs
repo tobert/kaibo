@@ -154,8 +154,9 @@ fn kaibo_lead() -> &'static str {
      Say what you did or want to know; no pasted files or diffs needed. \
      `explore` returns a cited survey report. `oneshot` answers from supplied context \
      with no codebase access. `run_kaish` drives the read-only shell directly. \
-     `deliberate` reasons offline over a dossier. `consult_submit` and `batch_submit` \
-     return handles; `job_wait`/`job_get`/`job_list`/`job_cancel` manage them."
+     `deliberate` reasons offline over a dossier. `research` searches the web, citing \
+     URLs; `web: true` adds the web to `consult`/`deliberate`. \
+     `consult_submit` and `batch_submit` return handles for `job_wait`/`job_get`."
 }
 
 /// The setup-guidance block prepended to the instructions when the default cast has

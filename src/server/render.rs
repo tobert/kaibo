@@ -218,10 +218,30 @@ pub(crate) fn consult_answer_text(
     cast: &str,
     models: &[(&str, &str)],
     usage: &rig_core::completion::Usage,
+    web: Option<&crate::web::WebSession>,
 ) -> String {
-    let with_warnings = append_warnings(answer, warnings);
+    let with_sources = with_web_sources(answer, web);
+    let with_warnings = append_warnings(with_sources, warnings);
     let with_footer = crate::artifact::with_artifacts(with_warnings, sink);
-    with_provenance(with_footer, cast, models, usage)
+    with_web_usage(with_provenance(with_footer, cast, models, usage), web)
+}
+
+/// Append the call's sources (the pages kaibo's record says the team fetched) right
+/// after the answer, or return it unchanged when the call fetched nothing or had no web.
+pub(crate) fn with_web_sources(answer: String, web: Option<&crate::web::WebSession>) -> String {
+    match web.and_then(|w| w.sources_block()) {
+        Some(block) => format!("{answer}{block}"),
+        None => answer,
+    }
+}
+
+/// Append the web-usage line under the provenance footer, when the call made any web
+/// request. Searches are billed, so the caller sees how many ran.
+pub(crate) fn with_web_usage(text: String, web: Option<&crate::web::WebSession>) -> String {
+    match web.and_then(|w| w.usage().footer(w.provider())) {
+        Some(line) => format!("{text}\n{line}"),
+        None => text,
+    }
 }
 
 /// The rendered failure text (detail + classified guidance) for a consultation that
@@ -962,6 +982,7 @@ mod tests {
             "deepseek",
             &[("synth", "deepseek-flash")],
             &rig_core::completion::Usage::new(),
+            None,
         );
         let at = |needle: &str| {
             text.find(needle)

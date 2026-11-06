@@ -2112,8 +2112,12 @@ mod tests {
     fn research_takes_neither_project_layer_and_has_its_own_override() {
         let none = PromptOverrides::default();
         let plain = resolve_phase_preamble(Phase::Research, &none, None, None);
-        let with_layers =
-            resolve_phase_preamble(Phase::Research, &none, Some("PROJECT FILES. x"), Some("RULES"));
+        let with_layers = resolve_phase_preamble(
+            Phase::Research,
+            &none,
+            Some("PROJECT FILES. x"),
+            Some("RULES"),
+        );
         assert_eq!(plain, with_layers, "research reads no project tree");
         assert_eq!(plain, research_preamble());
         let ov = PromptOverrides {
@@ -2121,7 +2125,10 @@ mod tests {
             research: Some("RESEARCH".into()),
             ..Default::default()
         };
-        assert_eq!(resolve_phase_preamble(Phase::Research, &ov, None, None), "RESEARCH");
+        assert_eq!(
+            resolve_phase_preamble(Phase::Research, &ov, None, None),
+            "RESEARCH"
+        );
         assert_eq!(Phase::Research.slot_role(), ModelRole::Explorer);
     }
 
@@ -2129,6 +2136,9 @@ mod tests {
     fn the_web_directive_keeps_the_project_first_and_names_the_deliverable() {
         let d = web_directive("answer");
         assert!(d.contains("The project is your first source"), "{d}");
-        assert!(d.contains("In your answer, cite each web fact by its URL"), "{d}");
+        assert!(
+            d.contains("In your answer, cite each web fact by its URL"),
+            "{d}"
+        );
     }
 }

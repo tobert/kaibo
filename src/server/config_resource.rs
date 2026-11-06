@@ -129,6 +129,7 @@ pub(crate) fn render_config_resource(
         list_models: bool,
         generate: bool,
         decide: bool,
+        research: bool,
     }
 
     /// Runtime-computed scope state. `follow_worktrees` echoes the knob;
@@ -619,6 +620,7 @@ pub(crate) fn render_config_resource(
         list_models,
         generate,
         decide,
+        research,
     } = &config.tools;
     let crate::sandbox::SandboxConfig {
         exec_timeout,
@@ -685,10 +687,14 @@ pub(crate) fn render_config_resource(
                 .iter()
                 .map(|p| p.display().to_string())
                 .collect(),
-            advertised_tools: super::live_tools(config, &usable)
-                .into_iter()
-                .map(str::to_string)
-                .collect(),
+            advertised_tools: super::live_tools(
+                config,
+                &usable,
+                config.web_usable(|k| std::env::var(k).ok()),
+            )
+            .into_iter()
+            .map(str::to_string)
+            .collect(),
             unstaffable_tools: unstaffable,
         },
         tools: ToolsDoc {
@@ -701,6 +707,7 @@ pub(crate) fn render_config_resource(
             list_models,
             generate,
             decide,
+            research,
         },
         sandbox: SandboxDoc {
             exec_timeout_secs: exec_timeout.as_secs(),

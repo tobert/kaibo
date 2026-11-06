@@ -1570,6 +1570,13 @@ impl Config {
     /// evaluating the explorer or for a stronger sweep than the caller's own. A synth-only
     /// cast (no explorer — `gemini-batch`/`oneshot`-only casts) can't, and is correctly
     /// left out (it would fault at the explorer-arm resolve).
+    /// Whether canonical cast `name` can staff a `research` call: it runs on the explorer
+    /// slot, or on an interactive synth when the cast has no explorer. Live web access is
+    /// the tool's other gate, applied in `live_tools`.
+    pub fn cast_can_research(&self, name: &str) -> bool {
+        self.cast_can_explore(name) || self.cast_is_interactive(name)
+    }
+
     pub fn cast_can_explore(&self, name: &str) -> bool {
         self.casts
             .get(name)
@@ -2555,6 +2562,9 @@ impl Config {
         if disable.decide {
             self.tools.decide = false;
         }
+        if disable.research {
+            self.tools.research = false;
+        }
         // Non-empty CLI allow_paths replaces lower layers (env/file).
         if !allow_paths.is_empty() {
             self.allow_paths = allow_paths;
@@ -2586,6 +2596,7 @@ pub struct ToolDisables {
     pub list_models: bool,
     pub generate: bool,
     pub decide: bool,
+    pub research: bool,
 }
 
 /// Register `alias → target` at one level (backend or cast), rejecting a clash
@@ -3070,6 +3081,7 @@ struct RawTools {
     list_models: Option<bool>,
     generate: Option<bool>,
     decide: Option<bool>,
+    research: Option<bool>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -3634,6 +3646,7 @@ fn merge_tools(raw: RawTools) -> ToolGating {
         list_models: raw.list_models.unwrap_or(d.list_models),
         generate: raw.generate.unwrap_or(d.generate),
         decide: raw.decide.unwrap_or(d.decide),
+        research: raw.research.unwrap_or(d.research),
     }
 }
 
@@ -3713,6 +3726,9 @@ fn apply_raw_env(raw: &mut RawConfig, get: &impl Fn(&str) -> Option<String>) -> 
     }
     if env_flag(get, "KAIBO_NO_DECIDE") {
         tools.decide = Some(false);
+    }
+    if env_flag(get, "KAIBO_NO_RESEARCH") {
+        tools.research = Some(false);
     }
 
     let defaults = raw.defaults.get_or_insert_with(Default::default);

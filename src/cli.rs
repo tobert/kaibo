@@ -302,6 +302,9 @@ pub struct ServeGates {
     /// Don't advertise the `decide` tool (typed questions answered with probabilities).
     #[arg(long)]
     pub no_decide: bool,
+    /// Don't advertise the `research` tool (a web survey).
+    #[arg(long)]
+    pub no_research: bool,
 
     /// Let a consult save bulk output as artifacts in kaibo's artifact store, when the
     /// call also asks for it with `save_artifacts` (both keys are required, and the
@@ -325,6 +328,7 @@ impl ServeGates {
             list_models: self.no_list_models,
             generate: self.no_generate,
             decide: self.no_decide,
+            research: self.no_research,
         }
     }
 }
@@ -1617,6 +1621,7 @@ async fn deliberate_inner(
         attach: &args.attach,
         model: args.explorer_model.as_deref(),
         backend: args.explorer_backend.as_deref(),
+        web: false,
     }) {
         return Err(SetupError {
             kind: "usage",
