@@ -13,7 +13,9 @@ set -euo pipefail
 [ "$#" -eq 1 ] || { echo "usage: $0 'kaibo X.Y.Z' (one argument: the binary's --version output)" >&2; exit 2; }
 got="${1%$'\r'}" # defensive: strip one trailing CR if a runner ever adds one
 
-# Same predicate as release.yml's publish gates: only a v* tag ref publishes.
+# Checks any v* tag ref, a tag push or a dispatch run against a tag. Publishing
+# additionally needs a push event (release.yml's gates); a mismatched tag is
+# worth failing either way.
 case "${GITHUB_REF:-}" in
   refs/tags/v*) : ;;
   *)

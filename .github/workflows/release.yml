@@ -161,10 +161,14 @@ jobs:
 
   # Signing, provenance, and the SBOM all live here in the tag-gated publish job —
   # a `workflow_dispatch` smoke run never mints an OIDC identity or a signature.
+  # Every publish gate in this file tests the EVENT as well as the ref: a dispatch
+  # run against a `v*` tag has github.ref == refs/tags/v…, so a ref-only gate
+  # would let it re-publish, sign, and attest that release. Only a tag push
+  # publishes; a dispatch on any ref is a smoke run.
   release:
     name: publish release
     needs: build
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     permissions:
       contents: write # create the release and upload assets
@@ -252,8 +256,8 @@ jobs:
   # into distroless/static:nonroot — see the Dockerfile for the image contract
   # (COPY source for devcontainers, /work mount, stdio ENTRYPOINT). The job runs
   # its build + smoke on a workflow_dispatch too, so a branch dispatch validates
-  # the Dockerfile and manifest assembly; pushing, signing, and attesting stay
-  # tag-gated like the release job, so no dispatch ever publishes or signs.
+  # the Dockerfile and manifest assembly; pushing, signing, and attesting are
+  # gated on a tag push like the release job, so no dispatch publishes or signs.
   image:
     name: publish ghcr image
     needs: build
@@ -297,7 +301,7 @@ jobs:
           bash scripts/check-tag-version.sh "$out"
 
       - name: Login to ghcr
-        if: startsWith(github.ref, 'refs/tags/v')
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
         uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
         with:
           registry: ghcr.io
@@ -341,20 +345,20 @@ jobs:
           context: .
           platforms: linux/amd64,linux/arm64
           labels: ${{ steps.meta.outputs.labels }}
-          outputs: type=image,name=ghcr.io/tobert/kaibo,name-canonical=true,push-by-digest=true,push=${{ startsWith(github.ref, 'refs/tags/v') }}
+          outputs: type=image,name=ghcr.io/tobert/kaibo,name-canonical=true,push-by-digest=true,push=${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') }}
 
       - name: Install cosign
-        if: startsWith(github.ref, 'refs/tags/v')
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
         uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
 
       # Same keyless machinery as the blob signing above, aimed at the manifest
       # digest — the signature covers every tag later pointed at it.
       - name: Sign image (cosign keyless)
-        if: startsWith(github.ref, 'refs/tags/v')
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
         run: cosign sign --yes ghcr.io/tobert/kaibo@${{ steps.build.outputs.digest }}
 
       - name: Attest image provenance
-        if: startsWith(github.ref, 'refs/tags/v')
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
           subject-name: ghcr.io/tobert/kaibo
@@ -365,7 +369,7 @@ jobs:
       # each tag to the existing list (no rebuild, no layer movement, and no new
       # package version, so this does not change the install box; see above).
       - name: Publish version tags (after signing)
-        if: startsWith(github.ref, 'refs/tags/v')
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
         env:
           TAGS: ${{ steps.meta.outputs.tags }}
           DIGEST: ${{ steps.build.outputs.digest }}
