@@ -94,12 +94,16 @@ jobs:
       # so every leg executes its own binary here. The aarch64 leg runs natively on
       # ubuntu-24.04-arm; x86_64-apple-darwin runs under Rosetta 2 on the arm64
       # macos-latest runner — expected, don't "fix" that leg back to an Intel runner.
-      - name: Smoke (run the binary)
+      # On a tag run the binary must report the tag's version. The version comes
+      # from Cargo.toml, so a tag pushed without the bump fails here, before any
+      # asset or image is published.
+      - name: Smoke (run the binary, check its version)
         shell: bash
         run: |
           bin="target/${{ matrix.target }}/release/kaibo"
           [ -f "$bin" ] || bin="$bin.exe"
-          "$bin" --version
+          out=$("$bin" --version) # its own line, so a binary that fails to run fails the step
+          bash scripts/check-tag-version.sh "$out"
 
       # musl legs only: ldd exits non-zero on a fully static binary, so that's the
       # success case here — hence `|| true` plus a grep instead of a plain run.
@@ -289,7 +293,8 @@ jobs:
       - name: Smoke (run the image)
         run: |
           docker buildx build --load --platform linux/amd64 -t kaibo-smoke .
-          docker run --rm kaibo-smoke --version
+          out=$(docker run --rm kaibo-smoke --version) # its own line, so a failed run fails the step
+          bash scripts/check-tag-version.sh "$out"
 
       - name: Login to ghcr
         if: startsWith(github.ref, 'refs/tags/v')
@@ -317,12 +322,18 @@ jobs:
             type=sha,enable=${{ github.ref_type != 'tag' }}
 
       # Tag runs push BY DIGEST here and apply the version tags in the last step
-      # below, after signing. Order matters for the package page: GitHub's install
-      # box advertises the most recently published version, and cosign/provenance
-      # land as sha256-* tagged artifacts in the same package — publish the version
-      # tags last and "Latest" is always a pullable image, never a signature
-      # bundle. (v0.2.0-rc.4 shipped image→sign order and the package page's
-      # copy-paste box offered the signature tag; podman refused it, confusingly.)
+      # below, after signing and attesting, so a version tag never names an
+      # unsigned image.
+      #
+      # This order does NOT fix the package page's install box, which offers the
+      # cosign `sha256-<digest>` signature tag instead of a version tag. ghcr keys a
+      # package version by digest and dates it by that digest's first push;
+      # `imagetools create` only adds tags to the existing index, so it creates no
+      # new version. The signature has to be pushed after the image digest exists,
+      # so it is always the newest version, and the box shows it (v0.6.1:
+      # signature 14:58:36Z, index 14:58:28Z). Pulling a version tag, `cosign
+      # verify`, and `gh attestation verify oci://` all work. We keep cosign on the
+      # image and say this in .github/release-body.md instead.
       - name: Build (and push by digest on a tag)
         id: build
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
@@ -350,11 +361,10 @@ jobs:
           subject-digest: ${{ steps.build.outputs.digest }}
           push-to-registry: true
 
-      # The finale, deliberately: point the version tags at the signed manifest
-      # list. imagetools create copies the existing list under each tag — no
-      # rebuild, no layer movement — and because this is the package's newest
-      # publish, the install box shows a real, pullable version.
-      - name: Publish version tags (last, so "Latest" is pullable)
+      # Point the version tags at the signed manifest list. imagetools create adds
+      # each tag to the existing list (no rebuild, no layer movement, and no new
+      # package version, so this does not change the install box; see above).
+      - name: Publish version tags (after signing)
         if: startsWith(github.ref, 'refs/tags/v')
         env:
           TAGS: ${{ steps.meta.outputs.tags }}
