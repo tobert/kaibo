@@ -1476,6 +1476,11 @@ const OPENAI_INPUT_FILENAME: &str = "kaibo-batch-input.jsonl";
 /// [`batch_effort`] rule, so the two lanes can't drift apart on which direction wins.
 /// Sampling is left to the provider default — `top_p = None` — matching the other
 /// providers' batch shape.
+///
+/// No `store: false` here, deliberately: the interactive arm sends it through
+/// `inject_provider_prefs`, but a batch's input and output files sit in OpenAI's Files
+/// API whatever the item bodies say, so the flag would buy no retention. Revisit if
+/// OpenAI documents `store` on batch items.
 pub fn openai_batch_shaping(model: &str, tunables: &SlotTunables) -> (u64, Option<Value>) {
     let max_tokens = tunables.max_tokens.max(BATCH_MAX_TOKENS_FLOOR);
     let params = crate::consult::hosted_openai_responses_params(

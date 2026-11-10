@@ -365,11 +365,16 @@ impl Arm {
         } else {
             None
         };
-        // OpenRouter routing honors the backend's data policy — deny by default, so
-        // source never reaches a data-collecting upstream host without an explicit
-        // config opt-in. A no-op for every other kind.
-        let params =
-            super::shaping::inject_provider_prefs(backend.kind, params, backend.data_collection);
+        // The backend's data policy, deny by default: OpenRouter routes only to
+        // no-collection hosts, and OpenAI's Responses wire sends `store: false`, so
+        // source is not retained without an explicit config opt-in. A no-op for
+        // every other kind.
+        let params = super::shaping::inject_provider_prefs(
+            backend.kind,
+            params,
+            backend.data_collection,
+            responses_wire,
+        );
         let caps = ModelCaps::resolve(backend.kind, &slot.id, slot.vision);
 
         // One HTTP backend carrying the per-request deadline, built by the shared
@@ -1543,7 +1548,8 @@ where
     fields(
         model = %model_name,
         max_turns = max_turns,
-        // The resolved wire blob (thinkingLevel/thinkingBudget + effort + sampling) as
+        // The resolved wire blob (thinkingLevel/thinkingBudget + effort + sampling, plus
+        // the data-policy field: OpenRouter's `provider` or OpenAI's `store`) as
         // actually sent — ground truth for "what reasoning shape shipped", which the
         // response-usage spans can only hint at. Empty here, filled in the body once it's
         // known non-None, so a `None` (toggle-less) provider records nothing and
@@ -7333,6 +7339,10 @@ mod tests {
             arm.caps.vision,
             "the vision pin survives into the hosted arm"
         );
+        assert_eq!(
+            params["store"], false,
+            "the default data policy turns OpenAI storage off on the hosted arm"
+        );
     }
 
     /// An effort Google's `thinkingLevel` enum can't name fails **here**, at arm
@@ -7695,6 +7705,53 @@ mod tests {
             params["reasoning"]["effort"],
             defaults.synth_effort.as_str(),
             "everything else in the blob is unchanged by the opt-in"
+        );
+    }
+
+    /// The openai half of the data policy, at the arm: `allow` on a hosted backend
+    /// sends no `store`, and a local chat-wire backend sends none either way, since
+    /// Chat Completions stores nothing by default. Arm-level for the same reason as
+    /// the OpenRouter test above: a flipped condition in `inject_provider_prefs`
+    /// would slip past the function-level test alone.
+    #[test]
+    fn openai_arm_store_follows_the_wire_and_the_policy() {
+        let defaults = crate::config::Defaults::default();
+        let backend = |base_url: &str, data_collection| crate::config::Backend {
+            name: "gpt".into(),
+            kind: ProviderKind::Openai,
+            base_url: Some(base_url.into()),
+            api_key_env: None,
+            api_key_file: None,
+            api_key_cmd: None,
+            key_optional: true,
+            request_timeout: Duration::from_secs(30),
+            data_collection,
+            prompt_cache: Default::default(),
+            wire: None,
+        };
+
+        let hosted = backend(
+            crate::credentials::HOSTED_OPENAI_BASE_URL,
+            crate::config::DataCollection::Allow,
+        );
+        let slot = ModelSlot::bare("gpt", "gpt-6-sol");
+        let arm = Arm::from_slot(&hosted, &slot, ModelRole::Synth, &defaults).unwrap();
+        let params = arm.params.expect("a GPT 6 slot sends reasoning params");
+        assert!(
+            params.get("store").is_none(),
+            "allow leaves `store` to the account default, got: {params}"
+        );
+
+        let local = backend(
+            "http://localhost:8080/v1",
+            crate::config::DataCollection::Deny,
+        );
+        let slot = ModelSlot::bare("gpt", "qwen2.5-coder-7b");
+        let arm = Arm::from_slot(&local, &slot, ModelRole::Synth, &defaults).unwrap();
+        assert!(
+            arm.params.as_ref().is_none_or(|p| p.get("store").is_none()),
+            "the chat wire sends no `store`, got: {:?}",
+            arm.params
         );
     }
 

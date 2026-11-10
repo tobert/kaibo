@@ -1781,6 +1781,7 @@ async fn openrouter_reasoning_accounting_live() {
         ProviderKind::OpenRouter,
         params,
         kaibo::config::DataCollection::Deny,
+        false,
     )
     .expect("openrouter always sends params");
     let resp = openrouter_probe_completion(&key, model, &params).await;
