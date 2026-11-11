@@ -1901,9 +1901,9 @@ dependencies = [
 
 [[package]]
 name = "kaish-glob"
-version = "0.18.1"
+version = "0.19.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "91045ec4e979b4da1cb1e2f1dcec2e1fa579b0c2c1ac7f6ad19c972a1aa27e91"
+checksum = "c4de7741a64b0bfe024da75dc96a266ec3ed96d77b71909e60a7398a361f014c"
 dependencies = [
  "async-trait",
  "ignore",
@@ -1913,18 +1913,18 @@ dependencies = [
 
 [[package]]
 name = "kaish-help"
-version = "0.18.1"
+version = "0.19.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9e214aedb16e01317043457656aca7279126ab14bd64abe921207e99b680687a"
+checksum = "1429361a3b89083e8dce6fbc4e41ae8492511ddb29fc3cd20f6f9b3e4fab0dbf"
 dependencies = [
  "kaish-types",
 ]
 
 [[package]]
 name = "kaish-kernel"
-version = "0.18.1"
+version = "0.19.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "56a638e68ad3225ad70ab84a7994ffc01e605ccd8a0a87c9bd1cedaccc3b1368"
+checksum = "0c91e7a2bc098b323fe38b190649088819d00ef00162167b07e9f641c069ee50"
 dependencies = [
  "anyhow",
  "ariadne",
@@ -1940,6 +1940,7 @@ dependencies = [
  "grep-matcher",
  "grep-regex",
  "grep-searcher",
+ "iana-time-zone",
  "ignore",
  "jaq-core",
  "jaq-json",
@@ -1973,9 +1974,9 @@ dependencies = [
 
 [[package]]
 name = "kaish-tool-api"
-version = "0.18.1"
+version = "0.19.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7935a717f60d54e53a1171427a8a757423d08b8f6f27db6a458a2bdf0402201d"
+checksum = "db49c9906995307ac5b073082b3c8804f41b8d55e8b3be7e5c89c77873258e9f"
 dependencies = [
  "async-trait",
  "clap",
@@ -1984,9 +1985,9 @@ dependencies = [
 
 [[package]]
 name = "kaish-types"
-version = "0.18.1"
+version = "0.19.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6fe206edacec492fe785b03781f2f4f6e5b14ab3ea3ebf92e39bd8222046812d"
+checksum = "d06b0e13f0c3f7f6edc8e66f095d3cbfd382d6283bd898fd77e8ad801ebc3e0b"
 dependencies = [
  "base64 0.22.1",
  "serde",
@@ -1998,13 +1999,14 @@ dependencies = [
 
 [[package]]
 name = "kaish-vfs"
-version = "0.18.1"
+version = "0.19.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d600321ad542ee07dcb1088a878f2d512aee0e8f8a629e94c956d524554af41c"
+checksum = "317f38604ab4ff1aed038d9cf6a1c62d4f48fd34a80741438ffb0551ce59f9d7"
 dependencies = [
  "async-trait",
  "getrandom 0.3.4",
  "kaish-types",
+ "nix 0.29.0",
  "rustix 1.1.5",
  "tokio",
 ]
@@ -2274,6 +2276,18 @@ name = "multiversion_no_op"
 version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "743fb55ba31b18fb1ecef6bdc9aa2743314978ac084044301a7eee33fb99a20d"
+
+[[package]]
+name = "nix"
+version = "0.29.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "71e2746dc3a24dd78b3cfcb7be93368c6de9963d30f43a6a73998a9cf4b17b46"
+dependencies = [
+ "bitflags 2.13.2",
+ "cfg-if",
+ "cfg_aliases",
+ "libc",
+]
 
 [[package]]
 name = "nix"
@@ -2693,7 +2707,7 @@ checksum = "0e3f4237d0e4741eb50bc5584db701f1299c85fa31ff0274dd6445e79dc42d12"
 dependencies = [
  "futures",
  "indexmap",
- "nix",
+ "nix 0.31.3",
  "tokio",
  "tracing",
  "windows",

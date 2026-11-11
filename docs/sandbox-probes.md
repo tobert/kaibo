@@ -85,12 +85,15 @@ ln -s /etc/passwd $ROOT/passwd_link     ; echo "ln=$?"
 sed -i s/name/pwned/ $ROOT/Cargo.toml   ; echo "sed-i=$?"
 truncate -s 0 $ROOT/Cargo.toml          ; echo "truncate=$?"
 # then prove nothing landed (a temp file from an atomic replace would show here).
-# kaish `ls` has no -A (`ls: -A is not supported`, exit 2), so a `ls -A | grep` here
-# greps nothing and "passes" while examining nothing; use `ls` or `ls -a`:
-ls $ROOT | grep -iE 'pwn|\.bak|\.copy|\.tmp|\.sed' ; echo "leftovers=$?"
+# `ls -A` (kaish 0.19+) includes dotfiles, so a hidden temp file shows too. Through
+# 0.18 `-A` exited 2 and the grep examined nothing; on those pins use `ls -a`:
+ls -A $ROOT | grep -iE 'pwn|\.bak|\.copy|\.tmp|\.sed' ; echo "leftovers=$?"
 ```
 
-**Pass:** every write reports a non-zero exit; `leftovers` greps empty (`exit 1`).
+**Pass:** every write reports a non-zero exit; `leftovers` greps empty (`exit 1`). Prove
+the check can see something first: plant `.zz.tmp` in the project on the host, run the
+`leftovers` line, and expect `exit 0`, then delete it. Without that control a broken
+listing reads as a pass.
 Nine of the eleven end `read-only filesystem` (through kaish 0.17 the message was
 `permission denied: filesystem is read-only`); `truncate` exits 127 with `truncate:
 external commands are not available in this build of the shell`.
@@ -218,6 +221,19 @@ toward the mount, so it can't be walked to a sibling.
 > `containment.rs::mount_layer_ancestors_synthesize_the_mount_path_and_nothing_else`,
 > which checks two chain levels and carries a recorded positive control.
 
+> **The GNU columns in `ls -l` and `stat` are not a finding (kaish 0.19).** Through 0.18.1
+> `ls -l` printed name, a type letter, and size. 0.19 adds, for each file on the mount,
+> its mode bits, link count, block count, owner, group, and mtime. All of these are
+> in-tree inode metadata, the same class as the size kaibo already showed. Only owner and
+> group consult host data: kaish looks up the uid and gid already on the in-tree inode in
+> the host's account database (`atobey`, or a bare number where the database has no
+> entry, such as a container's bind mount). The lookup takes no path from the model, so
+> it cannot be aimed at another account or enumerate them. Different files can show
+> different owners. Directories the VFS synthesizes (`/dev`, `/v`, and the mount chain,
+> including the mount point's own entry in its parent's listing) print `?` in every
+> column, so walking up still recovers only the path string. Pinned by part 4 of
+> `containment.rs::mount_layer_ancestors_synthesize_the_mount_path_and_nothing_else`.
+
 **Environment leak check** (a secret can hide in env, not just on disk):
 
 ```sh
@@ -229,14 +245,14 @@ echo "[$ANTHROPIC_API_KEY][$DEEPSEEK_API_KEY][$OPENAI_API_KEY][$HOME][$PATH]"
 *process* holds provider keys for its rig clients, but they are never propagated into
 the kaish kernel's environment.
 
-`env` itself is no longer strictly empty as of kaish 0.16 — it lists (0.18.1: `env` prints
-nothing and `kaish-vars` shows `PWD`; `PIPESTATUS` appears once any command has run) variables the
-*kernel* owns, neither inherited from the host: `PIPESTATUS` (the new pipeline-status
-list) and `PWD` (which 0.16 made follow `cd` instead of reporting the process's startup
-directory). `PWD` is the mount root, which the model is already told, so it discloses
-nothing new. Read the pass criterion as *nothing from the host*, not *nothing at all* —
-and check the named variables explicitly, since an empty `env` listing would otherwise
-pass vacuously the day the kernel stops populating it.
+`env` prints nothing on 0.18.1 and 0.19.0. The variables the *kernel* owns show in
+`kaish-vars`, which is why the battery runs both. None is inherited from the host: `PWD`
+(the mount root, which 0.16 made follow `cd`), `PIPESTATUS` (once any command has run),
+and `OLDPWD` (0.19.0: once a script runs `cd`; 0.18.1 set it to the mount root from the
+first command). `PWD` and `OLDPWD` hold the mount root or a path under it, which the
+model is already told, so they disclose nothing new. Read the pass criterion as *nothing
+from the host*, not *nothing at all*, and check the named variables explicitly, since an
+empty listing would otherwise pass vacuously the day the kernel stops populating it.
 
 ---
 
@@ -416,6 +432,11 @@ target's contents, not its permissions, not even whether it exists.
 host one link at a time, and G1 stops being acceptable. Escalate rather than
 re-baseline.
 
+> `ls -l` and `stat` on the three links (lstat, not a follow) differ in one more field,
+> the link's own size, which is the byte length of its target string (13, 17, 24 for the
+> three above). That is the string G1 already discloses, not a fact about the target, so
+> it is not a divergence. Every other column must match.
+
 > Pinned by `containment.rs::mount_layer_symlink_discloses_its_target_string_but_no_host_fact`
 > (all three arms, with a recorded positive control: point a link at an in-tree file
 > carrying the marker and the leak assertion fires) and its sibling
@@ -560,89 +581,44 @@ detail is in git, and anything durable a run found has been promoted into the ba
 belongs to rather than left here to be re-read — that promotion is the point of the
 compression, not a side effect of it.
 
-- **2026-10-13** — **Full A–H live, plus E3, the §6 suites, `cargo tree -i` and the musl
-  check; §7 not run**, main `6c90bd1`, `kaish-kernel` 0.18.1 (unchanged), the 0.6.0
-  pre-release pass. The trigger was #221: the `/` scratch `MemoryFs` now starts with an empty
-  `/tmp`. Run through `kaibo kaish` and the server launch against a scratch project
-  (`Cargo.toml`, `src/a.rs`, `src/b.rs`) that lives **under `/tmp`**, so the seed and the
-  mount chain meet; `env -i`, a temp `HOME` and temp XDG roots, never the operator's config or
-  stores. **All clear: no write, read, or environment leak.**
-  - **A** 11 writes, all refused, `sha256sum` and `ls -la` of the project identical before and
-    after, messages unchanged from 0.18.1's last run (nine `read-only filesystem`, cross-mount
-    `ln -s` `a link cannot cross mounts`, in-mount `ln -s` `read-only filesystem`, `truncate`
-    exit 127). `leftovers=1`, and the control holds: a host-planted `zz.tmp` gives
-    `leftovers=0`. The 0.18 write-capable builtins refuse on the mount (`edit` replace,
-    `--after`, `--delete` exit 1 `read-only filesystem`; a stale anchor is refused first;
-    `dd of=`, `write`, `write` from stdin, `mktemp -p .`, `tee -a`, `rm -r` exit 1; `patch -i`
-    exit 2 unsupported; `find -delete` exit 2; `find -exec … \;` 127; unescaped `-exec` exit 0).
-  - **The `/tmp` seed.** `ls /tmp` returns 0 entries (host: 1044) and `ls /` reads `dev`, `tmp`,
-    `v` — no `home`, because this project's mount chain starts at `/tmp`; with the worktree
-    as root it reads `dev`, `home`, `tmp`, `v`. Redirect, `mkdir -p`, `touch`, `dd of=`,
-    `write`, `cp`, `mktemp` and `mktemp -d` under `/tmp` all succeed in scratch, and none of the
-    eight paths exist on the host (host `/tmp` count 1044 before and after); a second
-    invocation reads the file back `not found`. The scratch budget covers `/tmp`: with
-    `scratch_limit_bytes = 4096` the sixth 600-byte append is refused
-    `kaibo-scratch budget exhausted`. Below `/tmp` the chain still synthesizes
-    (`ls /tmp/claude-1000` 1 entry, host 160; the root's parent 1, host 6). Shadowing does not
-    reach the mount: `mkdir -p <parent-of-root>` succeeds in scratch and then lists only its
-    scratch contents, but `mkdir <root>` and a redirect into the root still refuse
-    `read-only filesystem`, and the mount still reads. After `rm -r /tmp`, `ls /` still shows
-    `tmp` (a synthesized ancestor) and `echo z > /tmp/z` is refused `create the directory
-    first`; the mount is unaffected. A scratch link `ln -s /etc/passwd /tmp/pw` is made, and
-    `cat` through it is `not found` (it resolves inside scratch); a link from scratch into the
-    mount is refused `a link cannot cross mounts`. **Live negative control:** the binary
-    built during the seed-removed test run (below) showed `ls /tmp` with 1 entry (the
-    synthesized `claude-1000`) and refused `echo x > /tmp/x`; the rebuilt clean binary returns
-    0 entries and accepts it.
-  - **B** nine host commands plus `env FOO=bar curl …` and `/tmp/../bin/echo`, all 127,
-    `external commands are not available in this build of the shell`; control `echo ok` exit 0.
-    `kill 1` now exits 1 `signalling a PID requires the subprocess capability`.
-  - **C** reads outside the root all `not found`: `/etc/passwd`, `..`×3 and ×8, relative
-    `../../.ssh/id_rsa`, `/home/atobey/.ssh/id_ed25519`, `.anthropic-key.txt` and
-    `.deepseek-key` (all exist on the host; output was redirected into scratch and measured
-    0 bytes). `stat` and `realpath` on a real and an absent `/etc` file, and on a real and an
-    absent sibling of the root, refuse alike. `env` prints nothing; `kaish-vars` shows only
-    `PWD` until any command has run, then `PIPESTATUS` too; the five named variables plus
-    `$TMPDIR` and a canary are empty with fake keys, `TMPDIR=/tmp` and the canary set in the
-    launching env.
-  - **D** all refusals exit 3: `/etc`, the root's parent, `/tmp`, and `..`×8 to `/etc` and to
-    `/tmp` are refused by containment, naming the allowed set; `..`×4 dies at
-    canonicalization; `src` lists; `Cargo.toml` is `not a directory`.
-  - **E1/F1** refuse before touching disk (exit 1, nothing created, `..` spelling caught too);
-    the clean launch exits 1 `connection closed: initialize request`. **E2/F2/H4** the state
-    db (4096 bytes + `-wal` + `-tshm`), the state dir, the CAS, its parent and a fresh object
-    are `not found` while the host files exist (4 CAS files). Positive control: with `--root`
-    widened to the stores' parent the same probe reads `4096` and lists 4 files, so the probe
-    can see a store when one is mounted. **G** target string readable; `cat`, `file`, `wc`,
-    `checksum`, `stat -L`, `cp` to `/v` and to `/tmp` refuse `path escapes root`, `grep` exits
-    2; `[[ -e ]]`/`[[ -r ]]` false; five `cat` refusals (the three G3 links plus links to a
-    host `/tmp` file and to `../sha-before.txt`) are 1 distinct line once the target is
-    removed. **H** names equal `sha256sum`, 2 objects (4 files) from 3 writes; a fourth
-    write leaves inode and mtime unchanged to the nanosecond; a refused text file exits 2 and
-    leaves 4 files; `--no-persistence` exits 3 and stores nothing.
-  - **E3** `cargo test --test no_write_path`: 13 passed, `EXPECTED_BLESSED_LINES` 5. The seed
-    writes through `MemoryFs::mkdir`, not `std::fs`, so the guard has nothing new to bless.
-    **§6** `containment` 28, `sandbox` 18, `run_kaish_tool` 6, all pass. Negative controls,
-    each inside the heavy lock with a restore trap: mounting the project with `LocalFs::new`
-    fails 7 of 18 `sandbox` tests; removing the `seed_scratch_tmp` call fails 2 of 18
-    (`scratch_tmp_exists_in_memory_from_the_start`, `scratch_tmp_seed_fits_the_smallest_budget`).
-  - **Build.** `cargo tree -i` reports no match for `aws-lc-rs`, `aws-lc-sys`, `openssl-sys` and
-    `mimalloc` (control: `ring` matches). `cargo zigbuild --release --target
-    x86_64-unknown-linux-musl` (zig 0.17.0 from a venv, cargo-zigbuild 0.22.3): `statically
-    linked`, `not a dynamic executable`, `--version` runs; control: the debug binary is
-    `dynamically linked` and `ldd` lists libraries. A spot check through the musl binary
-    matches A/B/C and the `/tmp` seed.
-  - **Drifts, none a hole.** (1) `kill` changed its message. (2) `cd / && ls` names `home` only
-    when the root is under `/home`. (3) `PIPESTATUS` appears after any command, not only a
-    pipeline. (4) The §0 link to the model-driven section points at §4, and §7's cast names
-    `openai`/`glm`/`qwen` are not built-ins (`openai-local`, alias `local`). Not boundary:
-    E1's refusal says "This usually means kaibo ran with no --root/--allow-path" when
-    `--root` and `--state-db` were both given.
-  - Not run: §7 (no models this run), and F3 (`save_artifact`, model-driven).
+- **2026-11-11** — **A–G live, H4 via F2, E3 and the §6 suites; H1–H3, H5, musl and §7 not
+  run**, branch `kaish-0.19` (from main `4c4a1bb`), `kaish-kernel` 0.18.1 → 0.19.0. Run through
+  `kaibo kaish` and the server launch against a scratch project under `/tmp` (`Cargo.toml`,
+  `src/`, the three G links). **All clear: no write, read, or environment leak.** The composed
+  `Recipe::tool_description()` contract is byte-identical across the two pins (2793 bytes).
+  - **A** 19 writes (the 11 plus in-mount `ln -s`, `dd of=`, `write`, `mktemp -p`, `tee -a`,
+    `rm -r`, `find -delete`, and `edit` on a real `--hashline` anchor), all refused with the
+    0.18.1 messages; host `sha256sum` of every file identical. `ls -A` now works, so the
+    leftovers check uses it: `leftovers=1`, and a host-planted `.zz.tmp` gives `leftovers=0`
+    while plain `ls` misses it.
+  - **B** nine host commands plus `env FOO=bar curl`, all 127; `kill 1` exit 1.
+  - **C** `/etc/passwd`, `..`×3, `../../.ssh/id_rsa`, `.anthropic-key.txt`, `.openai-key.txt`,
+    `find /etc`, and `ls -l /etc/hostname` all `not found`; `stat` and `realpath` on a real and
+    a never-created `/etc` file refuse alike. The root's parent lists 1 entry (host: 6). Key
+    variables, `$HOME`, `$PATH`, `$TZ` and `$USER` empty; `kaish-vars` shows `OLDPWD` only after `cd`.
+  - **D** `/etc`, the root's parent, and `Cargo.toml` refused exit 3; `..`×4 dies at
+    canonicalization; `src` resolves.
+  - **E1/F1** refused before touching disk, nothing created. **E2/F2/H4** the state db and the
+    CAS (10 objects on the host), its parent, and a `find` into it are all `not found`.
+  - **G** G1 names the target in `readlink`, GNU-columned `ls -l` (`o-exists -> /etc/hostname`)
+    and `stat` (`File: o-exists -> /etc/hostname`); G2's eight following verbs refuse `path
+    escapes root`; G3's three `cat` refusals are 1 distinct line, and `ls -l` plus `stat`
+    differ only in the link's own size, which is its target string's length (now in G3).
+  - **E3 / §6** in the full `cargo test --locked`: all pass. New: part 4 of the ancestors
+    test pins `?` columns on synthesized directories; its teeth, adding `ls -l <root>` to
+    the probe list, fail it on the owner name.
+  - **Drifts, none a hole.** (1) `ls -l` and `stat` print GNU's columns, host owner names included (note in C). (2)
+    `ls -A` exists, and Battery A now uses it. (3) `OLDPWD` in `kaish-vars`. (4) A bare `]` in
+    a word names its fix (`foo\].mp4`, `"foo].mp4"`).
+
+- **2026-10-13** — Full A–H, E3, the §6 suites, `cargo tree -i` and musl, main `6c90bd1`,
+  `kaish-kernel` 0.18.1, the 0.6.0 pre-release pass for #221's empty `/tmp` seed in the `/`
+  scratch; §7 not run. All clear; the seed's behavior is now in Battery C, and its live
+  negative control is in git.
 
 - **2026-10-11** — A–D, E1–E2 and F–H live, kaibo `2444713`, `kaish-kernel` 0.18.0 → 0.18.1
   (#218). All clear. Fixed four false lines: Battery A's `ls -A | grep` examined nothing
-  (kaish `ls` has no `-A`), the `sed -i` message did not change, Battery H names six
+  (0.18 `ls` had no `-A`), the `sed -i` message did not change, Battery H names six
   containers, and `env` is empty in 0.18.1; found that `find -exec` refuses with exit 0.
   E3, the §6 suites, musl and `cargo tree` not run (the heavy lock was held).
 
