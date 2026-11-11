@@ -544,7 +544,7 @@ even for a one-line doc fix.
   reads that release's `.sha256` sidecars and pushes with your own `gh`/git auth, so
   there's no CI secret to rotate. Deliberately manual: releases are human-cut, so this
   is the ritual's last step, not a workflow job.
-- **kaish pin.** Currently `kaish-kernel = "0.18.1"` (from 0.18.0; the 0.14.1 to 0.17.1
+- **kaish pin.** Currently `kaish-kernel = "0.19.0"` (from 0.18.1; the 0.14.1 to 0.17.1
   jump's breaks are in that PR).
   **When you bump kaish, run the shell — a green build is not the check.** That bump's
   four behavioral changes all reached the model-facing surface and none broke
