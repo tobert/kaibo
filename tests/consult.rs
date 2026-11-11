@@ -1781,6 +1781,7 @@ async fn openrouter_reasoning_accounting_live() {
         ProviderKind::OpenRouter,
         params,
         kaibo::config::DataCollection::Deny,
+        false,
     )
     .expect("openrouter always sends params");
     let resp = openrouter_probe_completion(&key, model, &params).await;
@@ -2240,6 +2241,13 @@ async fn openai_probe(key: &str, model: &str, effort: &str) -> (u16, Value) {
     (status, resp.json().await.expect("openai response json"))
 }
 
+/// The reasoning tokens a Responses reply billed, `0` when the field is absent.
+fn reasoning_tokens(json: &Value) -> u64 {
+    json["usage"]["output_tokens_details"]["reasoning_tokens"]
+        .as_u64()
+        .unwrap_or(0)
+}
+
 /// The OpenAI ceiling is a **model** property, not a family property — and the *floor*
 /// moves too. Observed 2026-08-01 against `/v1/responses`:
 ///
@@ -2249,6 +2257,14 @@ async fn openai_probe(key: &str, model: &str, effort: &str) -> (u16, Value) {
 /// | gpt-5.2   | `max`            | none, low, medium, high, xhigh            |
 /// | gpt-5.1   | `xhigh`, `max`   | none, low, medium, high                   |
 /// | gpt-5     | `xhigh`, `max`   | minimal, low, medium, high  (no `none`!)  |
+///
+/// The GPT 6 line, observed 2026-11-10 and matching OpenAI's model pages. No GPT 6 id
+/// takes `minimal`, and two cannot switch reasoning off:
+///
+/// | model                                | rejects           | supported values                   |
+/// |--------------------------------------|-------------------|------------------------------------|
+/// | gpt-6-sol, gpt-6-luna, gpt-6.1-terra | `minimal`         | none, low, medium, high, xhigh, max |
+/// | gpt-6-astra, gpt-6.1-sol             | `none`, `minimal` | low, medium, high, xhigh, max      |
 ///
 /// This is the measurement behind kaibo keeping **no** effort allowlist: any table we
 /// baked in would be wrong within a release, and it would be wrong per model id rather
@@ -2302,6 +2318,64 @@ async fn openai_effort_ceiling_is_per_model_live() {
             assert!(
                 msg.contains("not supported with the") && msg.contains(model),
                 "expected a model-capability refusal naming {model}, got: {msg}"
+            );
+        }
+    }
+
+    // GPT 6: every id reaches `max`, none takes `minimal`, and the floor splits on whether
+    // the model can switch reasoning off. A refused `none` is why kaibo passes it through
+    // instead of guessing: OpenAI's own refusal names the rungs the model takes.
+    for model in [
+        "gpt-6-sol",
+        "gpt-6-luna",
+        "gpt-6.1-terra",
+        "gpt-6-astra",
+        "gpt-6.1-sol",
+    ] {
+        for effort in ["low", "medium", "high", "xhigh", "max"] {
+            let (status, json) = openai_probe(&key, model, effort).await;
+            assert_eq!(status, 200, "{model} should accept effort={effort}: {json}");
+            assert_eq!(
+                json["reasoning"]["effort"].as_str(),
+                Some(effort),
+                "{model} should echo the requested effort back: {json}"
+            );
+            // Accepted is not honored: the top rungs must actually reason.
+            if matches!(effort, "xhigh" | "max") {
+                assert!(
+                    reasoning_tokens(&json) > 0,
+                    "{model} at effort={effort} must actually bill reasoning tokens: {}",
+                    json["usage"]
+                );
+            }
+        }
+        let can_disable = !matches!(model, "gpt-6-astra" | "gpt-6.1-sol");
+        let refused: &[&str] = if can_disable {
+            &["minimal"]
+        } else {
+            &["none", "minimal"]
+        };
+        for effort in refused {
+            let (status, json) = openai_probe(&key, model, effort).await;
+            assert_eq!(
+                status, 400,
+                "{model} is expected to refuse effort={effort}: {json}"
+            );
+            let msg = json["error"]["message"].as_str().unwrap_or_default();
+            assert!(
+                msg.contains("not supported with the") && msg.contains(model),
+                "expected a model-capability refusal naming {model}, got: {msg}"
+            );
+        }
+        if can_disable {
+            let (status, json) = openai_probe(&key, model, "none").await;
+            assert_eq!(status, 200, "{model} should accept effort=none: {json}");
+            // Accepting `none` is not switching reasoning off; check the bill.
+            assert_eq!(
+                reasoning_tokens(&json),
+                0,
+                "{model} at effort=none must bill no reasoning tokens: {}",
+                json["usage"]
             );
         }
     }

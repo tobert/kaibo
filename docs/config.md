@@ -40,7 +40,7 @@ Connection settings only. Models are never declared here.
 | `api_key_file` | path | unset — declared by you | file source, checked second (mutually exclusive with `api_key_cmd`) |
 | `api_key_cmd` | argv array | unset — declared by you | command source: stdout, trimmed, is the key (no shell, 30s ceiling, stdin closed) |
 | `key_optional` | bool | `true` for `openai`, else `false` | allows a placeholder token |
-| `data_collection` | `deny` \| `allow` | `deny` | `kind = "openrouter"` only; load error elsewhere |
+| `data_collection` | `deny` \| `allow` | `deny` | `kind = "openrouter"` or `"openai"` only; load error elsewhere |
 | `prompt_cache` | `short` \| `long` \| `off` | `short` | `kind = "anthropic"` or `"openrouter"` only; load error elsewhere |
 | `request_timeout_secs` | integer > 0 | `[defaults]` value (900) | per-single-completion ceiling |
 
@@ -144,12 +144,30 @@ OpenRouter is a keyed gateway rather than a wire protocol of its own. One
   kaibo strips `:batch` automatically before sending the batch request. Cancelling an
   in-progress OpenRouter batch is unsupported upstream (`job_cancel` refuses and keeps the
   handle so `job_get` can collect it once terminal).
-- **`data_collection` defaults to `deny`.** One slug routes across competing upstream
-  hosts whose data policies differ, and kaibo's prompts carry your source, so
-  no-collection routing is pinned on every request. A model whose only hosts collect
-  (most `:free` variants) fails loudly instead of leaking quietly. `data_collection =
-  "allow"` is the explicit opt-in: kaibo then emits no restriction and your OpenRouter
-  account settings govern. `kaibo://config` renders the active policy per backend.
+- **`data_collection` defaults to `deny`**, which pins no-collection routing on every
+  request. See [`data_collection`](#data_collection).
+
+#### `data_collection`
+
+The data policy every interactive request on an `openrouter` or `openai` backend
+carries. kaibo's prompts carry your source, so the default is `deny`.
+
+- **`openrouter`**: `deny` pins no-collection routing on every request. One slug routes
+  across competing upstream hosts whose data policies differ, and a model whose only
+  hosts collect (most `:free` variants) fails loudly instead of leaking quietly.
+- **`openai` on the Responses wire**: `deny` sends `store: false` on every request.
+  OpenAI's Responses API otherwise keeps each response object, retrievable through the
+  API and shown in your dashboard logs. The tool loop still keeps its reasoning between
+  turns: kaibo asks for it as `reasoning.encrypted_content` and sends it back.
+- **`openai` on the chat wire**: nothing is sent. Chat Completions stores nothing by
+  default.
+- `allow`: kaibo sends no policy field and your account settings govern. On OpenAI that
+  means responses are stored.
+
+The batch lane sends no `store` field: OpenAI keeps batch input and output files in its
+Files API either way. `store: false` does not cover OpenAI's safety scanning of image
+and file inputs. `kaibo://config` renders the active policy for each backend where it
+sends a field.
 
 #### `prompt_cache`
 

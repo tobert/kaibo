@@ -1386,6 +1386,51 @@ async fn mount_layer_ancestors_synthesize_the_mount_path_and_nothing_else() {
         );
     }
 
+    // --- 4: a synthesized ancestor carries no host metadata --------------------
+    // kaish 0.19 prints GNU's `ls -l` and `stat`, so a file on the mount shows its mode,
+    // link count, owner, group, and mtime, with the names looked up in the host's
+    // account database. That is in-tree metadata, which kaibo accepts. A synthesized
+    // directory has no host inode behind it, so every one of those fields must print
+    // `?`. If one printed a real value, the chain would be reading the host directory,
+    // and its owner and mtime would be facts from outside the mount.
+    //
+    // The positive control comes first: the owner column of an in-tree file is real, so
+    // the assertion below is looking for something the shell does print.
+    let in_tree = try_run(&handler, &root, "ls -l inside.txt")
+        .await
+        .expect("a long listing inside the mount succeeds");
+    let owner = in_tree
+        .lines()
+        .find(|l| l.ends_with("inside.txt"))
+        .and_then(|l| l.split_whitespace().nth(2))
+        .filter(|o| *o != "?")
+        .unwrap_or_else(|| panic!("an in-tree file names its owner in `ls -l`, got: {in_tree}"))
+        .to_string();
+    for (script, operand) in [
+        (format!("ls -l {mid_abs}"), &mid_abs),
+        (format!("ls -ld {mid_abs}"), &mid_abs),
+        (format!("stat {mid_abs}"), &mid_abs),
+        (format!("stat {outer_abs}"), &outer_abs),
+    ] {
+        let text = text_of(try_run(&handler, &root, &script).await);
+        // The operand is a path the script supplied, and a temp dir under the home
+        // directory would name the owner in it, so it is removed before the check.
+        let shown = text.replace(operand.as_str(), "<PATH>");
+        let fields: Vec<&str> = shown
+            .split(|c: char| c.is_whitespace() || "()/".contains(c))
+            .collect();
+        assert!(
+            !fields.contains(&owner.as_str()),
+            "HOST LEAK: `{script}` printed the owner {owner:?} for a synthesized \
+             directory, so the chain read a host inode. Escalate before shipping. \
+             Got: {text}"
+        );
+        assert!(
+            text.contains('?'),
+            "a synthesized directory prints `?` for the fields it does not track, got: {text}"
+        );
+    }
+
     // The positive control: without it, a run where every probe came back empty
     // because the shell was broken would pass every assertion above.
     let inside = try_run(&handler, &root, "cat inside.txt")
