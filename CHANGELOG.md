@@ -16,6 +16,7 @@ record. Each later release appends a new section at the top.
 ## [Unreleased]
 
 ### Security
+- `rmcp` 3.9.0 fixes RUSTSEC-2026-0457, -0461, and -0462; none reaches the transports kaibo builds today.
 - `tokio` 1.54.1 fixes RUSTSEC-2026-0386 (`AsyncFd` constructors accepted any file descriptor); kaibo calls no `AsyncFd` itself.
 - A launch directory that holds `$HOME` (home, an ancestor, or `/`) is no longer inferred as scope, so a path-less call fails until `--root` names a workspace such as `~/src`.
 - Naming a tree that holds `$HOME` with `--root` or `--allow-path` logs a startup warning.
