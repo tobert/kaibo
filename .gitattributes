@@ -1,0 +1,4 @@
+# Shell scripts keep LF on every checkout. Windows runners set core.autocrlf, and
+# bash cannot run a script with CRLF line endings (release.yml runs
+# scripts/check-tag-version.sh on the Windows leg).
+*.sh text eol=lf

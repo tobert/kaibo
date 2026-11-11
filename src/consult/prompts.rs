@@ -956,7 +956,7 @@ pub fn consult_solo_preamble() -> String {
         "You are the synthesis agent.",
         "\n\n\
          You do every read yourself with `run_kaish`. Search for where things live \
-         with `grep -rn PATTERN .`, then read the files the question touches.",
+         with `grep -rn PATTERN`, then read the files the question touches.",
     )
 }
 

@@ -16,9 +16,11 @@ record. Each later release appends a new section at the top.
 ## [Unreleased]
 
 ### Security
+- `rmcp` 3.9.0 fixes RUSTSEC-2026-0457, -0461, and -0462; none reaches the transports kaibo builds today.
 - `tokio` 1.54.1 fixes RUSTSEC-2026-0386 (`AsyncFd` constructors accepted any file descriptor); kaibo calls no `AsyncFd` itself.
 - A launch directory that holds `$HOME` (home, an ancestor, or `/`) is no longer inferred as scope, so a path-less call fails until `--root` names a workspace such as `~/src`.
 - Naming a tree that holds `$HOME` with `--root` or `--allow-path` logs a startup warning.
+- `openai` backends on the Responses wire send `store: false` by default, so OpenAI does not keep the response objects; `data_collection = "allow"` opts back in.
 
 ### Added
 - `research` (and `kaibo research`) searches the web and returns a URL-cited report with kaibo's own list of sources.
@@ -33,6 +35,7 @@ record. Each later release appends a new section at the top.
 - `prompt_cache = "short" | "long" | "off"` on an `anthropic` or `openrouter` backend sets the cache retention; `short` is the default.
 
 ### Changed
+- Moves to kaish 0.19.0: `ls -l`, `stat`, and `date` in the model's shell print GNU's formats, `ls -A` lists hidden files, and `%` is a word character (`printf %s`).
 - The `configure` prompt recommends a workspace root such as `~/src` and asks for the user's clear yes before scoping to `~`, `$HOME`, or `/`.
 - The built-in `anthropic` cast sets `consult = "solo"`: the Sonnet reads the code itself, and the Haiku explorer serves `explore` only.
 - The built-in `gemini` cast's synth is `gemini/gemini-pro-latest` (explorer stays `gemini/gemini-flash-latest`).
@@ -44,6 +47,7 @@ record. Each later release appends a new section at the top.
 - OpenRouter prompt caching is sent as a request-level `cache_control` marker.
 
 ### Fixed
+- Release pages say the container package page's install box offers a `sha256-*` signature tag; pull a version tag instead.
 - `batch_submit` and `deliberate` on a `gemini` batch slot refuse invalid `effort` rungs (`max`, `xhigh`, `none`) at slot resolution instead of failing mid-batch.
 
 ## [0.6.1] — 2026-10-31

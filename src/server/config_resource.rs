@@ -348,10 +348,11 @@ pub(crate) fn render_config_resource(
         /// True when a missing key falls back to a placeholder (keyless endpoint).
         key_optional: bool,
         request_timeout_secs: u64,
-        /// OpenRouter only: the upstream-host data policy this backend requests
-        /// (`"deny"` routes only to no-collection hosts — the default; `"allow"`
-        /// is the explicit opt-in). Rendered so the privacy posture is visible,
-        /// absent on every other kind.
+        /// The data policy this backend requests: `"deny"`, the default, routes
+        /// OpenRouter only to no-collection hosts and sends `store: false` on OpenAI's
+        /// Responses wire; `"allow"` is the explicit opt-in. Rendered so the privacy
+        /// posture is visible, and only where it sends a field: OpenRouter, and an
+        /// openai backend on the Responses wire.
         #[serde(skip_serializing_if = "Option::is_none")]
         data_collection: Option<&'static str>,
         /// Anthropic and OpenRouter only: the prompt-cache retention every interactive
@@ -460,12 +461,17 @@ pub(crate) fn render_config_resource(
                 api_key_cmd: api_key_cmd.clone(),
                 key_optional: *key_optional,
                 request_timeout_secs: request_timeout.as_secs(),
-                data_collection: (*kind == crate::credentials::ProviderKind::OpenRouter).then_some(
-                    match data_collection {
-                        crate::config::DataCollection::Deny => "deny",
-                        crate::config::DataCollection::Allow => "allow",
-                    },
-                ),
+                // Rendered only where the policy puts a field on the wire: OpenRouter,
+                // and an openai backend on the Responses wire. A chat-wire openai
+                // backend (a local server, say) sends nothing for it, and showing
+                // `deny` there would read as a pin kaibo does not send.
+                data_collection: (*kind == crate::credentials::ProviderKind::OpenRouter
+                    || (*kind == crate::credentials::ProviderKind::Openai
+                        && b.uses_responses_wire()))
+                .then_some(match data_collection {
+                    crate::config::DataCollection::Deny => "deny",
+                    crate::config::DataCollection::Allow => "allow",
+                }),
                 prompt_cache: matches!(
                     kind,
                     crate::credentials::ProviderKind::Anthropic
@@ -1499,6 +1505,29 @@ mod tests {
             wire("onprem").as_deref(),
             Some("chat"),
             "unset wire on a local server resolves to chat"
+        );
+        // The data policy renders where it sends a field, and only there.
+        let policy = |name: &str| -> Option<String> {
+            doc.get("backends")
+                .and_then(|b| b.get(name))
+                .and_then(|b| b.get("data_collection"))
+                .and_then(|w| w.as_str())
+                .map(str::to_string)
+        };
+        assert_eq!(
+            policy("gpt").as_deref(),
+            Some("deny"),
+            "Responses wire shows deny"
+        );
+        assert_eq!(
+            policy("gateway").as_deref(),
+            Some("deny"),
+            "so does a Responses gateway"
+        );
+        assert_eq!(
+            policy("onprem"),
+            None,
+            "a chat-wire backend sends nothing for the policy, so none is shown"
         );
         assert_eq!(
             wire("anthropic"),

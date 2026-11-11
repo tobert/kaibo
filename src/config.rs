@@ -637,20 +637,23 @@ pub fn parse_slot_ref(s: &str) -> Result<(String, String)> {
 
 // --- Backends ---------------------------------------------------------------
 
-/// OpenRouter upstream-host data policy: whether requests may route to hosts
-/// that retain or train on prompts. kaibo ships source code in its prompts, so
-/// the default is [`DataCollection::Deny`] — OpenRouter then routes only to
-/// hosts whose policy is no-collection, and a model with no compliant host
-/// fails loudly instead of leaking quietly. `Allow` is the explicit opt-in:
-/// kaibo omits the restriction and the caller's OpenRouter account settings
-/// govern. Config: `data_collection = "deny" | "allow"` on an openrouter-kind
-/// backend (anywhere else is a load error).
+/// A backend's data policy: whether the provider may retain prompts. kaibo ships
+/// source code in its prompts, so the default is [`DataCollection::Deny`]. On
+/// OpenRouter, deny routes only to hosts whose policy is no-collection, and a model
+/// with no compliant host fails loudly instead of leaking quietly. On the openai
+/// kind's Responses wire, deny sends `store: false` so OpenAI keeps no response
+/// (see [`crate::consult::inject_provider_prefs`]). `Allow` is the explicit opt-in:
+/// kaibo omits the field and the caller's account settings govern. Config:
+/// `data_collection = "deny" | "allow"` on an openrouter- or openai-kind backend
+/// (anywhere else is a load error).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum DataCollection {
-    /// Route only to upstream hosts that don't retain/train on prompts (default).
+    /// Keep prompts out of provider retention (default): no-collection routing on
+    /// OpenRouter, `store: false` on OpenAI's Responses wire.
     #[default]
     Deny,
-    /// No routing restriction — the account's own OpenRouter settings apply.
+    /// Send no policy field: OpenRouter's account routing settings apply, and OpenAI
+    /// stores responses as it does by default.
     Allow,
 }
 
@@ -661,8 +664,10 @@ impl std::str::FromStr for DataCollection {
             "deny" => Ok(Self::Deny),
             "allow" => Ok(Self::Allow),
             other => bail!(
-                "data_collection {other:?} is not a policy — use \"deny\" (route only \
-                 to no-collection hosts, the default) or \"allow\" (explicit opt-in)"
+                "data_collection {other:?} is not a policy. Use \"deny\", the default \
+                 (OpenRouter routes only to no-collection hosts; OpenAI's Responses \
+                 wire gets `store: false`), or \"allow\", the explicit opt-in that \
+                 sends neither"
             ),
         }
     }
@@ -783,9 +788,9 @@ pub struct Backend {
     /// the 2026-06-06 stall regression-guarded in `tests/llm_timeout.rs`. Seeded from
     /// [`Defaults::request_timeout`], overridable per backend.
     pub request_timeout: Duration,
-    /// OpenRouter only: upstream-host data policy (see [`DataCollection`]).
-    /// Deny by default on every kind; only an openrouter-kind backend may set it,
-    /// and only the openrouter arm reads it.
+    /// The data policy (see [`DataCollection`]). Deny by default on every kind; only
+    /// openrouter- and openai-kind backends may set it, and only the OpenRouter arm
+    /// and an openai arm on the Responses wire read it.
     pub data_collection: DataCollection,
     /// Anthropic and OpenRouter only: the prompt-cache retention every interactive
     /// request asks for (see [`PromptCache`]). `Short` by default; only those two
@@ -3192,16 +3197,22 @@ impl RawBackend {
             b.request_timeout = Duration::from_secs(v);
         }
         if let Some(v) = &self.data_collection {
-            // The policy only exists on the OpenRouter wire; naming it anywhere
-            // else is a config mistake worth a loud error, not a silent no-op the
-            // user believes is protecting them.
-            if b.kind != ProviderKind::OpenRouter {
+            // The policy exists on two kinds: OpenRouter (host routing) and openai
+            // (`store` on the Responses wire; Chat Completions stores nothing by
+            // default, so deny holds there too). Naming it anywhere else is a config
+            // mistake worth a loud error, not a silent no-op the user believes is
+            // protecting them. Within the openai kind it is not refused on a chat-wire
+            // or batch-only backend: one backend can staff both lanes, so the honest
+            // signal is `kaibo://config` rendering the policy only where it sends a
+            // field.
+            if !matches!(b.kind, ProviderKind::OpenRouter | ProviderKind::Openai) {
                 bail!(
                     "backend {:?} (kind {:?}) sets data_collection, but only the \
-                     `openrouter` kind routes across upstream hosts with differing \
-                     data policies",
+                     `openrouter` and `openai` kinds read it. Remove `data_collection` \
+                     from [backends.{}]",
                     b.name,
-                    b.kind
+                    b.kind,
+                    b.name
                 );
             }
             b.data_collection = v
@@ -4911,11 +4922,11 @@ mod tests {
         assert!(msg.contains("deny") && msg.contains("allow"), "got: {msg}");
     }
 
-    /// The policy only exists on the OpenRouter wire; setting it elsewhere is a
+    /// The policy exists on the openrouter and openai kinds; setting it elsewhere is a
     /// config mistake refused at load — not a silent no-op the user believes is
-    /// protecting them.
+    /// protecting them. A hosted openai backend denies by default and parses `allow`.
     #[test]
-    fn data_collection_is_openrouter_only() {
+    fn data_collection_is_openrouter_and_openai_only() {
         let err = Config::from_toml_str(
             r#"
             [backends.anthropic]
@@ -4925,8 +4936,35 @@ mod tests {
         .unwrap_err();
         let msg = format!("{err:#}");
         assert!(
-            msg.contains("data_collection") && msg.contains("openrouter"),
-            "got: {msg}"
+            msg.contains("data_collection")
+                && msg.contains("openrouter")
+                && msg.contains("openai")
+                && msg.contains("[backends.anthropic]"),
+            "the refusal names the kinds that read it and the table to fix: {msg}"
+        );
+
+        let cfg = Config::from_toml_str(
+            r#"
+            [backends.gpt]
+            kind = "openai"
+            base_url = "https://api.openai.com/v1"
+
+            [backends.gpt-allow]
+            kind = "openai"
+            base_url = "https://api.openai.com/v1"
+            data_collection = "allow"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(
+            cfg.resolve_backend("gpt").unwrap().data_collection,
+            DataCollection::Deny,
+            "a hosted openai backend denies retention out of the box"
+        );
+        assert_eq!(
+            cfg.resolve_backend("gpt-allow").unwrap().data_collection,
+            DataCollection::Allow,
+            "the explicit opt-in parses on the openai kind"
         );
     }
 

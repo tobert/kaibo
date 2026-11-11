@@ -138,6 +138,7 @@ base_url = "https://api.openai.com/v1"
 api_key_env = "OPENAI_API_KEY"
 key_optional = false
 aliases = ["oai"]
+# data_collection = "deny"          # default; sends store = false on Responses
 
 [backends.llama]
 kind = "openai"

@@ -115,7 +115,13 @@ the digest, then apply the version tags as the job's final act (`buildx imagetoo
 create` — a tag-only copy of the signed manifest list), so the newest published
 version — the one the install box shows — is always pullable; the metadata `sha` tag
 is also disabled on tag runs (dispatch-only), keeping a release's tag set to versions
-only. Validated by the next tag. **Next: PR 5 (channels, gated on demand), and the real v0.2.0 —
+only. Validated by the next tag. *Correction, 2026-11-09:* the publish order does not
+fix the install box, which still offers the signature tag. ghcr dates a package version
+by its digest's first push, `imagetools create` adds tags without creating a version,
+and the signature is pushed after the image, so it is always the newest version
+(v0.6.1: signature 14:58:36Z, index 14:58:28Z; otel-cli v0.6.0 shows the same). We keep
+cosign on the image, keep the order (a version tag never names an unsigned image), and
+say it in the release-body note instead. **Next: PR 5 (channels, gated on demand), and the real v0.2.0 —
 born signed.**
 
 This doc is the *pipeline* side only. The operator-side checklist for actually cutting
