@@ -146,6 +146,10 @@ pub fn topics() -> Vec<(&'static str, &'static str)> {
 /// `## Casts` roster, in that order. The roster goes last because it is the only
 /// section whose size the operator controls, so a truncating host (Claude Code's
 /// 2048-char cap) cuts it rather than Scope.
+/// The lead's web sentence, added only when `research` is live.
+const RESEARCH_CLAUSE: &str = "`research` searches the web, citing URLs; `web: true` adds \
+     the web to `consult`/`deliberate`.";
+
 fn kaibo_lead() -> &'static str {
     "kaibo — codebase review and second opinions from another model family. \
      Hosted casts send questions, context, and source to configured providers; \
@@ -154,8 +158,8 @@ fn kaibo_lead() -> &'static str {
      Say what you did or want to know; no pasted files or diffs needed. \
      `explore` returns a cited survey report. `oneshot` answers from supplied context \
      with no codebase access. `run_kaish` drives the read-only shell directly. \
-     `deliberate` reasons offline over a dossier. `consult_submit` and `batch_submit` \
-     return handles; `job_wait`/`job_get`/`job_list`/`job_cancel` manage them."
+     `deliberate` reasons offline over a dossier. \
+     `consult_submit` and `batch_submit` return handles for `job_wait`/`job_get`."
 }
 
 /// The setup-guidance block prepended to the instructions when the default cast has
@@ -405,6 +409,7 @@ pub fn kaibo_instructions_with_scope(
     default_root_inferred: bool,
     usability: CastUsability,
     usable_casts: &[(String, CastUsability)],
+    research_live: bool,
 ) -> String {
     // The unconfigured-install banner leads, so a fresh user sees it first.
     let setup = match usability {
@@ -414,7 +419,13 @@ pub fn kaibo_instructions_with_scope(
     // Lead, then Scope, then the live cast roster. Scope is the containment posture
     // every handshake must carry and its size is fixed by kaibo; the roster's size is
     // the operator's, so it goes last, where a truncating host cuts it and not Scope.
-    let lead = kaibo_lead();
+    // The web clause rides only when `research` is advertised, so the resident pitch
+    // never names a tool the router dropped (the same rule `worktree_note` follows).
+    let lead = if research_live {
+        format!("{} {RESEARCH_CLAUSE}", kaibo_lead())
+    } else {
+        kaibo_lead().to_string()
+    };
     let casts = casts_section(config, usable_casts);
 
     // Scope section: always accurate, never ambiguous. Report the *effective* default
@@ -956,6 +967,7 @@ mod tests {
             false,
             CastUsability::Unconfigured,
             &[],
+            true,
         );
         assert!(
             text.contains("Setup needed"),
@@ -986,6 +998,27 @@ mod tests {
         );
     }
 
+    /// The web sentence rides only when `research` is advertised: a resident pitch that
+    /// names a dropped tool sends a model looking for it.
+    #[test]
+    fn instructions_name_research_only_when_it_is_live() {
+        let config = Config::builtin();
+        let render = |live| {
+            kaibo_instructions_with_scope(
+                &config,
+                &[PathBuf::from("/tmp")],
+                None,
+                false,
+                CastUsability::Ready,
+                &[],
+                live,
+            )
+        };
+        assert!(render(true).contains(RESEARCH_CLAUSE));
+        assert!(!render(false).contains("`research`"));
+        assert!(!render(false).contains("web: true"));
+    }
+
     /// A configured install (Ready) — and an unprobed-local one (LocalUnverified) —
     /// get the normal instructions, no setup banner nagging them.
     #[test]
@@ -999,6 +1032,7 @@ mod tests {
                 false,
                 usability,
                 &[],
+                true,
             );
             assert!(
                 !text.contains("Setup needed"),
@@ -1027,6 +1061,7 @@ mod tests {
             false,
             CastUsability::Ready,
             &usable,
+            true,
         );
         assert!(
             text.contains("## Casts"),
@@ -1078,6 +1113,7 @@ mod tests {
             false,
             CastUsability::Ready,
             &usable,
+            true,
         );
         // The interactive cast names its synth (Claude Sonnet, the built-in anthropic synth).
         assert!(
@@ -1124,6 +1160,7 @@ mod tests {
             false,
             CastUsability::Ready,
             &usable,
+            true,
         );
         assert!(
             text.contains("anthropic"),
@@ -1155,6 +1192,7 @@ mod tests {
             false,
             CastUsability::Ready,
             &usable,
+            true,
         );
         let line = text
             .lines()
@@ -1182,6 +1220,7 @@ mod tests {
             false,
             CastUsability::Ready,
             &usable,
+            true,
         );
         let line = text
             .lines()
@@ -1229,6 +1268,7 @@ mod tests {
             false,
             CastUsability::LocalUnverified,
             &usable,
+            true,
         );
         assert!(
             text.contains(
@@ -1248,6 +1288,7 @@ mod tests {
             false,
             CastUsability::Unconfigured,
             &usable,
+            true,
         );
         let roster: Vec<&str> = text
             .lines()
@@ -1291,6 +1332,7 @@ mod tests {
             false,
             CastUsability::LocalUnverified,
             &usable,
+            true,
         );
         let expected = format!("- +{} more: `kaibo://config`", 12 - ROSTER_MAX_LINES);
         assert!(
@@ -1331,6 +1373,7 @@ mod tests {
             false,
             CastUsability::Ready,
             &usable,
+            true,
         );
         assert!(
             text.contains("- `flux` (`generate` only) → bfl/flux-2-pro"),
@@ -1359,6 +1402,7 @@ mod tests {
             false,
             CastUsability::Ready,
             &usable,
+            true,
         );
         let casts_at = text.find("## Casts").expect("has a Casts section");
         let scope_at = text.find("## Scope").expect("has a Scope section");
@@ -1428,6 +1472,7 @@ mod tests {
                 true,
                 CastUsability::Ready,
                 &usable,
+                true,
             );
             let len = text.chars().count();
             assert!(
@@ -1470,6 +1515,7 @@ mod tests {
                 true,
                 CastUsability::Ready,
                 &usable,
+                true,
             );
             let head = &text[..text.find("## Casts").expect("has a roster")];
             let len = head.chars().count();
@@ -1501,6 +1547,7 @@ mod tests {
             false,
             CastUsability::Ready,
             &[],
+            true,
         );
         let trees: Vec<&str> = text.lines().filter(|l| l.starts_with("  - ")).collect();
         assert_eq!(trees.len(), ALLOWED_TREE_MAX_LINES + 1, "{text}");
@@ -1544,6 +1591,7 @@ mod tests {
             false,
             CastUsability::Ready,
             &usable,
+            true,
         );
         let roster: Vec<&str> = text
             .lines()
@@ -1584,6 +1632,7 @@ mod tests {
             true,
             CastUsability::Unconfigured,
             &[], // nothing usable yet — the setup banner owns this case
+            true,
         );
         let len = text.chars().count();
         assert!(
@@ -1622,7 +1671,10 @@ mod tests {
             "a `cd` lasts only until its script ends",
             "use absolute paths whenever possible",
         ] {
-            assert!(text.contains(needle), "addendum must say {needle:?}:\n{text}");
+            assert!(
+                text.contains(needle),
+                "addendum must say {needle:?}:\n{text}"
+            );
         }
         assert!(
             !text.contains("persistent cwd"),

@@ -106,6 +106,9 @@ pub(crate) fn render_config_resource(
         /// `[artifacts]`: whether this server allows the model team to save artifacts.
         /// Off by default; a call must also pass `save_artifacts`.
         artifacts: ArtifactsDoc,
+        /// `[web]`: the team's web search and fetch, and whether this server can serve it
+        /// now. `research` and `web: true` need `live = true`.
+        web: WebDoc,
         /// alias → canonical backend name. Aliases are valid slot-ref prefixes
         /// and per-call backend overrides, so callers must be able to discover
         /// them here — built-in and file-declared both.
@@ -129,6 +132,7 @@ pub(crate) fn render_config_resource(
         list_models: bool,
         generate: bool,
         decide: bool,
+        research: bool,
     }
 
     /// Runtime-computed scope state. `follow_worktrees` echoes the knob;
@@ -297,6 +301,21 @@ pub(crate) fn render_config_resource(
     #[derive(Serialize)]
     struct ArtifactsDoc {
         enabled: bool,
+    }
+
+    /// `[web]` as resolved, with the verdict. `research` is gated on live web access as
+    /// well as its flag and a cast, so a missing `research` appears in neither
+    /// `advertised_tools` nor `unstaffable_tools`; `live` and `why_not` are where it is
+    /// explained.
+    #[derive(Serialize)]
+    struct WebDoc {
+        enabled: bool,
+        backend: String,
+        max_searches: usize,
+        max_fetches: usize,
+        live: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        why_not: Option<String>,
     }
 
     #[derive(Serialize)]
@@ -625,6 +644,7 @@ pub(crate) fn render_config_resource(
         list_models,
         generate,
         decide,
+        research,
     } = &config.tools;
     let crate::sandbox::SandboxConfig {
         exec_timeout,
@@ -691,10 +711,14 @@ pub(crate) fn render_config_resource(
                 .iter()
                 .map(|p| p.display().to_string())
                 .collect(),
-            advertised_tools: super::live_tools(config, &usable)
-                .into_iter()
-                .map(str::to_string)
-                .collect(),
+            advertised_tools: super::live_tools(
+                config,
+                &usable,
+                config.web_usable(|k| std::env::var(k).ok()),
+            )
+            .into_iter()
+            .map(str::to_string)
+            .collect(),
             unstaffable_tools: unstaffable,
         },
         tools: ToolsDoc {
@@ -707,6 +731,7 @@ pub(crate) fn render_config_resource(
             list_models,
             generate,
             decide,
+            research,
         },
         sandbox: SandboxDoc {
             exec_timeout_secs: exec_timeout.as_secs(),
@@ -800,6 +825,28 @@ pub(crate) fn render_config_resource(
         },
         artifacts: ArtifactsDoc {
             enabled: config.artifacts.enabled,
+        },
+        web: {
+            let live = config.web_usable(|k| std::env::var(k).ok());
+            let why_not = (!live).then(|| {
+                if !config.web.enabled {
+                    "[web] enabled = false".to_string()
+                } else {
+                    format!(
+                        "the [web] backend `{}` has no API key; declare a key source on \
+                         [backends.{}] (`kaibo example-config` shows the shapes)",
+                        config.web.backend, config.web.backend
+                    )
+                }
+            });
+            WebDoc {
+                enabled: config.web.enabled,
+                backend: config.web.backend.clone(),
+                max_searches: config.web.max_searches,
+                max_fetches: config.web.max_fetches,
+                live,
+                why_not,
+            }
         },
         backend_aliases: config.backend_aliases().clone(),
         backends,

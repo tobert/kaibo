@@ -17,7 +17,7 @@ use kaibo::server::{KaiboHandler, ToolGating};
 /// the client's artifact-retrieval verb, live exactly while the media CAS is (see
 /// `read_cas_is_advertised_only_while_the_media_cas_is_on`), so every `--no-<tool>` case
 /// below keeps it.
-const ALL_TOOLS: [&str; 16] = [
+const ALL_TOOLS: [&str; 17] = [
     "batch_submit",
     "consult",
     "consult_submit",
@@ -32,6 +32,7 @@ const ALL_TOOLS: [&str; 16] = [
     "list_models",
     "oneshot",
     "read_cas",
+    "research",
     "run_kaish",
     "write_cas",
 ];
@@ -70,6 +71,15 @@ const FULLY_STAFFED: &str = r#"
     [backends.orx]
     kind = "openrouter"
     key_optional = true
+
+    # A keyless web backend, so `research` is live. Its own name, not the built-in
+    # `deepseek`, so no built-in cast becomes usable through it.
+    [backends.dsweb]
+    kind = "deepseek"
+    key_optional = true
+
+    [web]
+    backend = "dsweb"
 
     [casts.inter]
     explorer = "gem/lite"
@@ -173,7 +183,7 @@ fn each_flag_removes_exactly_its_own_tools() {
     // `job_get`/`job_cancel`/`job_list` belong to neither flag alone — gating one
     // capability leaves them because the other still needs them — so they appear in no
     // row's removed-set and are covered by the "every other tool remains" check below.
-    let cases: [(&[&str], ToolGating); 9] = [
+    let cases: [(&[&str], ToolGating); 10] = [
         (
             // `--no-consult` drops the blocking `consult` and the async `consult_submit`;
             // `job_get`/`job_cancel`/`job_list` stay (batch still uses them).
@@ -248,6 +258,15 @@ fn each_flag_removes_exactly_its_own_tools() {
             &["generate"],
             ToolGating {
                 generate: false,
+                ..Default::default()
+            },
+        ),
+        (
+            // `--no-research` drops only `research`. `web: true` on consult and
+            // deliberate is gated by `[web]`, not by this flag.
+            &["research"],
+            ToolGating {
+                research: false,
                 ..Default::default()
             },
         ),
@@ -359,6 +378,7 @@ fn all_disabled_is_detected() {
         list_models: false,
         generate: false,
         decide: false,
+        research: false,
     };
     assert!(none_on.all_disabled());
     // Any single tool on means it's a usable server, not the refused state.
@@ -525,4 +545,44 @@ fn a_dashscope_cast_staffs_generate() {
         tools.contains(&"generate".to_string()),
         "a dashscope image slot must staff `generate`; got {tools:?}"
     );
+}
+
+/// `research` follows live web access as well as its flag: `[web] enabled = false`, or a
+/// web backend with no key, drops it while every other tool stays.
+#[test]
+fn research_needs_live_web_access() {
+    let off = {
+        let toml = FULLY_STAFFED.replace(
+            "backend = \"dsweb\"",
+            "backend = \"dsweb\"\n    enabled = false",
+        );
+        assert_ne!(toml, FULLY_STAFFED, "the fixture edit applied");
+        let config = Config::from_toml_str(&toml).unwrap();
+        KaiboHandler::new_with_env(config, |_| None)
+            .unwrap()
+            .advertised_tools()
+    };
+    assert!(!off.contains(&"research".to_string()), "{off:?}");
+    let keyless_off = {
+        let toml = FULLY_STAFFED.replace(
+            "kind = \"deepseek\"\n    key_optional = true",
+            "kind = \"deepseek\"\n    api_key_file = \"/nonexistent-kaibo-test/dsweb\"",
+        );
+        assert_ne!(toml, FULLY_STAFFED, "the fixture edit applied");
+        let config = Config::from_toml_str(&toml).unwrap();
+        KaiboHandler::new_with_env(config, |_| None)
+            .unwrap()
+            .advertised_tools()
+    };
+    assert!(
+        !keyless_off.contains(&"research".to_string()),
+        "{keyless_off:?}"
+    );
+    for t in ALL_TOOLS.iter().filter(|t| **t != "research") {
+        assert!(off.contains(&t.to_string()), "{t} stays: {off:?}");
+        assert!(
+            keyless_off.contains(&t.to_string()),
+            "{t} stays: {keyless_off:?}"
+        );
+    }
 }

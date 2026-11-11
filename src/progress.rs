@@ -37,6 +37,10 @@ pub enum PhaseEvent {
     /// with the `attach` tool. The one beat that lets an operator actually observe
     /// the pattern the generous `max_attachments` default exists to watch for.
     Attached { path: String },
+    /// The model ran a web search. Each one is billed, so it is worth seeing.
+    WebSearched { query: String },
+    /// The model fetched a web page.
+    WebFetched { url: String },
     /// One model call finished — succeeded or failed — after `elapsed`. `agent` is the
     /// cast role that made it (`"synth"` / `"explorer"`), the axis a slow backend shows
     /// up on: the synth's calls carry the whole transcript and are the ones that stall.
@@ -83,6 +87,8 @@ impl PhaseEvent {
             }
             PhaseEvent::SweepFinished => "sweep complete".to_string(),
             PhaseEvent::Attached { path } => format!("attached {path} to the report"),
+            PhaseEvent::WebSearched { query } => format!("searching the web: {}", brief(query, 80)),
+            PhaseEvent::WebFetched { url } => format!("fetching {}", brief(url, 100)),
             PhaseEvent::ChatCompleted { agent, elapsed } => {
                 format!("{agent} chat: {}", secs(*elapsed))
             }

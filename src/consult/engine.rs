@@ -41,13 +41,15 @@ use crate::sweep_attach::{SweepAttach, SweepAttachSink, SweepConsumer, SweepCons
 use crate::tool_span::traced;
 use crate::view_image::ViewImage;
 
-use super::config::{ConsultConfig, ExploreConfig, PhaseContext};
+use super::config::{ConsultConfig, ExploreConfig, PhaseContext, ResearchConfig};
 #[cfg(test)]
 use super::prompts::PromptOverrides;
 use super::prompts::{
-    consult_user_prompt, deliberation_prompt, explorer_attach_directive, resolve_phase_preamble,
-    sweep_evidence_block, Phase, ReportReader,
+    closing_obligation, consult_user_prompt, consult_web_note, deliberation_prompt, explorer_attach_directive,
+    research_user_prompt, resolve_phase_preamble, sweep_evidence_block, web_directive, Phase,
+    ReportReader,
 };
+use crate::web::{WebFetch, WebSearch, WebSession};
 use super::shaping::{ModelCaps, ModelShape};
 
 // --- The Arm seam ------------------------------------------------------------
@@ -2124,6 +2126,49 @@ pub(crate) async fn run_completion(
 /// `None` (the top-level `explore` tool, v1) is byte-for-byte the old behavior —
 /// same preamble, same two-line toolset.
 #[allow(clippy::too_many_arguments)] // each arg is a distinct, named loop input
+/// `web_search` and `web_fetch` over the call's one [`WebSession`], traced like every
+/// other tool in a phase's toolset.
+fn web_tools(web: &Arc<WebSession>, progress: &Arc<dyn ProgressSink>) -> [DynamicTool; 2] {
+    [
+        traced(WebSearch::new(Arc::clone(web), progress.clone())),
+        traced(WebFetch::new(Arc::clone(web), progress.clone())),
+    ]
+}
+
+/// Run `research`: the explorer arm on the web, with `web_search` and `web_fetch` and
+/// no shell, returning its URL-cited report verbatim. No project is mounted, so no
+/// `root` and no kaish worker: this phase cannot read the operator's files at all. The
+/// caller's `context` rides the first user turn as starting evidence.
+pub(crate) async fn research_with(
+    question: &str,
+    context: Option<&str>,
+    arm: &Arm,
+    cfg: &ResearchConfig,
+) -> Result<(String, Usage)> {
+    let preamble = resolve_phase_preamble(
+        Phase::Research,
+        &cfg.phase.prompts,
+        cfg.phase.orientation.as_deref(),
+        cfg.phase.house_rules.as_deref(),
+    );
+    let progress = cfg.phase.progress.clone();
+    let web = Arc::clone(&cfg.web);
+    with_call_deadline(
+        cfg.phase.call_deadline,
+        "research",
+        arm.run(
+            &preamble,
+            Message::user(research_user_prompt(question, context)),
+            cfg.max_turns,
+            progress.clone(),
+            ModelRole::Explorer,
+            &|| Ok(web_tools(&web, &progress).into_iter().collect()),
+        ),
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)] // each arg is a distinct, named phase input
 pub(crate) async fn run_explore_phase(
     arm: &Arm,
     preamble: &str,
@@ -2133,18 +2178,25 @@ pub(crate) async fn run_explore_phase(
     max_turns: usize,
     progress: &Arc<dyn ProgressSink>,
     attach: Option<&Arc<SweepAttachSink>>,
+    web: Option<&Arc<WebSession>>,
 ) -> Result<(String, Usage)> {
-    let preamble_owned;
-    let preamble = match attach {
-        Some(sink) => {
-            preamble_owned = format!(
-                "{preamble}{}",
-                explorer_attach_directive(sink.max_attachments(), sink.consumer())
-            );
-            preamble_owned.as_str()
-        }
-        None => preamble,
-    };
+    let mut preamble = preamble.to_string();
+    if let Some(sink) = attach {
+        preamble.push_str(&explorer_attach_directive(
+            sink.max_attachments(),
+            sink.consumer(),
+        ));
+    }
+    if web.is_some() {
+        preamble.push_str(&web_directive("report"));
+    }
+    if attach.is_some() || web.is_some() {
+        // A directive spliced after the composed preamble moves the deliverable into the
+        // middle; restate it last, as `phase_preamble` does for its own splices.
+        preamble.push_str("\n\n");
+        preamble.push_str(closing_obligation(Phase::Explorer(ReportReader::SynthesisAgent)));
+    }
+    let preamble = preamble.as_str();
     arm.run(
         preamble,
         Message::user(question.to_string()),
@@ -2164,6 +2216,9 @@ pub(crate) async fn run_explore_phase(
                     Arc::clone(sink),
                     progress.clone(),
                 )));
+            }
+            if let Some(web) = web {
+                tools.extend(web_tools(web, progress));
             }
             Ok(tools)
         },
@@ -2219,6 +2274,9 @@ pub struct RunExplore {
     /// `attach` doesn't re-route what's already in front of the driver. Empty for
     /// `deliberate` (see `SweepAttachSink`'s doc).
     already_delivered: Arc<HashSet<PathBuf>>,
+    /// The call's web session when the caller asked for the web; every sweep shares it,
+    /// so the call has one budget however many sweeps the driver delegates.
+    web: Option<Arc<WebSession>>,
 }
 
 impl RunExplore {
@@ -2235,6 +2293,7 @@ impl RunExplore {
         consumer: SweepConsumer,
         max_attachments: usize,
         already_delivered: Arc<HashSet<PathBuf>>,
+        web: Option<Arc<WebSession>>,
     ) -> Self {
         Self {
             arm,
@@ -2248,6 +2307,7 @@ impl RunExplore {
             consumer,
             max_attachments,
             already_delivered,
+            web,
         }
     }
 }
@@ -2348,6 +2408,7 @@ impl Tool for RunExplore {
             self.max_turns,
             &self.progress,
             sink.as_ref(),
+            self.web.as_ref(),
         )
         .await;
         self.progress.emit(PhaseEvent::SweepFinished);
@@ -2565,8 +2626,20 @@ fn consult_tools(
             consumer,
             cfg.explore.max_attachments,
             Arc::new(already_delivered),
+            cfg.explore.web.clone(),
         );
         tools.push(traced(explore));
+        // The team driver reads one known page itself rather than paying for a survey;
+        // searching, and the breadth of page text it brings, stays with the sweep.
+        if let Some(web) = &cfg.explore.web {
+            tools.push(traced(WebFetch::new(
+                Arc::clone(web),
+                cfg.explore.phase.progress.clone(),
+            )));
+        }
+    } else if let Some(web) = &cfg.explore.web {
+        // A solo driver has no sweep to hold the web text, so it searches itself.
+        tools.extend(web_tools(web, &cfg.explore.phase.progress));
     }
     // The driver loop runs on the *synth* arm, so view_image rides the synth's
     // vision cap (the delegated explore′ sub-agent gets its own view_image keyed to
@@ -2625,6 +2698,7 @@ pub(crate) async fn explore_with(
             cfg.explorer_max_turns,
             &cfg.phase.progress,
             attach,
+            cfg.web.as_ref(),
         ),
     )
     .await
@@ -2723,16 +2797,7 @@ pub(crate) async fn consult_with(
         cfg.explore.phase.call_deadline,
         "consult",
         synth.run(
-            &resolve_phase_preamble(
-                if explorer.is_some() {
-                    Phase::Consult
-                } else {
-                    Phase::ConsultSolo
-                },
-                &cfg.explore.phase.prompts,
-                cfg.explore.phase.orientation.as_deref(),
-                cfg.explore.phase.house_rules.as_deref(),
-            ),
+            &consult_driver_preamble(explorer.is_some(), cfg),
             Message::user(user_prompt.to_string()),
             cfg.synth_max_turns,
             cfg.explore.phase.progress.clone(),
@@ -2769,6 +2834,32 @@ pub(crate) async fn consult_with(
         // consult loop has no non-fatal notices of its own.
         warnings: Vec::new(),
     })
+}
+
+/// The consult driver's system prompt. With the web on, a solo driver gets the web
+/// directive (it searches itself) and a team driver gets a note that its explorer can
+/// search (it delegates the web like any other breadth).
+fn consult_driver_preamble(has_explorer: bool, cfg: &ConsultConfig) -> String {
+    let mut preamble = resolve_phase_preamble(
+        if has_explorer {
+            Phase::Consult
+        } else {
+            Phase::ConsultSolo
+        },
+        &cfg.explore.phase.prompts,
+        cfg.explore.phase.orientation.as_deref(),
+        cfg.explore.phase.house_rules.as_deref(),
+    );
+    if cfg.explore.web.is_some() {
+        preamble.push_str(&if has_explorer {
+            consult_web_note()
+        } else {
+            web_directive("answer")
+        });
+        preamble.push_str("\n\n");
+        preamble.push_str(closing_obligation(Phase::Consult));
+    }
+    preamble
 }
 
 /// A consult turn's session binding: the session backend and the session id. `None` is a

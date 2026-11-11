@@ -85,6 +85,11 @@ pub struct ExploreConfig {
     /// `deliberate`'s dossier stage — which has no synth driver loop — uses this rung
     /// too. `0` means "don't inject the tool at all".
     pub max_attachments: usize,
+    /// The call's web session, when the caller asked for the web (`web: true`) and the
+    /// operator allows it. `Some` gives every explorer survey on this call `web_search`
+    /// and `web_fetch` plus the web directive, all drawing on the one budget. `None`
+    /// (the default) is byte-for-byte the project-only survey.
+    pub web: Option<Arc<crate::web::WebSession>>,
 }
 
 impl Default for ExploreConfig {
@@ -94,8 +99,20 @@ impl Default for ExploreConfig {
             explorer_max_turns: crate::config::Defaults::default().explorer_max_turns,
             sandbox: SandboxConfig::default(),
             max_attachments: crate::config::Defaults::default().max_attachments,
+            web: None,
         }
     }
+}
+
+/// What the `research` survey needs: preamble layering and liveness, the turn bound
+/// (the explorer's, since research runs on the explorer slot), and the call's web
+/// session, which is required here rather than optional because web access is the
+/// whole phase.
+#[derive(Debug, Clone)]
+pub struct ResearchConfig {
+    pub phase: PhaseContext,
+    pub max_turns: usize,
+    pub web: Arc<crate::web::WebSession>,
 }
 
 /// The full two-phase `consult`: an investigation ([`ExploreConfig`]) plus what

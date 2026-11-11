@@ -709,6 +709,7 @@ Everything else follows one naming rule:
 | consult system prompt | `prompts.consult` *(file-only — full replace)* | — | — |
 | oneshot system prompt | `prompts.oneshot` *(file-only — full replace)* | — | — |
 | batch system prompt | `prompts.batch` *(file-only — full replace)* | — | — |
+| research system prompt | `prompts.research` *(file-only — full replace)* | — | — |
 
 **Two exceptions to the naming rule:**
 
@@ -740,11 +741,12 @@ The rename map ships as load errors, never silent reinterpretation:
 A tool clears **two** gates to be advertised: the `[server.tools]` flag (equivalently
 `--no-<tool>` or `KAIBO_NO_<TOOL>`), and a configured cast that can **staff** it.
 
-The nine flags are *capability* switches, not one per MCP tool. `consult` gates both
+The ten flags are *capability* switches, not one per MCP tool. `consult` gates both
 `consult` and `consult_submit`; `batch` gates `batch_submit`; the `job_*` verbs have no
 flag of their own and follow whichever handle producers are live. `generate` clears a
 third gate as well: the media CAS must be on (`[cas] enabled`), because an
-artifact-producing tool needs somewhere to store artifacts.
+artifact-producing tool needs somewhere to store artifacts. `research` clears a third
+gate too: live web access (`[web] enabled`, and the `[web]` backend's key resolves).
 
 A tool with no usable cast is omitted. The same eligibility rules filter its `cast`
 argument, so advertised tools and selectable casts agree.
@@ -759,6 +761,7 @@ Which cast shape staffs which tool:
 | `deliberate` | a cast with an `explorer` **and** an offline synth (`lane = "batch"` or `lane = "direct"`) |
 | `generate` | a cast with an `image` slot (kind `stability`, `openai-images`, `gemini-media`, `dashscope`, or `bfl`) or an `audio` slot (kind `gemini-media` or `stability`) — plus `[cas]` on |
 | `decide` | a cast with a `decision` slot (kind `openrouter`) |
+| `research` | a cast with an `explorer` slot, or an interactive `synth` slot — plus live web access (`[web]`) |
 | `job_get`, `job_cancel`, `job_list`, `job_wait` | at least one live handle *producer*; they follow whatever survives above |
 | `run_kaish`, `list_models` | no cast at all; advertised whenever their flag is on |
 
@@ -774,6 +777,7 @@ No built-in cast has a media slot or pairs an explorer with an offline synth, so
 | Anthropic, Gemini, OpenRouter, or a hosted OpenAI Platform key | also `batch_submit` | a cast whose synth has `lane = "batch"`; `anthropic-batch` and `gemini-batch` are built in |
 | any of the above | also `deliberate` | a cast pairing an `explorer` with an offline synth: `lane = "batch"` on the four keys above, or `lane = "direct"` on any backend |
 | OpenRouter | also `decide` | a cast with a `decision` slot |
+| DeepSeek, as the `[web]` backend | `research`, and `web: true` on any cast | none; `[web] backend = "deepseek"` is the default |
 | a key for a `stability`, `gemini-media`, `bfl`, `openai-images`, or `dashscope` backend | `generate` | an `image` slot, or an `audio` slot on `stability` and `gemini-media` only; `[cas]` on |
 
 OpenRouter does not staff `generate`. `kaibo configure` covers `consult`, `batch_submit`,
@@ -782,7 +786,8 @@ OpenRouter does not staff `generate`. `kaibo configure` covers `consult`, `batch
 ### Finding out why a tool is missing
 
 Read `runtime.advertised_tools` and `runtime.unstaffable_tools` in `kaibo://config`.
-The latter names the cast requirements for missing tools. It omits tools you disabled;
+The latter names the cast requirements for missing tools. `research` can also be missing
+for want of web access, which `[web]` reports as `live = false` with a `why_not`. It omits tools you disabled;
 those are visible under `[tools]`. Startup warnings report missing cast shapes too.
 
 ## File location & loading
@@ -1065,6 +1070,53 @@ Answer and failure footers name artifacts already saved, including MIME type, si
 label, and disk path where available. Session turns persist the footer with the answer.
 Cancellation can abort before a footer is returned; allow a saving job to finish to
 retain its artifact addresses. Sidecars are first-writer-wins, as described under CAS.
+
+## Web search and fetch: `[web]`
+
+```toml
+[web]
+enabled = true          # default
+backend = "deepseek"    # default; must be a `deepseek`-kind backend
+max_searches = 10       # default, per call
+max_fetches = 10        # default, per call
+```
+
+The model team searches and reads the web through DeepSeek's Search and Fetch APIs
+(`/v1/tools/search`, `/v1/tools/fetch`), billed to the web backend's key at $0.75 per
+1,000 successful calls per endpoint. DeepSeek fetches each page on its own servers:
+kaibo sends the URL as a JSON field and never opens it, so a model cannot aim a request
+at the operator's network. Any cast can use the web this way; the model does not have
+to be DeepSeek's.
+
+The operator key is on by default because it spends nothing by itself. A call reaches
+the web only when it asks:
+
+- `research` searches by design.
+- `consult`, `consult_submit`, and `deliberate` take `web: true`, off by default, so a
+  code review never reaches the web unless its caller said so.
+
+Web access is live when `[web] enabled` is true and the web backend has a key source
+that resolves. Otherwise `research` is not advertised and `web: true` is refused. A
+`[web] backend` that names no backend, or a backend of another kind, is a load error
+even while `enabled = false`.
+
+`max_searches` and `max_fetches` count requests per kaibo call, shared across every
+phase in it: a consult driver that delegates five surveys has one budget, not five. A
+request over a cap is refused with a message the model reads. Both caps at 0 with
+`enabled = true` is a load error; use `enabled = false`.
+
+An answer from a call with web access ends with a sources list of the pages fetched,
+taken from kaibo's own record of the calls, and a `web:` footer line that counts the
+searches and fetches, zero included. `deliberate` puts both in the dossier and in its
+acknowledgment. One call may also bring at most 160,000 characters of page text into
+context (each page is cut at 40,000), because the transcript is re-sent each turn.
+
+On a team cast, delegated surveys search and the `consult` driver gets `web_fetch` alone,
+to read one page whose address it already has. On a solo cast the driver gets both
+tools.
+
+Each web request has a 60-second deadline, or the backend's `request_timeout` if that is
+shorter, and two retries on 408, 429, and 5xx.
 
 ## House rules: `[context]`
 

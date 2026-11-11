@@ -83,6 +83,22 @@ pub fn https_client(request_timeout: Duration) -> Result<reqwest::Client> {
         .map_err(|e| anyhow!("http client init: {e}"))
 }
 
+/// A client for a fixed API endpoint that carries the operator's key and must never be
+/// steered elsewhere: no redirects, so a 3xx reaches the caller as its status instead of
+/// carrying the `Authorization` header to wherever the response pointed. Unlike
+/// [`artifact_fetch_client`] it does not force TLS, because the endpoints are kaibo's own
+/// constants (always `https://`) and the offline tests point it at a local socket.
+pub fn api_client_no_redirect(request_timeout: Duration) -> Result<reqwest::Client> {
+    ensure_crypto_provider();
+    reqwest::Client::builder()
+        .user_agent(USER_AGENT)
+        .timeout(request_timeout)
+        .connect_timeout(request_timeout.min(Duration::from_secs(10)))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .map_err(|e| anyhow!("http client init: {e}"))
+}
+
 /// A client for fetching an artifact from an address a **provider** chose
 /// ([`crate::cas::fetch_artifact_bytes`]): TLS required, and exactly one hop.
 ///

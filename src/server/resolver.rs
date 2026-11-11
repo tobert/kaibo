@@ -33,6 +33,7 @@ use rmcp::ErrorData as McpError;
 
 use crate::config::{Cast, Config, ConsultMode, Lane, ModelRole, ModelSlot};
 use crate::consult::{Arm, PromptOverrides};
+use crate::web::{WebApi, WebClient, WebSession};
 
 /// The resolution state shared by the MCP handler and the CLI: the resolved
 /// config plus the canonicalized containment boundary. Cheap to `Clone` (every
@@ -577,6 +578,68 @@ impl Resolver {
         // the first thing an operator needs from a shaping refusal.
         Arm::from_slot(backend, slot, role, &self.config.defaults)
             .map_err(|e| McpError::internal_error(format!("cast {:?}: {e:#}", cast.name), None))
+    }
+
+    /// Open this call's web session: the `[web]` backend's key, the per-call caps, and a
+    /// fresh record. `tool` names the asking tool and `instead` the caller's next step in
+    /// the refusal, which differs between `research` (the web is the whole tool) and a
+    /// tool where `web` is an option.
+    pub(crate) fn web_session(
+        &self,
+        tool: &str,
+        instead: &str,
+    ) -> Result<Arc<WebSession>, McpError> {
+        let refuse = |why: String| {
+            McpError::invalid_params(
+                format!("`{tool}` was asked to use the web, but {why}. {instead}"),
+                None,
+            )
+        };
+        let web = &self.config.web;
+        if !web.enabled {
+            return Err(refuse(
+                "this kaibo has web access turned off (`[web] enabled = false` in \
+                 config.toml; `kaibo example-config` shows the `[web]` stanza)"
+                    .to_string(),
+            ));
+        }
+        let backend = self
+            .config
+            .web_backend()
+            .map_err(|e| refuse(format!("the `[web] backend` is not usable ({e:#})")))?;
+        let key = backend.resolve_key().map_err(|e| {
+            refuse(format!(
+                "the `[web] backend` `{}` has no usable API key ({e:#})",
+                backend.name
+            ))
+        })?;
+        let client = WebClient::deepseek(
+            key,
+            backend.request_timeout.min(crate::web::WEB_REQUEST_TIMEOUT),
+        )
+        .map_err(|e| McpError::internal_error(format!("web client: {e:#}"), None))?;
+        Ok(WebSession::new(
+            WebApi::DeepSeek(client),
+            backend.name.clone(),
+            web.max_searches,
+            web.max_fetches,
+        ))
+    }
+
+    /// The optional web session for a tool where `web` is a per-call choice.
+    pub(crate) fn web_if_asked(
+        &self,
+        asked: bool,
+        tool: &str,
+    ) -> Result<Option<Arc<WebSession>>, McpError> {
+        asked
+            .then(|| {
+                self.web_session(
+                    tool,
+                    "Re-run without `web` to answer from the project alone.",
+                )
+            })
+            .transpose()
     }
 
     /// [`arm`](Self::arm) for a slot the cast may leave out: `None` when `cast` has no
