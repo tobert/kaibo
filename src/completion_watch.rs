@@ -156,6 +156,10 @@ pub struct TurnRecord {
     pub text_chars: usize,
     /// Tool calls this turn emitted.
     pub tool_calls: usize,
+    /// What the provider's own web tools did inside this response (searches, fetches,
+    /// pages), read off `raw`; zero for a provider or turn that ran none. See
+    /// [`crate::web::native`].
+    pub native_web: crate::web::native::NativeTally,
 }
 
 impl TurnRecord {
@@ -180,6 +184,7 @@ impl TurnRecord {
             usage: response.usage,
             text_chars,
             tool_calls,
+            native_web: crate::web::native::NativeTally::read(raw),
         }
     }
 }
@@ -274,6 +279,15 @@ impl CompletionLog {
 
     /// The most recent completion's finish reason, if it reported one. The one-liner
     /// a caller reaches for when asking "why did this answer come back empty?".
+    /// The provider-native web activity of every recorded turn, summed.
+    pub fn native_web(&self) -> crate::web::native::NativeTally {
+        let mut total = crate::web::native::NativeTally::default();
+        for turn in self.turns() {
+            total.absorb(turn.native_web);
+        }
+        total
+    }
+
     pub fn last_finish_reason(&self) -> Option<String> {
         self.last().and_then(|turn| turn.finish_reason)
     }
@@ -484,7 +498,10 @@ mod tests {
         });
         let watch = Watch::new(CompletionLog::new(), None, "m").with_beat(sink.clone(), "synth");
 
-        watch.call(model.dyn_model(), req()).await.expect("first call answers");
+        watch
+            .call(model.dyn_model(), req())
+            .await
+            .expect("first call answers");
         let mut failing = req();
         failing.max_tokens = Some(1);
         watch
@@ -615,7 +632,15 @@ mod tests {
         let beats = sink
             .events()
             .into_iter()
-            .filter(|e| matches!(e, PhaseEvent::ChatCompleted { agent: "explorer", .. }))
+            .filter(|e| {
+                matches!(
+                    e,
+                    PhaseEvent::ChatCompleted {
+                        agent: "explorer",
+                        ..
+                    }
+                )
+            })
             .count();
         assert_eq!(beats, 2, "one beat per completion");
     }
@@ -843,6 +868,7 @@ mod tests {
                 usage: usage(11, 7),
                 text_chars: "the answer".len(),
                 tool_calls: 0,
+                native_web: Default::default(),
             }],
             "one turn recorded, with the reason the provider gave"
         );

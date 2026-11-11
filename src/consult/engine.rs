@@ -13,6 +13,7 @@ use rig_agent::agent::hook::{
     InvalidToolCallContext, ModelTurnAction, ModelTurnFinished, OutcomeAction, OutcomeEvent,
 };
 use rig_agent::agent::AgentBuilder;
+use rig_agent::run::RequestPatch;
 use rig_agent::completion::PromptError;
 use rig_agent::tool::{DynamicTool, Tool, ToolExecutionError, ToolOutput};
 use rig_core::completion::message::{
@@ -49,6 +50,7 @@ use super::prompts::{
     research_user_prompt, resolve_phase_preamble, sweep_evidence_block, web_directive, Phase,
     ReportReader,
 };
+use crate::web::native::NativeWeb;
 use crate::web::{WebFetch, WebSearch, WebSession};
 use super::shaping::{ModelCaps, ModelShape};
 
@@ -223,6 +225,10 @@ pub struct Arm {
     /// seam, where no provider is called and a recorded latency would be a fiction.
     /// [`Arm::from_slot`] is the single live construction point and always sets it.
     pub(crate) identity: Option<crate::metrics::PhaseIdentity>,
+    /// The provider's own web tools, when this arm's backend has them
+    /// ([`NativeWeb::for_kind`]). A capability, not a choice: whether a web-enabled
+    /// phase uses them is the call's [`WebSession`]'s decision (`[web] native`).
+    pub(crate) native_web: Option<NativeWeb>,
 }
 
 impl std::fmt::Debug for Arm {
@@ -281,6 +287,7 @@ impl Arm {
             caps,
             // Set by `from_slot`, which is the only path that knows a backend.
             identity: None,
+            native_web: None,
         }
     }
 
@@ -306,6 +313,7 @@ impl Arm {
             provider: backend.kind,
             agent: role.key(),
         });
+        arm.native_web = NativeWeb::for_kind(backend.kind);
         Ok(arm)
     }
 
@@ -559,6 +567,49 @@ impl Arm {
     /// model's answer paired with the token [`Usage`] the provider reported for this
     /// phase (zero-valued when the provider reported none, or on the undercounted
     /// exceptional paths — see [`run_phase`]).
+    /// Whether this arm's provider runs its own web tools.
+    pub(crate) fn has_native_web(&self) -> bool {
+        self.native_web.is_some()
+    }
+
+    /// Whether every arm in `arms` has native web tools: the condition for a call to
+    /// need no `[web]` backend key.
+    pub(crate) fn all_native<'a>(arms: impl IntoIterator<Item = &'a Arm>) -> bool {
+        arms.into_iter().all(Arm::has_native_web)
+    }
+
+    /// [`run`](Self::run) with a phase's native web tools.
+    #[allow(clippy::too_many_arguments)] // `run`'s inputs plus the hook
+    pub(crate) async fn run_native(
+        &self,
+        native: MaybeNativeWeb,
+        preamble: &str,
+        initial_prompt: Message,
+        max_turns: usize,
+        progress: Arc<dyn ProgressSink>,
+        role: ModelRole,
+        make_tools: ToolFactory<'_>,
+    ) -> Result<(String, Usage)> {
+        run_phase_native(
+            &CompletionLog::new(),
+            native,
+            &self.llm,
+            &self.model,
+            preamble,
+            self.max_tokens,
+            self.temperature,
+            initial_prompt,
+            max_turns,
+            self.params.as_ref(),
+            progress,
+            role,
+            make_tools,
+            self.rewrites_tool_images(),
+            self.identity,
+        )
+        .await
+    }
+
     pub(crate) async fn run(
         &self,
         preamble: &str,
@@ -743,6 +794,140 @@ impl AgentHook for CutOffStopHook {
             && turn_wrote_nothing(event.content)
         {
             ModelTurnAction::stop(CUT_OFF_STOP)
+        } else {
+            ModelTurnAction::continue_run()
+        }
+    }
+}
+
+/// The provider-native web tools of one phase, enforced against the call's budget.
+///
+/// Declared per request rather than once on the arm: a [`RequestPatch`] sets
+/// `additional_params.tools` on every turn, capped with `max_uses` at what the shared
+/// [`WebSession`] has left *now*, so concurrent sweeps and later turns cannot spend past
+/// the cap. The two providers count `max_uses` differently, and the cap follows each:
+/// Anthropic counts the whole provider turn (a kaibo phase, whose later requests carry
+/// only tool results), so its cap adds back what this phase already spent; OpenRouter
+/// counts one request, so its cap is the remainder alone. Each turn's use is read off
+/// its raw response and recorded into the session as it happens.
+#[derive(Clone)]
+pub(crate) struct NativeWebHook {
+    inner: Arc<NativeWebState>,
+}
+
+struct NativeWebState {
+    web: Arc<WebSession>,
+    kind: NativeWeb,
+    wanted: WebTools,
+    /// This phase's own native use so far.
+    used: Mutex<crate::web::WebUsage>,
+}
+
+impl NativeWebHook {
+    fn new(web: Arc<WebSession>, kind: NativeWeb, wanted: WebTools) -> Self {
+        Self {
+            inner: Arc::new(NativeWebState {
+                web,
+                kind,
+                wanted,
+                used: Mutex::new(crate::web::WebUsage::default()),
+            }),
+        }
+    }
+
+    /// The tool definitions for the next request.
+    fn defs(&self) -> Vec<Value> {
+        let st = &self.inner;
+        let (left_s, left_f) = st.web.remaining();
+        let used = *st.used.lock().expect("native web hook poisoned");
+        let (mut searches, fetches) = if st.kind.counts_per_turn() {
+            (left_s + used.searches, left_f + used.fetches)
+        } else {
+            (left_s, left_f)
+        };
+        if st.wanted == WebTools::FetchOnly {
+            searches = 0;
+        }
+        st.kind.tool_defs(searches, fetches)
+    }
+}
+
+impl AgentHook for NativeWebHook {
+    async fn on_completion_call(
+        &self,
+        _ctx: &HookContext,
+        _event: CompletionCallEvent<'_>,
+    ) -> CompletionCallAction {
+        CompletionCallAction::Patch(RequestPatch {
+            additional_params: Some(json!({ "tools": self.defs() })),
+            ..RequestPatch::default()
+        })
+    }
+
+    async fn on_model_turn_finished(
+        &self,
+        _ctx: &HookContext,
+        event: ModelTurnFinished<'_>,
+    ) -> ModelTurnAction {
+        let tally = crate::web::native::NativeTally::read(event.raw);
+        {
+            let mut used = self.inner.used.lock().expect("native web hook poisoned");
+            used.searches += tally.searches;
+            used.fetches += tally.fetches;
+        }
+        self.inner.web.record_native(self.inner.kind, tally);
+        ModelTurnAction::continue_run()
+    }
+}
+
+/// [`NativeWebHook`] when the phase has native web tools, else a hook that does nothing,
+/// so the loop's hook chain keeps one type.
+#[derive(Clone, Default)]
+pub(crate) struct MaybeNativeWeb(Option<NativeWebHook>);
+
+impl AgentHook for MaybeNativeWeb {
+    async fn on_completion_call(
+        &self,
+        ctx: &HookContext,
+        event: CompletionCallEvent<'_>,
+    ) -> CompletionCallAction {
+        match &self.0 {
+            Some(h) => h.on_completion_call(ctx, event).await,
+            None => CompletionCallAction::continue_run(),
+        }
+    }
+
+    async fn on_model_turn_finished(
+        &self,
+        ctx: &HookContext,
+        event: ModelTurnFinished<'_>,
+    ) -> ModelTurnAction {
+        match &self.0 {
+            Some(h) => h.on_model_turn_finished(ctx, event).await,
+            None => ModelTurnAction::continue_run(),
+        }
+    }
+}
+
+/// Continues an Anthropic server-tool turn the provider paused (`stop_reason:
+/// "pause_turn"`). rig maps the pause to a clean stop, so without this a long native web
+/// search would end the phase on a partial turn and hand its fragment back as the
+/// answer. Keeps the paused turn and asks for the rest, inside the run's turn budget.
+/// Inert for every other provider: only Anthropic sends the reason.
+struct PauseTurnHook;
+
+/// The note a resumed turn carries.
+const PAUSE_TURN_NOTE: &str = "Your web search paused before the turn finished. Continue \
+     the same work from where it stopped.";
+
+impl AgentHook for PauseTurnHook {
+    async fn on_model_turn_finished(
+        &self,
+        _ctx: &HookContext,
+        event: ModelTurnFinished<'_>,
+    ) -> ModelTurnAction {
+        if crate::web::native::is_paused(event.raw) {
+            ModelTurnAction::retry_with_feedback(PAUSE_TURN_NOTE)
         } else {
             ModelTurnAction::continue_run()
         }
@@ -1582,6 +1767,48 @@ pub(crate) async fn run_phase_logged<F>(
 where
     F: Fn() -> Result<Vec<DynamicTool>>,
 {
+    run_phase_native(
+        log,
+        MaybeNativeWeb::default(),
+        model,
+        model_name,
+        preamble,
+        max_tokens,
+        temperature,
+        initial_prompt,
+        max_turns,
+        thinking,
+        progress,
+        role,
+        make_tools,
+        break_on_tool_images,
+        identity,
+    )
+    .await
+}
+
+/// [`run_phase_logged`] with a phase's native web hook in the loop.
+#[allow(clippy::too_many_arguments)]
+async fn run_phase_native<F>(
+    log: &CompletionLog,
+    native: MaybeNativeWeb,
+    model: &Llm,
+    model_name: &str,
+    preamble: &str,
+    max_tokens: u64,
+    temperature: Option<f64>,
+    initial_prompt: Message,
+    max_turns: usize,
+    thinking: Option<&Value>,
+    progress: Arc<dyn ProgressSink>,
+    role: ModelRole,
+    make_tools: F,
+    break_on_tool_images: bool,
+    identity: Option<crate::metrics::PhaseIdentity>,
+) -> Result<(String, Usage)>
+where
+    F: Fn() -> Result<Vec<DynamicTool>>,
+{
     // Surface the exact reasoning/sampling params this phase ships (constant across the
     // resume loop), so a trace shows whether — and at what depth — thinking was on: the
     // wire truth behind the `chat` spans' `reasoning_tokens`. Inert with no exporter.
@@ -1605,6 +1832,7 @@ where
     let result = run_phase_loop(
         model,
         &watch,
+        &native,
         model_name,
         preamble,
         max_tokens,
@@ -1654,6 +1882,7 @@ where
 async fn run_phase_loop<F>(
     model: &Llm,
     watch: &Watch,
+    native: &MaybeNativeWeb,
     model_name: &str,
     preamble: &str,
     max_tokens: u64,
@@ -1747,6 +1976,8 @@ where
             // (`oneshot`, `deliberate`'s direct synth) bypass the agent entirely via
             // `Arm::complete` and can raise no tool call at all.
             .add_hook(UnknownToolFeedbackHook::new(model_name))
+            .add_hook(PauseTurnHook)
+            .add_hook(native.clone())
             .add_hook(cut_off.clone())
             .max_turns(remaining)
             .run()
@@ -2135,6 +2366,58 @@ fn web_tools(web: &Arc<WebSession>, progress: &Arc<dyn ProgressSink>) -> [Dynami
     ]
 }
 
+/// Which web tools a phase is given: both, or `web_fetch` alone (the team consult
+/// driver, which reads one known page while searching stays with the sweep).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WebTools {
+    Both,
+    FetchOnly,
+}
+
+/// Run one phase of `arm` with the web, the one place a phase's web route is chosen.
+/// With no session it is `arm.run` exactly. With one, an arm whose provider has native
+/// web tools (and `[web] native` on) declares those on its request and has its use
+/// tallied from the responses into the session; any other arm gets kaibo's
+/// `web_search`/`web_fetch` beside `base`. Both routes draw on the session's budget.
+#[allow(clippy::too_many_arguments)] // `Arm::run`'s inputs plus the web choice
+async fn run_with_web(
+    arm: &Arm,
+    web: Option<&Arc<WebSession>>,
+    wanted: WebTools,
+    preamble: &str,
+    prompt: Message,
+    max_turns: usize,
+    progress: Arc<dyn ProgressSink>,
+    role: ModelRole,
+    base: ToolFactory<'_>,
+) -> Result<(String, Usage)> {
+    let Some(web) = web else {
+        return arm.run(preamble, prompt, max_turns, progress, role, base).await;
+    };
+    if let Some(native) = web.native_for(arm.native_web) {
+        // The hook declares the tools per request and records each turn's use as it
+        // happens, so a phase that fails late has still recorded what it spent.
+        let hook = MaybeNativeWeb(Some(NativeWebHook::new(Arc::clone(web), native, wanted)));
+        return arm
+            .run_native(hook, preamble, prompt, max_turns, progress, role, base)
+            .await;
+    }
+    let with_web = || -> Result<Vec<DynamicTool>> {
+        let mut tools = base()?;
+        if web.has_api() {
+            match wanted {
+                WebTools::Both => tools.extend(web_tools(web, &progress)),
+                WebTools::FetchOnly => {
+                    tools.push(traced(WebFetch::new(Arc::clone(web), progress.clone())))
+                }
+            }
+        }
+        Ok(tools)
+    };
+    arm.run(preamble, prompt, max_turns, progress.clone(), role, &with_web)
+        .await
+}
+
 /// Run `research`: the explorer arm on the web, with `web_search` and `web_fetch` and
 /// no shell, returning its URL-cited report verbatim. No project is mounted, so no
 /// `root` and no kaish worker: this phase cannot read the operator's files at all. The
@@ -2151,18 +2434,19 @@ pub(crate) async fn research_with(
         cfg.phase.orientation.as_deref(),
         cfg.phase.house_rules.as_deref(),
     );
-    let progress = cfg.phase.progress.clone();
-    let web = Arc::clone(&cfg.web);
     with_call_deadline(
         cfg.phase.call_deadline,
         "research",
-        arm.run(
+        run_with_web(
+            arm,
+            Some(&cfg.web),
+            WebTools::Both,
             &preamble,
             Message::user(research_user_prompt(question, context)),
             cfg.max_turns,
-            progress.clone(),
+            cfg.phase.progress.clone(),
             ModelRole::Explorer,
-            &|| Ok(web_tools(&web, &progress).into_iter().collect()),
+            &|| Ok(Vec::new()),
         ),
     )
     .await
@@ -2197,7 +2481,10 @@ pub(crate) async fn run_explore_phase(
         preamble.push_str(closing_obligation(Phase::Explorer(ReportReader::SynthesisAgent)));
     }
     let preamble = preamble.as_str();
-    arm.run(
+    run_with_web(
+        arm,
+        web,
+        WebTools::Both,
         preamble,
         Message::user(question.to_string()),
         max_turns,
@@ -2216,9 +2503,6 @@ pub(crate) async fn run_explore_phase(
                     Arc::clone(sink),
                     progress.clone(),
                 )));
-            }
-            if let Some(web) = web {
-                tools.extend(web_tools(web, progress));
             }
             Ok(tools)
         },
@@ -2629,18 +2913,9 @@ fn consult_tools(
             cfg.explore.web.clone(),
         );
         tools.push(traced(explore));
-        // The team driver reads one known page itself rather than paying for a survey;
-        // searching, and the breadth of page text it brings, stays with the sweep.
-        if let Some(web) = &cfg.explore.web {
-            tools.push(traced(WebFetch::new(
-                Arc::clone(web),
-                cfg.explore.phase.progress.clone(),
-            )));
-        }
-    } else if let Some(web) = &cfg.explore.web {
-        // A solo driver has no sweep to hold the web text, so it searches itself.
-        tools.extend(web_tools(web, &cfg.explore.phase.progress));
     }
+    // The driver's own web tools (fetch-only on a team, both when solo) are added by
+    // `run_with_web` in `consult_with`, which also picks native or kaibo-run.
     // The driver loop runs on the *synth* arm, so view_image rides the synth's
     // vision cap (the delegated explore′ sub-agent gets its own view_image keyed to
     // the explorer arm's caps, inside `explore`). Shares the driver's kernel.
@@ -2796,7 +3071,17 @@ pub(crate) async fn consult_with(
     let (answer, synth_usage) = with_call_deadline(
         cfg.explore.phase.call_deadline,
         "consult",
-        synth.run(
+        run_with_web(
+            synth,
+            cfg.explore.web.as_ref(),
+            // The team driver reads one known page itself rather than paying for a
+            // survey; searching, and the breadth of page text it brings, stays with the
+            // sweep. A solo driver has no sweep, so it searches itself.
+            if explorer.is_some() {
+                WebTools::FetchOnly
+            } else {
+                WebTools::Both
+            },
             &consult_driver_preamble(explorer.is_some(), cfg),
             Message::user(user_prompt.to_string()),
             cfg.synth_max_turns,

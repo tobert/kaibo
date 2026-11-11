@@ -313,6 +313,7 @@ pub(crate) fn render_config_resource(
         backend: String,
         max_searches: usize,
         max_fetches: usize,
+        native: bool,
         live: bool,
         #[serde(skip_serializing_if = "Option::is_none")]
         why_not: Option<String>,
@@ -714,7 +715,7 @@ pub(crate) fn render_config_resource(
             advertised_tools: super::live_tools(
                 config,
                 &usable,
-                config.web_usable(|k| std::env::var(k).ok()),
+                config.web_live(|k| std::env::var(k).ok(), &usable),
             )
             .into_iter()
             .map(str::to_string)
@@ -827,23 +828,27 @@ pub(crate) fn render_config_resource(
             enabled: config.artifacts.enabled,
         },
         web: {
-            let live = config.web_usable(|k| std::env::var(k).ok());
-            let why_not = (!live).then(|| {
-                if !config.web.enabled {
-                    "[web] enabled = false".to_string()
-                } else {
-                    format!(
-                        "the [web] backend `{}` has no API key; declare a key source on \
-                         [backends.{}] (`kaibo example-config` shows the shapes)",
-                        config.web.backend, config.web.backend
-                    )
-                }
-            });
+            let keyed = config.web_usable(|k| std::env::var(k).ok());
+            let live = config.web_live(|k| std::env::var(k).ok(), &usable);
+            let why_not = if !config.web.enabled {
+                Some("[web] enabled = false".to_string())
+            } else if !keyed {
+                Some(format!(
+                    "the [web] backend `{}` has no API key, so only casts with native web \
+                     tools (anthropic, openrouter; [web] native = {}) can use the web; \
+                     declare a key source on [backends.{}] (`kaibo example-config` shows \
+                     the shapes)",
+                    config.web.backend, config.web.native, config.web.backend
+                ))
+            } else {
+                None
+            };
             WebDoc {
                 enabled: config.web.enabled,
                 backend: config.web.backend.clone(),
                 max_searches: config.web.max_searches,
                 max_fetches: config.web.max_fetches,
+                native: config.web.native,
                 live,
                 why_not,
             }

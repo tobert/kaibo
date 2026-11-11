@@ -584,10 +584,16 @@ impl Resolver {
     /// fresh record. `tool` names the asking tool and `instead` the caller's next step in
     /// the refusal, which differs between `research` (the web is the whole tool) and a
     /// tool where `web` is an option.
+    ///
+    /// `all_native` says every phase of the call that gets the web runs on an arm with
+    /// native web tools. Then the `[web]` backend's key is optional: with `[web] native`
+    /// on, those phases never call kaibo's search API, so a missing key is not a reason
+    /// to refuse.
     pub(crate) fn web_session(
         &self,
         tool: &str,
         instead: &str,
+        all_native: bool,
     ) -> Result<Arc<WebSession>, McpError> {
         let refuse = |why: String| {
             McpError::invalid_params(
@@ -607,19 +613,26 @@ impl Resolver {
             .config
             .web_backend()
             .map_err(|e| refuse(format!("the `[web] backend` is not usable ({e:#})")))?;
-        let key = backend.resolve_key().map_err(|e| {
-            refuse(format!(
-                "the `[web] backend` `{}` has no usable API key ({e:#})",
-                backend.name
-            ))
-        })?;
-        let client = WebClient::deepseek(
-            key,
-            backend.request_timeout.min(crate::web::WEB_REQUEST_TIMEOUT),
-        )
-        .map_err(|e| McpError::internal_error(format!("web client: {e:#}"), None))?;
-        Ok(WebSession::new(
-            WebApi::DeepSeek(client),
+        let native_only = all_native && web.native;
+        let api = match backend.resolve_key() {
+            Ok(key) => Some(WebApi::DeepSeek(
+                WebClient::deepseek(
+                    key,
+                    backend.request_timeout.min(crate::web::WEB_REQUEST_TIMEOUT),
+                )
+                .map_err(|e| McpError::internal_error(format!("web client: {e:#}"), None))?,
+            )),
+            Err(_) if native_only => None,
+            Err(e) => {
+                return Err(refuse(format!(
+                    "the `[web] backend` `{}` has no usable API key ({e:#})",
+                    backend.name
+                )))
+            }
+        };
+        Ok(WebSession::with(
+            api,
+            web.native,
             backend.name.clone(),
             web.max_searches,
             web.max_fetches,
@@ -631,12 +644,14 @@ impl Resolver {
         &self,
         asked: bool,
         tool: &str,
+        all_native: bool,
     ) -> Result<Option<Arc<WebSession>>, McpError> {
         asked
             .then(|| {
                 self.web_session(
                     tool,
                     "Re-run without `web` to answer from the project alone.",
+                    all_native,
                 )
             })
             .transpose()

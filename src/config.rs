@@ -1317,6 +1317,9 @@ pub struct WebConfig {
     pub max_searches: usize,
     /// Page fetches one call may make. Default 10.
     pub max_fetches: usize,
+    /// `[web] native`: an arm whose provider runs its own web tools (Anthropic,
+    /// OpenRouter) uses them instead of kaibo's. Default `true`.
+    pub native: bool,
 }
 
 impl Default for WebConfig {
@@ -1326,6 +1329,7 @@ impl Default for WebConfig {
             backend: "deepseek".to_string(),
             max_searches: 10,
             max_fetches: 10,
+            native: true,
         }
     }
 }
@@ -1582,6 +1586,22 @@ impl Config {
         self.cast_can_explore(name) || self.cast_is_interactive(name)
     }
 
+    /// Whether `name`'s `research` arm (the explorer slot, else the synth) runs on a
+    /// backend with native web tools, so with `[web] native` on it needs no `[web]`
+    /// backend key.
+    pub fn cast_researches_natively(&self, name: &str) -> bool {
+        let Some(cast) = self.casts.get(name) else {
+            return false;
+        };
+        let slot = cast
+            .slot(ModelRole::Explorer)
+            .or_else(|| cast.slot(ModelRole::Synth));
+        self.web.native
+            && slot
+                .and_then(|s| self.resolve_backend(&s.backend).ok())
+                .is_some_and(|b| crate::web::native::NativeWeb::for_kind(b.kind).is_some())
+    }
+
     pub fn cast_can_explore(&self, name: &str) -> bool {
         self.casts
             .get(name)
@@ -1660,6 +1680,15 @@ impl Config {
             && self
                 .web_backend()
                 .is_ok_and(|b| b.key_status(get_env) != KeyStatus::Missing)
+    }
+
+    /// Whether this server can serve a web call at all: `[web] enabled`, and either the
+    /// `[web]` backend's key resolves or some cast in `usable` researches on native web
+    /// tools. The gate `research` is advertised behind.
+    pub fn web_live(&self, get_env: impl Fn(&str) -> Option<String>, usable: &[String]) -> bool {
+        self.web.enabled
+            && (self.web_usable(get_env)
+                || usable.iter().any(|c| self.cast_researches_natively(c)))
     }
 
     pub fn resolve_backend(&self, name: &str) -> Result<&Backend> {
@@ -2951,6 +2980,7 @@ struct RawWeb {
     backend: Option<String>,
     max_searches: Option<usize>,
     max_fetches: Option<usize>,
+    native: Option<bool>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -3503,6 +3533,7 @@ fn merge_web(raw: RawWeb) -> Result<WebConfig> {
         backend: raw.backend.unwrap_or(d.backend),
         max_searches: raw.max_searches.unwrap_or(d.max_searches),
         max_fetches: raw.max_fetches.unwrap_or(d.max_fetches),
+        native: raw.native.unwrap_or(d.native),
     };
     if web.max_searches == 0 && web.max_fetches == 0 && web.enabled {
         bail!(
