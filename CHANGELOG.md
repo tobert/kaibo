@@ -20,6 +20,7 @@ record. Each later release appends a new section at the top.
 - `tokio` 1.54.1 fixes RUSTSEC-2026-0386 (`AsyncFd` constructors accepted any file descriptor); kaibo calls no `AsyncFd` itself.
 - A launch directory that holds `$HOME` (home, an ancestor, or `/`) is no longer inferred as scope, so a path-less call fails until `--root` names a workspace such as `~/src`.
 - Naming a tree that holds `$HOME` with `--root` or `--allow-path` logs a startup warning.
+- `openai` backends on the Responses wire send `store: false` by default, so OpenAI does not keep the response objects; `data_collection = "allow"` opts back in.
 
 ### Added
 - A cast's `consult = "solo" | "team"` key runs `consult` with the synth alone, keeping the explorer slot for `explore` and `deliberate`; `kaibo://config` shows each cast's mode.

@@ -792,27 +792,44 @@ pub fn effort_sinks(
     ModelShape::resolve(kind, model, style).sinks_effort()
 }
 
-/// Fold the backend's upstream-host data policy into `params`. **OpenRouter only**:
-/// one slug routes across competing hosts whose data policies differ, and kaibo's
-/// prompts carry source code — so under [`DataCollection::Deny`] (the default) every
-/// request pins `provider: {"data_collection": "deny"}` and OpenRouter routes only
-/// to no-collection hosts (a model with no compliant host fails loudly, which is
-/// the point). The explicit `Allow` opt-in emits nothing: kaibo never pushes
-/// *toward* collection, it just steps aside and lets the operator's own OpenRouter
-/// account settings govern. A no-op for every other kind.
+/// Fold the backend's data policy into `params`. kaibo's prompts carry source code, so
+/// under [`DataCollection::Deny`] (the default) two wires get a field:
+///
+/// - **OpenRouter**: one slug routes across competing hosts whose data policies differ,
+///   so every request pins `provider: {"data_collection": "deny"}` and OpenRouter routes
+///   only to no-collection hosts (a model with no compliant host fails loudly, which is
+///   the point).
+/// - **OpenAI's Responses wire** (`responses_wire`, from
+///   [`Backend::uses_responses_wire`](crate::config::Backend::uses_responses_wire)):
+///   the API stores every response for at least 30 days unless the request sends
+///   `store: false`, so every request sends it. rig then runs the tool loop statelessly,
+///   replaying reasoning through `encrypted_content` instead of stored item ids (rig
+///   0.46 adds `include: ["reasoning.encrypted_content"]` itself on OpenAI's dialect;
+///   `tests/openai_effort_wire.rs` pins that). Chat Completions stores nothing by
+///   default, so the chat wire gets nothing.
+///
+/// The explicit `Allow` opt-in emits nothing, and the provider's own default governs.
+/// That is not neutral on OpenAI: its default is to store, so `allow` is a choice to let
+/// OpenAI keep the responses. A no-op for every other kind.
 pub fn inject_provider_prefs(
     kind: ProviderKind,
     params: Option<Value>,
     data_collection: DataCollection,
+    responses_wire: bool,
 ) -> Option<Value> {
-    if kind != ProviderKind::OpenRouter || data_collection == DataCollection::Allow {
+    if data_collection == DataCollection::Allow {
         return params;
     }
+    let (key, value) = match kind {
+        ProviderKind::OpenRouter => ("provider", json!({ "data_collection": "deny" })),
+        ProviderKind::Openai if responses_wire => ("store", json!(false)),
+        _ => return params,
+    };
     let mut obj = match params {
         Some(Value::Object(m)) => m,
         _ => serde_json::Map::new(),
     };
-    obj.insert("provider".into(), json!({ "data_collection": "deny" }));
+    obj.insert(key.into(), value);
     Some(Value::Object(obj))
 }
 
@@ -1310,8 +1327,13 @@ mod tests {
             ThinkingStyleOverride::Auto,
         )
         .to_params(8192, None, None, DEFAULT_EFFORT);
-        let out = inject_provider_prefs(ProviderKind::OpenRouter, params, DataCollection::Deny)
-            .expect("openrouter always sends params");
+        let out = inject_provider_prefs(
+            ProviderKind::OpenRouter,
+            params,
+            DataCollection::Deny,
+            false,
+        )
+        .expect("openrouter always sends params");
         assert_eq!(
             out["provider"]["data_collection"], "deny",
             "the default must pin no-collection routing on every request"
@@ -1328,15 +1350,59 @@ mod tests {
             ThinkingStyleOverride::Auto,
         )
         .to_params(8192, None, None, DEFAULT_EFFORT);
-        let out = inject_provider_prefs(ProviderKind::OpenRouter, params, DataCollection::Allow)
-            .expect("openrouter always sends params");
+        let out = inject_provider_prefs(
+            ProviderKind::OpenRouter,
+            params,
+            DataCollection::Allow,
+            false,
+        )
+        .expect("openrouter always sends params");
         assert!(
             out.get("provider").is_none(),
             "allow emits nothing — the account's own policy governs"
         );
 
         // Any other kind: passthrough both ways, including a None params.
-        let out = inject_provider_prefs(ProviderKind::Anthropic, None, DataCollection::Deny);
+        let out = inject_provider_prefs(ProviderKind::Anthropic, None, DataCollection::Deny, false);
         assert!(out.is_none(), "non-openrouter kinds are untouched");
+    }
+
+    /// OpenAI's Responses API stores every response for at least 30 days unless the
+    /// request says `store: false`, and kaibo's requests carry source code. So `deny`,
+    /// the default, sends `store: false` on the Responses wire, beside the reasoning
+    /// blob and not over it. `allow` emits nothing and the account's own retention
+    /// applies. The chat wire is untouched: Chat Completions stores nothing by default.
+    #[test]
+    fn openai_responses_wire_denies_storage_by_default() {
+        let params =
+            hosted_openai_responses_params("gpt-6-sol", None, "high", ThinkingStyleOverride::Auto);
+        let out = inject_provider_prefs(ProviderKind::Openai, params, DataCollection::Deny, true)
+            .expect("deny always sends params on the Responses wire");
+        assert_eq!(out["store"], false, "deny turns OpenAI storage off");
+        assert_eq!(
+            out["reasoning"]["effort"], "high",
+            "store merges beside the reasoning blob, not over it"
+        );
+        assert!(
+            out.get("provider").is_none(),
+            "no OpenRouter routing object"
+        );
+
+        // A model with no other params still gets the flag.
+        let out = inject_provider_prefs(ProviderKind::Openai, None, DataCollection::Deny, true)
+            .expect("deny sends store even with no other params");
+        assert_eq!(out, json!({ "store": false }));
+
+        let out = inject_provider_prefs(ProviderKind::Openai, None, DataCollection::Allow, true);
+        assert!(
+            out.is_none(),
+            "allow emits nothing; the account's retention applies"
+        );
+
+        let out = inject_provider_prefs(ProviderKind::Openai, None, DataCollection::Deny, false);
+        assert!(
+            out.is_none(),
+            "the chat wire stores nothing by default; nothing to send"
+        );
     }
 }

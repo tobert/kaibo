@@ -75,6 +75,16 @@ async fn capture_one() -> (String, tokio::sync::oneshot::Receiver<Captured>) {
 /// Build a hosted-shaped arm for `model` at `effort`, send one `oneshot`, and return
 /// what reached the socket.
 async fn sent_body(model: &str, effort: &str, style: Option<ThinkingStyleOverride>) -> Captured {
+    sent_body_with(model, effort, style, "").await
+}
+
+/// [`sent_body`] with extra `[backends.gpt]` lines, such as a `data_collection` policy.
+async fn sent_body_with(
+    model: &str,
+    effort: &str,
+    style: Option<ThinkingStyleOverride>,
+    backend_extra: &str,
+) -> Captured {
     let (base_url, rx) = capture_one().await;
     let cfg = Config::from_toml_str(&format!(
         r#"
@@ -82,6 +92,7 @@ async fn sent_body(model: &str, effort: &str, style: Option<ThinkingStyleOverrid
         kind = "openai"
         base_url = "{base_url}"
         wire = "responses"
+        {backend_extra}
         "#
     ))
     .unwrap();
@@ -172,6 +183,43 @@ async fn thinking_style_off_omits_reasoning_for_gpt_6() {
         assert!(
             got.body.get("reasoning").is_none(),
             "{model}: `off` sends no reasoning object: {}",
+            got.body
+        );
+    }
+}
+
+/// OpenAI stores every Responses call for at least 30 days unless the request opts out,
+/// and kaibo's prompts carry source code. The default `data_collection = "deny"` sends
+/// `store: false` on every call; the explicit `allow` sends no `store` field, so the
+/// account's own retention applies.
+#[tokio::test]
+async fn data_collection_deny_sends_store_false_and_allow_omits_it() {
+    for model in GPT6_IDS {
+        let got = sent_body(model, "high", None).await;
+        assert_eq!(
+            got.body["store"], false,
+            "{model}: the default policy turns OpenAI storage off: {}",
+            got.body
+        );
+        assert_eq!(
+            got.body["reasoning"]["effort"], "high",
+            "{model}: `store` rides beside the effort, not over it"
+        );
+        // With nothing stored, reasoning survives a tool loop only as ciphertext that
+        // rig replays by value. rig 0.46 asks for it on OpenAI's dialect
+        // (`ResponsesQuirks::openai().reasoning_ciphertext`); if a bump stops asking,
+        // every later turn loses the reasoning before it.
+        let include = got.body["include"].as_array().cloned().unwrap_or_default();
+        assert!(
+            include.contains(&serde_json::json!("reasoning.encrypted_content")),
+            "{model}: a stateless request asks for the reasoning ciphertext: {}",
+            got.body
+        );
+
+        let got = sent_body_with(model, "high", None, r#"data_collection = "allow""#).await;
+        assert!(
+            got.body.get("store").is_none(),
+            "{model}: `allow` leaves `store` to the account default: {}",
             got.body
         );
     }
