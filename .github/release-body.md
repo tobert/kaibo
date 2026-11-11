@@ -20,8 +20,9 @@ docker pull ghcr.io/tobert/kaibo:${VERSION}
 COPY --from=ghcr.io/tobert/kaibo:${VERSION} /usr/local/bin/kaibo /usr/local/bin/kaibo
 ```
 
-(Pull version tags like `${VERSION}` — the `sha256-*` tags on the package page are
-cosign signature/attestation artifacts riding alongside the image, not images.)
+(Pull a version tag like `${VERSION}`. The package page's install box offers a
+`sha256-*` tag: that is the image's cosign signature and attestation, not an image,
+so pulling it fails.)
 
 ## Verify it
 

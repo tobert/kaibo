@@ -41,6 +41,7 @@ record. Each later release appends a new section at the top.
 - OpenRouter prompt caching is sent as a request-level `cache_control` marker.
 
 ### Fixed
+- Release pages say the container package page's install box offers a `sha256-*` signature tag; pull a version tag instead.
 - `batch_submit` and `deliberate` on a `gemini` batch slot refuse invalid `effort` rungs (`max`, `xhigh`, `none`) at slot resolution instead of failing mid-batch.
 
 ## [0.6.1] — 2026-10-31

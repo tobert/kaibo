@@ -94,12 +94,16 @@ jobs:
       # so every leg executes its own binary here. The aarch64 leg runs natively on
       # ubuntu-24.04-arm; x86_64-apple-darwin runs under Rosetta 2 on the arm64
       # macos-latest runner — expected, don't "fix" that leg back to an Intel runner.
-      - name: Smoke (run the binary)
+      # On a tag run the binary must report the tag's version. The version comes
+      # from Cargo.toml, so a tag pushed without the bump fails here, before any
+      # asset or image is published.
+      - name: Smoke (run the binary, check its version)
         shell: bash
         run: |
           bin="target/${{ matrix.target }}/release/kaibo"
           [ -f "$bin" ] || bin="$bin.exe"
-          "$bin" --version
+          out=$("$bin" --version) # its own line, so a binary that fails to run fails the step
+          bash scripts/check-tag-version.sh "$out"
 
       # musl legs only: ldd exits non-zero on a fully static binary, so that's the
       # success case here — hence `|| true` plus a grep instead of a plain run.
@@ -157,10 +161,14 @@ jobs:
 
   # Signing, provenance, and the SBOM all live here in the tag-gated publish job —
   # a `workflow_dispatch` smoke run never mints an OIDC identity or a signature.
+  # Every publish gate in this file tests the EVENT as well as the ref: a dispatch
+  # run against a `v*` tag has github.ref == refs/tags/v…, so a ref-only gate
+  # would let it re-publish, sign, and attest that release. Only a tag push
+  # publishes; a dispatch on any ref is a smoke run.
   release:
     name: publish release
     needs: build
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     permissions:
       contents: write # create the release and upload assets
@@ -248,8 +256,8 @@ jobs:
   # into distroless/static:nonroot — see the Dockerfile for the image contract
   # (COPY source for devcontainers, /work mount, stdio ENTRYPOINT). The job runs
   # its build + smoke on a workflow_dispatch too, so a branch dispatch validates
-  # the Dockerfile and manifest assembly; pushing, signing, and attesting stay
-  # tag-gated like the release job, so no dispatch ever publishes or signs.
+  # the Dockerfile and manifest assembly; pushing, signing, and attesting are
+  # gated on a tag push like the release job, so no dispatch publishes or signs.
   image:
     name: publish ghcr image
     needs: build
@@ -289,10 +297,11 @@ jobs:
       - name: Smoke (run the image)
         run: |
           docker buildx build --load --platform linux/amd64 -t kaibo-smoke .
-          docker run --rm kaibo-smoke --version
+          out=$(docker run --rm kaibo-smoke --version) # its own line, so a failed run fails the step
+          bash scripts/check-tag-version.sh "$out"
 
       - name: Login to ghcr
-        if: startsWith(github.ref, 'refs/tags/v')
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
         uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
         with:
           registry: ghcr.io
@@ -317,12 +326,18 @@ jobs:
             type=sha,enable=${{ github.ref_type != 'tag' }}
 
       # Tag runs push BY DIGEST here and apply the version tags in the last step
-      # below, after signing. Order matters for the package page: GitHub's install
-      # box advertises the most recently published version, and cosign/provenance
-      # land as sha256-* tagged artifacts in the same package — publish the version
-      # tags last and "Latest" is always a pullable image, never a signature
-      # bundle. (v0.2.0-rc.4 shipped image→sign order and the package page's
-      # copy-paste box offered the signature tag; podman refused it, confusingly.)
+      # below, after signing and attesting, so a version tag never names an
+      # unsigned image.
+      #
+      # This order does NOT fix the package page's install box, which offers the
+      # cosign `sha256-<digest>` signature tag instead of a version tag. ghcr keys a
+      # package version by digest and dates it by that digest's first push;
+      # `imagetools create` only adds tags to the existing index, so it creates no
+      # new version. The signature has to be pushed after the image digest exists,
+      # so it is always the newest version, and the box shows it (v0.6.1:
+      # signature 14:58:36Z, index 14:58:28Z). Pulling a version tag, `cosign
+      # verify`, and `gh attestation verify oci://` all work. We keep cosign on the
+      # image and say this in .github/release-body.md instead.
       - name: Build (and push by digest on a tag)
         id: build
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
@@ -330,32 +345,31 @@ jobs:
           context: .
           platforms: linux/amd64,linux/arm64
           labels: ${{ steps.meta.outputs.labels }}
-          outputs: type=image,name=ghcr.io/tobert/kaibo,name-canonical=true,push-by-digest=true,push=${{ startsWith(github.ref, 'refs/tags/v') }}
+          outputs: type=image,name=ghcr.io/tobert/kaibo,name-canonical=true,push-by-digest=true,push=${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') }}
 
       - name: Install cosign
-        if: startsWith(github.ref, 'refs/tags/v')
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
         uses: sigstore/cosign-installer@756fe2d284c7292c4e9b62c8a28f1e5629c59532 # v4.1.3
 
       # Same keyless machinery as the blob signing above, aimed at the manifest
       # digest — the signature covers every tag later pointed at it.
       - name: Sign image (cosign keyless)
-        if: startsWith(github.ref, 'refs/tags/v')
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
         run: cosign sign --yes ghcr.io/tobert/kaibo@${{ steps.build.outputs.digest }}
 
       - name: Attest image provenance
-        if: startsWith(github.ref, 'refs/tags/v')
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
           subject-name: ghcr.io/tobert/kaibo
           subject-digest: ${{ steps.build.outputs.digest }}
           push-to-registry: true
 
-      # The finale, deliberately: point the version tags at the signed manifest
-      # list. imagetools create copies the existing list under each tag — no
-      # rebuild, no layer movement — and because this is the package's newest
-      # publish, the install box shows a real, pullable version.
-      - name: Publish version tags (last, so "Latest" is pullable)
-        if: startsWith(github.ref, 'refs/tags/v')
+      # Point the version tags at the signed manifest list. imagetools create adds
+      # each tag to the existing list (no rebuild, no layer movement, and no new
+      # package version, so this does not change the install box; see above).
+      - name: Publish version tags (after signing)
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
         env:
           TAGS: ${{ steps.meta.outputs.tags }}
           DIGEST: ${{ steps.build.outputs.digest }}
