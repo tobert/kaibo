@@ -744,7 +744,9 @@ pub struct DecideInput {
     /// `{"type": "choice"|"score"|"noul", "instructions": "...", "criteria": ...}`.
     /// `choice`: `criteria` is an object from label to meaning, 2 to 255 labels; include an
     /// `other` label. `score`: `criteria` is an array of 2 to 10 level names, lowest first.
-    /// `noul`: no `criteria`; `instructions` holds the yes/no statement. At least one.
+    /// `noul`: `instructions` holds the yes/no statement; no `criteria`, except on a Gemini
+    /// cast, where `{"true_description": ..., "false_description": ...}` says what each answer
+    /// means (either key alone is fine). At least one question.
     pub questions: std::collections::BTreeMap<String, crate::decide::Question>,
 
     /// Which cast (model team) answers. Omit it when exactly one cast has a `decision`
@@ -1059,8 +1061,8 @@ const CAST_ENUM_RULES: &[CastEnumRule] = &[
         &["decide"],
         Config::cast_can_decide,
         "a cast with a `decision` slot pointing at a backend with a Decisions route (kind \
-         `openrouter`, model `~typesafe/jev-latest`) — see the decision-slot example in \
-         docs/config.example.toml",
+         `openrouter`, model `~typesafe/jev-latest`; or kind `gemini`, model \
+         `gemini-decision-1`) — see the decision-slot example in docs/config.example.toml",
     ),
     (
         &["generate"],
@@ -3003,8 +3005,9 @@ impl KaiboHandler {
             `{type, instructions, criteria}`. `choice` (criteria: label to meaning, 2 to 255 \
             labels, include `other`) answers a label with `probabilities` and `confidence`. \
             `score` (criteria: 2 to 10 level names, lowest first) answers a number that can \
-            fall between levels. `noul` (no criteria) answers the probability that the \
-            statement in `instructions` is true. The model writes no explanation, so ask \
+            fall between levels. `noul` answers the probability that the statement in \
+            `instructions` is true; on a Gemini cast its criteria may give \
+            `true_description` and `false_description`. The model writes no explanation, so ask \
             narrow questions. It reads only what you send and has no codebase access. Omit \
             `cast` when one cast has a decision slot. For reasoned answers with citations, use `consult`."
     )]
@@ -3042,7 +3045,8 @@ impl KaiboHandler {
             return Err(McpError::invalid_params(
                 format!(
                     "cast `{}` has no `decision` slot, so it cannot decide. Pass `cast` \
-                     naming one whose `decision` slot points at an `openrouter` backend; \
+                     naming one whose `decision` slot points at an `openrouter` or `gemini` \
+                     backend; \
                      when `cast` is omitted the default applies, set by `[server] cast` in \
                      config.toml.{named} kaibo://config lists the configured casts and \
                      their slots.",
@@ -3055,24 +3059,24 @@ impl KaiboHandler {
             .config
             .resolve_backend(&slot.backend)
             .map_err(|e| McpError::internal_error(format!("{e:#}"), None))?;
-        let url = match (&self.decisions_url, backend.kind.decisions_url()) {
-            (Some(url), _) => url.clone(),
-            (None, Some(url)) => url.to_string(),
-            (None, None) => {
-                return Err(McpError::internal_error(
-                    format!(
-                        "backend `{}` (kind `{}`) has no Decisions route; config load \
-                         should have refused this cast",
-                        backend.name,
-                        backend.kind.canonical_name(),
-                    ),
-                    None,
-                ))
-            }
+        let Some(wire) = crate::decide::DecisionsWire::for_kind(backend.kind) else {
+            return Err(McpError::internal_error(
+                format!(
+                    "backend `{}` (kind `{}`) has no Decisions route; config load \
+                     should have refused this cast",
+                    backend.name,
+                    backend.kind.canonical_name(),
+                ),
+                None,
+            ));
+        };
+        let url = match &self.decisions_url {
+            Some(url) => url.clone(),
+            None => wire.url(backend.base_url.as_deref()),
         };
         // Validate before resolving the key: the key may come from an operator command.
         let mut request =
-            crate::decide::DecisionRequest::new(slot.id.clone(), input.state, input.questions)
+            crate::decide::DecisionRequest::new_for(wire, slot.id.clone(), input.state, input.questions)
                 .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
         // The backend's `data_collection` pin rides this request too, as it does every
         // OpenRouter completion.
@@ -4763,9 +4767,9 @@ Platform key also staffs `batch_submit` (`lane = \"batch\"`; `anthropic-batch` a
 `gemini-batch` are built in), and any text backend staffs `deliberate` when a cast pairs an \
 interactive `explorer` with an offline `synth` (`lane = \"batch\"` on those four, or \
 `lane = \"direct\"` on any backend, as `gemini-deliberate` in the example config shows). \
-An OpenRouter key also staffs `decide`: add \
-`[casts.judge]` with `decision = \"openrouter/~typesafe/jev-latest\"` (use the backend's name \
-if it is not `openrouter`). The `judge` cast has no explorer or synth, so callers pass \
+An OpenRouter or Gemini key also staffs `decide`: add \
+`[casts.judge]` with `decision = \"openrouter/~typesafe/jev-latest\"` or \
+`decision = \"gemini/gemini-decision-1\"` (use the backend's name if it differs). The `judge` cast has no explorer or synth, so callers pass \
 `cast = \"judge\"` to `decide`; the default cast cannot decide. `generate` needs a media \
 backend and a cast with an `image` slot (or an `audio` slot on `stability` or `gemini-media`): \
 Stability, Gemini (`gemini-media`), Black Forest Labs (`bfl`), OpenAI images \
@@ -6603,6 +6607,91 @@ mod tests {
             sock.shutdown().await.ok();
         });
         format!("http://{addr}/api/alpha/decisions")
+    }
+
+    /// Serve one canned reply and hand back the raw request it answered.
+    async fn decide_capture(
+        body: &'static str,
+    ) -> (String, tokio::sync::oneshot::Receiver<String>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut req = Vec::new();
+            let mut buf = vec![0u8; 16384];
+            // Read headers and the whole body (content-length) before replying.
+            loop {
+                let n = sock.read(&mut buf).await.unwrap();
+                req.extend_from_slice(&buf[..n]);
+                let text = String::from_utf8_lossy(&req).to_string();
+                if let Some(end) = text.find("\r\n\r\n") {
+                    let len = text
+                        .lines()
+                        .find_map(|l| l.to_ascii_lowercase().strip_prefix("content-length:").map(|v| v.trim().parse::<usize>().unwrap_or(0)))
+                        .unwrap_or(0);
+                    if req.len() >= end + 4 + len || n == 0 {
+                        break;
+                    }
+                }
+                if n == 0 {
+                    break;
+                }
+            }
+            let reply = format!(
+                "HTTP/1.1 200 X\r\ncontent-type: application/json\r\n\
+                 content-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            sock.write_all(reply.as_bytes()).await.unwrap();
+            sock.shutdown().await.ok();
+            let _ = tx.send(String::from_utf8_lossy(&req).to_string());
+        });
+        (format!("http://{addr}/v1beta/decisions"), rx)
+    }
+
+    /// A decision slot on a `gemini` backend speaks Gemini's wire: the key in
+    /// `x-goog-api-key`, the state under `input`, and the model named in the footer even
+    /// though Gemini's reply names none.
+    #[tokio::test]
+    async fn decide_on_a_gemini_backend_speaks_the_gemini_wire() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = dir.path().join("gem-key");
+        std::fs::write(&key, "gem-secret\n").unwrap(); // test-only temp file, not the project
+        let toml = format!(
+            r#"
+            [backends.gem]
+            kind = "gemini"
+            api_key_file = "{}"
+
+            [casts.judge]
+            decision = "gem/gemini-decision-1"
+
+            [server]
+            cast = "judge"
+        "#,
+            key.display()
+        );
+        let (url, rx) = decide_capture(
+            r#"{"answers":{"verdict":{"type":"choice","choice":"risky","probabilities":{"safe":0.1,"risky":0.9},"confidence":0.9}},"usage":{"total_input_tokens":42,"total_output_tokens":0,"total_tokens":42}}"#,
+        )
+        .await;
+        let h = hermetic_handler_from_toml(&toml).with_decisions_url(url);
+        let text = result_text(
+            h.decide(Parameters(decide_input(None, risk_question())))
+                .await
+                .expect("decide succeeds"),
+        );
+        assert!(text.contains("\"choice\": \"risky\""), "{text}");
+        assert!(text.contains("model `gemini-decision-1`"), "{text}");
+        assert!(text.contains("42 in · 0 out"), "{text}");
+        let req = rx.await.unwrap();
+        let lower = req.to_ascii_lowercase();
+        assert!(lower.contains("x-goog-api-key: gem-secret"), "{req}");
+        assert!(!lower.contains("authorization:"), "{req}");
+        assert!(req.contains("\"input\":\"git push --force origin main\""), "{req}");
+        assert!(!req.contains("\"state\""), "{req}");
     }
 
     fn decide_input(cast: Option<&str>, questions: serde_json::Value) -> DecideInput {

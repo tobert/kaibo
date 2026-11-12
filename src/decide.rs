@@ -6,10 +6,18 @@
 //! model writes a sentence, so there is no preamble, no tool loop, and no thinking
 //! budget; this is not a completion phase and does not go through `run_phase`.
 //!
-//! Today's route is OpenRouter's `POST /api/alpha/decisions` (model ids
-//! `typesafe/jev-1.13`, `~typesafe/jev-latest`). The request and response shapes were
-//! confirmed by a live probe on 2026-10-06, which also found what the provider does not
-//! check, so this module checks it instead:
+//! Two routes speak it, one [`DecisionsWire`] each:
+//!
+//! - OpenRouter's `POST /api/alpha/decisions` (model ids `typesafe/jev-1.13`,
+//!   `~typesafe/jev-latest`), bearer key, the context under `state`. Shapes confirmed by a
+//!   live probe on 2026-10-06.
+//! - Google's Gemini Decisions API, `POST /v1beta/decisions` (model id
+//!   `gemini-decision-1`), `x-goog-api-key`, the context under `input` as text, and no
+//!   `model` or `cost` in the reply. Shapes confirmed by a live probe on 2026-11-12, the
+//!   day after launch.
+//!
+//! The 2026-10-06 probe also found what OpenRouter does not check, so this module checks
+//! it instead, for both routes:
 //!
 //! - a `choice` with one option is accepted and answers `1.0` for it, so [`Question`]
 //!   refuses fewer than 2 options before any request leaves;
@@ -35,6 +43,43 @@ use serde::{Deserialize, Serialize};
 
 /// OpenRouter's Decisions endpoint.
 pub const OPENROUTER_DECISIONS_URL: &str = "https://openrouter.ai/api/alpha/decisions";
+
+/// Google's Gemini Decisions endpoint, on the default Gemini host.
+pub const GEMINI_DECISIONS_URL: &str =
+    "https://generativelanguage.googleapis.com/v1beta/decisions";
+
+/// Which Decisions API a request speaks: the field names, the key header, and the reply
+/// shape differ between the two, while the question types are the same.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DecisionsWire {
+    /// OpenRouter: bearer key, context under `state`, `provider` routing preferences.
+    OpenRouter,
+    /// Gemini: `x-goog-api-key`, context under `input` as text, no routing preferences.
+    Gemini,
+}
+
+impl DecisionsWire {
+    /// The wire a backend kind speaks, or `None` for a kind with no Decisions route.
+    pub fn for_kind(kind: crate::credentials::ProviderKind) -> Option<Self> {
+        match kind {
+            crate::credentials::ProviderKind::OpenRouter => Some(Self::OpenRouter),
+            crate::credentials::ProviderKind::Gemini => Some(Self::Gemini),
+            _ => None,
+        }
+    }
+
+    /// The endpoint for a backend of this wire. A Gemini backend with its own `base_url`
+    /// (a host root, as its completions use) gets `/v1beta/decisions` under it.
+    pub fn url(self, base_url: Option<&str>) -> String {
+        match (self, base_url) {
+            (Self::Gemini, Some(base)) => {
+                format!("{}/v1beta/decisions", base.trim_end_matches('/'))
+            }
+            (Self::Gemini, None) => GEMINI_DECISIONS_URL.to_string(),
+            (Self::OpenRouter, _) => OPENROUTER_DECISIONS_URL.to_string(),
+        }
+    }
+}
 
 /// A `choice` may name at most this many options.
 pub const MAX_CHOICE_OPTIONS: usize = 255;
@@ -87,8 +132,9 @@ impl<'de> Deserialize<'de> for Criteria {
                 })
             }
             other => Err(D::Error::custom(format!(
-                "`criteria` is an object from option label to meaning (for `choice`) or \
-                 an array of level names (for `score`), got {other}"
+                "`criteria` is an object from option label to meaning (for `choice`), an \
+                 array of level names (for `score`), or, on a Gemini cast, an object with \
+                 `true_description` and `false_description` (for `noul`), got {other}"
             ))),
         }
     }
@@ -105,7 +151,8 @@ pub struct Question {
     pub instructions: String,
     /// `choice`: an object from option label to what it means (2 to 255 options; include
     /// an `other` option). `score`: an array of 2 to 10 level names, lowest first. `noul`:
-    /// omit.
+    /// omit, or on a Gemini cast an object with `true_description` and/or
+    /// `false_description` saying what each answer means.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub criteria: Option<Criteria>,
 }
@@ -113,7 +160,7 @@ pub struct Question {
 impl Question {
     /// Check the question against the rules the provider does not enforce itself, naming
     /// `id` in the refusal.
-    pub fn validate(&self, id: &str) -> Result<(), DecideError> {
+    pub fn validate(&self, id: &str, wire: DecisionsWire) -> Result<(), DecideError> {
         let bad = |why: String| DecideError::InvalidQuestion {
             id: id.to_string(),
             why,
@@ -159,21 +206,54 @@ impl Question {
                     .into(),
             )),
             (QuestionKind::Noul, None) => Ok(()),
-            (QuestionKind::Noul, Some(_)) => Err(bad(
-                "a `noul` takes no `criteria`; put the statement in `instructions`".into(),
+            // Gemini reads these: a probe (2026-11-12) that swapped the two descriptions
+            // flipped its answer from 0.97 to 0.03. Jev on OpenRouter accepted the same
+            // criteria and answered 0.97 both ways, so there they are refused rather than
+            // silently ignored.
+            (QuestionKind::Noul, Some(Criteria::Options(o))) if wire == DecisionsWire::Gemini => {
+                const KEYS: [&str; 2] = ["true_description", "false_description"];
+                if o.is_empty() {
+                    return Err(bad(
+                        "`criteria` on a `noul` is empty; omit it, or give \
+                         `true_description` and/or `false_description`"
+                            .into(),
+                    ));
+                }
+                if let Some(k) = o.keys().find(|k| !KEYS.contains(&k.as_str())) {
+                    return Err(bad(format!(
+                        "a `noul` takes only `true_description` and `false_description` in \
+                         `criteria`, got {k:?}"
+                    )));
+                }
+                if o.values().any(|v| v.trim().is_empty()) {
+                    return Err(bad("a `noul` description is empty".into()));
+                }
+                Ok(())
+            }
+            (QuestionKind::Noul, Some(Criteria::Options(_))) => Err(bad(
+                "this cast's decision model ignores `noul` criteria, so they are refused; \
+                 put what yes means in `instructions`, or use a cast whose `decision` slot \
+                 is on a `gemini` backend"
+                    .into(),
+            )),
+            (QuestionKind::Noul, Some(Criteria::Levels(_))) => Err(bad(
+                "a `noul` takes no list in `criteria`; put the statement in `instructions`, \
+                 and on a Gemini cast describe the answers with an object holding \
+                 `true_description` and `false_description`"
+                    .into(),
             )),
         }
     }
 }
 
-/// A validated request: state plus questions, for one model.
-#[derive(Debug, Clone, Serialize)]
+/// A validated request: state plus questions, for one model, on one wire.
+#[derive(Debug, Clone)]
 pub struct DecisionRequest {
     model: String,
     state: serde_json::Value,
     questions: BTreeMap<String, Question>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     provider: Option<ProviderPrefs>,
+    wire: DecisionsWire,
 }
 
 /// The `provider` routing preferences OpenRouter accepts on a decisions request. A live
@@ -185,8 +265,20 @@ struct ProviderPrefs {
 }
 
 impl DecisionRequest {
-    /// Build a request, refusing an empty question map or any invalid question.
+    /// Build an OpenRouter request, refusing an empty question map or any invalid
+    /// question. [`new_for`](Self::new_for) builds one for either wire.
     pub fn new(
+        model: impl Into<String>,
+        state: serde_json::Value,
+        questions: BTreeMap<String, Question>,
+    ) -> Result<Self, DecideError> {
+        Self::new_for(DecisionsWire::OpenRouter, model, state, questions)
+    }
+
+    /// Build a request for `wire`, validating each question by that wire's rules. The
+    /// wire is fixed here, so a request cannot change wires after it was checked.
+    pub fn new_for(
+        wire: DecisionsWire,
         model: impl Into<String>,
         state: serde_json::Value,
         questions: BTreeMap<String, Question>,
@@ -195,14 +287,49 @@ impl DecisionRequest {
             return Err(DecideError::NoQuestions);
         }
         for (id, q) in &questions {
-            q.validate(id)?;
+            q.validate(id, wire)?;
         }
         Ok(Self {
             model: model.into(),
             state,
             questions,
             provider: None,
+            wire,
         })
+    }
+
+    pub fn wire(&self) -> DecisionsWire {
+        self.wire
+    }
+
+    /// The JSON body for this request's wire. Gemini reads its context as text, so a
+    /// JSON `state` is sent as its JSON text and a string `state` as itself; it has no
+    /// routing preferences, so `provider` is OpenRouter's alone.
+    pub fn body(&self) -> serde_json::Value {
+        match self.wire {
+            DecisionsWire::OpenRouter => {
+                let mut v = serde_json::json!({
+                    "model": self.model,
+                    "state": self.state,
+                    "questions": self.questions,
+                });
+                if let Some(p) = &self.provider {
+                    v["provider"] = serde_json::json!(p);
+                }
+                v
+            }
+            DecisionsWire::Gemini => {
+                let input = match &self.state {
+                    serde_json::Value::String(s) => s.clone(),
+                    other => serde_json::to_string_pretty(other).unwrap_or_default(),
+                };
+                serde_json::json!({
+                    "model": self.model,
+                    "input": input,
+                    "questions": self.questions,
+                })
+            }
+        }
     }
 
     /// Route only to hosts that do not retain or train on the state
@@ -237,19 +364,49 @@ pub enum Answer {
     },
     Noul {
         noul: f64,
+        /// Gemini reports it (`max(noul, 1 - noul)`); OpenRouter does not.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        confidence: Option<f64>,
     },
 }
 
-/// Token counts and cost as the provider reports them.
+/// Token counts and cost as the provider reports them. Gemini spells the counts
+/// `total_input_tokens` and `total_output_tokens` and reports no cost. Read through
+/// [`RawUsage`] rather than serde aliases: an alias is the same field under two names, so a
+/// reply carrying both spellings would fail as a duplicate field.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(from = "RawUsage")]
 pub struct DecisionUsage {
-    #[serde(default)]
     pub input_tokens: u64,
-    #[serde(default)]
     pub output_tokens: u64,
     /// USD, when the gateway reports it.
     #[serde(default)]
     pub cost: Option<f64>,
+}
+
+/// Both providers' spellings, each optional; the plain name wins when both are present.
+#[derive(Deserialize)]
+struct RawUsage {
+    #[serde(default)]
+    input_tokens: Option<u64>,
+    #[serde(default)]
+    total_input_tokens: Option<u64>,
+    #[serde(default)]
+    output_tokens: Option<u64>,
+    #[serde(default)]
+    total_output_tokens: Option<u64>,
+    #[serde(default)]
+    cost: Option<f64>,
+}
+
+impl From<RawUsage> for DecisionUsage {
+    fn from(r: RawUsage) -> Self {
+        Self {
+            input_tokens: r.input_tokens.or(r.total_input_tokens).unwrap_or(0),
+            output_tokens: r.output_tokens.or(r.total_output_tokens).unwrap_or(0),
+            cost: r.cost,
+        }
+    }
 }
 
 impl DecisionUsage {
@@ -273,7 +430,9 @@ impl DecisionUsage {
 /// The provider's answer, checked against the request that produced it.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DecisionResponse {
-    /// The versioned model that answered, e.g. `typesafe/jev-1.13-20260917`.
+    /// The versioned model that answered, e.g. `typesafe/jev-1.13-20260917`. Gemini's
+    /// reply names none, so the client fills in the model asked for.
+    #[serde(default)]
     pub model: String,
     pub answers: BTreeMap<String, Answer>,
     #[serde(default)]
@@ -321,7 +480,7 @@ impl DecisionResponse {
                         ));
                     }
                 }
-                (QuestionKind::Noul, Answer::Noul { noul }, _) => {
+                (QuestionKind::Noul, Answer::Noul { noul, .. }, _) => {
                     if !(0.0..=1.0).contains(noul) {
                         return Err(mismatch(
                             id,
@@ -410,7 +569,8 @@ fn provider_message(body: &str) -> String {
         .unwrap_or_else(|| body.to_string())
 }
 
-/// A client for one Decisions endpoint and key.
+/// A client for one Decisions endpoint and key. The request's wire picks the key
+/// header.
 pub struct DecisionClient {
     url: String,
     key: String,
@@ -418,7 +578,7 @@ pub struct DecisionClient {
 }
 
 impl DecisionClient {
-    /// `url` is the full endpoint. Production passes [`OPENROUTER_DECISIONS_URL`]; a test
+    /// `url` is the full endpoint. Production passes [`DecisionsWire::url`]; a test
     /// passes a local listener.
     pub fn new(
         url: impl Into<String>,
@@ -434,11 +594,13 @@ impl DecisionClient {
 
     /// Send the request and return the checked response.
     pub async fn decide(&self, req: &DecisionRequest) -> Result<DecisionResponse, DecideError> {
-        let resp = self
-            .http
-            .post(&self.url)
-            .bearer_auth(&self.key)
-            .json(req)
+        let post = self.http.post(&self.url);
+        let post = match req.wire {
+            DecisionsWire::OpenRouter => post.bearer_auth(&self.key),
+            DecisionsWire::Gemini => post.header("x-goog-api-key", &self.key),
+        };
+        let resp = post
+            .json(&req.body())
             .send()
             .await
             .map_err(|e| DecideError::Transport(e.to_string()))?;
@@ -453,8 +615,11 @@ impl DecisionClient {
                 message: provider_message(&body),
             });
         }
-        let parsed: DecisionResponse =
+        let mut parsed: DecisionResponse =
             serde_json::from_str(&body).map_err(|e| DecideError::Unreadable(e.to_string()))?;
+        if parsed.model.is_empty() {
+            parsed.model = req.model.clone();
+        }
         parsed.check_against(req)?;
         Ok(parsed)
     }
@@ -518,15 +683,50 @@ mod tests {
     }
 
     #[test]
-    fn noul_takes_no_criteria() {
-        let mut q = Question {
+    fn noul_criteria_are_gemini_only() {
+        let noul = |c: Option<Criteria>| Question {
             kind: QuestionKind::Noul,
             instructions: "is it".into(),
-            criteria: None,
+            criteria: c,
         };
-        assert!(DecisionRequest::new("m", "s".into(), qs("q", q.clone())).is_ok());
-        q.criteria = Some(Criteria::Levels(vec!["a".into(), "b".into()]));
-        assert!(DecisionRequest::new("m", "s".into(), qs("q", q)).is_err());
+        let on = |wire, q: Question| DecisionRequest::new_for(wire, "m", "s".into(), qs("q", q));
+        let both = opts(&[("true_description", "yes means x"), ("false_description", "no means y")]);
+        let one = opts(&[("true_description", "yes means x")]);
+        for wire in [DecisionsWire::OpenRouter, DecisionsWire::Gemini] {
+            assert!(on(wire, noul(None)).is_ok());
+            let levels = Criteria::Levels(vec!["a".into(), "b".into()]);
+            assert!(on(wire, noul(Some(levels))).is_err());
+        }
+        // Gemini reads the descriptions; one alone is enough.
+        let req = on(DecisionsWire::Gemini, noul(Some(both.clone()))).unwrap();
+        assert_eq!(
+            req.body()["questions"]["q"]["criteria"],
+            serde_json::json!({"true_description": "yes means x", "false_description": "no means y"})
+        );
+        assert!(on(DecisionsWire::Gemini, noul(Some(one))).is_ok());
+        // Jev ignores them, so OpenRouter refuses them and names the way out.
+        let err = on(DecisionsWire::OpenRouter, noul(Some(both))).unwrap_err();
+        assert!(err.to_string().contains("`gemini` backend"), "{err}");
+        // A key Gemini would refuse, an empty object, and an empty description are caught here.
+        for bad in [
+            opts(&[("yes", "y")]),
+            opts(&[]),
+            opts(&[("true_description", " ")]),
+        ] {
+            assert!(on(DecisionsWire::Gemini, noul(Some(bad))).is_err());
+        }
+    }
+
+    #[test]
+    fn usage_reads_either_spelling_and_survives_both() {
+        let u: DecisionUsage =
+            serde_json::from_str(r#"{"input_tokens":5,"total_input_tokens":7,"output_tokens":1}"#)
+                .unwrap();
+        assert_eq!((u.input_tokens, u.output_tokens), (5, 1));
+        let g: DecisionUsage =
+            serde_json::from_str(r#"{"total_input_tokens":7,"total_output_tokens":0,"total_tokens":7}"#)
+                .unwrap();
+        assert_eq!((g.input_tokens, g.output_tokens, g.cost), (7, 0, None));
     }
 
     #[test]
@@ -552,7 +752,7 @@ mod tests {
             qs("v", q),
         )
         .unwrap();
-        let v = serde_json::to_value(&req).unwrap();
+        let v = req.body();
         assert_eq!(
             v,
             serde_json::json!({
@@ -573,6 +773,10 @@ mod tests {
       "id":"gen-dec-1","provider":"TypeSafe"}"#;
 
     fn probed_request() -> DecisionRequest {
+        probed_request_for(DecisionsWire::OpenRouter)
+    }
+
+    fn probed_request_for(wire: DecisionsWire) -> DecisionRequest {
         let mut m = qs(
             "verdict",
             choice(opts(&[("safe", "s"), ("risky", "r"), ("other", "o")])),
@@ -597,7 +801,7 @@ mod tests {
                 criteria: None,
             },
         );
-        DecisionRequest::new("typesafe/jev-1.13", "x".into(), m).unwrap()
+        DecisionRequest::new_for(wire, "typesafe/jev-1.13", "x".into(), m).unwrap()
     }
 
     #[test]
@@ -619,9 +823,9 @@ mod tests {
     fn a_wrong_kind_of_answer_is_an_error() {
         let mut r: DecisionResponse = serde_json::from_str(PROBED).unwrap();
         r.answers
-            .insert("pushes".into(), Answer::Noul { noul: 0.5 });
+            .insert("pushes".into(), Answer::Noul { noul: 0.5, confidence: None });
         r.answers
-            .insert("verdict".into(), Answer::Noul { noul: 0.5 });
+            .insert("verdict".into(), Answer::Noul { noul: 0.5, confidence: None });
         let err = r.check_against(&probed_request()).unwrap_err();
         assert!(err.to_string().contains("verdict"), "{err}");
     }
@@ -639,7 +843,7 @@ mod tests {
     #[test]
     fn an_unrequested_answer_is_an_error() {
         let mut r: DecisionResponse = serde_json::from_str(PROBED).unwrap();
-        r.answers.insert("extra".into(), Answer::Noul { noul: 0.1 });
+        r.answers.insert("extra".into(), Answer::Noul { noul: 0.1, confidence: None });
         assert!(r.check_against(&probed_request()).is_err());
     }
 
@@ -671,7 +875,7 @@ mod tests {
     fn a_noul_outside_zero_to_one_is_an_error() {
         let mut r: DecisionResponse = serde_json::from_str(PROBED).unwrap();
         r.answers
-            .insert("pushes".into(), Answer::Noul { noul: 1.5 });
+            .insert("pushes".into(), Answer::Noul { noul: 1.5, confidence: None });
         let err = r.check_against(&probed_request()).unwrap_err();
         assert!(err.to_string().contains("pushes"), "{err}");
     }
@@ -718,18 +922,79 @@ mod tests {
                 criteria: None,
             },
         );
-        let plain = serde_json::to_value(DecisionRequest::new("m", "s".into(), q.clone()).unwrap())
-            .unwrap();
+        let plain = DecisionRequest::new("m", "s".into(), q.clone()).unwrap().body();
         assert!(plain.get("provider").is_none(), "{plain}");
-        let denied = serde_json::to_value(
-            DecisionRequest::new("m", "s".into(), q)
-                .unwrap()
-                .deny_data_collection(),
-        )
-        .unwrap();
+        let denied = DecisionRequest::new("m", "s".into(), q.clone())
+            .unwrap()
+            .deny_data_collection()
+            .body();
         assert_eq!(
             denied["provider"],
             serde_json::json!({"data_collection": "deny"})
+        );
+        // Gemini has no routing preferences; the pin is OpenRouter's alone.
+        let gemini = DecisionRequest::new_for(DecisionsWire::Gemini, "m", "s".into(), q)
+            .unwrap()
+            .deny_data_collection()
+            .body();
+        assert!(gemini.get("provider").is_none(), "{gemini}");
+    }
+
+    #[test]
+    fn a_gemini_request_sends_the_state_as_input_text() {
+        let q = choice(opts(&[("a", "first"), ("b", "second")]));
+        let json_state = DecisionRequest::new_for(
+            DecisionsWire::Gemini,
+            "gemini-decision-1",
+            serde_json::json!({"cmd": "ls"}),
+            qs("v", q.clone()),
+        )
+        .unwrap()
+        .body();
+        assert_eq!(
+            json_state,
+            serde_json::json!({
+                "model": "gemini-decision-1",
+                "input": "{\n  \"cmd\": \"ls\"\n}",
+                "questions": {"v": {"type": "choice", "instructions": "which",
+                                    "criteria": {"a": "first", "b": "second"}}}
+            })
+        );
+        assert!(json_state.get("state").is_none());
+        let text_state =
+            DecisionRequest::new_for(DecisionsWire::Gemini, "gemini-decision-1", "plain text".into(), qs("v", q))
+                .unwrap()
+                .body();
+        assert_eq!(text_state["input"], "plain text");
+    }
+
+    /// The reply recorded from the live Gemini probe of 2026-11-12, one of each kind.
+    const GEMINI_PROBED: &str = r#"{"answers":{
+      "pushes":{"confidence":0.98,"noul":0.98,"type":"noul"},
+      "undo":{"confidence":0.73,"score":0.30,"probabilities":{"0":0.73,"1":0.23,"2":0.04},"legend":{"2":"impossible","1":"hard","0":"easy"},"type":"score"},
+      "verdict":{"confidence":0.89,"choice":"risky","probabilities":{"safe":0.06,"other":0.05,"risky":0.89},"type":"choice"}},
+      "usage":{"total_tokens":295,"total_input_tokens":295,"input_tokens_by_modality":[{"modality":"text","tokens":295}],"total_output_tokens":0}}"#;
+
+    #[test]
+    fn the_gemini_probed_response_parses_and_checks() {
+        let r: DecisionResponse = serde_json::from_str(GEMINI_PROBED).unwrap();
+        assert_eq!(r.model, "", "Gemini names no model; the client fills it in");
+        assert_eq!((r.usage.input_tokens, r.usage.output_tokens, r.usage.cost), (295, 0, None));
+        assert_eq!(
+            r.answers["pushes"],
+            Answer::Noul { noul: 0.98, confidence: Some(0.98) }
+        );
+        r.check_against(&probed_request_for(DecisionsWire::Gemini)).unwrap();
+        assert_eq!(r.usage.footer().as_deref(), Some("tokens · 295 in · 0 out"));
+    }
+
+    #[test]
+    fn each_wire_has_its_endpoint() {
+        assert_eq!(DecisionsWire::OpenRouter.url(None), OPENROUTER_DECISIONS_URL);
+        assert_eq!(DecisionsWire::Gemini.url(None), GEMINI_DECISIONS_URL);
+        assert_eq!(
+            DecisionsWire::Gemini.url(Some("https://proxy.test/")),
+            "https://proxy.test/v1beta/decisions"
         );
     }
 

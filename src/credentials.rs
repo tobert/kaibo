@@ -315,6 +315,7 @@ impl ProviderKind {
     pub fn decisions_url(self) -> Option<&'static str> {
         match self {
             ProviderKind::OpenRouter => Some(crate::decide::OPENROUTER_DECISIONS_URL),
+            ProviderKind::Gemini => Some(crate::decide::GEMINI_DECISIONS_URL),
             _ => None,
         }
     }

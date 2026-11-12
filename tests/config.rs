@@ -3297,7 +3297,7 @@ fn a_decision_slot_on_openrouter_loads_and_is_neither_reasoning_nor_media() {
 #[test]
 fn a_decision_slot_on_a_kind_without_a_decisions_route_is_refused() {
     for (kind, extra) in [
-        ("gemini", "key_optional = true"),
+        ("anthropic", "key_optional = true"),
         ("deepseek", "key_optional = true"),
         ("openai", "base_url = \"http://localhost:1/v1\""),
         ("stability", "key_optional = true"),
@@ -3320,6 +3320,19 @@ fn a_decision_slot_on_a_kind_without_a_decisions_route_is_refused() {
             "the error names the slot, the kind, and the fix, got: {msg}"
         );
     }
+    // Gemini has a Decisions route of its own, so its decision slot loads.
+    let gemini = Config::from_toml_str(
+        r#"
+        [backends.g]
+        kind = "gemini"
+        key_optional = true
+
+        [casts.judge]
+        decision = "g/gemini-decision-1"
+        "#,
+    )
+    .expect("a decision slot on a gemini backend loads");
+    assert!(gemini.cast_can_decide("judge"));
 }
 
 /// A misspelled role is still a load error now that `decision` joined the list.
