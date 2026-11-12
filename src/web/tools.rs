@@ -32,7 +32,7 @@ pub const MAX_PAGE_CHARS: usize = 40_000;
 /// fetch is cut to what remains and then refused.
 pub const MAX_CALL_PAGE_CHARS: usize = 160_000;
 
-/// The most sources a Sources block lists.
+/// The most entries the appended sources block lists, across both of its sections.
 pub const MAX_LISTED_SOURCES: usize = 12;
 
 /// One page the team fetched, or a result a provider's own search cited.
@@ -40,6 +40,42 @@ pub const MAX_LISTED_SOURCES: usize = 12;
 pub struct WebSource {
     pub url: String,
     pub title: String,
+    /// True when kaibo has a record of the page being fetched. A provider's search
+    /// result that the answer cited but nobody fetched is `false`: the team saw only the
+    /// search summary.
+    pub fetched: bool,
+}
+
+impl WebSource {
+    pub fn new(url: &str, title: &str, fetched: bool) -> Self {
+        Self {
+            url: url.to_string(),
+            title: title.to_string(),
+            fetched,
+        }
+    }
+
+    pub fn fetched(url: &str, title: &str) -> Self {
+        Self::new(url, title, true)
+    }
+
+    pub fn cited(url: &str, title: &str) -> Self {
+        Self::new(url, title, false)
+    }
+
+    /// Add `source` to `list` once per URL, first sighting first. A later fetch of a
+    /// URL first seen as a citation marks it fetched, and fills in a missing title.
+    pub fn merge_into(list: &mut Vec<WebSource>, source: WebSource) {
+        match list.iter_mut().find(|s| s.url == source.url) {
+            Some(s) => {
+                s.fetched |= source.fetched;
+                if s.title.trim().is_empty() {
+                    s.title = source.title;
+                }
+            }
+            None => list.push(source),
+        }
+    }
 }
 
 /// How much of the web budget one call spent.
@@ -172,8 +208,9 @@ impl WebSession {
                 )),
             }
         }
-        for (url, title) in tally.sources {
-            self.record(&url, &title);
+        let mut sources = self.sources.lock().expect("web sources poisoned");
+        for source in tally.sources {
+            WebSource::merge_into(&mut sources, source);
         }
     }
 
@@ -230,37 +267,61 @@ impl WebSession {
         })
     }
 
-    /// Pages fetched successfully, first fetch first, each URL once.
+    /// Pages fetched successfully and search results cited, first sighting first, each
+    /// URL once.
     pub fn sources(&self) -> Vec<WebSource> {
         self.sources.lock().expect("web sources poisoned").clone()
     }
 
-    /// The Sources block kaibo appends to an answer, or `None` when the record is empty.
-    /// Lists at most [`MAX_LISTED_SOURCES`]; a provider that cites every search result
-    /// (OpenRouter annotates them all) would otherwise bury the pages that mattered.
+    /// The block kaibo appends to an answer, or `None` when the record is empty: the
+    /// pages the team fetched, then the search results the answer cited without a fetch,
+    /// so a reader can tell a read page from a search summary. Lists at most
+    /// [`MAX_LISTED_SOURCES`] in all, fetched pages first; a provider that cites every
+    /// search result (OpenRouter annotates them all) would otherwise bury the pages
+    /// that mattered.
     pub fn sources_block(&self) -> Option<String> {
         let sources = self.sources();
         if sources.is_empty() {
             return None;
         }
-        let mut out = String::from(
-            "\n\n**Sources** (kaibo's record of the pages the team fetched, and of the results \
-             a provider's own search cited):\n",
+        let (fetched, cited): (Vec<_>, Vec<_>) = sources.iter().partition(|s| s.fetched);
+        let mut out = String::new();
+        let mut listed = 0;
+        // Each section reports its own overflow, so an entry left out is never counted
+        // under the other section's heading.
+        let mut section = |heading: &str, items: &[&WebSource], more: &str, out: &mut String| {
+            if items.is_empty() {
+                return;
+            }
+            out.push_str(heading);
+            let room = MAX_LISTED_SOURCES - listed;
+            for s in items.iter().take(room) {
+                listed += 1;
+                let title = if s.title.trim().is_empty() {
+                    "untitled"
+                } else {
+                    s.title.trim()
+                };
+                out.push_str(&format!("{listed}. {title} — {}\n", s.url));
+            }
+            if items.len() > room {
+                out.push_str(&format!("+{} more {more} not listed\n", items.len() - room));
+            }
+        };
+        section(
+            "\n\n**Pages read** (kaibo's record of the pages the team fetched):\n",
+            &fetched,
+            "pages read",
+            &mut out,
         );
-        for (i, s) in sources.iter().take(MAX_LISTED_SOURCES).enumerate() {
-            let title = if s.title.trim().is_empty() {
-                "untitled"
-            } else {
-                s.title.trim()
-            };
-            out.push_str(&format!("{}. {title} — {}\n", i + 1, s.url));
-        }
-        if sources.len() > MAX_LISTED_SOURCES {
-            out.push_str(&format!(
-                "+{} more not listed\n",
-                sources.len() - MAX_LISTED_SOURCES
-            ));
-        }
+        section(
+            "\n\n**Search results cited** (results of the provider's own search that the \
+             answer cited; kaibo has no record of a fetch, so the team may have seen only \
+             the search summary):\n",
+            &cited,
+            "search results cited",
+            &mut out,
+        );
         Some(out.trim_end().to_string())
     }
 
@@ -271,12 +332,7 @@ impl WebSession {
 
     fn record(&self, url: &str, title: &str) {
         let mut sources = self.sources.lock().expect("web sources poisoned");
-        if !sources.iter().any(|s| s.url == url) {
-            sources.push(WebSource {
-                url: url.to_string(),
-                title: title.to_string(),
-            });
-        }
+        WebSource::merge_into(&mut sources, WebSource::fetched(url, title));
     }
 
     /// Run a search against the budget and format the results for a model. The progress
@@ -688,7 +744,57 @@ mod tests {
         }
         let block = s.sources_block().unwrap();
         assert!(block.contains("12. X — https://x/9"), "{block}");
-        assert!(block.ends_with("+10 more not listed"), "{block}");
+        assert!(block.ends_with("+10 more pages read not listed"), "{block}");
+    }
+
+    #[test]
+    fn cited_search_results_list_apart_from_pages_read() {
+        let s = offline(1, 1);
+        s.record_native(
+            NativeWeb::Anthropic,
+            NativeTally {
+                searches: 1,
+                fetches: 1,
+                sources: vec![
+                    WebSource::cited("https://snippet", "Snippet"),
+                    WebSource::cited("https://later", "Later"),
+                    WebSource::fetched("https://read", "Read"),
+                ],
+            },
+        );
+        // A citation the team fetches afterwards moves to the pages read.
+        s.record("https://later", "Later");
+        let block = s.sources_block().unwrap();
+        let read = block.find("**Pages read**").expect(&block);
+        let cited = block.find("**Search results cited**").expect(&block);
+        assert!(read < cited, "{block}");
+        let (read_part, cited_part) = block.split_at(cited);
+        assert!(read_part.contains("1. Later — https://later"), "{block}");
+        assert!(read_part.contains("2. Read — https://read"), "{block}");
+        assert!(cited_part.contains("3. Snippet — https://snippet"), "{block}");
+        assert!(!cited_part.contains("https://later"), "{block}");
+
+        // A full Pages read section still names the citations it had no room for.
+        for i in 0..20 {
+            s.record(&format!("https://x/{i}"), "X");
+        }
+        let block = s.sources_block().unwrap();
+        assert!(block.contains("+10 more pages read not listed"), "{block}");
+        assert!(block.ends_with("+1 more search results cited not listed"), "{block}");
+
+        // Only citations: no Pages read heading claims a read.
+        let c = offline(1, 1);
+        c.record_native(
+            NativeWeb::Anthropic,
+            NativeTally {
+                searches: 1,
+                fetches: 0,
+                sources: vec![WebSource::cited("https://s", "S")],
+            },
+        );
+        let block = c.sources_block().unwrap();
+        assert!(!block.contains("Pages read"), "{block}");
+        assert!(block.contains("1. S — https://s"), "{block}");
     }
 
     #[test]

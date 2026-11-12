@@ -141,7 +141,7 @@ async fn research_searches_fetches_and_reports() {
             assert!(
                 preamble(req)
                     .unwrap()
-                    .starts_with("You are the explorer, researching"),
+                    .starts_with("You are the explorer. An agent working outside kaibo asked a question that the web"),
                 "research runs on its own preamble"
             );
             let seen = transcript_text(req);

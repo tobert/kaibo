@@ -403,7 +403,9 @@ pub struct ConsultInput {
     /// dependency's docs or changelog, an advisory, a spec. Off by default: a code review
     /// stays on the code. The explorer searches (on a solo cast, the synth does), with its
     /// provider's own web tools or DeepSeek's; the provider reads each page on its servers,
-    /// so nothing on your network is opened. Sources are listed after the answer. See
+    /// so nothing on your network is opened. To have a page read, give its full URL in
+    /// `question` or `context`. kaibo lists the pages read and the search results cited
+    /// after the answer. See
     /// `kaibo://tools`.
     #[serde(default)]
     pub web: bool,
@@ -2416,12 +2418,15 @@ impl KaiboHandler {
             reliable sources say, each claim tied to its URL. A fast model searches and reads \
             pages with its provider's own web tools on an Anthropic or OpenRouter cast, and \
             through DeepSeek's Search and Fetch APIs on any other. Either way the provider \
-            fetches each page on its servers, so nothing on your network is opened. It returns a summary \
-            of findings, the sources with dates and quotes, and the searches it ran, then \
-            kaibo's own list of the pages fetched. Reads no project. Use it for what a \
+            fetches each page on its servers, so nothing on your network is opened. It returns an answer \
+            with numbered references (URL, date, and a quote from each page read), then kaibo's \
+            own record of the pages read and the search results cited without a read. \
+            Reads no project. Use it for what a \
             codebase cannot tell you: a dependency's changelog or known bugs, a security \
             advisory, an API that changed after your training cutoff. Pass `context` with \
-            what you already know. To bring the web into a code question, pass `web: true` \
+            what you already know. To have a page read, give its full URL in `question` \
+            or `context`: a model reaches a page by a URL it was given or a search \
+            returned. To bring the web into a code question, pass `web: true` \
             to `consult` or `deliberate` instead."
     )]
     async fn research(
@@ -5009,9 +5014,16 @@ When you want the conclusion rather than the map, use `consult`.
 
 `research` answers from the web instead of the repo: the cast's explorer (its synth, on a
 cast with no explorer) searches and reads pages, and returns a report citing every claim
-by its URL, then kaibo's own list of the pages fetched and a `web:` footer line counting
-searches and fetches. It reads no project and takes no `path`; pass `context` with what
-you already know (a version pin, an error message, what you ruled out).
+by its URL. kaibo then appends its own record: the pages fetched under **Pages read**, any
+search result the answer cited without a fetch under **Search results cited**, and a
+`web:` footer line counting searches and fetches. It reads no project and takes no `path`;
+pass `context` with what you already know (a version pin, an error message, what you
+ruled out).
+
+To have a specific page read, give its full URL in `question` or `context`. A model
+fetches a URL it was given or one a search returned; Anthropic's native `web_fetch`
+refuses any other (`url_not_in_prior_context`), so an advisory or model page the caller
+names by URL is read, and one the model would have to guess may not be.
 
 `web: true` on `consult`, `consult_submit`, or `deliberate` adds the web to a code
 question. It is off by default. On a team cast each delegated survey gets `web_search`

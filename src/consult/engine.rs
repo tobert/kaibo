@@ -870,6 +870,15 @@ impl AgentHook for NativeWebHook {
         event: ModelTurnFinished<'_>,
     ) -> ModelTurnAction {
         let tally = crate::web::native::NativeTally::read(event.raw);
+        for e in crate::web::native::tool_errors(event.raw) {
+            tracing::warn!(
+                provider = self.inner.kind.label(),
+                tool = e.tool,
+                error_code = %e.code,
+                url = e.url.as_deref().unwrap_or(""),
+                "native web tool returned an error"
+            );
+        }
         {
             let mut used = self.inner.used.lock().expect("native web hook poisoned");
             used.searches += tally.searches;
