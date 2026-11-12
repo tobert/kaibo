@@ -27,6 +27,7 @@ record. Each later release appends a new section at the top.
 - `web: true` on `consult`, `consult_submit`, and `deliberate` (`--web` in the CLI) adds web search to a code question; off by default.
 - On an Anthropic or OpenRouter arm, web calls use the provider's own server tools (`[web] native`, on by default).
 - OpenRouter reports no fetch count, so kaibo counts its fetches as executed tool calls minus searches, against the call's fetch budget.
+- OpenRouter web search and fetch run on Exa, named on every request, instead of OpenRouter's default `auto`.
 - A native web tool error logs the provider's `error_code` at warn, since the model's own account of a refusal is often wrong.
 - `--json` output marks each web source with `fetched`: `true`, `false`, or `null` where the provider does not say.
 - `[web]` sets the search backend and per-call caps (`max_searches`, `max_fetches`, 10 each); `--no-research` drops the tool; `kaibo://config` reports `[web]` with `live`.

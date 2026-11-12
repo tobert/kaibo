@@ -5036,7 +5036,8 @@ line in the dossier and in its acknowledgment. A `web: true` call always carries
 absent one.
 
 A phase on an Anthropic or OpenRouter arm uses that provider's own web tools (`[web]
-native`, on by default; Anthropic search is $10 per 1,000), and the `web:` line marks it
+native`, on by default; Anthropic search is $10 per 1,000, and OpenRouter's runs on Exa at
+$7 per 1,000 searches and $1 per 1,000 fetches), and the `web:` line marks it
 `(native)`. Every other arm uses DeepSeek's Search and Fetch APIs, billed to the `[web]`
 backend's key ($0.75 per 1,000 calls per endpoint). Either way the provider reads each
 page on its own servers, so kaibo never opens a URL a model chose. One call has 10

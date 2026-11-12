@@ -32,6 +32,13 @@ const NATIVE_FETCH_TOKENS: u64 = 10_000;
 /// Results one native search returns, where the provider takes the knob.
 const NATIVE_RESULTS: u64 = 8;
 
+/// The engine OpenRouter's search and fetch run on. Named rather than left at OpenRouter's
+/// default `auto`, which switches to a model's own provider search where one exists
+/// (GPT-5+, Claude 4+, Gemini 3+, Grok 4+): that search ignores `max_results` and may not
+/// count as a tool call, which breaks the fetch count [`NativeTally::read`] derives. Exa
+/// runs the same way on every model, so what kaibo sends and counts holds on all of them.
+const OPENROUTER_ENGINE: &str = "exa";
+
 /// A provider whose completions can run web tools server-side.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NativeWeb {
@@ -93,13 +100,18 @@ impl NativeWeb {
                 if searches > 0 {
                     defs.push(json!({
                         "type": "openrouter:web_search",
-                        "parameters": { "max_uses": searches, "max_results": NATIVE_RESULTS },
+                        "parameters": {
+                            "engine": OPENROUTER_ENGINE,
+                            "max_uses": searches,
+                            "max_results": NATIVE_RESULTS,
+                        },
                     }));
                 }
                 if fetches > 0 {
                     defs.push(json!({
                         "type": "openrouter:web_fetch",
                         "parameters": {
+                            "engine": OPENROUTER_ENGINE,
                             "max_uses": fetches,
                             "max_content_tokens": NATIVE_FETCH_TOKENS,
                         },
@@ -136,11 +148,10 @@ impl NativeTally {
         // count, and `tool_calls_executed` counts every server tool call that produced a
         // result, a call refused past `max_uses` included. kaibo declares only search and
         // fetch there, so the calls that were not searches are the fetches. A future
-        // `web_fetch_requests` is taken as given. The one known gap: OpenRouter's docs say
-        // a provider-native search (search `engine` `auto`, the default, on a model whose
-        // provider searches natively) may count in `web_search_requests` without a tool
-        // call, and then this undercounts fetches by that many. Each request stays capped
-        // by its own `max_uses` either way; only the call-wide budget can drift.
+        // `web_fetch_requests` is taken as given. This holds because kaibo names the Exa
+        // engine ([`OPENROUTER_ENGINE`]): OpenRouter's docs say a provider-native search,
+        // which its default `auto` engine picks on some models, may count in
+        // `web_search_requests` without a tool call, and this would undercount by that many.
         let or_fetches = match details.get("web_fetch_requests") {
             Some(_) => count(details, "web_fetch_requests"),
             None => count(details, "tool_calls_executed").saturating_sub(or_searches),
@@ -337,6 +348,12 @@ mod tests {
         assert_eq!(or.len(), 1);
         assert_eq!(or[0]["type"], "openrouter:web_search");
         assert_eq!(or[0]["parameters"]["max_uses"], 4);
+        // The engine is named, never OpenRouter's `auto`, on both tools.
+        let both = NativeWeb::OpenRouter.tool_defs(1, 1);
+        assert_eq!(both.len(), 2);
+        for def in &both {
+            assert_eq!(def["parameters"]["engine"], "exa", "{def}");
+        }
     }
 
     #[test]
