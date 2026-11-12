@@ -23,7 +23,7 @@
 use serde_json::{json, Value};
 
 use crate::credentials::ProviderKind;
-use super::tools::WebSource;
+use super::tools::{SourceKind, WebSource};
 
 /// Approximate token cap on one natively fetched page: about the 40,000 characters a
 /// kaibo-run fetch is cut at ([`super::tools::MAX_PAGE_CHARS`]).
@@ -123,23 +123,37 @@ pub struct NativeTally {
 impl NativeTally {
     /// Read a raw provider response. Anthropic reports counts under
     /// `usage.server_tool_use` and pages as `web_fetch_tool_result` blocks and
-    /// `web_search_result_location` citations; OpenRouter reports counts under
-    /// `usage.server_tool_use_details` and pages as `url_citation` annotations. Any other
+    /// `web_search_result_location` citations; OpenRouter reports searches and all
+    /// executed tool calls under `usage.server_tool_use_details`, and pages as
+    /// `url_citation` annotations that do not say whether a page was fetched. Any other
     /// shape reads as zero.
     pub fn read(raw: &Value) -> Self {
         let usage = &raw["usage"];
         let count = |v: &Value, key: &str| v[key].as_u64().unwrap_or(0) as usize;
+        let details = &usage["server_tool_use_details"];
+        let or_searches = count(details, "web_search_requests");
+        // OpenRouter has no fetch counter: `web_search_requests` is its only per-tool
+        // count, and `tool_calls_executed` counts every server tool call that produced a
+        // result, a call refused past `max_uses` included. kaibo declares only search and
+        // fetch there, so the calls that were not searches are the fetches. A future
+        // `web_fetch_requests` is taken as given. The one known gap: OpenRouter's docs say
+        // a provider-native search (search `engine` `auto`, the default, on a model whose
+        // provider searches natively) may count in `web_search_requests` without a tool
+        // call, and then this undercounts fetches by that many. Each request stays capped
+        // by its own `max_uses` either way; only the call-wide budget can drift.
+        let or_fetches = match details.get("web_fetch_requests") {
+            Some(_) => count(details, "web_fetch_requests"),
+            None => count(details, "tool_calls_executed").saturating_sub(or_searches),
+        };
         let mut tally = Self {
-            searches: count(&usage["server_tool_use"], "web_search_requests")
-                + count(&usage["server_tool_use_details"], "web_search_requests"),
-            fetches: count(&usage["server_tool_use"], "web_fetch_requests")
-                + count(&usage["server_tool_use_details"], "web_fetch_requests"),
+            searches: count(&usage["server_tool_use"], "web_search_requests") + or_searches,
+            fetches: count(&usage["server_tool_use"], "web_fetch_requests") + or_fetches,
             sources: Vec::new(),
         };
-        let mut add = |url: Option<&str>, title: Option<&str>, fetched: bool| {
+        let mut add = |url: Option<&str>, title: Option<&str>, kind: SourceKind| {
             if let Some(url) = url.filter(|u| !u.is_empty()) {
                 let title = title.unwrap_or("");
-                WebSource::merge_into(&mut tally.sources, WebSource::new(url, title, fetched));
+                WebSource::merge_into(&mut tally.sources, WebSource::new(url, title, kind));
             }
         };
         // Anthropic: content blocks.
@@ -152,13 +166,13 @@ impl NativeTally {
                     add(
                         result["url"].as_str(),
                         result["content"]["title"].as_str(),
-                        true,
+                        SourceKind::Fetched,
                     );
                 }
                 Some("text") => {
                     for c in block["citations"].as_array().into_iter().flatten() {
                         if c["type"] == "web_search_result_location" {
-                            add(c["url"].as_str(), c["title"].as_str(), false);
+                            add(c["url"].as_str(), c["title"].as_str(), SourceKind::SearchResult);
                         }
                     }
                 }
@@ -175,7 +189,7 @@ impl NativeTally {
                 if a["type"] == "url_citation" {
                     // An annotation does not say whether the provider fetched the page.
                     let c = &a["url_citation"];
-                    add(c["url"].as_str(), c["title"].as_str(), false);
+                    add(c["url"].as_str(), c["title"].as_str(), SourceKind::Unattributed);
                 }
             }
         }
@@ -357,14 +371,24 @@ mod tests {
 
     #[test]
     fn an_openrouter_response_tallies_annotations() {
+        // The shape a live Qwen research run returned (2026-11-12): three searches and
+        // fourteen executed calls, so eleven fetches, one of them refused past the cap.
         let raw = json!({
             "choices": [{"message": {"content": "x", "annotations": [
                 {"type": "url_citation", "url_citation": {"url": "https://c", "title": "C"}}]}}],
-            "usage": {"server_tool_use_details": {"web_search_requests": 1}}
+            "usage": {"server_tool_use_details": {
+                "web_search_requests": 3, "tool_calls_requested": 14, "tool_calls_executed": 14}}
         });
         let t = NativeTally::read(&raw);
-        assert_eq!((t.searches, t.fetches), (1, 0));
-        assert_eq!(t.sources, vec![WebSource::cited("https://c", "C")]);
+        assert_eq!((t.searches, t.fetches), (3, 11));
+        assert_eq!(t.sources, vec![WebSource::unattributed("https://c", "C")]);
+
+        // Searches alone: no fetches. A fetch counter, if OpenRouter adds one, wins.
+        let only = |details| NativeTally::read(&json!({"usage": {"server_tool_use_details": details}}));
+        let t = only(json!({"web_search_requests": 2, "tool_calls_executed": 2}));
+        assert_eq!((t.searches, t.fetches), (2, 0));
+        let t = only(json!({"web_search_requests": 1, "web_fetch_requests": 2, "tool_calls_executed": 9}));
+        assert_eq!((t.searches, t.fetches), (1, 2));
     }
 
     #[test]

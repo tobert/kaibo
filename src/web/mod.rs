@@ -29,7 +29,7 @@ use std::time::Duration;
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
 
-pub use tools::{WebFetch, WebSearch, WebSession, WebSource, WebUsage};
+pub use tools::{SourceKind, WebFetch, WebSearch, WebSession, WebSource, WebUsage};
 
 /// The per-request deadline for a web call. A search or fetch answers in seconds, so it
 /// gets its own bound rather than the backend's `request_timeout`, which is sized for a

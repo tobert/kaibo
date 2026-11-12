@@ -26,8 +26,9 @@ record. Each later release appends a new section at the top.
 - `research` (and `kaibo research`) searches the web and returns an answer with numbered references (URL, date, and a quote), then kaibo's own list of the pages read and of search results cited without a read.
 - `web: true` on `consult`, `consult_submit`, and `deliberate` (`--web` in the CLI) adds web search to a code question; off by default.
 - On an Anthropic or OpenRouter arm, web calls use the provider's own server tools (`[web] native`, on by default).
+- OpenRouter reports no fetch count, so kaibo counts its fetches as executed tool calls minus searches, against the call's fetch budget.
 - A native web tool error logs the provider's `error_code` at warn, since the model's own account of a refusal is often wrong.
-- `--json` output marks each web source with `fetched`.
+- `--json` output marks each web source with `fetched`: `true`, `false`, or `null` where the provider does not say.
 - `[web]` sets the search backend and per-call caps (`max_searches`, `max_fetches`, 10 each); `--no-research` drops the tool; `kaibo://config` reports `[web]` with `live`.
 - A cast's `consult = "solo" | "team"` key runs `consult` with the synth alone, keeping the explorer slot for `explore` and `deliberate`; `kaibo://config` shows each cast's mode.
 - `batch_submit` and `deliberate` run on `openrouter` backends via `/api/v1/batches`, stripping any `:batch` suffix from `list_models` ids.

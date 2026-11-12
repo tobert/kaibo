@@ -1259,7 +1259,7 @@ fn web_json(web: &WebSession) -> serde_json::Value {
         "sources": web
             .sources()
             .iter()
-            .map(|s| serde_json::json!({ "url": s.url, "title": s.title, "fetched": s.fetched }))
+            .map(|s| serde_json::json!({ "url": s.url, "title": s.title, "fetched": s.fetched_flag() }))
             .collect::<Vec<_>>(),
     })
 }
