@@ -23,9 +23,11 @@ record. Each later release appends a new section at the top.
 - `openai` backends on the Responses wire send `store: false` by default, so OpenAI does not keep the response objects; `data_collection = "allow"` opts back in.
 
 ### Added
-- `research` (and `kaibo research`) searches the web and returns a URL-cited report with kaibo's own list of sources.
+- `research` (and `kaibo research`) searches the web and returns an answer with numbered references (URL, date, and a quote), then kaibo's own list of the pages read and of search results cited without a read.
 - `web: true` on `consult`, `consult_submit`, and `deliberate` (`--web` in the CLI) adds web search to a code question; off by default.
 - On an Anthropic or OpenRouter arm, web calls use the provider's own server tools (`[web] native`, on by default).
+- A native web tool error logs the provider's `error_code` at warn, since the model's own account of a refusal is often wrong.
+- `--json` output marks each web source with `fetched`.
 - `[web]` sets the search backend and per-call caps (`max_searches`, `max_fetches`, 10 each); `--no-research` drops the tool; `kaibo://config` reports `[web]` with `live`.
 - A cast's `consult = "solo" | "team"` key runs `consult` with the synth alone, keeping the explorer slot for `explore` and `deliberate`; `kaibo://config` shows each cast's mode.
 - `batch_submit` and `deliberate` run on `openrouter` backends via `/api/v1/batches`, stripping any `:batch` suffix from `list_models` ids.

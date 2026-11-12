@@ -474,7 +474,8 @@ pub struct ResearchArgs {
     pub question: String,
 
     /// Starting evidence to build on: a version pin, an error message, what you already
-    /// ruled out. The researcher extends it rather than re-checking it.
+    /// ruled out. The researcher extends it rather than re-checking it. To have a page
+    /// read, give its full URL here or in the question.
     #[arg(long, value_name = "TEXT")]
     pub context: Option<String>,
 
@@ -1258,7 +1259,7 @@ fn web_json(web: &WebSession) -> serde_json::Value {
         "sources": web
             .sources()
             .iter()
-            .map(|s| serde_json::json!({ "url": s.url, "title": s.title }))
+            .map(|s| serde_json::json!({ "url": s.url, "title": s.title, "fetched": s.fetched }))
             .collect::<Vec<_>>(),
     })
 }
