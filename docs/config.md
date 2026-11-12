@@ -250,11 +250,16 @@ generation request, not a reasoning loop, so the reasoning tunables (`effort`,
 `thinking_budget`, `temperature`, ...) written on it are inert — `kaibo://config`
 flags them under `inert_tunables`.
 
-`decision` points at a backend of kind `openrouter` and staffs the `decide` tool: one request
-to OpenRouter's Decisions API (`POST /api/alpha/decisions`) with typed questions about a
-state, answered with probabilities and no text. The model id is the provider's, for
-example `~typesafe/jev-latest`, which tracks the newest Jev. A decision slot on any other kind
-is a load error. Like a media slot it runs no reasoning loop, so reasoning tunables
+`decision` points at a backend of kind `openrouter` or `gemini` and staffs the `decide` tool:
+one request with typed questions about a state, answered with probabilities and no text. On
+`openrouter` it goes to OpenRouter's Decisions API (`POST /api/alpha/decisions`), model for
+example `~typesafe/jev-latest`, which tracks the newest Jev. On `gemini` it goes to Google's
+Gemini Decisions API (`POST /v1beta/decisions` under the backend's host), model
+`gemini-decision-1`; the state is sent as text (a JSON state as its JSON text), answers
+carry a `confidence`, a `noul` question may describe its answers with `criteria`
+`{"true_description": "...", "false_description": "..."}` (refused on `openrouter`, whose Jev
+ignores them), and the reply reports tokens but no cost. A decision slot on any
+other kind is a load error. Like a media slot it runs no reasoning loop, so reasoning tunables
 written on it are inert.
 
 Jev (`~typesafe/jev-latest`) is a fast classifier: it
@@ -760,7 +765,7 @@ Which cast shape staffs which tool:
 | `batch_submit` | a cast whose synth runs on `lane = "batch"` (or the `batch = true` sugar) |
 | `deliberate` | a cast with an `explorer` **and** an offline synth (`lane = "batch"` or `lane = "direct"`) |
 | `generate` | a cast with an `image` slot (kind `stability`, `openai-images`, `gemini-media`, `dashscope`, or `bfl`) or an `audio` slot (kind `gemini-media` or `stability`) — plus `[cas]` on |
-| `decide` | a cast with a `decision` slot (kind `openrouter`) |
+| `decide` | a cast with a `decision` slot (kind `openrouter` or `gemini`) |
 | `research` | a cast with an `explorer` slot, or an interactive `synth` slot — plus live web access (`[web]`) |
 | `job_get`, `job_cancel`, `job_list`, `job_wait` | at least one live handle *producer*; they follow whatever survives above |
 | `run_kaish`, `list_models` | no cast at all; advertised whenever their flag is on |
@@ -776,7 +781,7 @@ No built-in cast has a media slot or pairs an explorer with an offline synth, so
 | a hosted OpenAI Platform key | the same three | a new `openai` backend and cast, as `[backends.gpt]` and `[casts.gpt]` show |
 | Anthropic, Gemini, OpenRouter, or a hosted OpenAI Platform key | also `batch_submit` | a cast whose synth has `lane = "batch"`; `anthropic-batch` and `gemini-batch` are built in |
 | any of the above | also `deliberate` | a cast pairing an `explorer` with an offline synth: `lane = "batch"` on the four keys above, or `lane = "direct"` on any backend |
-| OpenRouter | also `decide` | a cast with a `decision` slot |
+| OpenRouter or Gemini | also `decide` | a cast with a `decision` slot |
 | DeepSeek, as the `[web]` backend | `research`, and `web: true` on any cast | none; `[web] backend = "deepseek"` is the default |
 | Anthropic or OpenRouter | `research`, and `web: true`, on their own casts | none; `[web] native = true` is the default |
 | a key for a `stability`, `gemini-media`, `bfl`, `openai-images`, or `dashscope` backend | `generate` | an `image` slot, or an `audio` slot on `stability` and `gemini-media` only; `[cas]` on |

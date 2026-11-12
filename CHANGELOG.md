@@ -64,6 +64,7 @@ record. Each later release appends a new section at the top.
 
 ### Added
 - `decide` asks a fast decision model typed questions (`choice`, `score`, `noul`) and returns probabilities; it runs a cast's `decision` slot on an `openrouter` backend, and `--no-decide` drops it.
+- `decide` also runs on a `gemini` backend, through Google's Gemini Decisions API (`gemini-decision-1`), where a `noul` may take `true_description`/`false_description` criteria.
 - `decide` without `cast` uses the one cast with a `decision` slot, and refuses with their names when there are several.
 - `consult` runs single-stage on a cast with no `explorer`: the synth does every read itself.
 - `generate` makes audio with `media = "audio"` (`kaibo generate --media audio`) on a cast's `audio` slot: Gemini text-to-speech, and Stable Audio 2, 2.5, and 3.

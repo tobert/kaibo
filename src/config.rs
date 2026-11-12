@@ -2302,8 +2302,9 @@ impl Config {
                     bail!(
                         "cast {name:?}: the decision slot points at backend {:?} (kind \
                          `{}`), which has no Decisions route — point the slot at a \
-                         backend of kind `openrouter`, e.g. `decision = \"openrouter/\
-                         ~typesafe/jev-latest\"`",
+                         backend of kind `openrouter` or `gemini`, e.g. `decision = \
+                         \"openrouter/~typesafe/jev-latest\"` or `decision = \
+                         \"gemini/gemini-decision-1\"`",
                         slot.backend,
                         kind.canonical_name(),
                     );

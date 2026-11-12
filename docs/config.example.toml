@@ -277,11 +277,13 @@ synth = { backend = "gemma", id = "Big-Local-70B-GGUF", lane = "direct" }
 # [casts.flux-artist]
 # image = "bfl/flux-2-pro"
 
-# `decide`: a fast classifier (Jev) answers typed questions with probabilities, no text.
-# The slot needs an openrouter backend (the prefix below is that backend's name). Give it
-# its own cast and pass cast = "judge" on each call: the default cast has no decision slot.
+# `decide`: a fast classifier answers typed questions with probabilities, no text.
+# The slot needs an openrouter or gemini backend (the prefix is that backend's name). Give
+# it its own cast and pass cast = "judge" on each call: the default cast has no decision slot.
 # [casts.judge]
 # decision = "openrouter/~typesafe/jev-latest"   # tracks the newest Jev
+# [casts.gemini-judge]
+# decision = "gemini/gemini-decision-1"           # Gemini Decisions API
 
 # House rules: project files read if present; user files required when a phase runs.
 # [context]

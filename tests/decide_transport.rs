@@ -134,7 +134,7 @@ async fn the_request_carries_the_key_and_the_probed_body() {
 
     assert_eq!(resp.model, "typesafe/jev-1.13-20260917");
     assert_eq!(resp.usage.cost, Some(0.00001));
-    assert!(matches!(resp.answers["pushes"], Answer::Noul { noul } if noul == 0.96));
+    assert!(matches!(resp.answers["pushes"], Answer::Noul { noul, .. } if noul == 0.96));
 }
 
 #[tokio::test]
