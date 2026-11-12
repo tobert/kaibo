@@ -5019,7 +5019,9 @@ When you want the conclusion rather than the map, use `consult`.
 `research` answers from the web instead of the repo: the cast's explorer (its synth, on a
 cast with no explorer) searches and reads pages, and returns a report citing every claim
 by its URL. kaibo then appends its own record: the pages fetched under **Pages read**, any
-search result the answer cited without a fetch under **Search results cited**, and a
+search result the answer cited without a fetch under **Search results cited**, any page an
+OpenRouter cast's tools returned under **Pages the provider cited** (OpenRouter does not
+say which pages it fetched), and a
 `web:` footer line counting searches and fetches. It reads no project and takes no `path`;
 pass `context` with what you already know (a version pin, an error message, what you
 ruled out).
@@ -5038,7 +5040,8 @@ line in the dossier and in its acknowledgment. A `web: true` call always carries
 absent one.
 
 A phase on an Anthropic or OpenRouter arm uses that provider's own web tools (`[web]
-native`, on by default; Anthropic search is $10 per 1,000), and the `web:` line marks it
+native`, on by default; Anthropic search is $10 per 1,000, and OpenRouter's runs on Exa at
+$7 per 1,000 searches and $1 per 1,000 fetches), and the `web:` line marks it
 `(native)`. Every other arm uses DeepSeek's Search and Fetch APIs, billed to the `[web]`
 backend's key ($0.75 per 1,000 calls per endpoint). Either way the provider reads each
 page on its own servers, so kaibo never opens a URL a model chose. One call has 10

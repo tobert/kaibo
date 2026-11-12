@@ -35,40 +35,68 @@ pub const MAX_CALL_PAGE_CHARS: usize = 160_000;
 /// The most entries the appended sources block lists, across both of its sections.
 pub const MAX_LISTED_SOURCES: usize = 12;
 
-/// One page the team fetched, or a result a provider's own search cited.
+/// How kaibo came to know of a source, which decides the heading it lists under.
+/// Ordered by how much it says: a fetch outranks a citation, which outranks a page a
+/// provider named without saying how it reached it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum SourceKind {
+    /// The provider returned this page, and does not report whether it fetched the page
+    /// or took it from a search (OpenRouter's `url_citation` annotations).
+    Unattributed,
+    /// A result of the provider's own search that the answer cited, with no fetch on
+    /// record: the team may have seen only the search summary.
+    SearchResult,
+    /// kaibo has a record of the page being fetched.
+    Fetched,
+}
+
+/// One page the team fetched, or a page a provider's own tools returned and the answer
+/// cited.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WebSource {
     pub url: String,
     pub title: String,
-    /// True when kaibo has a record of the page being fetched. A provider's search
-    /// result that the answer cited but nobody fetched is `false`: the team saw only the
-    /// search summary.
-    pub fetched: bool,
+    pub kind: SourceKind,
 }
 
 impl WebSource {
-    pub fn new(url: &str, title: &str, fetched: bool) -> Self {
+    pub fn new(url: &str, title: &str, kind: SourceKind) -> Self {
         Self {
             url: url.to_string(),
             title: title.to_string(),
-            fetched,
+            kind,
         }
     }
 
     pub fn fetched(url: &str, title: &str) -> Self {
-        Self::new(url, title, true)
+        Self::new(url, title, SourceKind::Fetched)
     }
 
     pub fn cited(url: &str, title: &str) -> Self {
-        Self::new(url, title, false)
+        Self::new(url, title, SourceKind::SearchResult)
     }
 
-    /// Add `source` to `list` once per URL, first sighting first. A later fetch of a
-    /// URL first seen as a citation marks it fetched, and fills in a missing title.
+    pub fn unattributed(url: &str, title: &str) -> Self {
+        Self::new(url, title, SourceKind::Unattributed)
+    }
+
+    /// `Some(true)` for a fetched page, `Some(false)` for a search result, `None` when
+    /// the provider did not say. The `fetched` field of `--json`.
+    pub fn fetched_flag(&self) -> Option<bool> {
+        match self.kind {
+            SourceKind::Fetched => Some(true),
+            SourceKind::SearchResult => Some(false),
+            SourceKind::Unattributed => None,
+        }
+    }
+
+    /// Add `source` to `list` once per URL, first sighting first. A later sighting that
+    /// says more (a fetch of a URL first seen as a citation) raises its kind, and a
+    /// missing title is filled in.
     pub fn merge_into(list: &mut Vec<WebSource>, source: WebSource) {
         match list.iter_mut().find(|s| s.url == source.url) {
             Some(s) => {
-                s.fetched |= source.fetched;
+                s.kind = s.kind.max(source.kind);
                 if s.title.trim().is_empty() {
                     s.title = source.title;
                 }
@@ -267,7 +295,7 @@ impl WebSession {
         })
     }
 
-    /// Pages fetched successfully and search results cited, first sighting first, each
+    /// Pages fetched successfully and pages a provider cited, first sighting first, each
     /// URL once.
     pub fn sources(&self) -> Vec<WebSource> {
         self.sources.lock().expect("web sources poisoned").clone()
@@ -275,7 +303,8 @@ impl WebSession {
 
     /// The block kaibo appends to an answer, or `None` when the record is empty: the
     /// pages the team fetched, then the search results the answer cited without a fetch,
-    /// so a reader can tell a read page from a search summary. Lists at most
+    /// then pages a provider cited without saying which, so a reader can tell a read
+    /// page from a search summary. Lists at most
     /// [`MAX_LISTED_SOURCES`] in all, fetched pages first; a provider that cites every
     /// search result (OpenRouter annotates them all) would otherwise bury the pages
     /// that mattered.
@@ -284,11 +313,11 @@ impl WebSession {
         if sources.is_empty() {
             return None;
         }
-        let (fetched, cited): (Vec<_>, Vec<_>) = sources.iter().partition(|s| s.fetched);
+        let of = |kind| sources.iter().filter(|s| s.kind == kind).collect::<Vec<_>>();
         let mut out = String::new();
         let mut listed = 0;
         // Each section reports its own overflow, so an entry left out is never counted
-        // under the other section's heading.
+        // under another section's heading.
         let mut section = |heading: &str, items: &[&WebSource], more: &str, out: &mut String| {
             if items.is_empty() {
                 return;
@@ -310,7 +339,7 @@ impl WebSession {
         };
         section(
             "\n\n**Pages read** (kaibo's record of the pages the team fetched):\n",
-            &fetched,
+            &of(SourceKind::Fetched),
             "pages read",
             &mut out,
         );
@@ -318,8 +347,15 @@ impl WebSession {
             "\n\n**Search results cited** (results of the provider's own search that the \
              answer cited; kaibo has no record of a fetch, so the team may have seen only \
              the search summary):\n",
-            &cited,
+            &of(SourceKind::SearchResult),
             "search results cited",
+            &mut out,
+        );
+        section(
+            "\n\n**Pages the provider cited** (the provider's own web tools returned these, \
+             and it does not report which it fetched and which came from a search):\n",
+            &of(SourceKind::Unattributed),
+            "pages the provider cited",
             &mut out,
         );
         Some(out.trim_end().to_string())
@@ -781,6 +817,31 @@ mod tests {
         let block = s.sources_block().unwrap();
         assert!(block.contains("+10 more pages read not listed"), "{block}");
         assert!(block.ends_with("+1 more search results cited not listed"), "{block}");
+
+        // A page the provider cited without saying how lists under its own heading, and
+        // a fetch of it later moves it to the pages read.
+        let o = offline(1, 1);
+        o.record_native(
+            NativeWeb::OpenRouter,
+            NativeTally {
+                searches: 1,
+                fetches: 1,
+                sources: vec![
+                    WebSource::unattributed("https://u", "U"),
+                    WebSource::unattributed("https://v", "V"),
+                ],
+            },
+        );
+        o.record("https://v", "V");
+        let block = o.sources_block().unwrap();
+        let read = block.find("**Pages read**").expect(&block);
+        let provider = block.find("**Pages the provider cited**").expect(&block);
+        assert!(read < provider, "{block}");
+        assert!(!block.contains("Search results cited"), "{block}");
+        let (read_part, provider_part) = block.split_at(provider);
+        assert!(read_part.contains("1. V — https://v"), "{block}");
+        assert!(provider_part.contains("2. U — https://u"), "{block}");
+        assert!(!provider_part.contains("https://v"), "{block}");
 
         // Only citations: no Pages read heading claims a read.
         let c = offline(1, 1);

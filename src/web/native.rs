@@ -23,7 +23,7 @@
 use serde_json::{json, Value};
 
 use crate::credentials::ProviderKind;
-use super::tools::WebSource;
+use super::tools::{SourceKind, WebSource};
 
 /// Approximate token cap on one natively fetched page: about the 40,000 characters a
 /// kaibo-run fetch is cut at ([`super::tools::MAX_PAGE_CHARS`]).
@@ -31,6 +31,13 @@ const NATIVE_FETCH_TOKENS: u64 = 10_000;
 
 /// Results one native search returns, where the provider takes the knob.
 const NATIVE_RESULTS: u64 = 8;
+
+/// The engine OpenRouter's search and fetch run on. Named rather than left at OpenRouter's
+/// default `auto`, which switches to a model's own provider search where one exists
+/// (GPT-5+, Claude 4+, Gemini 3+, Grok 4+): that search ignores `max_results` and may not
+/// count as a tool call, which breaks the fetch count [`NativeTally::read`] derives. Exa
+/// runs the same way on every model, so what kaibo sends and counts holds on all of them.
+const OPENROUTER_ENGINE: &str = "exa";
 
 /// A provider whose completions can run web tools server-side.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -93,13 +100,18 @@ impl NativeWeb {
                 if searches > 0 {
                     defs.push(json!({
                         "type": "openrouter:web_search",
-                        "parameters": { "max_uses": searches, "max_results": NATIVE_RESULTS },
+                        "parameters": {
+                            "engine": OPENROUTER_ENGINE,
+                            "max_uses": searches,
+                            "max_results": NATIVE_RESULTS,
+                        },
                     }));
                 }
                 if fetches > 0 {
                     defs.push(json!({
                         "type": "openrouter:web_fetch",
                         "parameters": {
+                            "engine": OPENROUTER_ENGINE,
                             "max_uses": fetches,
                             "max_content_tokens": NATIVE_FETCH_TOKENS,
                         },
@@ -123,23 +135,36 @@ pub struct NativeTally {
 impl NativeTally {
     /// Read a raw provider response. Anthropic reports counts under
     /// `usage.server_tool_use` and pages as `web_fetch_tool_result` blocks and
-    /// `web_search_result_location` citations; OpenRouter reports counts under
-    /// `usage.server_tool_use_details` and pages as `url_citation` annotations. Any other
+    /// `web_search_result_location` citations; OpenRouter reports searches and all
+    /// executed tool calls under `usage.server_tool_use_details`, and pages as
+    /// `url_citation` annotations that do not say whether a page was fetched. Any other
     /// shape reads as zero.
     pub fn read(raw: &Value) -> Self {
         let usage = &raw["usage"];
         let count = |v: &Value, key: &str| v[key].as_u64().unwrap_or(0) as usize;
+        let details = &usage["server_tool_use_details"];
+        let or_searches = count(details, "web_search_requests");
+        // OpenRouter has no fetch counter: `web_search_requests` is its only per-tool
+        // count, and `tool_calls_executed` counts every server tool call that produced a
+        // result, a call refused past `max_uses` included. kaibo declares only search and
+        // fetch there, so the calls that were not searches are the fetches. A future
+        // `web_fetch_requests` is taken as given. This holds because kaibo names the Exa
+        // engine ([`OPENROUTER_ENGINE`]): OpenRouter's docs say a provider-native search,
+        // which its default `auto` engine picks on some models, may count in
+        // `web_search_requests` without a tool call, and this would undercount by that many.
+        let or_fetches = match details.get("web_fetch_requests") {
+            Some(_) => count(details, "web_fetch_requests"),
+            None => count(details, "tool_calls_executed").saturating_sub(or_searches),
+        };
         let mut tally = Self {
-            searches: count(&usage["server_tool_use"], "web_search_requests")
-                + count(&usage["server_tool_use_details"], "web_search_requests"),
-            fetches: count(&usage["server_tool_use"], "web_fetch_requests")
-                + count(&usage["server_tool_use_details"], "web_fetch_requests"),
+            searches: count(&usage["server_tool_use"], "web_search_requests") + or_searches,
+            fetches: count(&usage["server_tool_use"], "web_fetch_requests") + or_fetches,
             sources: Vec::new(),
         };
-        let mut add = |url: Option<&str>, title: Option<&str>, fetched: bool| {
+        let mut add = |url: Option<&str>, title: Option<&str>, kind: SourceKind| {
             if let Some(url) = url.filter(|u| !u.is_empty()) {
                 let title = title.unwrap_or("");
-                WebSource::merge_into(&mut tally.sources, WebSource::new(url, title, fetched));
+                WebSource::merge_into(&mut tally.sources, WebSource::new(url, title, kind));
             }
         };
         // Anthropic: content blocks.
@@ -152,13 +177,13 @@ impl NativeTally {
                     add(
                         result["url"].as_str(),
                         result["content"]["title"].as_str(),
-                        true,
+                        SourceKind::Fetched,
                     );
                 }
                 Some("text") => {
                     for c in block["citations"].as_array().into_iter().flatten() {
                         if c["type"] == "web_search_result_location" {
-                            add(c["url"].as_str(), c["title"].as_str(), false);
+                            add(c["url"].as_str(), c["title"].as_str(), SourceKind::SearchResult);
                         }
                     }
                 }
@@ -175,7 +200,7 @@ impl NativeTally {
                 if a["type"] == "url_citation" {
                     // An annotation does not say whether the provider fetched the page.
                     let c = &a["url_citation"];
-                    add(c["url"].as_str(), c["title"].as_str(), false);
+                    add(c["url"].as_str(), c["title"].as_str(), SourceKind::Unattributed);
                 }
             }
         }
@@ -323,6 +348,12 @@ mod tests {
         assert_eq!(or.len(), 1);
         assert_eq!(or[0]["type"], "openrouter:web_search");
         assert_eq!(or[0]["parameters"]["max_uses"], 4);
+        // The engine is named, never OpenRouter's `auto`, on both tools.
+        let both = NativeWeb::OpenRouter.tool_defs(1, 1);
+        assert_eq!(both.len(), 2);
+        for def in &both {
+            assert_eq!(def["parameters"]["engine"], "exa", "{def}");
+        }
     }
 
     #[test]
@@ -357,14 +388,24 @@ mod tests {
 
     #[test]
     fn an_openrouter_response_tallies_annotations() {
+        // The shape a live Qwen research run returned (2026-11-12): three searches and
+        // fourteen executed calls, so eleven fetches, one of them refused past the cap.
         let raw = json!({
             "choices": [{"message": {"content": "x", "annotations": [
                 {"type": "url_citation", "url_citation": {"url": "https://c", "title": "C"}}]}}],
-            "usage": {"server_tool_use_details": {"web_search_requests": 1}}
+            "usage": {"server_tool_use_details": {
+                "web_search_requests": 3, "tool_calls_requested": 14, "tool_calls_executed": 14}}
         });
         let t = NativeTally::read(&raw);
-        assert_eq!((t.searches, t.fetches), (1, 0));
-        assert_eq!(t.sources, vec![WebSource::cited("https://c", "C")]);
+        assert_eq!((t.searches, t.fetches), (3, 11));
+        assert_eq!(t.sources, vec![WebSource::unattributed("https://c", "C")]);
+
+        // Searches alone: no fetches. A fetch counter, if OpenRouter adds one, wins.
+        let only = |details| NativeTally::read(&json!({"usage": {"server_tool_use_details": details}}));
+        let t = only(json!({"web_search_requests": 2, "tool_calls_executed": 2}));
+        assert_eq!((t.searches, t.fetches), (2, 0));
+        let t = only(json!({"web_search_requests": 1, "web_fetch_requests": 2, "tool_calls_executed": 9}));
+        assert_eq!((t.searches, t.fetches), (1, 2));
     }
 
     #[test]
