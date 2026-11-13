@@ -1434,7 +1434,7 @@ impl KaiboHandler {
             tracing::warn!(
                 tools = "research",
                 "disabled: the [web] backend `{}` has no API key and no usable cast runs on a \
-                 backend with native web tools (anthropic, openrouter), so web search \
+                 backend with native web tools (anthropic, openrouter, gemini), so web search \
                  cannot run and `web: true` will be refused. Declare a key source on [backends.{}] in config.toml \
                  (`kaibo example-config` shows the shapes).",
                 config.web.backend,
