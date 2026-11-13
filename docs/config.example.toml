@@ -99,15 +99,21 @@ scratch_limit_bytes = 67108864      # in-memory root scratch; a write past it is
 # [artifacts]
 # enabled = false                   # default; --allow-save-artifact enables in serve
 
-# Web search and fetch for the model team: DeepSeek's Search and Fetch APIs, or the
-# provider's own server tools on an Anthropic or OpenRouter arm.
+# Web search and fetch for the model team: the [web] backend's search API (DeepSeek or
+# Exa), or the provider's own server tools on an Anthropic or OpenRouter arm.
 # Spends nothing until a call asks: `research`, or `web: true` on consult/deliberate.
 # [web]
 # enabled = true                    # false turns off every web route
-# backend = "deepseek"              # a deepseek-kind backend; its key is billed
+# backend = "deepseek"              # a deepseek or exa backend; its key is billed
 # max_searches = 10                 # per call, shared by every phase in it
 # max_fetches = 10
 # native = true                     # Anthropic/OpenRouter arms use their own web tools
+
+# Exa as the [web] backend: $7 per 1,000 searches, $1 per 1,000 pages read.
+# [backends.exa]
+# kind = "exa"
+# api_key_env = "EXA_API_KEY"      # or api_key_file / api_key_cmd, as for any backend
+# Then set `backend = "exa"` under [web].
 
 # Credentials: declare sources explicitly; built-ins assume none.
 # env wins over file OR command. api_key_file and api_key_cmd are mutually exclusive.

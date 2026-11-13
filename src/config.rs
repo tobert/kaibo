@@ -1305,13 +1305,13 @@ pub struct ArtifactsConfig {
 /// so a code review never reaches the web unless its caller said so, and the `research`
 /// tool exists only to search. `enabled = false` turns every web route off at once.
 ///
-/// The searches run on a `deepseek` backend's Search and Fetch APIs (`src/web`), billed
-/// to that backend's key. The caps are per kaibo call and shared by every phase in it.
+/// The searches run on a `deepseek` or `exa` backend's search and fetch APIs
+/// (`src/web`), billed to that backend's key. The caps are per kaibo call and shared by every phase in it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WebConfig {
     /// `[web] enabled`. Default `true`.
     pub enabled: bool,
-    /// `[web] backend` — a `deepseek`-kind backend. Default `"deepseek"`.
+    /// `[web] backend` — a `deepseek` or `exa` backend. Default `"deepseek"`.
     pub backend: String,
     /// Searches one call may make. Default 10.
     pub max_searches: usize,
@@ -1650,17 +1650,17 @@ impl Config {
     pub fn web_backend(&self) -> Result<&Backend> {
         let backend = self.resolve_backend(&self.web.backend).with_context(|| {
             format!(
-                "[web] backend = {:?} names no backend. Set it to a `deepseek`-kind \
+                "[web] backend = {:?} names no backend. Set it to a `deepseek` or `exa` \
                  backend, such as the built-in `deepseek` (`kaibo example-config` shows \
                  the shape)",
                 self.web.backend
             )
         })?;
-        if backend.kind != ProviderKind::DeepSeek {
+        if !matches!(backend.kind, ProviderKind::DeepSeek | ProviderKind::Exa) {
             bail!(
-                "[web] backend = {:?} is a `{}` backend, and only a `deepseek` backend has \
-                 the Search and Fetch APIs kaibo's web tools call. Set [web] backend to a \
-                 `deepseek` backend, or set [web] enabled = false.",
+                "[web] backend = {:?} is a `{}` backend, and only a `deepseek` or `exa` \
+                 backend has the search and fetch APIs kaibo's web tools call. Set [web] \
+                 backend to one of those, or set [web] enabled = false.",
                 self.web.backend,
                 backend.kind.canonical_name()
             );
@@ -2067,7 +2067,10 @@ impl Config {
             // each kind's real hosted endpoint (api.stability.ai /
             // api.openai.com/v1). Class-based on the media side so a new media kind
             // never has to join a hand-maintained list here.
-            let base_url_legal = matches!(b.kind.class(), credentials::ProviderClass::Media(_))
+            let base_url_legal = matches!(
+                b.kind.class(),
+                credentials::ProviderClass::Media(_) | credentials::ProviderClass::Web(_)
+            )
                 || matches!(
                     b.kind,
                     ProviderKind::Openai | ProviderKind::Anthropic | ProviderKind::Gemini
@@ -2075,8 +2078,8 @@ impl Config {
             if !base_url_legal && b.base_url.is_some() {
                 bail!(
                     "backend {:?} (kind {:?}) sets base_url, but only the `openai`, \
-                     `anthropic`, and `gemini` completion kinds and the media kinds \
-                     have a configurable endpoint",
+                     `anthropic`, and `gemini` completion kinds, the media kinds, and \
+                     `exa` have a configurable endpoint",
                     b.name,
                     b.kind
                 );
@@ -2298,6 +2301,18 @@ impl Config {
                 // bail on — if the two ever disagree, both refuse rather than
                 // improvise.
                 let is_media = matches!(kind.class(), credentials::ProviderClass::Media(_));
+                if matches!(kind.class(), credentials::ProviderClass::Web(_)) {
+                    bail!(
+                        "cast {name:?}: the {} slot points at backend {:?} (kind `{}`), \
+                         which is a web search API with no model to staff a slot — point \
+                         the slot at a completion or media backend, and name backend {:?} \
+                         in `[web] backend` to use it for web search",
+                        role.key(),
+                        slot.backend,
+                        kind.canonical_name(),
+                        slot.backend,
+                    );
+                }
                 if *role == ModelRole::Decision && kind.decisions_url().is_none() {
                     bail!(
                         "cast {name:?}: the decision slot points at backend {:?} (kind \
@@ -6014,8 +6029,8 @@ mod tests {
             .to_string();
         assert!(
             err.contains(
-                "only the `openai`, `anthropic`, and `gemini` completion kinds and the \
-                 media kinds"
+                "only the `openai`, `anthropic`, and `gemini` completion kinds, the \
+                 media kinds, and `exa`"
             ),
             "got: {err}"
         );
