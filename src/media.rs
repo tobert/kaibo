@@ -611,6 +611,14 @@ impl MediaArm {
                 backend.kind.canonical_name(),
                 output.key(),
             ),
+            ProviderClass::Web(_) => bail!(
+                "backend {:?} is kind `{}`, a web search API — it cannot staff a media \
+                 slot. Point the `{}` slot at a media backend, and name this backend in \
+                 `[web] backend` for web search",
+                backend.name,
+                backend.kind.canonical_name(),
+                output.key(),
+            ),
         }
     }
 

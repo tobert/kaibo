@@ -239,10 +239,22 @@ pub fn discovery_endpoint_page(
     // beats returning an empty list that would read as "this backend serves no
     // models". Classified up front so the wire match below stays media-free.
     let Some(wire) = backend.kind.wire() else {
-        let crate::credentials::ProviderClass::Media(media) = backend.kind.class() else {
-            unreachable!("wire() was None, so the kind is a media kind")
-        };
-        anyhow::bail!("{}", media_listing_refusal(backend, media))
+        match backend.kind.class() {
+            crate::credentials::ProviderClass::Media(media) => {
+                anyhow::bail!("{}", media_listing_refusal(backend, media))
+            }
+            crate::credentials::ProviderClass::Web(_) => anyhow::bail!(
+                "backend {:?} is kind `{}`, a web search API that serves no models, so \
+                 there is nothing to list. kaibo uses it for web search when `[web] \
+                 backend = {:?}`.",
+                backend.name,
+                backend.kind.canonical_name(),
+                backend.name
+            ),
+            crate::credentials::ProviderClass::Wire(_) => {
+                unreachable!("wire() was None, so the kind is not a completion wire")
+            }
+        }
     };
     let key = backend.resolve_key()?;
     match wire {

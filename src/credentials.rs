@@ -120,6 +120,12 @@ pub enum ProviderKind {
     /// still working past that budget; see `src/bfl.rs`'s module doc. Keyed and not
     /// built-in, like the other media kinds: generation costs money per image.
     Bfl,
+    /// Exa's search and contents API, via `src/web/exa.rs` — the first kind of the
+    /// web class. It serves only kaibo's `web_search` and `web_fetch` tools, named by
+    /// `[web] backend`; no cast slot can point at it. Exa reads each page on its own
+    /// servers, so kaibo still never opens a URL a model chose. Keyed and not
+    /// built-in: every search costs money.
+    Exa,
 }
 
 impl ProviderKind {
@@ -127,7 +133,7 @@ impl ProviderKind {
     /// new kind can never be accepted by `FromStr` while staying unlisted in the message
     /// a user actually reads — a hand-maintained list in that string had already drifted
     /// once (`openrouter` shipped before it was named there).
-    pub const ALL: [ProviderKind; 10] = [
+    pub const ALL: [ProviderKind; 11] = [
         Self::Anthropic,
         Self::DeepSeek,
         Self::Gemini,
@@ -138,6 +144,7 @@ impl ProviderKind {
         Self::GeminiMedia,
         Self::DashScope,
         Self::Bfl,
+        Self::Exa,
     ];
 
     /// Whether a missing credential is tolerated rather than a hard error. Only the
@@ -189,7 +196,9 @@ impl ProviderKind {
             // others if that ever changes.
             | ProviderKind::Stability
             | ProviderKind::DashScope
-            | ProviderKind::Bfl => PLACEHOLDER_OPENAI_KEY,
+            | ProviderKind::Bfl
+            // Never reached either: `exa` is not `key_optional`.
+            | ProviderKind::Exa => PLACEHOLDER_OPENAI_KEY,
         }
     }
 
@@ -210,6 +219,7 @@ impl ProviderKind {
             ProviderKind::GeminiMedia => "gemini-media",
             ProviderKind::DashScope => "dashscope",
             ProviderKind::Bfl => "bfl",
+            ProviderKind::Exa => "exa",
         }
     }
 
@@ -248,6 +258,7 @@ impl ProviderKind {
             // Reuses the constant `src/bfl.rs` already resolves keys with, so the
             // facade and the config layer can never disagree about which var to read.
             ProviderKind::Bfl => crate::bfl::BFL_KEY_ENV_VAR,
+            ProviderKind::Exa => crate::web::exa::EXA_KEY_ENV_VAR,
         }
     }
 
@@ -268,6 +279,7 @@ impl ProviderKind {
             ProviderKind::DashScope => crate::dashscope::DASHSCOPE_KEY_FILE_NAME,
             // Same constant `src/bfl.rs` uses, for the same reason as `env_var`.
             ProviderKind::Bfl => crate::bfl::BFL_KEY_FILE_NAME,
+            ProviderKind::Exa => crate::web::exa::EXA_KEY_FILE_NAME,
         }
     }
 
@@ -294,6 +306,7 @@ impl ProviderKind {
             ProviderKind::GeminiMedia => ProviderClass::Media(MediaKind::GeminiMedia),
             ProviderKind::DashScope => ProviderClass::Media(MediaKind::DashScope),
             ProviderKind::Bfl => ProviderClass::Media(MediaKind::Bfl),
+            ProviderKind::Exa => ProviderClass::Web(WebKind::Exa),
         }
     }
 
@@ -305,7 +318,7 @@ impl ProviderKind {
     pub fn wire(self) -> Option<WireKind> {
         match self.class() {
             ProviderClass::Wire(w) => Some(w),
-            ProviderClass::Media(_) => None,
+            ProviderClass::Media(_) | ProviderClass::Web(_) => None,
         }
     }
 
@@ -378,11 +391,22 @@ impl MediaKind {
     }
 }
 
-/// The two families a [`ProviderKind`] can belong to — see [`ProviderKind::class`].
+/// The three families a [`ProviderKind`] can belong to — see [`ProviderKind::class`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProviderClass {
     Wire(WireKind),
     Media(MediaKind),
+    /// A search and fetch API that serves kaibo's web tools and nothing else. Named
+    /// only by `[web] backend`; a cast slot pointed at one is a load error.
+    Web(WebKind),
+}
+
+/// The web-class kinds. `deepseek` also serves kaibo's web tools, but it is a
+/// completion wire first, so it stays `Wire`; `[web] backend` accepts both.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WebKind {
+    /// Exa's `/search` and `/contents`, via `src/web/exa.rs`.
+    Exa,
 }
 
 /// The media-class kinds as a display list (``"`stability`, `openai-images`"``) —
@@ -403,7 +427,7 @@ pub fn media_kinds_producing(output: Option<crate::media::MediaOutput>) -> Strin
         .filter(|k| match (k.class(), output) {
             (ProviderClass::Media(m), Some(out)) => m.produces(out),
             (ProviderClass::Media(_), None) => true,
-            (ProviderClass::Wire(_), _) => false,
+            (ProviderClass::Wire(_) | ProviderClass::Web(_), _) => false,
         })
         .map(|k| format!("`{}`", k.canonical_name()))
         .collect::<Vec<_>>()
@@ -429,6 +453,7 @@ impl std::str::FromStr for ProviderKind {
             "gemini-media" | "gemini-images" => Ok(ProviderKind::GeminiMedia),
             "dashscope" => Ok(ProviderKind::DashScope),
             "bfl" => Ok(ProviderKind::Bfl),
+            "exa" => Ok(ProviderKind::Exa),
             other => Err(anyhow!(
                 "unknown provider {other:?} (expected one of: {})",
                 ProviderKind::ALL

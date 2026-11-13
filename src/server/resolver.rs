@@ -614,14 +614,20 @@ impl Resolver {
             .web_backend()
             .map_err(|e| refuse(format!("the `[web] backend` is not usable ({e:#})")))?;
         let native_only = all_native && web.native;
+        let timeout = backend.request_timeout.min(crate::web::WEB_REQUEST_TIMEOUT);
         let api = match backend.resolve_key() {
-            Ok(key) => Some(WebApi::DeepSeek(
-                WebClient::deepseek(
-                    key,
-                    backend.request_timeout.min(crate::web::WEB_REQUEST_TIMEOUT),
-                )
+            Ok(key) => Some(
+                if backend.kind == crate::credentials::ProviderKind::Exa {
+                    let base = backend
+                        .base_url
+                        .as_deref()
+                        .unwrap_or(crate::web::exa::EXA_API_BASE);
+                    WebClient::exa(key, base, timeout).map(WebApi::Exa)
+                } else {
+                    WebClient::deepseek(key, timeout).map(WebApi::DeepSeek)
+                }
                 .map_err(|e| McpError::internal_error(format!("web client: {e:#}"), None))?,
-            )),
+            ),
             Err(_) if native_only => None,
             Err(e) => {
                 return Err(refuse(format!(

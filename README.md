@@ -476,7 +476,7 @@ when you want the map.
 ### `research` — the web, not the repo
 
 A web survey: the cast's explorer searches and reads pages (with its provider's own web
-tools on an Anthropic or OpenRouter cast, else through DeepSeek's Search and Fetch APIs)
+tools on an Anthropic or OpenRouter cast, else through the `[web]` backend's search API, DeepSeek or Exa)
 and returns a report with every claim cited by its URL, followed by kaibo's
 own list of the pages it fetched and a footer counting searches and fetches. It reads no
 project. Reach for it when a codebase cannot answer: a dependency's changelog or known
