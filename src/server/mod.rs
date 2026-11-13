@@ -2419,7 +2419,7 @@ impl KaiboHandler {
     #[tool(
         description = "Research a question on the web and get back a cited report: what \
             reliable sources say, each claim tied to its URL. A fast model searches and reads \
-            pages with its provider's own web tools on an Anthropic or OpenRouter cast, and \
+            pages with its provider's own web tools on an Anthropic, OpenRouter, or Gemini cast, and \
             through the `[web]` backend's search API (DeepSeek or Exa) on any other. Either way the provider \
             fetches each page on its servers, so nothing on your network is opened. It returns an answer \
             with numbered references (URL, date, and a quote from each page read), then kaibo's \
@@ -5040,10 +5040,10 @@ line in the dossier and in its acknowledgment. A `web: true` call always carries
 `web:` line, `0 searches, 0 fetches` included, so an unused web reads differently from an
 absent one.
 
-A phase on an Anthropic or OpenRouter arm uses that provider's own web tools (`[web]
-native`, on by default; Anthropic search is $10 per 1,000, and OpenRouter's runs on Exa at
-$7 per 1,000 searches and $1 per 1,000 fetches), and the `web:` line marks it
-`(native)`. Every other arm uses the `[web]` backend's search and fetch API, billed to its
+A phase on an Anthropic, OpenRouter, or Gemini arm uses that provider's own web tools
+(`[web] native`, on by default; Anthropic search is $10 per 1,000, OpenRouter's runs on Exa
+at $7 per 1,000 searches and $1 per 1,000 fetches, and Gemini's is Google Search grounding),
+and the `web:` line marks it `(native)`. Every other arm uses the `[web]` backend's search and fetch API, billed to its
 key: DeepSeek ($0.75 per 1,000 calls per endpoint) or Exa ($7 per 1,000 searches, $1 per
 1,000 pages read). Either way the provider reads each
 page on its own servers, so kaibo never opens a URL a model chose. One call has 10

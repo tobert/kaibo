@@ -15,6 +15,16 @@
 //! raw response, provider-agnostic by spelling the way `completion_watch` reads a finish
 //! reason, so an unknown shape tallies zero instead of failing a call.
 //!
+//! Gemini (probed 2026-11-13) declares `google_search` and `url_context`. Two facts
+//! shape it. First, built-in tools beside function declarations need
+//! `toolConfig.includeServerSideToolInvocations`; the reply then carries each server
+//! call as a `toolCall`/`toolResponse` part pair, which rig keeps as opaque parts and
+//! replays verbatim, thought signatures included. Second, Gemini takes no use cap, so
+//! kaibo enforces the shared budget by leaving a spent tool off the next request; one
+//! turn can run past it, and the tally records what it really ran. Pages Gemini found by
+//! search come back as `vertexaisearch.cloud.google.com/grounding-api-redirect/...`
+//! links titled with a bare domain, so they list as provider-cited, not read.
+//!
 //! Versions are pinned to the basic tools: Anthropic's `web_search_20250305` and
 //! `web_fetch_20250910`. The newer versions default to running search from code
 //! execution (dynamic filtering), a second server loop kaibo has not tested; the basic
@@ -46,6 +56,8 @@ pub enum NativeWeb {
     Anthropic,
     /// OpenRouter: the `openrouter:web_search` and `openrouter:web_fetch` server tools.
     OpenRouter,
+    /// Gemini API: the `google_search` and `url_context` built-in tools.
+    Gemini,
 }
 
 impl NativeWeb {
@@ -54,6 +66,7 @@ impl NativeWeb {
         match kind {
             ProviderKind::Anthropic => Some(Self::Anthropic),
             ProviderKind::OpenRouter => Some(Self::OpenRouter),
+            ProviderKind::Gemini => Some(Self::Gemini),
             _ => None,
         }
     }
@@ -63,6 +76,20 @@ impl NativeWeb {
         match self {
             Self::Anthropic => "anthropic",
             Self::OpenRouter => "openrouter",
+            Self::Gemini => "gemini",
+        }
+    }
+
+    /// Request fields beside `tools` that this provider's web tools need, merged into
+    /// the same `additional_params` patch. Gemini refuses built-in tools next to
+    /// function declarations without `includeServerSideToolInvocations`.
+    pub fn request_params(self) -> Option<(&'static str, Value)> {
+        match self {
+            Self::Gemini => Some((
+                "toolConfig",
+                json!({ "includeServerSideToolInvocations": true }),
+            )),
+            Self::Anthropic | Self::OpenRouter => None,
         }
     }
 
@@ -116,6 +143,15 @@ impl NativeWeb {
                             "max_content_tokens": NATIVE_FETCH_TOKENS,
                         },
                     }));
+                }
+            }
+            // No use cap exists, so a cap of 0 leaving the tool off is the whole budget.
+            Self::Gemini => {
+                if searches > 0 {
+                    defs.push(json!({ "google_search": {} }));
+                }
+                if fetches > 0 {
+                    defs.push(json!({ "url_context": {} }));
                 }
             }
         }
@@ -190,6 +226,50 @@ impl NativeTally {
                 _ => {}
             }
         }
+        // Gemini: server-side `toolCall` parts carry each search's queries and each
+        // fetch's URLs; with no function tools declared there are no such parts, and
+        // `groundingMetadata.webSearchQueries` is the only count. Pages read are
+        // `urlContextMetadata` entries; search results are `groundingChunks`.
+        for cand in raw["candidates"].as_array().into_iter().flatten() {
+            let mut calls = (0, 0, false);
+            for part in cand["content"]["parts"].as_array().into_iter().flatten() {
+                let call = &part["toolCall"];
+                let n = |key: &str| call["args"][key].as_array().map_or(1, |a| a.len().max(1));
+                match call["toolType"].as_str() {
+                    Some("GOOGLE_SEARCH_WEB") => (calls.0, calls.2) = (calls.0 + n("queries"), true),
+                    Some("URL_CONTEXT") => (calls.1, calls.2) = (calls.1 + n("urls"), true),
+                    _ => {}
+                }
+            }
+            let grounding = &cand["groundingMetadata"];
+            let urls = cand["urlContextMetadata"]["urlMetadata"].as_array();
+            if calls.2 {
+                tally.searches += calls.0;
+                tally.fetches += calls.1;
+            } else {
+                tally.searches += grounding["webSearchQueries"].as_array().map_or(0, Vec::len);
+                tally.fetches += urls.map_or(0, Vec::len);
+            }
+            for u in urls.into_iter().flatten() {
+                let url = u["retrievedUrl"].as_str();
+                let ok = u["urlRetrievalStatus"] == "URL_RETRIEVAL_STATUS_SUCCESS";
+                // A redirect link is a search result Gemini read; its real address is
+                // unknown, so it lists with the provider-cited pages below.
+                let redirect = url.is_some_and(is_grounding_redirect);
+                if ok {
+                    let (kind, title) = if redirect {
+                        (SourceKind::Unattributed, Some(GROUNDING_REDIRECT_TITLE))
+                    } else {
+                        (SourceKind::Fetched, None)
+                    };
+                    add(url, title, kind);
+                }
+            }
+            for chunk in grounding["groundingChunks"].as_array().into_iter().flatten() {
+                let web = &chunk["web"];
+                add(web["uri"].as_str(), web["title"].as_str(), SourceKind::Unattributed);
+            }
+        }
         // OpenRouter (OpenAI chat shape): message annotations.
         for choice in raw["choices"].as_array().into_iter().flatten() {
             for a in choice["message"]["annotations"]
@@ -215,6 +295,16 @@ impl NativeTally {
             WebSource::merge_into(&mut self.sources, source);
         }
     }
+}
+
+/// The title a Gemini redirect link lists under when Gemini names nothing better. Gemini
+/// reports no title for a search result it read, and the link hides the real address.
+const GROUNDING_REDIRECT_TITLE: &str = "a Google Search result (Gemini hides its address)";
+
+/// Whether `url` is one of Gemini's grounding redirect links, which hide the real page
+/// address behind Google's host.
+fn is_grounding_redirect(url: &str) -> bool {
+    url.starts_with("https://vertexaisearch.cloud.google.com/grounding-api-redirect/")
 }
 
 /// One error a native web tool returned, as the provider reported it.
@@ -287,13 +377,69 @@ mod tests {
             NativeWeb::for_kind(ProviderKind::OpenRouter),
             Some(NativeWeb::OpenRouter)
         );
+        assert_eq!(
+            NativeWeb::for_kind(ProviderKind::Gemini),
+            Some(NativeWeb::Gemini)
+        );
         for kind in [
             ProviderKind::DeepSeek,
-            ProviderKind::Gemini,
+            ProviderKind::GeminiMedia,
             ProviderKind::Openai,
         ] {
             assert_eq!(NativeWeb::for_kind(kind), None, "{kind:?}");
         }
+    }
+
+    /// Gemini has no use cap: a spent budget leaves the tool off, and only Gemini asks
+    /// for the `toolConfig` flag.
+    #[test]
+    fn gemini_tools_follow_the_budget_and_ask_for_server_side_invocations() {
+        let g = NativeWeb::Gemini;
+        assert_eq!(
+            g.tool_defs(3, 2),
+            vec![json!({"google_search": {}}), json!({"url_context": {}})]
+        );
+        assert_eq!(g.tool_defs(0, 2), vec![json!({"url_context": {}})]);
+        assert!(g.tool_defs(0, 0).is_empty());
+        assert_eq!(
+            g.request_params(),
+            Some(("toolConfig", json!({"includeServerSideToolInvocations": true})))
+        );
+        assert_eq!(NativeWeb::Anthropic.request_params(), None);
+        assert_eq!(NativeWeb::OpenRouter.request_params(), None);
+    }
+
+    /// With no function tools declared, Gemini sends no `toolCall` parts, so the counts
+    /// come from the metadata. A failed page read is not a source, and a redirect link
+    /// Gemini did read lists as provider-cited.
+    #[test]
+    fn a_gemini_reply_without_tool_call_parts_is_counted_from_its_metadata() {
+        let raw = json!({"candidates": [{
+            "content": {"parts": [{"text": "answer"}]},
+            "groundingMetadata": {
+                "webSearchQueries": ["a", "b", "c"],
+                "groundingChunks": [{"web": {"uri": "https://vertexaisearch.cloud.google.com/grounding-api-redirect/X", "title": "turso.tech"}}]
+            },
+            "urlContextMetadata": {"urlMetadata": [
+                {"retrievedUrl": "https://ok.example/", "urlRetrievalStatus": "URL_RETRIEVAL_STATUS_SUCCESS"},
+                {"retrievedUrl": "https://gone.example/", "urlRetrievalStatus": "URL_RETRIEVAL_STATUS_ERROR"},
+                {"retrievedUrl": "https://vertexaisearch.cloud.google.com/grounding-api-redirect/Y", "urlRetrievalStatus": "URL_RETRIEVAL_STATUS_SUCCESS"}
+            ]}
+        }]});
+        let t = NativeTally::read(&raw);
+        assert_eq!((t.searches, t.fetches), (3, 3));
+        assert_eq!(t.sources[1].title, GROUNDING_REDIRECT_TITLE);
+        assert_eq!(t.sources[2].title, "turso.tech");
+        let urls: Vec<(&str, Option<bool>)> =
+            t.sources.iter().map(|s| (s.url.as_str(), s.fetched_flag())).collect();
+        assert_eq!(
+            urls,
+            vec![
+                ("https://ok.example/", Some(true)),
+                ("https://vertexaisearch.cloud.google.com/grounding-api-redirect/Y", None),
+                ("https://vertexaisearch.cloud.google.com/grounding-api-redirect/X", None),
+            ]
+        );
     }
 
     #[test]

@@ -866,8 +866,14 @@ impl AgentHook for NativeWebHook {
         _ctx: &HookContext,
         _event: CompletionCallEvent<'_>,
     ) -> CompletionCallAction {
+        let defs = self.defs();
+        let mut params = json!({});
+        if let (false, Some((key, value))) = (defs.is_empty(), self.inner.kind.request_params()) {
+            params[key] = value;
+        }
+        params["tools"] = Value::Array(defs);
         CompletionCallAction::Patch(RequestPatch {
-            additional_params: Some(json!({ "tools": self.defs() })),
+            additional_params: Some(params),
             ..RequestPatch::default()
         })
     }
