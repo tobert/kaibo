@@ -402,7 +402,8 @@ pub struct ConsultInput {
     /// Let this call search and read the web for what the project cannot answer — a
     /// dependency's docs or changelog, an advisory, a spec. Off by default: a code review
     /// stays on the code. The explorer searches (on a solo cast, the synth does), with its
-    /// provider's own web tools or DeepSeek's; the provider reads each page on its servers,
+    /// provider's own web tools or the `[web]` backend's (DeepSeek or Exa); the provider
+    /// reads each page on its servers,
     /// so nothing on your network is opened. To have a page read, give its full URL in
     /// `question` or `context`. kaibo lists the pages read and the search results cited
     /// after the answer. See

@@ -488,8 +488,9 @@ explorer survey can search, and the team `consult` driver reads only the survey'
 report. A solo cast's driver searches itself.
 
 The provider fetches each page on its own servers, so kaibo never opens a URL a model
-chose. Any cast can use it: native search bills the cast's provider, and the DeepSeek
-route bills the `[web]` backend's key ($0.75 per 1,000 calls per endpoint). See `[web]` in
+chose. Any cast can use it: native search bills the cast's provider, and every other cast
+bills the `[web]` backend's key: DeepSeek ($0.75 per 1,000 calls per endpoint) or Exa ($7
+per 1,000 searches, $1 per 1,000 pages read). See `[web]` in
 [`docs/config.md`](docs/config.md).
 
 *Args:* `question` (required), `context`, `cast`.

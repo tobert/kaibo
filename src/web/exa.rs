@@ -181,9 +181,22 @@ impl WebClient {
     }
 
     /// Read one page through Exa. `url` should already have passed `check_fetch_url`.
+    ///
+    /// A page failure arrives inside a 200, after [`WebClient::post`] has finished its
+    /// own retries, so a retryable page status (408, 429, 5xx) gets the same two
+    /// retries here.
     pub async fn exa_fetch(&self, url: &str) -> Result<FetchedPage, WebError> {
-        let body = self.post(&self.fetch_url, &fetch_body(url)).await?;
-        parse_fetch(&body, url)
+        let mut delays = super::RETRY_DELAYS.iter();
+        loop {
+            let body = self.post(&self.fetch_url, &fetch_body(url)).await?;
+            match parse_fetch(&body, url) {
+                Err(e) if e.retryable() => match delays.next() {
+                    Some(d) => tokio::time::sleep(*d).await,
+                    None => return Err(e),
+                },
+                other => return other,
+            }
+        }
     }
 }
 
@@ -261,7 +274,9 @@ mod tests {
 
     /// An Exa stand-in on a local socket that records each request (head and body) and
     /// answers `/search` and `/contents` with Exa's shapes.
-    async fn exa_listener() -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+    async fn exa_listener(
+        page_fails_first: bool,
+    ) -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -295,8 +310,15 @@ mod tests {
                         }
                     }
                     let req = String::from_utf8_lossy(&buf).to_string();
+                    let first_contents = !log
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .any(|r: &String| r.starts_with("POST /contents"));
                     let body = if req.starts_with("POST /search") {
                         r#"{"results":[{"url":"https://turso.tech/blog/0.8","title":"Turso 0.8","highlights":["EXA_HIGHLIGHT"]}]}"#
+                    } else if page_fails_first && first_contents {
+                        r#"{"results":[],"statuses":[{"id":"https://turso.tech/blog/0.8","status":"error","error":{"httpStatusCode":503,"tag":"CRAWL_TIMEOUT"}}]}"#
                     } else {
                         r#"{"results":[{"url":"https://turso.tech/blog/0.8","title":"Turso 0.8","text":"EXA_PAGE_TEXT"}],"statuses":[{"id":"https://turso.tech/blog/0.8","status":"success"}]}"#
                     };
@@ -320,7 +342,7 @@ mod tests {
     #[tokio::test]
     async fn a_session_on_exa_searches_and_fetches_through_exa_shapes() {
         use crate::progress::NullSink;
-        let (base, seen) = exa_listener().await;
+        let (base, seen) = exa_listener(false).await;
         let client =
             WebClient::exa("exa-test-key", &base, std::time::Duration::from_secs(10)).unwrap();
         let session = super::super::WebSession::new(super::super::WebApi::Exa(client), "exa", 5, 5);
@@ -358,6 +380,20 @@ mod tests {
             "{}",
             seen[1]
         );
+    }
+
+    /// Exa reports a page failure inside a 200, past the HTTP retry loop, so a retryable
+    /// page status is retried here: a 503 then a page reads as the page, in two requests.
+    #[tokio::test]
+    async fn a_retryable_page_status_is_retried() {
+        let (base, seen) = exa_listener(true).await;
+        let client = WebClient::exa("k", &base, std::time::Duration::from_secs(10)).unwrap();
+        let page = client
+            .exa_fetch("https://turso.tech/blog/0.8")
+            .await
+            .unwrap();
+        assert_eq!(page.content, "EXA_PAGE_TEXT");
+        assert_eq!(seen.lock().unwrap().len(), 2);
     }
 
     #[test]

@@ -784,6 +784,7 @@ No built-in cast has a media slot or pairs an explorer with an offline synth, so
 | any of the above | also `deliberate` | a cast pairing an `explorer` with an offline synth: `lane = "batch"` on the four keys above, or `lane = "direct"` on any backend |
 | OpenRouter or Gemini | also `decide` | a cast with a `decision` slot |
 | DeepSeek, as the `[web]` backend | `research`, and `web: true` on any cast | none; `[web] backend = "deepseek"` is the default |
+| Exa, as the `[web]` backend | `research`, and `web: true` on any cast | an `exa` backend with a key source, and `[web] backend` naming it |
 | Anthropic or OpenRouter | `research`, and `web: true`, on their own casts | none; `[web] native = true` is the default |
 | a key for a `stability`, `gemini-media`, `bfl`, `openai-images`, or `dashscope` backend | `generate` | an `image` slot, or an `audio` slot on `stability` and `gemini-media` only; `[cas]` on |
 
@@ -1101,8 +1102,8 @@ The model team searches and reads the web one of two ways, chosen per arm:
   - a `deepseek` backend: DeepSeek's Search and Fetch APIs (`/v1/tools/search`,
     `/v1/tools/fetch`), $0.75 per 1,000 successful calls per endpoint.
   - an `exa` backend: Exa's `/search` and `/contents`, $7 per 1,000 searches and $1 per
-    1,000 pages read. Its key comes from `EXA_API_KEY`, then `~/.exa-key`, unless the
-    backend names its own. `base_url` replaces `https://api.exa.ai`.
+    1,000 pages read. Declare its key source like any backend's (`api_key_env`,
+    `api_key_file`, or `api_key_cmd`). `base_url` replaces `https://api.exa.ai`.
 
 Either way the provider fetches each page on its own servers: kaibo never opens a URL a
 model chose, so a model cannot aim a request at the operator's network.
