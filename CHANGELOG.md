@@ -30,6 +30,7 @@ record. Each later release appends a new section at the top.
 - OpenRouter web search and fetch run on Exa, named on every request, instead of OpenRouter's default `auto`.
 - An `exa` backend kind serves kaibo's web search and fetch: set `[web] backend` to it to search with Exa instead of DeepSeek.
 - On a Gemini arm, web calls use Google Search and URL context, Gemini's own tools (`[web] native`).
+- kaibo cannot cap a Gemini arm's native searches, and one call often runs past `max_searches`; `[web] native = false` keeps the cap.
 - A native web tool error logs the provider's `error_code` at warn, since the model's own account of a refusal is often wrong.
 - `--json` output marks each web source with `fetched`: `true`, `false`, or `null` where the provider does not say.
 - `[web]` sets the search backend and per-call caps (`max_searches`, `max_fetches`, 10 each); `--no-research` drops the tool; `kaibo://config` reports `[web]` with `live`.

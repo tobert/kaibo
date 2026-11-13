@@ -1098,9 +1098,12 @@ The model team searches and reads the web one of two ways, chosen per arm:
   `openrouter:web_fetch`, billed by OpenRouter per its engine. Gemini gets
   `google_search` and `url_context`, billed by Google per its grounding pricing. kaibo
   reads the counts and sources off each response.
-  Gemini takes no use cap, so kaibo leaves a spent tool off the next request. One
-  Gemini response can run many searches (10 to 16 in probes on 2026-11-13), so a Gemini
-  call can end well past `max_searches`; the footer counts what ran. Gemini names the pages its
+  **kaibo cannot limit Gemini's searches.** Gemini takes no use cap, so `max_searches`
+  and `max_fetches` only make kaibo leave a spent tool off the next request. One Gemini
+  response can run 10 to 16 searches, and in our runs on 2026-11-13 a `research` call
+  ran 44 and a `consult` with `web: true` ran 66, against a cap of 10. The footer counts
+  what ran. To keep the cap, set `native = false`: every arm then uses the `[web]`
+  backend, Anthropic and OpenRouter arms included. Gemini names the pages its
   searches found only by `grounding-api-redirect` links titled with a domain, so those
   list under "Pages the provider cited", and only a page the model asked for by URL
   lists under "Pages read".

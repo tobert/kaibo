@@ -108,6 +108,7 @@ scratch_limit_bytes = 67108864      # in-memory root scratch; a write past it is
 # max_searches = 10                 # per call, shared by every phase in it
 # max_fetches = 10
 # native = true                     # Anthropic/OpenRouter/Gemini arms use their own
+#                                   # (Gemini ignores max_searches: docs/config.md)
 
 # Exa as the [web] backend: $7 per 1,000 searches, $1 per 1,000 pages read.
 # [backends.exa]
