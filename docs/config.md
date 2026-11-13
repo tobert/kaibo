@@ -785,7 +785,7 @@ No built-in cast has a media slot or pairs an explorer with an offline synth, so
 | OpenRouter or Gemini | also `decide` | a cast with a `decision` slot |
 | DeepSeek, as the `[web]` backend | `research`, and `web: true` on any cast | none; `[web] backend = "deepseek"` is the default |
 | Exa, as the `[web]` backend | `research`, and `web: true` on any cast | an `exa` backend with a key source, and `[web] backend` naming it |
-| Anthropic or OpenRouter | `research`, and `web: true`, on their own casts | none; `[web] native = true` is the default |
+| Anthropic, OpenRouter, or Gemini | `research`, and `web: true`, on their own casts | none; `[web] native = true` is the default |
 | a key for a `stability`, `gemini-media`, `bfl`, `openai-images`, or `dashscope` backend | `generate` | an `image` slot, or an `audio` slot on `stability` and `gemini-media` only; `[cas]` on |
 
 OpenRouter does not staff `generate`. `kaibo configure` covers `consult`, `batch_submit`,
@@ -1091,12 +1091,22 @@ max_fetches = 10        # default, per call
 
 The model team searches and reads the web one of two ways, chosen per arm:
 
-- **Native** (`[web] native = true`, the default): an arm on an `anthropic` or
-  `openrouter` backend declares that provider's own server tools. Anthropic gets
-  `web_search_20250305` and `web_fetch_20250910`, billed by Anthropic ($10 per 1,000
+- **Native** (`[web] native = true`, the default): an arm on an `anthropic`,
+  `openrouter`, or `gemini` backend declares that provider's own server tools. Anthropic
+  gets `web_search_20250305` and `web_fetch_20250910`, billed by Anthropic ($10 per 1,000
   searches; fetch is free beyond tokens). OpenRouter gets `openrouter:web_search` and
-  `openrouter:web_fetch`, billed by OpenRouter per its engine. kaibo reads the counts and
-  sources off each response.
+  `openrouter:web_fetch`, billed by OpenRouter per its engine. Gemini gets
+  `google_search` and `url_context`, billed by Google per its grounding pricing. kaibo
+  reads the counts and sources off each response.
+  **kaibo cannot limit Gemini's searches.** Gemini takes no use cap, so `max_searches`
+  and `max_fetches` only make kaibo leave a spent tool off the next request. One Gemini
+  response can run 10 to 16 searches, and in our runs on 2026-11-13 a `research` call
+  ran 44 and a `consult` with `web: true` ran 66, against a cap of 10. The footer counts
+  what ran. To keep the cap, set `native = false`: every arm then uses the `[web]`
+  backend, Anthropic and OpenRouter arms included. Gemini names the pages its
+  searches found only by `grounding-api-redirect` links titled with a domain, so those
+  list under "Pages the provider cited", and only a page the model asked for by URL
+  lists under "Pages read".
 - **kaibo-run**: every other arm, or every arm with `native = false`, gets kaibo's
   `web_search` and `web_fetch`, which call the `[web]` backend's API, billed to its key:
   - a `deepseek` backend: DeepSeek's Search and Fetch APIs (`/v1/tools/search`,

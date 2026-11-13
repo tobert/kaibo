@@ -421,6 +421,66 @@ async fn native_research_declares_provider_tools_and_tallies_the_response() {
     );
 }
 
+/// A Gemini arm declares `google_search` and `url_context` beside its function tools,
+/// with the `toolConfig` flag Gemini requires for that mix, and its use is tallied off
+/// the `toolCall` parts and `urlContextMetadata` of a GenerateContent reply (shapes from
+/// a live probe, 2026-11-13).
+#[tokio::test]
+async fn gemini_research_declares_built_in_tools_and_tallies_the_reply() {
+    let client = ScriptedClient::builder()
+        .on_model(EXPLORER, |req| {
+            let params = req.additional_params.as_ref().expect("native params");
+            assert_eq!(
+                params["tools"],
+                json!([{"google_search": {}}, {"url_context": {}}]),
+                "{params}"
+            );
+            assert_eq!(
+                params["toolConfig"],
+                json!({"includeServerSideToolInvocations": true}),
+                "{params}"
+            );
+            assert!(!has_tool(req, "web_search") && !has_tool(req, "web_fetch"));
+            Ok(with_raw(
+                text_response("REPORT per https://turso.tech/blog/turso-0.8.0"),
+                json!({"candidates": [{
+                    "content": {"role": "model", "parts": [
+                        {"toolCall": {"toolType": "URL_CONTEXT",
+                            "args": {"urls": ["https://turso.tech/blog/turso-0.8.0"]}, "id": "c1"}},
+                        {"toolCall": {"toolType": "GOOGLE_SEARCH_WEB",
+                            "args": {"queries": ["turso mvcc bug", "turso 0.8 issue"]}, "id": "c2"}},
+                        {"toolResponse": {"toolType": "URL_CONTEXT", "id": "c1", "response": {}}},
+                        {"text": "REPORT per https://turso.tech/blog/turso-0.8.0"}
+                    ]},
+                    "finishReason": "STOP",
+                    "urlContextMetadata": {"urlMetadata": [{
+                        "retrievedUrl": "https://turso.tech/blog/turso-0.8.0",
+                        "urlRetrievalStatus": "URL_RETRIEVAL_STATUS_SUCCESS"}]},
+                    "groundingMetadata": {"groundingChunks": [{"web": {
+                        "uri": "https://vertexaisearch.cloud.google.com/grounding-api-redirect/AB",
+                        "title": "github.com"}}]}
+                }]}),
+            ))
+        })
+        .build();
+    let web = idle_session();
+    let cfg = ResearchConfig {
+        phase: PhaseContext::default(),
+        max_turns: 5,
+        web: Arc::clone(&web),
+    };
+    let mut gemini = arm(&client, EXPLORER);
+    gemini.native_web = Some(NativeWeb::Gemini);
+    research_with("q", None, &gemini, &cfg).await.unwrap();
+    assert_eq!((web.usage().searches, web.usage().fetches), (2, 1));
+    let sources = web.sources();
+    assert_eq!(sources[0].url, "https://turso.tech/blog/turso-0.8.0");
+    assert_eq!(sources[0].fetched_flag(), Some(true));
+    assert_eq!(sources[1].title, "github.com");
+    assert_eq!(sources[1].fetched_flag(), None, "a redirect link is provider-cited");
+    assert_eq!(web.footer(), "web: 2 searches, 1 fetch via gemini (native)");
+}
+
 /// `[web] native = false` keeps a native-capable arm on kaibo's tools.
 #[tokio::test]
 async fn native_off_keeps_kaibo_tools() {

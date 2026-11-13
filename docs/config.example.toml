@@ -100,14 +100,15 @@ scratch_limit_bytes = 67108864      # in-memory root scratch; a write past it is
 # enabled = false                   # default; --allow-save-artifact enables in serve
 
 # Web search and fetch for the model team: the [web] backend's search API (DeepSeek or
-# Exa), or the provider's own server tools on an Anthropic or OpenRouter arm.
+# Exa), or the provider's own server tools on an Anthropic, OpenRouter, or Gemini arm.
 # Spends nothing until a call asks: `research`, or `web: true` on consult/deliberate.
 # [web]
 # enabled = true                    # false turns off every web route
 # backend = "deepseek"              # a deepseek or exa backend; its key is billed
 # max_searches = 10                 # per call, shared by every phase in it
 # max_fetches = 10
-# native = true                     # Anthropic/OpenRouter arms use their own web tools
+# native = true                     # Anthropic/OpenRouter/Gemini arms use their own
+#                                   # (Gemini ignores max_searches: docs/config.md)
 
 # Exa as the [web] backend: $7 per 1,000 searches, $1 per 1,000 pages read.
 # [backends.exa]
