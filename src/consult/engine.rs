@@ -95,6 +95,47 @@ fn deepseek_dialect() -> openai::wire::Dialect {
     }
 }
 
+/// The ChatGPT plan route ("Sign in with ChatGPT" plan usage): rig's ChatGPT dialect,
+/// aimed at OpenAI's public `/v1/responses` instead of rig's `chatgpt.com/backend-api`
+/// default. What kaibo takes from it is the request contract
+/// (`ResponsesContract::Codex`): no `max_output_tokens`, `temperature`, or sampling,
+/// `store: false`, every system message in `instructions`, and always streamed — the
+/// plan route's rules — with the stream folded back into one reply, so the agent loop
+/// is unchanged. What kaibo drops is rig's identity for its own ChatGPT client: the
+/// `originator: rig` header, the "You are ChatGPT" default instructions, the account
+/// and session headers, and every environment lookup, so nothing outside config.toml
+/// steers the request. The bearer token is set per request by `oauth::GrantAuthHttp`.
+fn chatgpt_plan_dialect() -> openai::wire::Dialect {
+    let base = rig_core::providers::chatgpt::DIALECT;
+    let mut quirks = base.quirks;
+    quirks.identity = None;
+    quirks.default_instructions = None;
+    quirks.instructions_env = None;
+    quirks.account_id_env = None;
+    quirks.base_url_env_alias = None;
+    quirks.session_header = None;
+    openai::wire::Dialect {
+        name: "openai-chatgpt-plan",
+        base_url: crate::credentials::HOSTED_OPENAI_BASE_URL,
+        base_url_env: None,
+        quirks,
+        ..base
+    }
+}
+
+/// The raw params a ChatGPT plan request carries: the reasoning effort, with an
+/// `auto` summary as rig's own ChatGPT mapping asks for. Nothing else — the plan
+/// route rejects sampling and output caps, and rig's contract leaves those out.
+fn chatgpt_plan_params(
+    model: &str,
+    effort: &str,
+    style: super::shaping::ThinkingStyleOverride,
+) -> Option<Value> {
+    (super::shaping::hosted_openai_accepts_reasoning(model)
+        && style != super::shaping::ThinkingStyleOverride::Off)
+        .then(|| serde_json::json!({ "reasoning": { "effort": effort, "summary": "auto" } }))
+}
+
 /// Stamps an app's name and URL on every request, the two headers OpenRouter reads to
 /// attribute traffic to an app in its dashboard.
 struct AppIdentity {
@@ -455,9 +496,23 @@ impl Arm {
             WireKind::OpenRouter => {
                 // A keyed gateway with a *fixed* endpoint (rig pins the base URL), so —
                 // unlike the openai kind — there is no base_url to resolve.
-                let key = backend.resolve_key()?;
-                let model =
-                    Self::openrouter_completion_model(http, key, &slot.id, backend.prompt_cache);
+                // A signed-in OpenRouter backend sends its minted key per request; the
+                // key handed to rig here is replaced on every send.
+                let model = match backend.auth {
+                    Some(auth) => {
+                        let source = crate::oauth::TokenSource::for_process(&backend.name, auth)?;
+                        Self::openrouter_completion_model(
+                            crate::oauth::GrantAuthHttp::new(http, source),
+                            crate::credentials::PLACEHOLDER_OPENAI_KEY.to_string(),
+                            &slot.id,
+                            backend.prompt_cache,
+                        )
+                    }
+                    None => {
+                        let key = backend.resolve_key()?;
+                        Self::openrouter_completion_model(http, key, &slot.id, backend.prompt_cache)
+                    }
+                };
                 Ok(Self::from_model(model, &slot.id, t.max_tokens, params, caps))
             }
             WireKind::Openai => {
@@ -465,6 +520,30 @@ impl Arm {
                 // URL. The key is optional for a keyless backend: `resolve_key`
                 // returns the configured key or a placeholder the server ignores.
                 let base_url = backend.resolved_base_url();
+                if let Some(auth) = backend.auth {
+                    // The ChatGPT plan route (config load allows no other sign-in on
+                    // this kind).
+                    let source = crate::oauth::TokenSource::for_process(&backend.name, auth)?;
+                    let client = openai::OpenAIConfig::with_key(
+                        &chatgpt_plan_dialect(),
+                        crate::credentials::PLACEHOLDER_OPENAI_KEY,
+                    )
+                    .with_base_url(&base_url)
+                    .connect(crate::oauth::GrantAuthHttp::new(http, source));
+                    let params = super::shaping::inject_provider_prefs(
+                        backend.kind,
+                        chatgpt_plan_params(&slot.id, &t.effort, t.thinking_style),
+                        backend.data_collection,
+                        true,
+                    );
+                    return Ok(Self::from_model(
+                        Llm::new(client.responses(&slot.id)),
+                        &slot.id,
+                        t.max_tokens,
+                        params,
+                        caps,
+                    ));
+                }
                 let key = backend.resolve_key()?;
                 let client = openai::OpenAIConfig::new(key)
                     .with_base_url(&base_url)
@@ -7635,6 +7714,7 @@ mod tests {
             data_collection: Default::default(),
             prompt_cache: Default::default(),
             wire: None,
+            auth: None,
         };
         let slot = ModelSlot {
             vision: Some(true),
@@ -7689,6 +7769,7 @@ mod tests {
             data_collection: Default::default(),
             prompt_cache: Default::default(),
             wire: None,
+            auth: None,
         };
         assert!(
             backend.is_hosted_openai(),
@@ -7755,6 +7836,7 @@ mod tests {
             data_collection: Default::default(),
             prompt_cache: Default::default(),
             wire: None,
+            auth: None,
         };
         // `docs/config.example.toml` used to invite exactly this, and it broke every
         // Gemini cast the moment a call was made.
@@ -7828,6 +7910,7 @@ mod tests {
             data_collection: Default::default(),
             prompt_cache: Default::default(),
             wire: Some(crate::config::OpenaiWire::Responses),
+            auth: None,
         };
         assert!(
             !backend.is_hosted_openai(),
@@ -7876,6 +7959,7 @@ mod tests {
             data_collection: Default::default(),
             prompt_cache: Default::default(),
             wire: None,
+            auth: None,
         };
         let slot = ModelSlot {
             temperature: Some(0.4),
@@ -7920,6 +8004,7 @@ mod tests {
             data_collection: Default::default(),
             prompt_cache: Default::default(),
             wire: None,
+            auth: None,
         };
         let slot = ModelSlot::bare("anthropic", "claude-sonnet-4-6");
         let arm = Arm::from_slot(&backend, &slot, ModelRole::Synth, &defaults)
@@ -7952,6 +8037,7 @@ mod tests {
             data_collection: Default::default(),
             prompt_cache: Default::default(),
             wire: None,
+            auth: None,
         };
         let defaults = crate::config::Defaults {
             synth_effort: "none".into(),
@@ -7985,6 +8071,7 @@ mod tests {
             data_collection: Default::default(),
             prompt_cache: Default::default(),
             wire: None,
+            auth: None,
         };
         let slot = ModelSlot::bare("gemini", "gemini-3.5-flash");
         let arm = Arm::from_slot(&backend, &slot, ModelRole::Synth, &defaults)
@@ -8027,6 +8114,7 @@ mod tests {
             data_collection: Default::default(),
             prompt_cache: Default::default(),
             wire: None,
+            auth: None,
         };
         let slot = ModelSlot {
             temperature: Some(0.3),
@@ -8077,6 +8165,7 @@ mod tests {
             data_collection: crate::config::DataCollection::Allow,
             prompt_cache: crate::config::PromptCache::default(),
             wire: None,
+            auth: None,
         };
         let slot = ModelSlot::bare("openrouter", "~anthropic/claude-sonnet-latest");
         let arm = Arm::from_slot(&backend, &slot, ModelRole::Synth, &defaults)
@@ -8113,6 +8202,7 @@ mod tests {
             data_collection,
             prompt_cache: Default::default(),
             wire: None,
+            auth: None,
         };
 
         let hosted = backend(
@@ -8162,6 +8252,7 @@ mod tests {
             data_collection: Default::default(),
             prompt_cache: Default::default(),
             wire: None,
+            auth: None,
         };
         let slot = ModelSlot {
             effort: Some("none".into()),
@@ -8214,6 +8305,7 @@ mod tests {
             data_collection: Default::default(),
             prompt_cache: Default::default(),
             wire: None,
+            auth: None,
         };
         let slot = ModelSlot::bare("openrouter", "~anthropic/claude-sonnet-latest");
         let arm = Arm::from_slot(&backend, &slot, ModelRole::Synth, &defaults)
@@ -8468,6 +8560,7 @@ mod tests {
             data_collection: Default::default(),
             prompt_cache: Default::default(),
             wire: None,
+            auth: None,
         };
         let slot = ModelSlot::bare("anthropic", "claude-haiku-4-5");
         let err = Arm::from_slot(&backend, &slot, ModelRole::Explorer, &defaults)
@@ -8502,6 +8595,7 @@ mod tests {
             data_collection: Default::default(),
             prompt_cache: Default::default(),
             wire: None,
+            auth: None,
         };
         let slot = ModelSlot::bare("gemini", "gemini-3.5-flash");
         if let Err(e) = Arm::from_slot(&backend, &slot, ModelRole::Explorer, &defaults) {

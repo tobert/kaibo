@@ -79,6 +79,8 @@ async fn run_command(common: CommonArgs, command: Command) -> i32 {
         Command::Generate(args) => kaibo::cli::run_generate(common, args).await,
         Command::Cas(args) => kaibo::cli::run_cas(common, args).await,
         Command::Models(args) => kaibo::cli::run_models(common, args).await,
+        Command::Login(args) => kaibo::cli::run_login(common, args).await,
+        Command::Logout(args) => kaibo::cli::run_logout(common, args).await,
         Command::Config => kaibo::cli::run_config(common),
         Command::Configure(args) => kaibo::cli::run_configure(args.goal),
         Command::ExampleConfig => kaibo::cli::run_example_config(),

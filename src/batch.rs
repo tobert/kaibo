@@ -2809,6 +2809,7 @@ mod tests {
             data_collection: Default::default(),
             prompt_cache: Default::default(),
             wire: None,
+            auth: None,
         }
     }
 
@@ -5126,6 +5127,7 @@ mod tests {
             key_optional: true,
             request_timeout: std::time::Duration::from_secs(60),
             wire: None,
+            auth: None,
             data_collection: crate::config::DataCollection::Allow,
             prompt_cache: Default::default(),
         };

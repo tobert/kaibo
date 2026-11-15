@@ -621,3 +621,90 @@ async fn opens_a_state_db_written_by_turso_0_7_2() {
     let store = SessionStore::open(&path, cap(8), &[]).await.unwrap();
     assert_eq!(store.replay(FIXTURE_SESSION).await.unwrap().len(), 3);
 }
+
+// --- Sign-in grants and the refresh lease ------------------------------------------
+
+fn grant(backend: &str) -> kaibo::oauth::Grant {
+    kaibo::oauth::Grant {
+        backend: backend.into(),
+        auth: kaibo::oauth::AuthProfile::Chatgpt,
+        client_id: Some("oaiapp_1".into()),
+        token_url: "https://auth.openai.com/api/accounts/oauth/token".into(),
+        access_token: "at-1".into(),
+        refresh_token: Some("rt-1".into()),
+        expires_at: Some(1_000),
+        account: Some("a@example.com".into()),
+        scopes: Some("openid".into()),
+    }
+}
+
+#[tokio::test]
+async fn grants_round_trip_replace_and_delete() {
+    let (store, _d) = open(4).await;
+    assert!(store.get_grant("plan").await.unwrap().is_none());
+    store.put_grant(&grant("plan")).await.unwrap();
+    assert_eq!(store.get_grant("plan").await.unwrap(), Some(grant("plan")));
+    let mut again = grant("plan");
+    again.access_token = "at-2".into();
+    store.put_grant(&again).await.unwrap();
+    assert_eq!(store.list_grants().await.unwrap(), vec![again]);
+    assert!(store.delete_grant("plan").await.unwrap());
+    assert!(!store.delete_grant("plan").await.unwrap());
+}
+
+#[tokio::test]
+async fn one_holder_at_a_time_takes_the_refresh_lease() {
+    let (store, _d) = open(4).await;
+    store.put_grant(&grant("plan")).await.unwrap();
+    assert!(store
+        .claim_refresh_lease("plan", "a", 100, 60)
+        .await
+        .unwrap());
+    assert!(
+        !store
+            .claim_refresh_lease("plan", "b", 120, 60)
+            .await
+            .unwrap(),
+        "held until 160"
+    );
+    // A finish from a non-holder changes nothing.
+    let mut fresh = grant("plan");
+    fresh.access_token = "at-b".into();
+    assert!(!store.finish_refresh("b", &fresh).await.unwrap());
+    // The lapsed lease is taken over, and the old holder's late finish is discarded.
+    assert!(store
+        .claim_refresh_lease("plan", "b", 161, 60)
+        .await
+        .unwrap());
+    let mut late = grant("plan");
+    late.access_token = "at-a".into();
+    assert!(!store.finish_refresh("a", &late).await.unwrap());
+    assert!(store.finish_refresh("b", &fresh).await.unwrap());
+    assert_eq!(
+        store.get_grant("plan").await.unwrap().unwrap().access_token,
+        "at-b"
+    );
+    // Finishing released it.
+    assert!(store
+        .claim_refresh_lease("plan", "c", 162, 60)
+        .await
+        .unwrap());
+    store.release_refresh_lease("plan", "c").await.unwrap();
+    assert!(store
+        .claim_refresh_lease("plan", "d", 162, 60)
+        .await
+        .unwrap());
+}
+
+#[tokio::test]
+async fn the_host_id_is_created_once_and_kept() {
+    let (store, dir) = open(4).await;
+    let id = store.host_id().await.unwrap();
+    assert!(id.starts_with("urn:uuid:"), "{id}");
+    assert_eq!(store.host_id().await.unwrap(), id);
+    drop(store);
+    let reopened = SessionStore::open(&dir.path().join("state.db"), cap(4), &[])
+        .await
+        .unwrap();
+    assert_eq!(reopened.host_id().await.unwrap(), id, "survives a reopen");
+}

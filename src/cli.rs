@@ -151,6 +151,11 @@ pub enum Command {
     /// List the models a backend serves, read from its own /models endpoint. No cast is
     /// resolved and no model runs.
     Models(ModelsArgs),
+    /// Sign a backend in through the browser (`auth = "chatgpt"` or `"openrouter"`), or
+    /// list sign-ins with `--status`. Prints a URL to open; kaibo starts no browser.
+    Login(LoginArgs),
+    /// Remove a backend's stored sign-in.
+    Logout(LogoutArgs),
     /// Print the resolved runtime configuration (the `kaibo://config` document).
     Config,
     /// Print the guided "set up my models" walkthrough — the CLI equivalent of the
@@ -748,6 +753,27 @@ pub struct BatchListArgs {
     /// Emit a JSON object (entries + recovered handles + per-backend errors) instead of prose.
     #[arg(long)]
     pub json: bool,
+}
+
+/// `kaibo login` — the operator's browser sign-in for a backend that declares `auth`.
+#[derive(Args, Debug)]
+pub struct LoginArgs {
+    /// The backend (name or alias) to sign in. It must set `auth` in config.toml.
+    #[arg(value_name = "BACKEND", required_unless_present = "status")]
+    pub backend: Option<String>,
+
+    /// List every backend that declares `auth` and whether it is signed in, then exit.
+    /// Contacts no provider.
+    #[arg(long, conflicts_with = "backend")]
+    pub status: bool,
+}
+
+/// `kaibo logout` — forget a backend's stored sign-in.
+#[derive(Args, Debug)]
+pub struct LogoutArgs {
+    /// The backend (name or alias) whose sign-in to remove.
+    #[arg(value_name = "BACKEND")]
+    pub backend: String,
 }
 
 /// `kaibo models` — read-only model discovery: ask a backend's provider "what models
@@ -3353,6 +3379,293 @@ async fn batch_list_inner(args: &BatchListArgs, resolver: &Resolver) -> Result<i
 /// *every* queried backend's discovery call failed (a per-backend error inside an
 /// otherwise-successful sweep is reported inline and is NOT fatal — matching `batch
 /// list`'s inline-error convention), else 0.
+/// Open the state db for a sign-in command, or say why it cannot be opened.
+async fn open_sign_in_store(resolver: &Resolver) -> Result<crate::store::SessionStore, String> {
+    let persistence = &resolver.config.persistence;
+    let path = match (&persistence.enabled, &persistence.path) {
+        (true, Some(path)) => path.clone(),
+        _ => {
+            return Err(
+                "kaibo keeps sign-ins in its state db, and persistence is off for this \
+                 run (`--no-persistence`, `KAIBO_NO_PERSISTENCE`, or `[persistence] enabled = \
+                 false`). Run without that setting so kaibo can store the sign-in."
+                    .to_string(),
+            )
+        }
+    };
+    let allowed = resolver.allowed_set();
+    let refs: Vec<&std::path::Path> = allowed.iter().map(PathBuf::as_path).collect();
+    crate::store::SessionStore::open(&path, resolver.config.defaults.session_capacity, &refs)
+        .await
+        .map_err(|e| {
+            format!(
+                "kaibo could not open its state db at {} to store the sign-in: {e}. Fix the \
+                 path or its permissions, or name another with --state-db",
+                path.display()
+            )
+        })
+}
+
+/// Resolve `name` to a backend that declares `auth`, or a usage error naming the fix.
+fn sign_in_backend<'c>(
+    config: &'c Config,
+    name: &str,
+) -> Result<&'c crate::config::Backend, String> {
+    let backend = config.resolve_backend(name).map_err(|e| e.to_string())?;
+    if backend.auth.is_none() {
+        return Err(format!(
+            "backend {:?} has no `auth` key, so there is nothing to sign in — it uses an API \
+             key. To sign in instead, set `auth = \"chatgpt\"` (kind = \"openai\") or \
+             `auth = \"openrouter\"` (kind = \"openrouter\") in [backends.{}] and remove its \
+             api_key_* keys; `kaibo example-config` shows the shape",
+            backend.name, backend.name
+        ));
+    }
+    Ok(backend)
+}
+
+/// Render a stored sign-in's expiry for `--status`.
+fn describe_expiry(expires_at: Option<i64>, refreshes: bool) -> String {
+    match expires_at {
+        None => "does not expire".to_string(),
+        Some(at) => {
+            let left = at - crate::oauth::grant::now();
+            let when = if left <= 0 {
+                "access token expired".to_string()
+            } else {
+                format!("access token expires in {} min", left / 60)
+            };
+            if refreshes {
+                format!("{when}; refreshed automatically")
+            } else {
+                when
+            }
+        }
+    }
+}
+
+/// `kaibo login` / `kaibo login --status`.
+pub async fn run_login(common: CommonArgs, args: LoginArgs) -> i32 {
+    init_cli_logging();
+    let config = match load_config(&common) {
+        Ok(c) => c,
+        Err(e) => {
+            return fail_preflight(false, "config", format!("config error: {e:#}"), EXIT_USAGE)
+        }
+    };
+    let resolver = match Resolver::from_config(Arc::new(config)) {
+        Ok(r) => r,
+        Err(e) => return fail_preflight(false, "setup", format!("{e:#}"), EXIT_SETUP),
+    };
+    let store = match open_sign_in_store(&resolver).await {
+        Ok(s) => s,
+        Err(e) => return fail_preflight(false, "setup", e, EXIT_SETUP),
+    };
+
+    if args.status {
+        let grants = match store.list_grants().await {
+            Ok(g) => g,
+            Err(e) => {
+                return fail_preflight(false, "setup", format!("reading sign-ins: {e}"), EXIT_SETUP)
+            }
+        };
+        let declared: Vec<&crate::config::Backend> = resolver
+            .config
+            .backends
+            .values()
+            .filter(|b| b.auth.is_some())
+            .collect();
+        if declared.is_empty() && grants.is_empty() {
+            println!(
+                "No backend declares `auth`, so there is nothing to sign in. `kaibo \
+                 example-config` shows a signed-in backend's shape."
+            );
+            return EXIT_OK;
+        }
+        for b in &declared {
+            let auth = b.auth.expect("filtered on auth");
+            match grants
+                .iter()
+                .find(|g| g.backend == b.name && g.auth == auth)
+            {
+                Some(g) => println!(
+                    "{}: signed in to {}{} ({})",
+                    b.name,
+                    auth.profile().title,
+                    g.account
+                        .as_deref()
+                        .map(|a| format!(" as {a}"))
+                        .unwrap_or_default(),
+                    describe_expiry(g.expires_at, g.refresh_token.is_some())
+                ),
+                None => println!("{}: not signed in — run `kaibo login {}`", b.name, b.name),
+            }
+        }
+        for g in grants
+            .iter()
+            .filter(|g| !declared.iter().any(|b| b.name == g.backend))
+        {
+            println!(
+                "{}: a stored {} sign-in for a backend config.toml no longer declares with \
+                 auth — `kaibo logout {}` removes it",
+                g.backend,
+                g.auth.profile().title,
+                g.backend
+            );
+        }
+        return EXIT_OK;
+    }
+
+    let name = args
+        .backend
+        .expect("clap requires BACKEND without --status");
+    let backend = match sign_in_backend(&resolver.config, &name) {
+        Ok(b) => b,
+        Err(e) => return fail_preflight(false, "usage", e, EXIT_USAGE),
+    };
+    let auth = backend.auth.expect("sign_in_backend checked auth");
+    let profile = auth.profile();
+    let http = match crate::tls::https_client(crate::oauth::TOKEN_REQUEST_TIMEOUT) {
+        Ok(h) => h,
+        Err(e) => return fail_preflight(false, "setup", format!("{e:#}"), EXIT_SETUP),
+    };
+    let backend_name = backend.name.clone();
+    let outcome = crate::oauth::sign_in(
+        profile,
+        &backend_name,
+        &store,
+        &http,
+        profile.token_url,
+        crate::oauth::callback::CALLBACK_TIMEOUT,
+        |url, port| {
+            eprintln!(
+                "To sign backend `{backend_name}` in to {}, open this URL in a browser on this \
+                 machine:\n\n  {url}\n\nkaibo is waiting for the browser on 127.0.0.1:{port} \
+                 (up to {} minutes). Over SSH, forward that port first: `ssh -L \
+                 {port}:127.0.0.1:{port} <host>`.",
+                profile.title,
+                crate::oauth::callback::CALLBACK_TIMEOUT.as_secs() / 60,
+            );
+        },
+    )
+    .await;
+    match outcome {
+        Ok(grant) => {
+            println!(
+                "Signed in: backend `{}` now uses {}{}.",
+                grant.backend,
+                profile.title,
+                grant
+                    .account
+                    .as_deref()
+                    .map(|a| format!(" as {a}"))
+                    .unwrap_or_default()
+            );
+            if let Some(warning) = resolver
+                .config
+                .persistence
+                .path
+                .as_deref()
+                .and_then(state_dir_exposure)
+            {
+                eprintln!("{warning}");
+            }
+            EXIT_OK
+        }
+        Err(e) => {
+            eprintln!(
+                "kaibo login {}: the sign-in did not complete: {e:#}",
+                backend_name
+            );
+            EXIT_CONSULT_FAILURE
+        }
+    }
+}
+
+/// A warning when the state db's directory lets other local users in, now that it holds
+/// a sign-in. Reads the mode only; changing it is the operator's call.
+fn state_dir_exposure(db: &std::path::Path) -> Option<String> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = db.parent()?;
+        let mode = std::fs::metadata(dir).ok()?.permissions().mode();
+        (mode & 0o077 != 0).then(|| {
+            format!(
+                "warning: kaibo's state dir {} has mode {:o}, so other users on this machine \
+                 can read the stored sign-in. Run `chmod 700 {}` to restrict it to you.",
+                dir.display(),
+                mode & 0o777,
+                dir.display()
+            )
+        })
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = db;
+        None
+    }
+}
+
+/// `kaibo logout`.
+pub async fn run_logout(common: CommonArgs, args: LogoutArgs) -> i32 {
+    init_cli_logging();
+    let config = match load_config(&common) {
+        Ok(c) => c,
+        Err(e) => {
+            return fail_preflight(false, "config", format!("config error: {e:#}"), EXIT_USAGE)
+        }
+    };
+    let resolver = match Resolver::from_config(Arc::new(config)) {
+        Ok(r) => r,
+        Err(e) => return fail_preflight(false, "setup", format!("{e:#}"), EXIT_SETUP),
+    };
+    let store = match open_sign_in_store(&resolver).await {
+        Ok(s) => s,
+        Err(e) => return fail_preflight(false, "setup", e, EXIT_SETUP),
+    };
+    // A stored grant can outlive its config stanza, so look it up by the name given,
+    // canonicalized when it still resolves.
+    let name = resolver
+        .config
+        .resolve_backend(&args.backend)
+        .map(|b| b.name.clone())
+        .unwrap_or_else(|_| args.backend.clone());
+    let grant = match store.get_grant(&name).await {
+        Ok(g) => g,
+        Err(e) => {
+            return fail_preflight(false, "setup", format!("reading sign-ins: {e}"), EXIT_SETUP)
+        }
+    };
+    let Some(grant) = grant else {
+        println!("Backend `{name}` has no stored sign-in; nothing to remove.");
+        return EXIT_OK;
+    };
+    if let Err(e) = store.delete_grant(&name).await {
+        return fail_preflight(
+            false,
+            "setup",
+            format!("removing the sign-in: {e}"),
+            EXIT_SETUP,
+        );
+    }
+    let revoke_hint = match grant.auth {
+        crate::oauth::AuthProfile::Chatgpt => {
+            "The ChatGPT authorization itself stays on your account until you remove kaibo \
+             from your ChatGPT account settings."
+        }
+        crate::oauth::AuthProfile::OpenRouter => {
+            "The API key the sign-in minted still exists on your OpenRouter account; delete \
+             it at https://openrouter.ai/settings/keys."
+        }
+    };
+    println!(
+        "Removed backend `{name}`'s {} sign-in. {revoke_hint}",
+        grant.auth.profile().title
+    );
+    EXIT_OK
+}
+
 pub async fn run_models(common: CommonArgs, args: ModelsArgs) -> i32 {
     init_cli_logging();
     let config = match load_config(&common) {

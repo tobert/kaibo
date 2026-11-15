@@ -63,6 +63,11 @@ enum FailureKind {
     /// A kaibo-*side* failure (e.g. the synth's kaish kernel failed to build) — not the
     /// provider's fault, so we must not say it was.
     Internal,
+    /// A ChatGPT plan backend's included usage is spent
+    /// (`completion_retry::PLAN_USAGE_LIMIT_CODE`), whether the 429 arrived before the
+    /// stream or as a `response.failed` inside it. Not transient: it lasts until the
+    /// plan's window resets, so it must not read as "retry".
+    PlanUsageLimit,
 }
 
 /// Classify a consultation failure from its error chain. This is a **heuristic on the
@@ -117,6 +122,10 @@ fn classify_failure(err: &anyhow::Error) -> FailureKind {
     // error, so one list decides both.
     if crate::completion_retry::is_malformed_generation(&s) {
         return FailureKind::MalformedGeneration;
+    }
+    // Before the transient list, whose "rate limit"/"429" vocabulary it would match.
+    if s.contains(crate::completion_retry::PLAN_USAGE_LIMIT_CODE) {
+        return FailureKind::PlanUsageLimit;
     }
     // Transient vocabulary across Anthropic / Gemini / OpenAI / DeepSeek bodies and the
     // transport layer (reqwest timeouts/resets from our own `request_timeout`).
@@ -311,6 +320,12 @@ pub(crate) fn consultation_failure_text(tool: &str, cast: &str, err: anyhow::Err
         FailureKind::Internal => {
             "This is a kaibo-side error, not the provider's. Ask the user whether to \
              retry this call or continue without the consultation."
+        }
+        FailureKind::PlanUsageLimit => {
+            "The ChatGPT plan behind this cast has used its included usage. Retrying fails \
+             until the plan's usage window resets; ChatGPT shows when, under Settings > \
+             Usage. Ask the user whether to run this on a cast with another backend, wait \
+             for the reset, or continue without the consultation."
         }
     };
     format!("{tool} could not complete (cast `{cast}`): {detail}. {guidance}")
@@ -654,6 +669,19 @@ mod tests {
     /// the consultation. An agent told to proceed on its own hides a failure the user may
     /// want to fix. One body per `FailureKind`, and the classification is asserted first,
     /// so a body that drifted into another arm cannot pass on that arm's wording.
+    /// A spent ChatGPT plan is not a rate limit: its guidance must not invite a retry.
+    #[test]
+    fn a_spent_plan_points_at_another_backend_not_a_retry() {
+        let err = anyhow::anyhow!(
+            "model loop failed on `gpt-6.1-sol`: Invalid status code 429 Too Many Requests \
+             with message: {{\"error\":{{\"code\":\"subscription_sharing_usage_limit_exceeded\"}}}}"
+        );
+        assert_eq!(classify_failure(&err), FailureKind::PlanUsageLimit);
+        let text = consultation_failure_text("consult", "gpt-plan", err);
+        assert!(text.contains("Settings > Usage"), "{text}");
+        assert!(!text.contains("transient"), "{text}");
+    }
+
     #[test]
     fn every_failure_asks_the_user_what_to_do() {
         let cases = [
@@ -681,6 +709,12 @@ mod tests {
             (
                 FailureKind::Internal,
                 "failed to build read-only kaish kernel: out of memory",
+            ),
+            (
+                FailureKind::PlanUsageLimit,
+                "model call failed on `gpt-6.1-sol`: ProviderResponseError: status 200 OK: \
+                 {\"type\":\"response.failed\",\"response\":{\"error\":{\"code\":\
+                 \"subscription_sharing_usage_limit_exceeded\"}}}",
             ),
         ];
         for (kind, body) in cases {

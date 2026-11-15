@@ -157,6 +157,14 @@ wire = "responses"                 # responses | chat; interactive only
 kind = "deepseek"
 api_key_cmd = ["op", "read", "op://Vault/Kaibo/Deepseek-key"]
 
+# Sign in instead of a key: run `kaibo login gpt-plan` once; kaibo stores and refreshes it.
+# "chatgpt" bills your ChatGPT plan (openai kind; interactive only, no batch).
+# "openrouter" mints a key on your OpenRouter account (openrouter kind).
+# auth excludes every api_key_* source. See docs/config.md "Sign-in backends".
+[backends.gpt-plan]
+kind = "openai"
+auth = "chatgpt"                    # or "openrouter" on an openrouter-kind backend
+
 # Cast examples. Usually start with a built-in family; mix backends when useful.
 # String slots split at the first slash. Table slots accept per-model tunables.
 # Prefer an undated id that tracks new releases (`deepseek-flash`, `gemini-pro-latest`,

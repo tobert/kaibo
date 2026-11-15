@@ -115,7 +115,10 @@ surface rule in the invariants).
   stdin closed, `KEY_CMD_TIMEOUT`-bounded, output never logged, and reachable only
   through `Backend::resolve_key` at client construction, which the model-facing kaish
   (sandbox lever 3, unchanged) can never reach. The model can *trigger* it by calling a
-  tool on a cmd-backed backend, but cannot control its argv or environment.
+  tool on a cmd-backed backend, but cannot control its argv or environment. A sign-in
+  (`auth`, `src/oauth/`) follows the same line: only `kaibo login` writes a grant into the
+  store, and a model call can trigger a refresh against the token endpoint stored with the
+  grant, never choose it.
 - **Persistence engine (turso) — do not weaken.** Pure-Rust `turso`, **exact-pinned**
   (`=0.8.x` — `.db-tshm` format and API both drift between releases) with
   **`default-features = false`** (defaults pull mimalloc's global-allocator hijack + fts)
@@ -129,7 +132,11 @@ surface rule in the invariants).
   surfaced in the log and as `persistence.active = false` in `kaibo://config`; every other
   open error stays fatal. Connect-per-operation, never a shared `Connection`. See
   `src/store.rs`, `main.rs`.
-- **stdio only.** kaibo can read a filesystem, so it must never bind a socket.
+- **stdio only, with one loopback exception.** kaibo can read a filesystem, so the MCP
+  server never binds a socket. The one listener is `kaibo login`'s sign-in callback
+  (`src/oauth/callback.rs`): loopback only, started only by that CLI command, closed after
+  one sign-in or 5 minutes. `tests/no_bind.rs` pins it as the only bind site in `src/`; a
+  second listener is a change to this invariant, made here with its own review.
 - **kaish is `!Send`.** The kernel runs on a dedicated thread behind `KaishWorker`;
   rig tools require `Send` futures. Don't hold the kernel across an `.await`.
 - **TLS is rustls + ring, no aws-lc / no OpenSSL.** The whole tree must stay free of

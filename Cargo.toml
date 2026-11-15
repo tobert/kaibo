@@ -24,7 +24,7 @@ path = "src/main.rs"
 kaish-kernel = { version = "0.19.0", default-features = false, features = ["localfs"] }
 # `time` is used by the deferred `generate` job's poll cadence (sleep + Instant) —
 # named here rather than inherited from a transitive enabler.
-tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "sync", "time"] }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "sync", "time", "net", "io-util"] }
 async-trait = "0.1"
 anyhow = "1"
 
@@ -222,6 +222,11 @@ tracing-opentelemetry = "0.33"
 # events. Pure `tracing` → `opentelemetry` glue, no transport of its own: it feeds the
 # same OTLP/HTTP exporter and inherits the reqwest/TLS reasoning above.
 opentelemetry-appender-tracing = "0.32"
+
+# URL and form encoding for the sign-in flow (src/oauth): the authorize URL, the
+# callback query, and the token endpoint's form body. Already in the lock through
+# reqwest; named here so the dep is ours.
+url = "2"
 
 # sha256 for the media CAS (src/cas.rs): the address IS the digest, so hashing is the
 # one operation the whole design leans on. Pure Rust, no C/asm, already in the lock

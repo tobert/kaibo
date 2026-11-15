@@ -53,6 +53,12 @@
 //! **Any future second open-site is a data-loss bug**, not a refactor — route every open
 //! through [`build_database`].
 //!
+//! Within one process, a path is built at most once: [`SessionStore::open`] records
+//! every `Database` it builds by resolved path and hands the same handle to a later
+//! open of that path, under an async lock so two concurrent opens cannot both build
+//! one. A CLI command can open the store for a `--session` and again for a signed-in
+//! backend's credential (`oauth::grant`) and still hold one handle.
+//!
 //! On Windows (and any non-64-bit-Unix target) MP mode is unavailable, so the store runs
 //! default single-process mode: a concurrent second open fails loudly with a clear kaibo
 //! error ([`StoreError::SingleProcessLocked`]) telling the operator to close the other
@@ -82,7 +88,7 @@ const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Current on-disk schema version. Bump + add a migration arm when the shape changes;
 /// migrations are forward-only and applied through [`SessionStore::migrate`].
-pub const SCHEMA_VERSION: i64 = 2;
+pub const SCHEMA_VERSION: i64 = 3;
 
 /// How long a batch handle is kept before it's pruned. Provider batches expire around 30
 /// days (Anthropic/Gemini both), so a handle older than that names a batch the provider has
@@ -207,6 +213,27 @@ fn now() -> i64 {
         .unwrap_or(0)
 }
 
+/// Every state db this process opened, by resolved path, first-opened first. A later
+/// [`SessionStore::open`] of the same path shares the handle; see there.
+static OPENED: std::sync::Mutex<Vec<(PathBuf, Database)>> = std::sync::Mutex::new(Vec::new());
+
+/// Held across the check-then-build in [`SessionStore::open`], so two concurrent opens
+/// of one path cannot both miss [`OPENED`] and both build a `Database`.
+static OPENING: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+fn opened() -> std::sync::MutexGuard<'static, Vec<(PathBuf, Database)>> {
+    OPENED.lock().unwrap_or_else(|p| p.into_inner())
+}
+
+/// The state db this process opened first, if any — the one signed-in backends read
+/// their credentials from when no persistence spec is recorded (`oauth::grant`).
+pub fn process_store() -> Option<SessionStore> {
+    opened().first().map(|(_, db)| SessionStore {
+        db: db.clone(),
+        capacity: crate::config::Defaults::default().session_capacity.get(),
+    })
+}
+
 /// A capacity-bounded, LRU-evicting persistent store of consult sessions plus a registry
 /// of provider batch handles. `Clone`-cheap: [`Database`] is a `Send + Sync` `Arc`
 /// internally, so every per-request handler clone shares one underlying db.
@@ -285,6 +312,22 @@ impl SessionStore {
             }
         }
 
+        // One `Database` per file per process: when this process already opened this
+        // db, share that handle instead of building a second one. Every open goes
+        // through here, so a CLI command that opens the store for a session and again
+        // for a signed-in backend's credential still holds one handle.
+        let _opening = OPENING.lock().await;
+        if let Some(db) = opened()
+            .iter()
+            .find(|(p, _)| *p == resolved_full)
+            .map(|(_, db)| db.clone())
+        {
+            return Ok(Self {
+                db,
+                capacity: capacity.get(),
+            });
+        }
+
         // Containment passed — now the state dir may be created and probed. Creating it is
         // the one blessed write (through `create_state_dir`); it can't be a data-loss event,
         // and it lets turso create the db file and the `statfs` probe below see a real dir.
@@ -303,6 +346,9 @@ impl SessionStore {
             capacity: capacity.get(),
         };
         store.migrate().await?;
+        // Recorded only once migrated, so a later open of this path (above) shares a
+        // handle that is ready to use.
+        opened().push((resolved_full.clone(), store.db.clone()));
         // Sweep batch handles the provider has already expired (TTL). One prune at open
         // clears anything that aged out while kaibo was down, so `job_list` never serializes
         // long-dead handles even on a store that hasn't seen a `put_batch` in a while.
@@ -334,6 +380,7 @@ impl SessionStore {
             match version {
                 0 => Self::apply_v1(&conn).await?,
                 1 => Self::apply_v2(&conn).await?,
+                2 => Self::apply_v3(&conn).await?,
                 other => {
                     return Err(StoreError::Corrupt(format!(
                         "no migration from schema version {other} (this binary knows up to \
@@ -393,6 +440,38 @@ impl SessionStore {
     async fn apply_v2(conn: &Connection) -> Result<()> {
         conn.execute_batch("ALTER TABLE batch_handles ADD COLUMN submitted_count INTEGER;")
             .await?;
+        Ok(())
+    }
+
+    /// v2 → v3: the sign-in tables. `oauth_grants` holds one credential per `auth`
+    /// backend (written only by `kaibo login`, refreshed in place under a lease — see
+    /// `oauth::grant`); `meta` holds this machine's SIWC `ext_agent_host_id`, created
+    /// on first sign-in and kept so later sign-ins name the same host.
+    async fn apply_v3(conn: &Connection) -> Result<()> {
+        conn.execute_batch(
+            r#"
+            CREATE TABLE IF NOT EXISTS oauth_grants (
+                backend       TEXT    PRIMARY KEY,
+                auth          TEXT    NOT NULL,
+                client_id     TEXT,
+                token_url     TEXT    NOT NULL,
+                access_token  TEXT    NOT NULL,
+                refresh_token TEXT,
+                expires_at    INTEGER,
+                account       TEXT,
+                scopes        TEXT,
+                updated_at    INTEGER NOT NULL,
+                lease_holder  TEXT,
+                lease_until   INTEGER
+            ) STRICT;
+
+            CREATE TABLE IF NOT EXISTS meta (
+                key   TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            ) STRICT;
+            "#,
+        )
+        .await?;
         Ok(())
     }
 
@@ -590,6 +669,213 @@ impl SessionStore {
             out.push(row_to_handle(&row)?);
         }
         Ok(out)
+    }
+}
+
+// --- Sign-in grants (`oauth`) ---------------------------------------------------
+
+const GRANT_COLUMNS: &str = "backend, auth, client_id, token_url, access_token, refresh_token, \
+                             expires_at, account, scopes";
+
+fn opt_text(v: &Option<String>) -> Value {
+    match v {
+        Some(s) => Value::Text(s.clone()),
+        None => Value::Null,
+    }
+}
+
+fn opt_int(v: Option<i64>) -> Value {
+    match v {
+        Some(n) => Value::Integer(n),
+        None => Value::Null,
+    }
+}
+
+fn row_opt_text(row: &turso::Row, i: usize, what: &str) -> Result<Option<String>> {
+    match row.get_value(i)? {
+        Value::Null => Ok(None),
+        Value::Text(s) => Ok(Some(s)),
+        other => Err(StoreError::Corrupt(format!(
+            "oauth_grants.{what} is {other:?}, not TEXT or NULL"
+        ))),
+    }
+}
+
+fn row_to_grant(row: &turso::Row) -> Result<crate::oauth::Grant> {
+    let auth: String = row.get(1)?;
+    let auth = auth
+        .parse()
+        .map_err(|e| StoreError::Corrupt(format!("oauth_grants.auth: {e}")))?;
+    let expires_at = match row.get_value(6)? {
+        Value::Null => None,
+        Value::Integer(n) => Some(n),
+        other => {
+            return Err(StoreError::Corrupt(format!(
+                "oauth_grants.expires_at is {other:?}, not an INTEGER or NULL"
+            )))
+        }
+    };
+    Ok(crate::oauth::Grant {
+        backend: row.get(0)?,
+        auth,
+        client_id: row_opt_text(row, 2, "client_id")?,
+        token_url: row.get(3)?,
+        access_token: row.get(4)?,
+        refresh_token: row_opt_text(row, 5, "refresh_token")?,
+        expires_at,
+        account: row_opt_text(row, 7, "account")?,
+        scopes: row_opt_text(row, 8, "scopes")?,
+    })
+}
+
+impl SessionStore {
+    /// The stored sign-in for `backend`, if any.
+    pub async fn get_grant(&self, backend: &str) -> Result<Option<crate::oauth::Grant>> {
+        let conn = self.conn().await?;
+        let mut rows = conn
+            .query(
+                &format!("SELECT {GRANT_COLUMNS} FROM oauth_grants WHERE backend = ?1"),
+                [backend.to_string()],
+            )
+            .await?;
+        match rows.next().await? {
+            Some(row) => Ok(Some(row_to_grant(&row)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Every stored sign-in, by backend name.
+    pub async fn list_grants(&self) -> Result<Vec<crate::oauth::Grant>> {
+        let conn = self.conn().await?;
+        let mut rows = conn
+            .query(
+                &format!("SELECT {GRANT_COLUMNS} FROM oauth_grants ORDER BY backend"),
+                (),
+            )
+            .await?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next().await? {
+            out.push(row_to_grant(&row)?);
+        }
+        Ok(out)
+    }
+
+    /// Store a new sign-in for `grant.backend`, replacing any earlier one and clearing
+    /// any refresh lease on it. `kaibo login` is the only caller.
+    pub async fn put_grant(&self, grant: &crate::oauth::Grant) -> Result<()> {
+        let conn = self.conn().await?;
+        conn.execute(
+            "INSERT INTO oauth_grants (backend, auth, client_id, token_url, access_token,
+                 refresh_token, expires_at, account, scopes, updated_at, lease_holder, lease_until)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, NULL, NULL)
+             ON CONFLICT(backend) DO UPDATE SET auth = ?2, client_id = ?3, token_url = ?4,
+                 access_token = ?5, refresh_token = ?6, expires_at = ?7, account = ?8,
+                 scopes = ?9, updated_at = ?10, lease_holder = NULL, lease_until = NULL",
+            (
+                grant.backend.clone(),
+                grant.auth.as_str().to_string(),
+                opt_text(&grant.client_id),
+                grant.token_url.clone(),
+                grant.access_token.clone(),
+                opt_text(&grant.refresh_token),
+                opt_int(grant.expires_at),
+                opt_text(&grant.account),
+                opt_text(&grant.scopes),
+                now(),
+            ),
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// Remove `backend`'s sign-in. True if there was one.
+    pub async fn delete_grant(&self, backend: &str) -> Result<bool> {
+        let conn = self.conn().await?;
+        let n = conn
+            .execute(
+                "DELETE FROM oauth_grants WHERE backend = ?1",
+                [backend.to_string()],
+            )
+            .await?;
+        Ok(n > 0)
+    }
+
+    /// Try to take `backend`'s refresh lease for `ttl` seconds as `holder`. True when
+    /// this caller now holds it: no lease was held, or the held one had lapsed. One
+    /// autocommit `UPDATE`, so two claimants can never both see `true`.
+    pub async fn claim_refresh_lease(
+        &self,
+        backend: &str,
+        holder: &str,
+        now: i64,
+        ttl: i64,
+    ) -> Result<bool> {
+        let conn = self.conn().await?;
+        let n = conn
+            .execute(
+                "UPDATE oauth_grants SET lease_holder = ?2, lease_until = ?3
+                 WHERE backend = ?1 AND (lease_until IS NULL OR lease_until < ?4)",
+                (backend.to_string(), holder.to_string(), now + ttl, now),
+            )
+            .await?;
+        Ok(n > 0)
+    }
+
+    /// Store a refreshed credential and release the lease — only if `holder` still
+    /// holds it. False means the lease lapsed and another holder took over, so this
+    /// refresh's result is discarded.
+    pub async fn finish_refresh(&self, holder: &str, grant: &crate::oauth::Grant) -> Result<bool> {
+        let conn = self.conn().await?;
+        let n = conn
+            .execute(
+                "UPDATE oauth_grants SET access_token = ?3, refresh_token = ?4, expires_at = ?5,
+                     scopes = ?6, updated_at = ?7, lease_holder = NULL, lease_until = NULL
+                 WHERE backend = ?1 AND lease_holder = ?2",
+                (
+                    grant.backend.clone(),
+                    holder.to_string(),
+                    grant.access_token.clone(),
+                    opt_text(&grant.refresh_token),
+                    opt_int(grant.expires_at),
+                    opt_text(&grant.scopes),
+                    now(),
+                ),
+            )
+            .await?;
+        Ok(n > 0)
+    }
+
+    /// Release `holder`'s lease on `backend` after a refresh that failed but left the
+    /// grant usable, so the next caller can try at once instead of waiting it out.
+    pub async fn release_refresh_lease(&self, backend: &str, holder: &str) -> Result<()> {
+        let conn = self.conn().await?;
+        conn.execute(
+            "UPDATE oauth_grants SET lease_holder = NULL, lease_until = NULL
+             WHERE backend = ?1 AND lease_holder = ?2",
+            (backend.to_string(), holder.to_string()),
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// This machine's SIWC `ext_agent_host_id`, created on first use. `INSERT ... DO
+    /// NOTHING` then a read, so two first sign-ins racing still agree on one id.
+    pub async fn host_id(&self) -> Result<String> {
+        let conn = self.conn().await?;
+        conn.execute(
+            "INSERT INTO meta (key, value) VALUES ('oauth_host_id', ?1) ON CONFLICT(key) DO NOTHING",
+            [crate::oauth::new_host_id()],
+        )
+        .await?;
+        let mut rows = conn
+            .query("SELECT value FROM meta WHERE key = 'oauth_host_id'", ())
+            .await?;
+        match rows.next().await? {
+            Some(row) => Ok(row.get(0)?),
+            None => Err(StoreError::Corrupt(
+                "meta.oauth_host_id missing right after insert".into(),
+            )),
+        }
     }
 }
 

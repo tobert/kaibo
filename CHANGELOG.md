@@ -16,6 +16,7 @@ record. Each later release appends a new section at the top.
 ## [Unreleased]
 
 ### Security
+- `kaibo login` listens once on `127.0.0.1` for the browser's sign-in redirect; it is the only socket kaibo opens, and the MCP server never opens it.
 - `rmcp` 3.9.0 fixes RUSTSEC-2026-0457, -0461, and -0462; none reaches the transports kaibo builds today.
 - `tokio` 1.54.1 fixes RUSTSEC-2026-0386 (`AsyncFd` constructors accepted any file descriptor); kaibo calls no `AsyncFd` itself.
 - A launch directory that holds `$HOME` (home, an ancestor, or `/`) is no longer inferred as scope, so a path-less call fails until `--root` names a workspace such as `~/src`.
@@ -23,6 +24,10 @@ record. Each later release appends a new section at the top.
 - `openai` backends on the Responses wire send `store: false` by default, so OpenAI does not keep the response objects; `data_collection = "allow"` opts back in.
 
 ### Added
+- `auth = "chatgpt"` on an `openai` backend bills interactive calls to your ChatGPT plan through OpenAI's "Sign in with ChatGPT"; `kaibo login <backend>` signs in once.
+- `auth = "openrouter"` on an `openrouter` backend mints its key by signing in instead of pasting one.
+- `kaibo login --status` lists sign-ins; `kaibo logout <backend>` removes one.
+- A spent ChatGPT plan (`subscription_sharing_usage_limit_exceeded`) is not retried, and the error names ChatGPT's usage page.
 - `research` (and `kaibo research`) searches the web and returns an answer with numbered references (URL, date, and a quote), then kaibo's own list of the pages read and of search results cited without a read.
 - `web: true` on `consult`, `consult_submit`, and `deliberate` (`--web` in the CLI) adds web search to a code question; off by default.
 - On an Anthropic or OpenRouter arm, web calls use the provider's own server tools (`[web] native`, on by default).

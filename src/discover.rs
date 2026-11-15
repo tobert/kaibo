@@ -244,7 +244,17 @@ pub fn discovery_endpoint_page(
         };
         anyhow::bail!("{}", media_listing_refusal(backend, media))
     };
-    let key = backend.resolve_key()?;
+    discovery_request_with_key(backend, wire, cursor, backend.resolve_key()?)
+}
+
+/// [`discovery_endpoint_page`] with the credential already in hand: a resolved API
+/// key, or a signed-in backend's current bearer token.
+fn discovery_request_with_key(
+    backend: &Backend,
+    wire: WireKind,
+    cursor: Option<&str>,
+    key: String,
+) -> Result<DiscoveryRequest> {
     match wire {
         WireKind::Openai => {
             let base = backend.resolved_base_url();
@@ -547,8 +557,28 @@ pub async fn discover_models(
             .await
         }
         WireKind::Openai | WireKind::OpenRouter | WireKind::DeepSeek => {
-            let req = discovery_endpoint(backend)?;
-            let body = fetcher.get_json(&req).await?;
+            let Some(auth) = backend.auth else {
+                let req = discovery_endpoint(backend)?;
+                let body = fetcher.get_json(&req).await?;
+                return Ok(parse_openai_models(&body));
+            };
+            // A signed-in backend lists with its current token, refreshed if due.
+            let token = crate::oauth::TokenSource::for_process(&backend.name, auth)?
+                .bearer()
+                .await?;
+            let req = discovery_request_with_key(backend, wire, None, token)?;
+            let mut body = fetcher.get_json(&req).await?;
+            if auth == crate::oauth::AuthProfile::Chatgpt {
+                // SIWC lists every model id; only `visibility: "list"` entries are the
+                // ones a plan can call.
+                if let Some(data) = body.get_mut("data").and_then(Value::as_array_mut) {
+                    data.retain(|m| {
+                        m.get("visibility")
+                            .and_then(Value::as_str)
+                            .is_none_or(|v| v == "list")
+                    });
+                }
+            }
             Ok(parse_openai_models(&body))
         }
     }
@@ -713,6 +743,7 @@ mod tests {
             data_collection: DataCollection::default(),
             prompt_cache: crate::config::PromptCache::default(),
             wire: None,
+            auth: None,
         }
     }
 

@@ -367,6 +367,11 @@ pub(crate) fn render_config_resource(
         /// visible even when nothing was configured. Absent on every other kind.
         #[serde(skip_serializing_if = "Option::is_none")]
         wire: Option<&'static str>,
+        /// The sign-in this backend uses in place of an API key (`"chatgpt"` or
+        /// `"openrouter"`), when set. Whether someone has signed in is not shown here:
+        /// `kaibo login --status` reads that from the state db.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        auth: Option<&'static str>,
     }
 
     /// One cast slot: the `"backend/id"` ref plus its *resolved* capabilities
@@ -444,6 +449,7 @@ pub(crate) fn render_config_resource(
                 data_collection,
                 prompt_cache,
                 wire: _,
+                auth,
             } = b;
             let rendered_base_url = if *kind == crate::credentials::ProviderKind::Openai {
                 Some(b.resolved_base_url())
@@ -488,6 +494,8 @@ pub(crate) fn render_config_resource(
                         "chat"
                     },
                 ),
+                // The profile name only; the credential lives in the state db.
+                auth: auth.map(crate::oauth::AuthProfile::as_str),
             };
             (name.clone(), doc)
         })

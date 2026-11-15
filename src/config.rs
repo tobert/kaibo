@@ -801,6 +801,11 @@ pub struct Backend {
     /// case) defers to [`Backend::uses_responses_wire`]'s endpoint-exact
     /// heuristic. Only an openai-kind backend may set it.
     pub wire: Option<OpenaiWire>,
+    /// A sign-in in place of an API key (`auth = "chatgpt"` | `"openrouter"`): the
+    /// credential comes from `kaibo login` and is read per request (see
+    /// [`crate::oauth::grant`]). Exclusive with every `api_key_*` source, and only on
+    /// the kind the sign-in serves.
+    pub auth: Option<crate::oauth::AuthProfile>,
 }
 
 impl Backend {
@@ -833,6 +838,17 @@ impl Backend {
     /// [`resolve_key`](Self::resolve_key), testable without touching the real
     /// environment (the same discipline `key_status` already follows).
     pub fn resolve_key_where(&self, get_env: impl Fn(&str) -> Option<String>) -> Result<String> {
+        // A signed-in backend has no static key. Its credential is read per request by
+        // `oauth::GrantAuthHttp`; a call site that reaches here instead would send a
+        // placeholder upstream, so it is refused loudly.
+        if let Some(auth) = self.auth {
+            return Err(anyhow!(
+                "backend {:?} signs in with `auth = \"{auth}\"`, and this feature cannot use \
+                 a signed-in backend (only interactive completions and `kaibo models` can). \
+                 Point this slot at a backend with an API key",
+                self.name
+            ));
+        }
         // env wins, when set and non-blank.
         if let Some(v) = self.api_key_env.as_deref().and_then(get_env) {
             let v = v.trim();
@@ -930,6 +946,10 @@ impl Backend {
         if self.kind != ProviderKind::Openai {
             return false;
         }
+        // The ChatGPT plan route is Responses-only.
+        if self.auth == Some(crate::oauth::AuthProfile::Chatgpt) {
+            return true;
+        }
         match self.wire {
             Some(OpenaiWire::Responses) => true,
             Some(OpenaiWire::Chat) => false,
@@ -950,6 +970,12 @@ impl Backend {
     /// a command is never run (there is no cheap offline equivalent of `exists()` —
     /// a typo'd binary name passes classification and fails at the first resolve).
     pub fn key_status(&self, get_env: impl Fn(&str) -> Option<String>) -> KeyStatus {
+        // A sign-in is Present by declaration: startup classifies casts before the
+        // state db opens, so the grant row cannot be read here. A backend nobody has
+        // signed in yet is refused at its first request, naming `kaibo login`.
+        if self.auth.is_some() {
+            return KeyStatus::Present;
+        }
         // env wins, when set and non-blank — same rule as resolve_key.
         if let Some(name) = self.api_key_env.as_deref() {
             if let Some(v) = get_env(name) {
@@ -2020,7 +2046,12 @@ impl Config {
                     // belongs to the built-in `openai-local` backend alone —
                     // inherited here it would silently dial the wrong server and fail
                     // as a cryptic 404 mid-call instead of loudly at load.
-                    if b.kind == ProviderKind::Openai && b.base_url.is_none() {
+                    // A ChatGPT sign-in is the exception: its endpoint is OpenAI's own,
+                    // so unset means that (filled in below, after the merge).
+                    if b.kind == ProviderKind::Openai
+                        && b.base_url.is_none()
+                        && b.auth != Some(crate::oauth::AuthProfile::Chatgpt)
+                    {
                         bail!(
                             "backend {name:?} (kind \"openai\") must set base_url — \
                              only the built-in `openai-local` backend falls back to \
@@ -2112,6 +2143,43 @@ impl Config {
             // itself. (Today no later layer can declare a backend source — the builtin
             // template seeds none and env/CLI carry no stanzas — but the check is
             // placement-proof by construction, and the single-stanza tests pin it.)
+            if let Some(auth) = b.auth {
+                let declared: Vec<&str> = [
+                    ("api_key_env", b.api_key_env.is_some()),
+                    ("api_key_file", b.api_key_file.is_some()),
+                    ("api_key_cmd", b.api_key_cmd.is_some()),
+                ]
+                .into_iter()
+                .filter_map(|(k, set)| set.then_some(k))
+                .collect();
+                if !declared.is_empty() {
+                    bail!(
+                        "backend {:?} sets auth = \"{auth}\" and also {} — a signed-in \
+                         backend takes its credential from `kaibo login`, so remove {} from \
+                         [backends.{}], or remove `auth` to use the key",
+                        b.name,
+                        declared.join(" and "),
+                        declared.join(" and "),
+                        b.name,
+                    );
+                }
+                if auth == crate::oauth::AuthProfile::Chatgpt {
+                    if b.wire == Some(OpenaiWire::Chat) {
+                        bail!(
+                            "backend {:?} sets auth = \"chatgpt\" and wire = \"chat\", but the \
+                             ChatGPT plan route takes only the Responses wire. Remove `wire` \
+                             from [backends.{}]",
+                            b.name,
+                            b.name
+                        );
+                    }
+                    // The plan route is OpenAI's own endpoint; unset means that, not
+                    // the openai kind's local-server default.
+                    if b.base_url.is_none() {
+                        b.base_url = Some(credentials::HOSTED_OPENAI_BASE_URL.to_string());
+                    }
+                }
+            }
             if b.api_key_file.is_some() && b.api_key_cmd.is_some() {
                 bail!(
                     "backend {:?} declares both api_key_file and api_key_cmd — \
@@ -2379,6 +2447,17 @@ impl Config {
                             role.key(),
                             lane.as_str()
                         );
+                    }
+                    if lane == Lane::Batch {
+                        if let Some(auth) = backends[&slot.backend].auth {
+                            bail!(
+                                "cast {name:?}: synth lane = \"batch\" but the synth backend \
+                                 {:?} signs in with auth = \"{auth}\", and a sign-in covers \
+                                 interactive requests only — point the batch synth at a \
+                                 backend with an API key",
+                                slot.backend,
+                            );
+                        }
                     }
                     if lane == Lane::Batch
                         && !crate::batch::batch_supported(&backends[&slot.backend])
@@ -2702,6 +2781,7 @@ fn backend_template(kind: ProviderKind, defaults: &Defaults) -> Backend {
         prompt_cache: PromptCache::Short,
         // Unset defers to the endpoint-exact heuristic (`uses_responses_wire`).
         wire: None,
+        auth: None,
     }
 }
 
@@ -3159,6 +3239,8 @@ struct RawBackend {
     prompt_cache: Option<String>,
     /// `openai` kind only — see [`OpenaiWire`]. A load error on any other kind.
     wire: Option<String>,
+    /// A sign-in in place of an API key — see [`Backend::auth`].
+    auth: Option<String>,
 }
 
 impl RawBackend {
@@ -3255,6 +3337,24 @@ impl RawBackend {
                 v.parse()
                     .with_context(|| format!("backend {:?} wire", b.name))?,
             );
+        }
+        if let Some(v) = &self.auth {
+            let auth: crate::oauth::AuthProfile = v
+                .parse()
+                .with_context(|| format!("backend {:?} auth", b.name))?;
+            if auth.kind() != b.kind {
+                bail!(
+                    "backend {:?} (kind {:?}) sets auth = {:?}, which signs in to a `{}` \
+                     backend. Set kind = \"{}\" on [backends.{}], or remove `auth`",
+                    b.name,
+                    b.kind,
+                    auth.as_str(),
+                    auth.kind().canonical_name(),
+                    auth.kind().canonical_name(),
+                    b.name
+                );
+            }
+            b.auth = Some(auth);
         }
         Ok(())
     }

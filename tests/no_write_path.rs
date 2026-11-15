@@ -1,4 +1,4 @@
-//! The read-only invariant, guarded at the source — now with three blessed exceptions.
+//! The read-only invariant, guarded at the source — now with four blessed exceptions.
 //!
 //! kaibo writes essentially nothing: no write path through kaish (enforced structurally —
 //! see `tests/sandbox.rs`/`tests/worker.rs`, where a kaish write is refused), and no
@@ -41,6 +41,12 @@
 //! this front door serves them, visibly and countably (Amy, 2026-08-07: "we do know when
 //! we might output binary and the caller likely knows they're gonna get binary").
 //!
+//! **Blessed site 4** (2026-11-15): the `kaibo login` callback answering the browser —
+//! `src/oauth/callback.rs` writing one short HTML reply to the loopback socket the
+//! browser connected to. Like site 3 it creates nothing on any filesystem; it is here
+//! for the same reason, that `.write_all(` cannot tell a socket from a file. The socket
+//! itself is guarded separately (`tests/no_bind.rs`).
+//!
 //! The carve-out is deliberately narrow, and this test keeps its teeth:
 //! - a blessed line is exempted **only** when its file is one of the blessed files
 //!   *and* the line's own raw text carries that file's marker *and* the call is one that
@@ -51,7 +57,7 @@
 //!   fails everywhere, including inside the blessed files, on any line lacking that
 //!   file's own marker;
 //! - the total number of blessed marker lines tree-wide is pinned to an **exact count**
-//!   (`EXPECTED_BLESSED_LINES`, currently 5), so a new write site — in an existing blessed
+//!   (`EXPECTED_BLESSED_LINES`, currently 6), so a new write site — in an existing blessed
 //!   file or a new one — can't quietly ride in behind an existing marker without this test
 //!   failing (`blessed_marker_count_matches_exactly`).
 //!
@@ -110,6 +116,12 @@ const BLESSED: &[Blessed] = &[
         // call is a different capability and must fail here even with the marker on it.
         needles: &[".write_all("],
     },
+    Blessed {
+        file: "callback.rs",
+        marker: "callback-reply: blessed sign-in callback answer (AGENTS.md)",
+        // The reply to the browser's one request, on the loopback socket it opened.
+        needles: &[".write_all("],
+    },
 ];
 
 /// One blessed write site: which file may carry it, the marker its line must show, and
@@ -131,9 +143,10 @@ struct Blessed {
 /// (`create_state_dir`'s `create_dir_all`) + 3 in `cas.rs` (the shard-dir `create_dir_all`,
 /// the `create_new` open, and the `write_all` of the bytes — see `src/cas.rs`'s module
 /// doc and the count breakdown in this file's module doc) + 1 in `cli.rs` (`kaibo cas
-/// read` handing an artifact's bytes to stdout). Pinned so a new write site can't
-/// silently ride in behind an existing marker.
-const EXPECTED_BLESSED_LINES: usize = 5;
+/// read` handing an artifact's bytes to stdout) + 1 in `callback.rs` (the sign-in
+/// callback's reply to the browser). Pinned so a new write site can't silently ride in
+/// behind an existing marker.
+const EXPECTED_BLESSED_LINES: usize = 6;
 
 fn rs_files(dir: &Path, out: &mut Vec<PathBuf>) {
     for entry in std::fs::read_dir(dir).expect("read src dir") {
@@ -230,8 +243,9 @@ fn no_handler_side_write_path_in_production_code() {
 
     assert!(
         violations.is_empty(),
-        "kaibo writes nothing in production but the two blessed sites (store.rs's state dir, \
-         cas.rs's media CAS) — read-only is unconditional. Found a filesystem-mutating call in \
+        "kaibo writes nothing in production but the blessed sites (store.rs's state dir, \
+         cas.rs's media CAS, cli.rs's stdout bytes, callback.rs's browser reply) — read-only \
+         is unconditional. Found a filesystem-mutating call in \
          non-test code:\n  {}\nIf this is a deliberate, individually-mediated capability, update \
          this guard's carve-out in the same change (and its review).",
         violations.join("\n  ")
@@ -259,7 +273,8 @@ fn blessed_marker_count_matches_exactly() {
     assert_eq!(
         total, EXPECTED_BLESSED_LINES,
         "expected exactly {EXPECTED_BLESSED_LINES} blessed write sites tree-wide (1 in \
-         src/store.rs + 3 in src/cas.rs + 1 in src/cli.rs), found {total}"
+         src/store.rs + 3 in src/cas.rs + 1 in src/cli.rs + 1 in src/oauth/callback.rs), \
+         found {total}"
     );
 }
 
@@ -350,6 +365,19 @@ fn teeth_cli_writes_without_the_marker_fail() {
         !scan_source("server.rs", &elsewhere).is_empty(),
         "cli.rs's marker must not exempt a write in another file"
     );
+}
+
+/// The callback's reply is exempt on its marked line, and its marker launders nothing
+/// else: not an `fs::write` in the same file, not the same reply in another file.
+#[test]
+fn teeth_callback_reply_is_narrow() {
+    let marker = BLESSED[3].marker;
+    let reply = format!("    let _ = stream.write_all(reply.as_bytes()).await; // {marker}\n");
+    assert!(scan_source("callback.rs", &reply).is_empty());
+    let laundered = format!("    std::fs::write(path, b)?; // {marker}\n");
+    assert!(!scan_source("callback.rs", &laundered).is_empty());
+    assert!(!scan_source("server.rs", &reply).is_empty());
+    assert!(!scan_source("callback.rs", "    stream.write_all(b).await?;\n").is_empty());
 }
 
 /// A forbidden call inside a `#[cfg(test)]` module is ignored (fixtures may write).

@@ -1332,6 +1332,7 @@ fn local_backend(api_key_file: Option<String>, key_optional: bool) -> Backend {
         data_collection: Default::default(),
         prompt_cache: Default::default(),
         wire: None,
+        auth: None,
     }
 }
 
@@ -1362,6 +1363,7 @@ fn key_optional_gemini_backend_resolves_to_an_empty_query_key() {
         data_collection: Default::default(),
         prompt_cache: Default::default(),
         wire: None,
+        auth: None,
     };
     assert_eq!(
         b.resolve_key().unwrap(),
@@ -1412,6 +1414,7 @@ fn required_key_with_no_source_is_an_error() {
         data_collection: Default::default(),
         prompt_cache: Default::default(),
         wire: None,
+        auth: None,
     };
     let err = b.resolve_key().unwrap_err();
     assert!(
@@ -3011,6 +3014,7 @@ fn key_status_reads_a_declared_cmd_as_present_without_running_it() {
         data_collection: Default::default(),
         prompt_cache: Default::default(),
         wire: None,
+        auth: None,
     };
     assert_eq!(b.key_status(|_| None), kaibo::config::KeyStatus::Present);
 }
@@ -3041,6 +3045,7 @@ fn declared_env_wins_over_the_cmd_without_running_it() {
         data_collection: Default::default(),
         prompt_cache: Default::default(),
         wire: None,
+        auth: None,
     };
 
     // Env present: the injected lookup (the `resolve_key_where` seam, mirroring
@@ -3086,6 +3091,7 @@ fn a_declared_key_cmd_resolves_even_on_a_key_optional_backend() {
         data_collection: Default::default(),
         prompt_cache: Default::default(),
         wire: None,
+        auth: None,
     };
     let key = b.resolve_key().expect("cmd runs before the placeholder");
     assert_eq!(key, "sk-local");
@@ -3409,4 +3415,100 @@ fn web_is_usable_only_with_a_key_and_the_flag() {
     assert!(!c.web_usable(none), "no key, no web");
     let off = Config::from_toml_str(&format!("{KEYED}[web]\nenabled = false\n")).unwrap();
     assert!(!off.web_usable(keyed), "the operator's off switch wins over a key");
+}
+
+// --- Sign-in backends (`auth`) ----------------------------------------------------
+
+#[test]
+fn a_chatgpt_sign_in_defaults_to_openai_and_the_responses_wire() {
+    let cfg =
+        Config::from_toml_str("[backends.plan]\nkind = \"openai\"\nauth = \"chatgpt\"\n").unwrap();
+    let b = cfg.resolve_backend("plan").unwrap();
+    assert_eq!(b.auth, Some(kaibo::oauth::AuthProfile::Chatgpt));
+    assert_eq!(
+        b.base_url.as_deref(),
+        Some("https://api.openai.com/v1"),
+        "unset means OpenAI's own endpoint"
+    );
+    assert!(b.uses_responses_wire());
+    assert_eq!(b.key_status(|_| None), kaibo::config::KeyStatus::Present);
+}
+
+#[test]
+fn a_signed_in_backend_refuses_a_static_key_lookup() {
+    let cfg =
+        Config::from_toml_str("[backends.plan]\nkind = \"openai\"\nauth = \"chatgpt\"\n").unwrap();
+    let err = cfg
+        .resolve_backend("plan")
+        .unwrap()
+        .resolve_key()
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("auth = \"chatgpt\""), "{err}");
+    assert!(err.contains("API key"), "names what to use instead: {err}");
+}
+
+#[test]
+fn auth_excludes_every_api_key_source() {
+    for source in [
+        "api_key_env = \"OPENAI_API_KEY\"",
+        "api_key_file = \"/tmp/key\"",
+        "api_key_cmd = [\"op\", \"read\", \"x\"]",
+    ] {
+        let err = Config::from_toml_str(&format!(
+            "[backends.plan]\nkind = \"openai\"\nauth = \"chatgpt\"\n{source}\n"
+        ))
+        .unwrap_err();
+        let msg = format!("{err:#}");
+        let key = source.split(' ').next().unwrap();
+        assert!(msg.contains(key) && msg.contains("kaibo login"), "{msg}");
+    }
+}
+
+#[test]
+fn auth_must_match_the_backend_kind() {
+    let err = Config::from_toml_str("[backends.x]\nkind = \"deepseek\"\nauth = \"chatgpt\"\n")
+        .unwrap_err();
+    let msg = format!("{err:#}");
+    assert!(msg.contains("kind = \"openai\""), "{msg}");
+    let err = Config::from_toml_str(
+        "[backends.x]\nkind = \"openai\"\nbase_url = \"http://x/v1\"\nauth = \"openrouter\"\n",
+    )
+    .unwrap_err();
+    assert!(
+        format!("{err:#}").contains("kind = \"openrouter\""),
+        "{err:#}"
+    );
+    assert!(Config::from_toml_str("[backends.openrouter]\nauth = \"openrouter\"\n").is_ok());
+}
+
+#[test]
+fn an_unknown_sign_in_names_the_known_ones() {
+    let err =
+        Config::from_toml_str("[backends.x]\nkind = \"openai\"\nauth = \"codex\"\n").unwrap_err();
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("\"chatgpt\"") && msg.contains("\"openrouter\""),
+        "{msg}"
+    );
+}
+
+#[test]
+fn a_chatgpt_sign_in_refuses_the_chat_wire() {
+    let err = Config::from_toml_str(
+        "[backends.plan]\nkind = \"openai\"\nauth = \"chatgpt\"\nwire = \"chat\"\n",
+    )
+    .unwrap_err();
+    assert!(format!("{err:#}").contains("Responses"), "{err:#}");
+}
+
+#[test]
+fn a_signed_in_backend_cannot_staff_a_batch_synth() {
+    let err = Config::from_toml_str(
+        "[backends.plan]\nkind = \"openai\"\nauth = \"chatgpt\"\n\
+         [casts.planb]\nsynth = { backend = \"plan\", id = \"gpt-6.1-sol\", lane = \"batch\" }\n",
+    )
+    .unwrap_err();
+    let msg = format!("{err:#}");
+    assert!(msg.contains("batch") && msg.contains("API key"), "{msg}");
 }

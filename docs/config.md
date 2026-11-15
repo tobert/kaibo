@@ -39,6 +39,7 @@ Connection settings only. Models are never declared here.
 | `api_key_env` | env var *name* | unset — declared by you | env source, checked first |
 | `api_key_file` | path | unset — declared by you | file source, checked second (mutually exclusive with `api_key_cmd`) |
 | `api_key_cmd` | argv array | unset — declared by you | command source: stdout, trimmed, is the key (no shell, 30s ceiling, stdin closed) |
+| `auth` | `chatgpt` \| `openrouter` | unset | sign in with `kaibo login` instead of a key; excludes every `api_key_*` source; see [Sign-in backends](#sign-in-backends-auth) |
 | `key_optional` | bool | `true` for `openai`, else `false` | allows a placeholder token |
 | `data_collection` | `deny` \| `allow` | `deny` | `kind = "openrouter"` or `"openai"` only; load error elsewhere |
 | `prompt_cache` | `short` \| `long` \| `off` | `short` | `kind = "anthropic"` or `"openrouter"` only; load error elsewhere |
@@ -125,6 +126,60 @@ in an operator-owned script and name that script.
 `key_optional = true` permits a placeholder when a source is absent. A present but
 broken source still fails, including an empty or unreadable file or failing command.
 A missing-key diagnostic needs source metadata, never the secret itself.
+
+#### Sign-in backends: `auth`
+
+```toml
+[backends.gpt-plan]
+kind = "openai"
+auth = "chatgpt"
+
+[casts.gpt-plan]
+synth = "gpt-plan/<current GPT id>"
+```
+
+`auth` replaces the key with a sign-in. Run `kaibo login gpt-plan` once. kaibo prints a
+URL; open it in a browser on the same machine and approve. kaibo stores the credential
+in its state db and reads it there on every request.
+
+| `auth` | kind | what it uses | expiry |
+|---|---|---|---|
+| `chatgpt` | `openai` | your ChatGPT plan, through OpenAI's "Sign in with ChatGPT" plan usage | one-hour access token, refreshed automatically; the refresh token lasts 30 days unused |
+| `openrouter` | `openrouter` | a key the sign-in creates on your OpenRouter account | does not expire |
+
+- `kaibo login --status` lists each `auth` backend and whether it is signed in.
+  `kaibo logout <backend>` removes the stored sign-in. A ChatGPT authorization stays on
+  your account until you remove kaibo in ChatGPT's settings. An OpenRouter key stays
+  until you delete it at `openrouter.ai/settings/keys`.
+- Only a person runs `kaibo login`. A model call on a backend nobody signed in is
+  refused with "run `kaibo login <backend>`". A model call can trigger a refresh, the
+  same way it can trigger `api_key_cmd`.
+- Persistence must be on (`[persistence]`): the state db holds the sign-in. kaibo
+  creates the state dir with your umask, often `755`; `kaibo login` warns when other
+  users can read it. `chmod 700 ~/.local/state/kaibo` restricts it to you.
+- The sign-in listens for the browser on `127.0.0.1`, port 1455 for ChatGPT and 3000
+  for OpenRouter, or any free port when that one is busy. A `base_url` other than
+  OpenAI's on a `chatgpt` backend sends the plan token to that host; kaibo warns at
+  startup. It stops after one sign-in or
+  5 minutes. Over SSH, forward the printed port first:
+  `ssh -L 1455:127.0.0.1:1455 <host>`. kaibo never opens a browser itself.
+- `auth = "chatgpt"` sets `base_url` to `https://api.openai.com/v1` when unset and
+  always uses the Responses wire; `wire = "chat"` is a load error. Requests stream,
+  send `store: false`, and carry no `max_output_tokens` or sampling fields, which the
+  plan route rejects. `max_tokens`, `temperature`, and `top_p` on its slots do
+  nothing.
+- kaibo treats an `openai` backend as vision-blind unless a slot pins it; set
+  `vision = true` on a plan slot whose model reads images
+  (`synth = { backend = "gpt-plan", id = "<id>", vision = true }`).
+- A signed-in backend staffs interactive completion slots only: no batch lane, no
+  media slot, and no feature that needs a static key. `kaibo models` works and lists
+  only the models your plan can call.
+- When the ChatGPT plan's included usage is spent, the call fails with
+  `subscription_sharing_usage_limit_exceeded` and is not retried. ChatGPT shows when the
+  window resets, under Settings > Usage. Plus plans share one usage window across every
+  app on the plan, Codex included.
+- A sign-in that the provider revoked or that went 30 days unused is removed on the
+  next request, and the error says to run `kaibo login` again.
 
 #### `kind = "openrouter"` specifics
 
@@ -933,6 +988,7 @@ CLI/env: `--no-persistence` / `KAIBO_NO_PERSISTENCE` disable it (in-memory, like
 |---|---|
 | the `(question, answer)` turns of each session, caller question included (capacity-evicted, no TTL, same as the in-memory store) | background consult/deliberate job handles (`job-N`), which are in-memory and session-only by design |
 | the `{backend, provider-id, label}` of each submitted batch, so `job_list` can re-surface a handle after a restart | exploration reports, which would be stale bloat |
+| each `kaibo login` sign-in (access and refresh tokens, the issued client id) and this machine's sign-in host id | |
 
 Stored content is the caller's questions, the models' answers, and batch-handle metadata.
 Nothing the *inner model team* steers reaches disk: the store is handler-side, and kaish
