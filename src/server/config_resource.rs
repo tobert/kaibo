@@ -835,7 +835,7 @@ pub(crate) fn render_config_resource(
             } else if !keyed {
                 Some(format!(
                     "the [web] backend `{}` has no API key, so only casts with native web \
-                     tools (anthropic, openrouter; [web] native = {}) can use the web; \
+                     tools (anthropic, openrouter, gemini; [web] native = {}) can use the web; \
                      declare a key source on [backends.{}] (`kaibo example-config` shows \
                      the shapes)",
                     config.web.backend, config.web.native, config.web.backend

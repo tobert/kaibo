@@ -563,17 +563,29 @@ fn research_needs_live_web_access() {
             .advertised_tools()
     };
     assert!(!off.contains(&"research".to_string()), "{off:?}");
-    let keyless_off = {
+    // The fixture's casts run on Gemini, which searches natively, so a keyless web
+    // backend alone leaves `research` live; `native = false` takes the last route away.
+    let keyless = |native: bool| {
         let toml = FULLY_STAFFED.replace(
             "kind = \"deepseek\"\n    key_optional = true",
             "kind = \"deepseek\"\n    api_key_file = \"/nonexistent-kaibo-test/dsweb\"",
         );
         assert_ne!(toml, FULLY_STAFFED, "the fixture edit applied");
+        let toml = if native {
+            toml
+        } else {
+            toml.replace("backend = \"dsweb\"", "backend = \"dsweb\"\n    native = false")
+        };
         let config = Config::from_toml_str(&toml).unwrap();
         KaiboHandler::new_with_env(config, |_| None)
             .unwrap()
             .advertised_tools()
     };
+    assert!(
+        keyless(true).contains(&"research".to_string()),
+        "a Gemini cast researches natively without a [web] key"
+    );
+    let keyless_off = keyless(false);
     assert!(
         !keyless_off.contains(&"research".to_string()),
         "{keyless_off:?}"
