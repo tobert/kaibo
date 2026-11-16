@@ -33,7 +33,7 @@ Connection settings only. Models are never declared here.
 
 | key | type | default | notes |
 |---|---|---|---|
-| `kind` | `anthropic` \| `deepseek` \| `gemini` \| `openrouter` \| `openai` \| `stability` \| `openai-images` \| `gemini-media` \| `dashscope` \| `bfl` | required on a new backend | closed enum; selects client + request shape (`stability`, `openai-images`, `gemini-media`, `dashscope`, and `bfl` are the media kinds — media slots only; `gemini-images` is an alias of `gemini-media`) |
+| `kind` | `anthropic` \| `deepseek` \| `gemini` \| `openrouter` \| `openai` \| `stability` \| `openai-images` \| `gemini-media` \| `dashscope` \| `bfl` \| `exa` | required on a new backend | closed enum; selects client + request shape (`stability`, `openai-images`, `gemini-media`, `dashscope`, and `bfl` are the media kinds — media slots only; `gemini-images` is an alias of `gemini-media`; `exa` is a web search API, named only by `[web] backend`) |
 | `base_url` | string | kind-dependent | required for a new `openai` backend; optional for `anthropic`/`gemini` and the media kinds; load error elsewhere |
 | `wire` | `responses` \| `chat` | inferred | `kind = "openai"` only; load error elsewhere |
 | `api_key_env` | env var *name* | unset — declared by you | env source, checked first |
@@ -58,6 +58,7 @@ kind. No backend declares a key source unless you write one.
 | `openai-images` | `https://api.openai.com/v1` | include `/v1`; kaibo adds `/images/generations` |
 | `dashscope` | `https://dashscope-intl.aliyuncs.com` | host root; kaibo adds the multimodal route |
 | `bfl` | `https://api.bfl.ai` | host root; kaibo adds the operation route |
+| `exa` | `https://api.exa.ai` | host root; kaibo adds `/search` and `/contents` |
 | `deepseek`, `openrouter` | fixed provider endpoint | refused |
 
 Separate names allow several connections using the same protocol. `OPENAI_BASE_URL`
@@ -783,6 +784,7 @@ No built-in cast has a media slot or pairs an explorer with an offline synth, so
 | any of the above | also `deliberate` | a cast pairing an `explorer` with an offline synth: `lane = "batch"` on the four keys above, or `lane = "direct"` on any backend |
 | OpenRouter or Gemini | also `decide` | a cast with a `decision` slot |
 | DeepSeek, as the `[web]` backend | `research`, and `web: true` on any cast | none; `[web] backend = "deepseek"` is the default |
+| Exa, as the `[web]` backend | `research`, and `web: true` on any cast | an `exa` backend with a key source, and `[web] backend` naming it |
 | Anthropic or OpenRouter | `research`, and `web: true`, on their own casts | none; `[web] native = true` is the default |
 | a key for a `stability`, `gemini-media`, `bfl`, `openai-images`, or `dashscope` backend | `generate` | an `image` slot, or an `audio` slot on `stability` and `gemini-media` only; `[cas]` on |
 
@@ -1082,7 +1084,7 @@ retain its artifact addresses. Sidecars are first-writer-wins, as described unde
 ```toml
 [web]
 enabled = true          # default
-backend = "deepseek"    # default; must be a `deepseek`-kind backend
+backend = "deepseek"    # default; must be a `deepseek` or `exa` backend
 max_searches = 10       # default, per call
 max_fetches = 10        # default, per call
 ```
@@ -1096,9 +1098,12 @@ The model team searches and reads the web one of two ways, chosen per arm:
   `openrouter:web_fetch`, billed by OpenRouter per its engine. kaibo reads the counts and
   sources off each response.
 - **kaibo-run**: every other arm, or every arm with `native = false`, gets kaibo's
-  `web_search` and `web_fetch`, which call DeepSeek's Search and Fetch APIs
-  (`/v1/tools/search`, `/v1/tools/fetch`), billed to the `[web]` backend's key at $0.75 per
-  1,000 successful calls per endpoint.
+  `web_search` and `web_fetch`, which call the `[web]` backend's API, billed to its key:
+  - a `deepseek` backend: DeepSeek's Search and Fetch APIs (`/v1/tools/search`,
+    `/v1/tools/fetch`), $0.75 per 1,000 successful calls per endpoint.
+  - an `exa` backend: Exa's `/search` and `/contents`, $7 per 1,000 searches and $1 per
+    1,000 pages read. Declare its key source like any backend's (`api_key_env`,
+    `api_key_file`, or `api_key_cmd`). `base_url` replaces `https://api.exa.ai`.
 
 Either way the provider fetches each page on its own servers: kaibo never opens a URL a
 model chose, so a model cannot aim a request at the operator's network.

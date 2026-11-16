@@ -476,7 +476,7 @@ when you want the map.
 ### `research` — the web, not the repo
 
 A web survey: the cast's explorer searches and reads pages (with its provider's own web
-tools on an Anthropic or OpenRouter cast, else through DeepSeek's Search and Fetch APIs)
+tools on an Anthropic or OpenRouter cast, else through the `[web]` backend's search API, DeepSeek or Exa)
 and returns a report with every claim cited by its URL, followed by kaibo's
 own list of the pages it fetched and a footer counting searches and fetches. It reads no
 project. Reach for it when a codebase cannot answer: a dependency's changelog or known
@@ -488,8 +488,9 @@ explorer survey can search, and the team `consult` driver reads only the survey'
 report. A solo cast's driver searches itself.
 
 The provider fetches each page on its own servers, so kaibo never opens a URL a model
-chose. Any cast can use it: native search bills the cast's provider, and the DeepSeek
-route bills the `[web]` backend's key ($0.75 per 1,000 calls per endpoint). See `[web]` in
+chose. Any cast can use it: native search bills the cast's provider, and every other cast
+bills the `[web]` backend's key: DeepSeek ($0.75 per 1,000 calls per endpoint) or Exa ($7
+per 1,000 searches, $1 per 1,000 pages read). See `[web]` in
 [`docs/config.md`](docs/config.md).
 
 *Args:* `question` (required), `context`, `cast`.

@@ -654,8 +654,8 @@ fn base_url_on_a_keyed_backend_is_rejected() {
     assert!(msg.contains("base_url"), "got: {msg}");
     assert!(
         msg.contains(
-            "only the `openai`, `anthropic`, and `gemini` completion kinds and the \
-             media kinds"
+            "only the `openai`, `anthropic`, and `gemini` completion kinds, the \
+             media kinds, and `exa`"
         ),
         "got: {msg}"
     );
@@ -3381,12 +3381,47 @@ fn a_web_backend_without_search_apis_is_refused_at_load() {
     let err = Config::from_toml_str("[web]\nbackend = \"anthropic\"\n")
         .unwrap_err()
         .to_string();
-    assert!(err.contains("only a `deepseek` backend"), "{err}");
+    assert!(err.contains("only a `deepseek` or `exa`"), "{err}");
     assert!(err.contains("[web] enabled = false"), "{err}");
     // Checked even while web is off, so the typo shows when it is written.
     let err = Config::from_toml_str("[web]\nenabled = false\nbackend = \"nope\"\n")
         .unwrap_err();
     assert!(format!("{err:#}").contains("names no backend"), "{err:#}");
+}
+
+/// An `exa` backend is the other search provider `[web] backend` accepts. It takes a
+/// `base_url` (so a test or a proxy can stand in for api.exa.ai) and its own key
+/// sources, `EXA_API_KEY` and `~/.exa-key`.
+#[test]
+fn an_exa_backend_serves_web_search() {
+    let c = Config::from_toml_str(
+        "[backends.exa]\nkind = \"exa\"\nbase_url = \"http://127.0.0.1:9\"\n\
+         api_key_env = \"EXA_API_KEY\"\n[web]\nbackend = \"exa\"\n",
+    )
+    .unwrap();
+    let b = c.web_backend().unwrap();
+    assert_eq!(b.kind, ProviderKind::Exa);
+    assert_eq!(b.base_url.as_deref(), Some("http://127.0.0.1:9"));
+    let keyed = |k: &str| (k == "EXA_API_KEY").then(|| "exa-test".to_string());
+    assert!(c.web_usable(keyed));
+    assert!(!c.web_usable(|_: &str| None), "no key, no web");
+    assert_eq!(ProviderKind::Exa.env_var(), "EXA_API_KEY");
+    assert_eq!(ProviderKind::Exa.key_file_name(), ".exa-key");
+}
+
+/// A web search API has no model, so no cast slot can point at it, whatever the role.
+/// The refusal says where the backend belongs instead.
+#[test]
+fn a_cast_slot_on_an_exa_backend_is_refused_at_load() {
+    for slot in ["explorer", "synth", "image", "decision"] {
+        let err = Config::from_toml_str(&format!(
+            "[backends.exa]\nkind = \"exa\"\n[casts.c]\n{slot} = \"exa/search\"\n"
+        ))
+        .unwrap_err();
+        let err = format!("{err:#}");
+        assert!(err.contains("web search API"), "{slot}: {err}");
+        assert!(err.contains("[web] backend"), "{slot}: {err}");
+    }
 }
 
 #[test]
