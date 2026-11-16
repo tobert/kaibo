@@ -141,25 +141,93 @@ pub fn topics() -> Vec<(&'static str, &'static str)> {
     list_topics()
 }
 
+/// The tools the lead can name. Each is named only while it is in the `live` list the
+/// caller passes (the names the router advertises), so the resident pitch never sends a
+/// model looking for a tool that `--no-<tool>`, staffing, or web access dropped.
+/// `list_models`, `read_cas`, `write_cas`, `generate`, `decide`, and the `job_*`
+/// verbs other than the two the handle clause names are not in the lead at all.
+pub const LEAD_TOOLS: &[&str] = &[
+    "consult",
+    "oneshot",
+    "run_kaish",
+    "deliberate",
+    "consult_submit",
+    "batch_submit",
+    "job_wait",
+    "job_get",
+    "research",
+];
+
 /// The opening paragraph of the handshake: what kaibo is and the tool menu. Split out
 /// so [`kaibo_instructions_with_scope`] can compose it with `## Scope` and the
 /// `## Casts` roster, in that order. The roster goes last because it is the only
 /// section whose size the operator controls, so a truncating host (Claude Code's
 /// 2048-char cap) cuts it rather than Scope.
-/// The lead's web sentence, added only when `research` is live.
-const RESEARCH_CLAUSE: &str = "`research` searches the web, citing URLs; `web: true` adds \
-     the web to `consult`/`deliberate`.";
-
-fn kaibo_lead() -> &'static str {
-    "kaibo — codebase review and second opinions from another model family. \
-     Hosted casts send questions, context, and source to configured providers; \
-     local casts use local endpoints. The project stays READ-ONLY. `consult` is the front door; kaibo \
-     finds and reads the current code, then answers with file:line citations. \
-     Say what you did or want to know; no pasted files or diffs needed. \
-     `oneshot` answers from supplied context \
-     with no codebase access. `run_kaish` drives the read-only shell directly. \
-     `deliberate` reasons offline over a dossier. \
-     `consult_submit` and `batch_submit` return handles for `job_wait`/`job_get`."
+///
+/// With every tool in [`LEAD_TOOLS`] live this is the full pitch, and that is the
+/// longest the lead gets, so the budget tests measure it that way.
+pub fn kaibo_lead(live: &[&str]) -> String {
+    let on = |name: &str| live.contains(&name);
+    let mut lead = String::from(
+        "kaibo — codebase review and second opinions from another model family. \
+         Hosted casts send questions, context, and source to configured providers; \
+         local casts use local endpoints. The project stays READ-ONLY.",
+    );
+    let mut add = |clause: &str| {
+        lead.push(' ');
+        lead.push_str(clause);
+    };
+    if on("consult") {
+        add("`consult` is the front door; kaibo finds and reads the current code, then \
+             answers with file:line citations. Say what you did or want to know; no \
+             pasted files or diffs needed.");
+    }
+    if on("oneshot") {
+        add("`oneshot` answers from supplied context with no codebase access.");
+    }
+    if on("run_kaish") {
+        add("`run_kaish` drives the read-only shell directly.");
+    }
+    if on("deliberate") {
+        add("`deliberate` reasons offline over a dossier.");
+    }
+    let submits: Vec<String> = ["consult_submit", "batch_submit"]
+        .into_iter()
+        .filter(|n| on(n))
+        .map(|n| format!("`{n}`"))
+        .collect();
+    let collects: Vec<String> = ["job_wait", "job_get"]
+        .into_iter()
+        .filter(|n| on(n))
+        .map(|n| format!("`{n}`"))
+        .collect();
+    if !submits.is_empty() {
+        let (verb, noun) = if submits.len() == 1 {
+            ("returns", "a handle")
+        } else {
+            ("return", "handles")
+        };
+        let mut clause = format!("{} {verb} {noun}", submits.join(" and "));
+        if !collects.is_empty() {
+            clause.push_str(&format!(" for {}", collects.join("/")));
+        }
+        clause.push('.');
+        add(&clause);
+    }
+    if on("research") {
+        let mut clause = String::from("`research` searches the web, citing URLs");
+        let targets: Vec<String> = ["consult", "deliberate"]
+            .into_iter()
+            .filter(|n| on(n))
+            .map(|n| format!("`{n}`"))
+            .collect();
+        if !targets.is_empty() {
+            clause.push_str(&format!("; `web: true` adds the web to {}", targets.join("/")));
+        }
+        clause.push('.');
+        add(&clause);
+    }
+    lead
 }
 
 /// The setup-guidance block prepended to the instructions when the default cast has
@@ -409,7 +477,7 @@ pub fn kaibo_instructions_with_scope(
     default_root_inferred: bool,
     usability: CastUsability,
     usable_casts: &[(String, CastUsability)],
-    research_live: bool,
+    live_tools: &[&str],
 ) -> String {
     // The unconfigured-install banner leads, so a fresh user sees it first.
     let setup = match usability {
@@ -419,13 +487,9 @@ pub fn kaibo_instructions_with_scope(
     // Lead, then Scope, then the live cast roster. Scope is the containment posture
     // every handshake must carry and its size is fixed by kaibo; the roster's size is
     // the operator's, so it goes last, where a truncating host cuts it and not Scope.
-    // The web clause rides only when `research` is advertised, so the resident pitch
-    // never names a tool the router dropped (the same rule `worktree_note` follows).
-    let lead = if research_live {
-        format!("{} {RESEARCH_CLAUSE}", kaibo_lead())
-    } else {
-        kaibo_lead().to_string()
-    };
+    // The lead names only the tools in `live_tools`, so the resident pitch never names a
+    // tool the router dropped (the same rule `worktree_note` follows).
+    let lead = kaibo_lead(live_tools);
     let casts = casts_section(config, usable_casts);
 
     // Scope section: always accurate, never ambiguous. Report the *effective* default
@@ -737,22 +801,22 @@ mod tests {
         // itself, so it should say what it did rather than dump a diff. If this
         // framing is ever dropped, callers fall back to pasting source kaibo would
         // only re-read from disk — catch that here.
-        let lead = kaibo_lead().to_lowercase();
+        let lead = kaibo_lead(LEAD_TOOLS).to_lowercase();
         assert!(
             lead.contains("diff"),
             "lead must steer callers away from pasting a diff:\n{}",
-            kaibo_lead()
+            kaibo_lead(LEAD_TOOLS)
         );
         assert!(
             lead.contains("finds and reads the current code"),
             "lead must say kaibo finds and reads the code itself:\n{}",
-            kaibo_lead()
+            kaibo_lead(LEAD_TOOLS)
         );
         // consult is the front door; the others surface via schema.
         assert!(
             lead.contains("`consult` is the front door"),
             "lead must foreground `consult` as the front door:\n{}",
-            kaibo_lead()
+            kaibo_lead(LEAD_TOOLS)
         );
     }
 
@@ -928,7 +992,7 @@ mod tests {
             false,
             CastUsability::Unconfigured,
             &[],
-            true,
+            LEAD_TOOLS,
         );
         assert!(
             text.contains("Setup needed"),
@@ -959,24 +1023,35 @@ mod tests {
         );
     }
 
-    /// The web sentence rides only when `research` is advertised: a resident pitch that
-    /// names a dropped tool sends a model looking for it.
+    /// The lead names a tool only while that tool is advertised: dropping one from the
+    /// live list removes its name, and its clause, from the resident pitch. Dropping
+    /// `consult` also drops the front-door sentence and the `consult` target of `web: true`.
     #[test]
-    fn instructions_name_research_only_when_it_is_live() {
-        let config = Config::builtin();
-        let render = |live| {
-            kaibo_instructions_with_scope(
-                &config,
-                &[PathBuf::from("/tmp")],
-                None,
-                false,
-                CastUsability::Ready,
-                &[],
-                live,
-            )
-        };
-        assert!(!render(false).contains("`research`"));
-        assert!(!render(false).contains("web: true"));
+    fn the_lead_names_only_the_tools_that_are_live() {
+        for gone in LEAD_TOOLS {
+            let live: Vec<&str> = LEAD_TOOLS.iter().copied().filter(|t| t != gone).collect();
+            let lead = kaibo_lead(&live);
+            assert!(
+                !lead.contains(&format!("`{gone}`")),
+                "`{gone}` is not advertised, so the lead must not name it:\n{lead}"
+            );
+        }
+        let none = kaibo_lead(&[]);
+        assert!(
+            !none.contains('`'),
+            "with no tool live the lead names none:\n{none}"
+        );
+        let one_submit = kaibo_lead(&["batch_submit", "job_get"]);
+        assert!(
+            one_submit.contains("`batch_submit` returns a handle for `job_get`."),
+            "one submit tool reads in the singular:\n{one_submit}"
+        );
+        let web_only = kaibo_lead(&["research"]);
+        assert!(
+            web_only.contains("`research` searches the web, citing URLs.")
+                && !web_only.contains("web: true"),
+            "`web: true` names a target only when one is live:\n{web_only}"
+        );
     }
 
     /// A configured install (Ready) — and an unprobed-local one (LocalUnverified) —
@@ -992,7 +1067,7 @@ mod tests {
                 false,
                 usability,
                 &[],
-                true,
+                LEAD_TOOLS,
             );
             assert!(
                 !text.contains("Setup needed"),
@@ -1021,7 +1096,7 @@ mod tests {
             false,
             CastUsability::Ready,
             &usable,
-            true,
+            LEAD_TOOLS,
         );
         assert!(
             text.contains("## Casts"),
@@ -1073,7 +1148,7 @@ mod tests {
             false,
             CastUsability::Ready,
             &usable,
-            true,
+            LEAD_TOOLS,
         );
         // The interactive cast names its synth (Claude Sonnet, the built-in anthropic synth).
         assert!(
@@ -1120,7 +1195,7 @@ mod tests {
             false,
             CastUsability::Ready,
             &usable,
-            true,
+            LEAD_TOOLS,
         );
         assert!(
             text.contains("anthropic"),
@@ -1152,7 +1227,7 @@ mod tests {
             false,
             CastUsability::Ready,
             &usable,
-            true,
+            LEAD_TOOLS,
         );
         let line = text
             .lines()
@@ -1180,7 +1255,7 @@ mod tests {
             false,
             CastUsability::Ready,
             &usable,
-            true,
+            LEAD_TOOLS,
         );
         let line = text
             .lines()
@@ -1227,7 +1302,7 @@ mod tests {
             false,
             CastUsability::LocalUnverified,
             &usable,
-            true,
+            LEAD_TOOLS,
         );
         assert!(
             text.contains(
@@ -1247,7 +1322,7 @@ mod tests {
             false,
             CastUsability::Unconfigured,
             &usable,
-            true,
+            LEAD_TOOLS,
         );
         let roster: Vec<&str> = text
             .lines()
@@ -1290,7 +1365,7 @@ mod tests {
             false,
             CastUsability::LocalUnverified,
             &usable,
-            true,
+            LEAD_TOOLS,
         );
         let expected = format!("- +{} more: `kaibo://config`", 12 - ROSTER_MAX_LINES);
         assert!(
@@ -1330,7 +1405,7 @@ mod tests {
             false,
             CastUsability::Ready,
             &usable,
-            true,
+            LEAD_TOOLS,
         );
         assert!(
             text.contains("- `flux` (`generate` only) → bfl/flux-2-pro"),
@@ -1359,7 +1434,7 @@ mod tests {
             false,
             CastUsability::Ready,
             &usable,
-            true,
+            LEAD_TOOLS,
         );
         let casts_at = text.find("## Casts").expect("has a Casts section");
         let scope_at = text.find("## Scope").expect("has a Scope section");
@@ -1367,7 +1442,7 @@ mod tests {
         // "kaibo" somewhere before `## Casts` — the Casts section's own `kaibo://config`
         // reference would satisfy a bare `find`, leaving this weaker than it reads.
         assert!(
-            text.starts_with(kaibo_lead()),
+            text.starts_with(&kaibo_lead(LEAD_TOOLS)),
             "the instructions must open with the lead verbatim — it is the resident pitch \
              and the tool-search retrieval index:\n{text}"
         );
@@ -1428,7 +1503,7 @@ mod tests {
                 true,
                 CastUsability::Ready,
                 &usable,
-                true,
+                LEAD_TOOLS,
             );
             let len = text.chars().count();
             assert!(
@@ -1471,7 +1546,7 @@ mod tests {
                 true,
                 CastUsability::Ready,
                 &usable,
-                true,
+                LEAD_TOOLS,
             );
             let head = &text[..text.find("## Casts").expect("has a roster")];
             let len = head.chars().count();
@@ -1503,7 +1578,7 @@ mod tests {
             false,
             CastUsability::Ready,
             &[],
-            true,
+            LEAD_TOOLS,
         );
         let trees: Vec<&str> = text.lines().filter(|l| l.starts_with("  - ")).collect();
         assert_eq!(trees.len(), ALLOWED_TREE_MAX_LINES + 1, "{text}");
@@ -1546,7 +1621,7 @@ mod tests {
             false,
             CastUsability::Ready,
             &usable,
-            true,
+            LEAD_TOOLS,
         );
         let roster: Vec<&str> = text
             .lines()
@@ -1587,7 +1662,7 @@ mod tests {
             true,
             CastUsability::Unconfigured,
             &[], // nothing usable yet — the setup banner owns this case
-            true,
+            LEAD_TOOLS,
         );
         let len = text.chars().count();
         assert!(
