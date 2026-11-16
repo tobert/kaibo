@@ -884,6 +884,24 @@ async fn a_symlinked_credentials_db_file_is_refused() {
     assert!(!outside.exists(), "nothing written through the link");
 }
 
+/// A `creds.db` with a second hard link is refused: the other name, possibly outside the
+/// private directory, would still reach the tokens.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_hard_linked_credentials_db_file_is_refused() {
+    let dir = TempDir::new().unwrap();
+    let creds = dir.path().join("kaibo/credentials");
+    std::fs::create_dir_all(&creds).unwrap();
+    let outside = dir.path().join("outside.db");
+    std::fs::write(&outside, b"").unwrap();
+    std::fs::hard_link(&outside, creds.join("creds.db-wal")).unwrap();
+    let err = CredentialStore::open(&creds_path(&dir), &[])
+        .await
+        .err()
+        .expect("refused");
+    assert!(err.to_string().contains("hard links"), "{err}");
+}
+
 /// The credentials db obeys the same containment rule as the state db.
 #[tokio::test]
 async fn the_credentials_db_is_refused_inside_an_allowed_tree() {

@@ -706,7 +706,7 @@ impl CredentialStore {
         // through a symlink that someone else could replace.
         let dir = secure_credentials_dir(dir)?;
         let path = dir.join(path.file_name().unwrap_or_default());
-        refuse_symlinked_db_files(&path)?;
+        refuse_shared_db_files(&path)?;
         validate_local_filesystem(&dir).map_err(credentials_error)?;
         let store = Self {
             db: build_database(&path).await.map_err(credentials_error)?,
@@ -1032,22 +1032,68 @@ fn credentials_error(e: StoreError) -> StoreError {
     }
 }
 
-/// Refuse a credentials db, or one of its `-wal`/`-tshm` side files, that is a symlink:
-/// the private directory would not cover where the tokens actually land.
-fn refuse_symlinked_db_files(path: &Path) -> Result<()> {
+/// Refuse a credentials db, or one of its `-wal`/`-tshm`/`-shm` side files, that could be
+/// shared with someone else: a symlink (the tokens would land outside the private
+/// directory), a file owned by another user, or a file with a second hard link (another
+/// name for it outside the directory would still reach the tokens). Each existing file
+/// must be a regular file owned by this user with one link; an absent one is fine, and
+/// any other error reading it refuses.
+fn refuse_shared_db_files(path: &Path) -> Result<()> {
     let name = path.file_name().unwrap_or_default().to_string_lossy().into_owned();
     for suffix in ["", "-wal", "-tshm", "-shm"] {
         let file = path.with_file_name(format!("{name}{suffix}"));
-        if std::fs::symlink_metadata(&file).is_ok_and(|m| m.file_type().is_symlink()) {
+        let meta = match std::fs::symlink_metadata(&file) {
+            Ok(meta) => meta,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => {
+                return Err(StoreError::CredentialsDir(format!(
+                    "reading {}: {e}",
+                    file.display()
+                )))
+            }
+        };
+        let problem = if meta.file_type().is_symlink() {
+            Some("is a symlink, so the tokens would be stored outside kaibo's private \
+                  credentials directory"
+                .to_string())
+        } else if !meta.is_file() {
+            Some("is not a regular file".to_string())
+        } else {
+            shared_file_problem(&meta)
+        };
+        if let Some(problem) = problem {
             return Err(StoreError::CredentialsDir(format!(
-                "kaibo keeps sign-ins in {}, and that file is a symlink, so the tokens would \
-                 be stored outside kaibo's private credentials directory. Remove the symlink; \
-                 kaibo creates the file on the next sign-in",
+                "kaibo keeps sign-ins in {}, and that file {problem}. Remove it; kaibo \
+                 creates the file on the next sign-in, and you sign in again",
                 file.display()
             )));
         }
     }
     Ok(())
+}
+
+/// Why a regular credentials file could be reachable by someone else, if it could.
+#[cfg(unix)]
+fn shared_file_problem(meta: &std::fs::Metadata) -> Option<String> {
+    use std::os::unix::fs::MetadataExt;
+    // SAFETY: geteuid takes no arguments, cannot fail, and touches no memory.
+    let me = unsafe { libc::geteuid() };
+    if meta.uid() != me {
+        Some(format!("belongs to another user (uid {})", meta.uid()))
+    } else if meta.nlink() != 1 {
+        Some(format!(
+            "has {} hard links, so another name for it may be outside the credentials \
+             directory",
+            meta.nlink()
+        ))
+    } else {
+        None
+    }
+}
+
+#[cfg(not(unix))]
+fn shared_file_problem(_meta: &std::fs::Metadata) -> Option<String> {
+    None
 }
 
 /// Refuse a credentials directory whose ancestors another user could change: each one
