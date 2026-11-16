@@ -1285,7 +1285,17 @@ pub fn secure_credentials_dir(dir: &Path) -> Result<PathBuf> {
 /// something unexpected and stays a fatal open error. The guard is a `cfg!` value, not a
 /// `#[cfg]` arm, so [`is_lock_error`] compiles and is tested on every platform.
 async fn build_database(path: &Path) -> Result<Database> {
-    let builder = Builder::new_local(&path.to_string_lossy());
+    // turso takes a `&str`. A lossy conversion would turn invalid UTF-8 bytes into U+FFFD
+    // and open a *different* path from the one containment and the credentials checks
+    // vouched for, so a path that is not UTF-8 is refused instead.
+    let utf8 = path.to_str().ok_or_else(|| {
+        StoreError::InvalidStatePath(format!(
+            "{}: the path is not valid UTF-8, and kaibo opens its databases only at the exact \
+             path it checked. Set XDG_STATE_HOME (or --state-db) to a path with a UTF-8 name",
+            path.display()
+        ))
+    })?;
+    let builder = Builder::new_local(utf8);
     // Must match `MULTIPROCESS_WAL` below: the flag and the carve-out gate are one decision.
     #[cfg(all(unix, target_pointer_width = "64"))]
     let builder = builder.experimental_multiprocess_wal(true);

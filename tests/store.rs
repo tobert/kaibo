@@ -902,6 +902,24 @@ async fn a_hard_linked_credentials_db_file_is_refused() {
     assert!(err.to_string().contains("hard links"), "{err}");
 }
 
+/// A path that is not valid UTF-8 is refused rather than opened under its lossy
+/// spelling, which would be a different, unchecked path. Linux only: macOS
+/// filesystems reject such names outright.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn a_non_utf8_credentials_path_is_refused_not_respelled() {
+    use std::os::unix::ffi::OsStrExt;
+    let dir = TempDir::new().unwrap();
+    let raw = dir.path().join(std::ffi::OsStr::from_bytes(b"state-\xFF"));
+    let lossy = dir.path().join("state-\u{FFFD}");
+    let err = CredentialStore::open(&raw.join("kaibo/credentials/creds.db"), &[])
+        .await
+        .err()
+        .expect("refused");
+    assert!(err.to_string().contains("not valid UTF-8"), "{err}");
+    assert!(!lossy.exists(), "the lossy spelling is never created or opened");
+}
+
 /// The credentials db obeys the same containment rule as the state db.
 #[tokio::test]
 async fn the_credentials_db_is_refused_inside_an_allowed_tree() {
