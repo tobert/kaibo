@@ -1112,7 +1112,8 @@ fn refuse_replaceable_ancestors(resolved: &Path, dir: &Path) -> Result<()> {
 ///   mode 700.
 /// - Present at a mode that lets group or others in: changed to 700, and the change is
 ///   logged at `warn`.
-/// - Not a real directory (a symlink or a file), or a mode kaibo cannot change: refused.
+/// - Not a real directory (a symlink or a file), owned by another user, or a mode kaibo
+///   cannot change: refused.
 ///
 /// The directory mode is what protects the tokens. turso creates the db and its `-wal`
 /// and `-tshm` side files under the process umask, often 644, and a 700 directory keeps
@@ -1175,6 +1176,22 @@ pub fn secure_credentials_dir(dir: &Path) -> Result<PathBuf> {
                  directory at mode 700 on the next sign-in",
                 dir.display()
             )));
+        }
+        // Ours, not just a directory: another user's directory with a 700 mode passes
+        // the mode check, and its owner could open it up after the check.
+        {
+            use std::os::unix::fs::MetadataExt;
+            // SAFETY: geteuid takes no arguments, cannot fail, and touches no memory.
+            let me = unsafe { libc::geteuid() };
+            if meta.uid() != me {
+                return Err(err(format!(
+                    "kaibo keeps sign-ins in {}, and that directory belongs to another user \
+                     (uid {}), who could read anything stored there. Move it aside; kaibo \
+                     creates its own on the next sign-in",
+                    dir.display(),
+                    meta.uid()
+                )));
+            }
         }
         let mode = meta.permissions().mode() & 0o777;
         if mode & 0o077 != 0 {
