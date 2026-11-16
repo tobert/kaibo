@@ -447,6 +447,14 @@ impl Arm {
         // construction match below on `WireKind`, where a media arm cannot exist.
         let wire = match backend.kind.class() {
             crate::credentials::ProviderClass::Wire(w) => w,
+            crate::credentials::ProviderClass::Web(_) => anyhow::bail!(
+                "backend {:?} is kind `{}`, a web search API with no model, and cannot \
+                 staff a reasoning slot — point `explorer`/`synth` at a completion \
+                 backend, and name {:?} in `[web] backend` for web search",
+                backend.name,
+                backend.kind.canonical_name(),
+                backend.name
+            ),
             crate::credentials::ProviderClass::Media(_) => anyhow::bail!(
                 "backend {:?} is kind `{}`, which generates media and cannot staff a \
                  reasoning slot — point `explorer`/`synth` at a completion backend, \
@@ -937,8 +945,14 @@ impl AgentHook for NativeWebHook {
         _ctx: &HookContext,
         _event: CompletionCallEvent<'_>,
     ) -> CompletionCallAction {
+        let defs = self.defs();
+        let mut params = json!({});
+        if let (false, Some((key, value))) = (defs.is_empty(), self.inner.kind.request_params()) {
+            params[key] = value;
+        }
+        params["tools"] = Value::Array(defs);
         CompletionCallAction::Patch(RequestPatch {
-            additional_params: Some(json!({ "tools": self.defs() })),
+            additional_params: Some(params),
             ..RequestPatch::default()
         })
     }

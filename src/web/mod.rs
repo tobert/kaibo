@@ -1,5 +1,5 @@
-//! The web client — DeepSeek's Search and Fetch APIs, driven directly rather than
-//! through rig.
+//! The web client — DeepSeek's Search and Fetch APIs, and Exa's (`exa.rs`), driven
+//! directly rather than through rig. The DeepSeek route is described here.
 //!
 //! These are plain JSON endpoints, not completion routes: `POST /v1/tools/search` takes a
 //! query and returns ranked results, `POST /v1/tools/fetch` takes one URL and returns the
@@ -21,6 +21,7 @@
 //! The client is independent of the tools a model calls ([`WebSearch`]/[`WebFetch`], in
 //! `tools.rs`) so a later route (an operator CLI, a different provider) can reuse it.
 
+pub mod exa;
 pub mod native;
 mod tools;
 
@@ -41,25 +42,28 @@ pub const WEB_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 /// model: a proxy's HTML error page is noise in a tool result.
 const MAX_ERROR_CHARS: usize = 500;
 
-/// The search provider a session calls. One variant today; another provider (Exa, say)
-/// is a new variant with its own client, and every phase, budget, and record above it
-/// stays the same. The rule each variant keeps: the provider reads the page on its own
-/// servers, so kaibo never opens a URL a model chose.
+/// The search provider a session calls. Each variant is the same [`WebClient`] speaking
+/// one provider's request and response shapes, so every phase, budget, and record above
+/// it stays the same. The rule each variant keeps: the provider reads the page on its
+/// own servers, so kaibo never opens a URL a model chose.
 #[derive(Debug)]
 pub enum WebApi {
     DeepSeek(WebClient),
+    Exa(WebClient),
 }
 
 impl WebApi {
     pub async fn search(&self, req: &SearchRequest) -> Result<Vec<SearchResult>, WebError> {
         match self {
             Self::DeepSeek(c) => c.search(req).await,
+            Self::Exa(c) => c.exa_search(req).await,
         }
     }
 
     pub async fn fetch(&self, url: &str) -> Result<FetchedPage, WebError> {
         match self {
             Self::DeepSeek(c) => c.fetch(url).await,
+            Self::Exa(c) => c.exa_fetch(url).await,
         }
     }
 }
@@ -172,9 +176,9 @@ pub enum WebError {
     Refused(String),
     /// The request never got an HTTP answer (connect failure, timeout).
     Transport(String),
-    /// DeepSeek answered with an error status.
+    /// The provider answered with an error status (or, for Exa, a page error status).
     Provider { status: u16, message: String },
-    /// DeepSeek answered 200 with a body kaibo could not read.
+    /// The provider answered 200 with a body kaibo could not read.
     Unreadable(String),
 }
 
@@ -203,7 +207,7 @@ impl std::fmt::Display for WebError {
                 message,
             } => write!(
                 f,
-                "the web API refused the call: the DeepSeek account has no balance \
+                "the web API refused the call: the search account has no balance \
                  (402: {message}). Answer from the evidence you have and say web access \
                  is unavailable."
             ),
@@ -240,12 +244,21 @@ impl std::fmt::Display for WebError {
 
 impl std::error::Error for WebError {}
 
-/// Pull the message out of the `{"error": {"message"}}` envelope, falling back to the raw
-/// body so nothing the provider said is dropped.
+/// Pull the message out of the error envelope, falling back to the raw body so nothing
+/// the provider said is dropped. DeepSeek uses the OpenAI `{"error": {"message"}}`;
+/// Exa uses `{"error": "<text>", "tag": "<TAG>"}`.
 fn provider_message(body: &str) -> String {
-    let message = serde_json::from_str::<serde_json::Value>(body)
-        .ok()
-        .and_then(|v| v["error"]["message"].as_str().map(str::to_string))
+    let parsed = serde_json::from_str::<serde_json::Value>(body).ok();
+    let message = parsed
+        .as_ref()
+        .and_then(|v| {
+            v["error"]["message"].as_str().map(str::to_string).or_else(|| {
+                v["error"].as_str().map(|e| match v["tag"].as_str() {
+                    Some(tag) => format!("{e} ({tag})"),
+                    None => e.to_string(),
+                })
+            })
+        })
         .unwrap_or_else(|| body.trim().to_string());
     if message.chars().count() <= MAX_ERROR_CHARS {
         return message;
@@ -460,6 +473,10 @@ mod tests {
             "bad key"
         );
         assert_eq!(provider_message(" plain text "), "plain text");
+        assert_eq!(
+            provider_message(r#"{"requestId":"r","error":"Invalid API key.","tag":"INVALID_API_KEY"}"#),
+            "Invalid API key. (INVALID_API_KEY)"
+        );
         let page = "x".repeat(MAX_ERROR_CHARS * 3);
         let cut = provider_message(&page);
         assert!(cut.ends_with("[cut at 500 characters]"), "{cut}");
