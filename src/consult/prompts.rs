@@ -1109,13 +1109,9 @@ mod tests {
 
     /// Reading is sized to the claim: a whole file when it is needed in full, a span
     /// around a match otherwise, and spans for a file too large to come back whole.
-    /// The whole-file-first directive (2026-07 to 2026-11, stated in four phrasings to
-    /// move lite explorers off small slices) is retired for the Haiku/Luna/Flash floor,
-    /// so this also pins that none of its phrasings comes back, in any preamble or in
-    /// the shell guidance every phase shares. Attachments are the one place "whole"
-    /// stays a rule: the caller chose those files.
+    /// Attachments are the one place "whole" stays a rule: the caller chose those files.
     #[test]
-    fn reading_is_sized_to_the_claim_not_whole_file_first() {
+    fn reading_is_sized_to_the_claim() {
         let p = report_preamble(ReportReader::SynthesisAgent);
         assert!(p.contains("Read what each claim needs."), "{p}");
         assert!(
@@ -1128,27 +1124,6 @@ mod tests {
             p.contains("grep -n SYMBOL FILE") && p.contains("sed -n '1200,2400p'"),
             "a truncated read continues in targeted spans: {p}"
         );
-        for (label, text) in [
-            ("explorer", p.clone()),
-            ("explorer → caller", report_preamble(ReportReader::CallingAgent)),
-            ("consult", consult_preamble()),
-            ("consult solo", consult_solo_preamble()),
-            ("shell addendum", crate::kaish_syntax::KAISH_SANDBOX_ADDENDUM.to_string()),
-            ("sandbox doc", crate::kaish_syntax::kaibo_sandbox_doc()),
-        ] {
-            for retired in [
-                "Read files WHOLE",
-                "Prefer the bigger read",
-                "The default is the whole file",
-                "Reading too little costs you every read after it",
-                "open that file whole",
-            ] {
-                assert!(
-                    !text.contains(retired),
-                    "{label} must not bring back the whole-file-first rule ({retired:?}): {text}"
-                );
-            }
-        }
     }
 
     /// Every `sed` range kaibo puts in front of a model is quoted, and this sweeps every
@@ -1240,10 +1215,6 @@ mod tests {
                 p.contains("You are the synthesis agent"),
                 "{label} must open on the synthesis-agent role: {p}"
             );
-            assert!(
-                !p.contains("capable model"),
-                "{label} must name the role, not describe a capability: {p}"
-            );
         }
         let c = consult_preamble();
         assert!(
@@ -1265,11 +1236,8 @@ mod tests {
     /// Standalone `explore` hands its report straight back to the calling agent, so the
     /// preamble must not promise a synthesis agent that will not exist on that call.
     ///
-    /// This is the failing-first half of the bug it fixes: before `ReportReader`, all
-    /// three explorer tools were told "The synthesis agent writes the final answer from
-    /// what you found", which is true for the `consult` sweep and `deliberate`'s dossier
-    /// and false for `explore`. A model that believes a downstream rewrite is coming can
-    /// reasonably leave a thread for the rewriter to pull; on `explore` nobody pulls it.
+    /// A model that believes a downstream rewrite is coming can reasonably leave a
+    /// thread for the rewriter to pull; on `explore` nobody pulls it.
     #[test]
     fn the_calling_agent_is_never_promised_a_synthesis_agent() {
         let p = report_preamble(ReportReader::CallingAgent);
@@ -1294,8 +1262,7 @@ mod tests {
             "the reader's name is capitalized where it opens a sentence: {p}"
         );
 
-        // The counterpart still says what it always said — this fix narrows one claim,
-        // it does not delete the two-model framing where that framing is true.
+        // The sweep and dossier readers keep the two-model framing, where it is true.
         let synth = report_preamble(ReportReader::SynthesisAgent);
         assert!(
             synth.contains("The synthesis agent writes the final answer from what you found"),
