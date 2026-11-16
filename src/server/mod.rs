@@ -10182,7 +10182,9 @@ enabled = false
     fn the_handshake_does_not_pitch_a_tool_the_router_dropped() {
         let mut config = Config::builtin();
         config.tools.consult = false;
-        let handler = KaiboHandler::new(config).expect("handler builds");
+        // Blank environment: `get_info` reads cast usability from it, and the setup
+        // banner (shown with no keys) would change what the text contains.
+        let handler = KaiboHandler::new_with_env(config, |_| None).expect("handler builds");
         let text = handler.get_info().instructions.expect("instructions");
         assert!(
             !text.contains("`consult` is the front door") && !text.contains("`consult_submit`"),
@@ -11278,7 +11280,7 @@ enabled = false
             None,
             false,
             crate::config::CastUsability::Ready,
-            &[], crate::kaish_syntax::LEAD_TOOLS);
+            &[], crate::kaish_syntax::HANDSHAKE_TOOLS);
         // The scope section must name each allowed path.
         assert!(
             text.contains("/projects/myapp"),
@@ -11308,7 +11310,7 @@ enabled = false
             Some(&root),
             false,
             crate::config::CastUsability::Ready,
-            &[], crate::kaish_syntax::LEAD_TOOLS);
+            &[], crate::kaish_syntax::HANDSHAKE_TOOLS);
         assert!(
             text.contains("/projects/myapp"),
             "scope section must name the configured root:\n{text}"
@@ -11332,7 +11334,7 @@ enabled = false
             Some(&root),
             true,
             crate::config::CastUsability::Ready,
-            &[], crate::kaish_syntax::LEAD_TOOLS);
+            &[], crate::kaish_syntax::HANDSHAKE_TOOLS);
         assert!(
             text.contains("/work/space"),
             "scope section must name the inferred root:\n{text}"
@@ -11354,7 +11356,7 @@ enabled = false
             None,
             false,
             crate::config::CastUsability::Ready,
-            &[], crate::kaish_syntax::LEAD_TOOLS);
+            &[], crate::kaish_syntax::HANDSHAKE_TOOLS);
         // Must explain that every call must pass a path.
         assert!(
             text.to_lowercase().contains("every call") || text.contains("no default"),
