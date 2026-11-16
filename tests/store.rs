@@ -9,7 +9,7 @@
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 
-use kaibo::store::{SessionStore, StoreError, Turn};
+use kaibo::store::{CredentialStore, SessionStore, StoreError, Turn};
 use tempfile::TempDir;
 
 fn cap(n: usize) -> NonZeroUsize {
@@ -620,4 +620,326 @@ async fn opens_a_state_db_written_by_turso_0_7_2() {
     drop(store);
     let store = SessionStore::open(&path, cap(8), &[]).await.unwrap();
     assert_eq!(store.replay(FIXTURE_SESSION).await.unwrap().len(), 3);
+}
+
+// --- Sign-in grants and the refresh lease ------------------------------------------
+
+fn creds_path(dir: &TempDir) -> PathBuf {
+    dir.path().join("kaibo/credentials/creds.db")
+}
+
+/// A fresh credentials db under a temp dir, plus the dir.
+async fn open_creds() -> (CredentialStore, TempDir) {
+    let dir = TempDir::new().unwrap();
+    let store = CredentialStore::open(&creds_path(&dir), &[])
+        .await
+        .expect("open credentials db");
+    (store, dir)
+}
+
+fn grant(backend: &str) -> kaibo::oauth::Grant {
+    kaibo::oauth::Grant {
+        backend: backend.into(),
+        auth: kaibo::oauth::AuthProfile::Chatgpt,
+        client_id: Some("oaiapp_1".into()),
+        token_url: "https://auth.openai.com/api/accounts/oauth/token".into(),
+        access_token: "at-1".into(),
+        refresh_token: Some("rt-1".into()),
+        expires_at: Some(1_000),
+        account: Some("a@example.com".into()),
+        scopes: Some("openid".into()),
+    }
+}
+
+#[tokio::test]
+async fn grants_round_trip_replace_and_delete() {
+    let (store, _d) = open_creds().await;
+    assert!(store.get_grant("plan").await.unwrap().is_none());
+    store.put_grant(&grant("plan")).await.unwrap();
+    assert_eq!(store.get_grant("plan").await.unwrap(), Some(grant("plan")));
+    let mut again = grant("plan");
+    again.access_token = "at-2".into();
+    store.put_grant(&again).await.unwrap();
+    assert_eq!(store.list_grants().await.unwrap(), vec![again]);
+    assert!(store.delete_grant("plan").await.unwrap());
+    assert!(!store.delete_grant("plan").await.unwrap());
+}
+
+#[tokio::test]
+async fn one_holder_at_a_time_takes_the_refresh_lease() {
+    let (store, _d) = open_creds().await;
+    store.put_grant(&grant("plan")).await.unwrap();
+    assert!(store
+        .claim_refresh_lease("plan", "a", 100, 60)
+        .await
+        .unwrap());
+    assert!(
+        !store
+            .claim_refresh_lease("plan", "b", 120, 60)
+            .await
+            .unwrap(),
+        "held until 160"
+    );
+    // A finish from a non-holder changes nothing.
+    let mut fresh = grant("plan");
+    fresh.access_token = "at-b".into();
+    assert!(!store.finish_refresh("b", &fresh).await.unwrap());
+    // The lapsed lease is taken over, and the old holder's late finish is discarded.
+    assert!(store
+        .claim_refresh_lease("plan", "b", 161, 60)
+        .await
+        .unwrap());
+    let mut late = grant("plan");
+    late.access_token = "at-a".into();
+    assert!(!store.finish_refresh("a", &late).await.unwrap());
+    assert!(store.finish_refresh("b", &fresh).await.unwrap());
+    assert_eq!(
+        store.get_grant("plan").await.unwrap().unwrap().access_token,
+        "at-b"
+    );
+    // Finishing released it.
+    assert!(store
+        .claim_refresh_lease("plan", "c", 162, 60)
+        .await
+        .unwrap());
+    store.release_refresh_lease("plan", "c").await.unwrap();
+    assert!(store
+        .claim_refresh_lease("plan", "d", 162, 60)
+        .await
+        .unwrap());
+}
+
+/// A refresh that finds its grant dead removes it only while it still holds the lease.
+/// `kaibo login` replacing the row clears the lease, so a refresh that started on the
+/// old grant cannot delete the new sign-in when its `invalid_grant` arrives late.
+#[tokio::test]
+async fn a_stale_refresh_cannot_delete_a_newer_sign_in() {
+    let (store, _d) = open_creds().await;
+    store.put_grant(&grant("plan")).await.unwrap();
+    assert!(store
+        .claim_refresh_lease("plan", "old-refresh", 100, 60)
+        .await
+        .unwrap());
+    // The operator signs in again while that refresh is in flight.
+    let mut newer = grant("plan");
+    newer.access_token = "at-new".into();
+    newer.refresh_token = Some("rt-new".into());
+    store.put_grant(&newer).await.unwrap();
+    assert!(
+        !store
+            .delete_grant_held("plan", "old-refresh")
+            .await
+            .unwrap(),
+        "the old holder's lease was cleared by the new sign-in"
+    );
+    assert_eq!(store.get_grant("plan").await.unwrap(), Some(newer));
+
+    // The current holder can remove a dead grant.
+    assert!(store
+        .claim_refresh_lease("plan", "current", 100, 60)
+        .await
+        .unwrap());
+    assert!(store.delete_grant_held("plan", "current").await.unwrap());
+    assert!(store.get_grant("plan").await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn the_host_id_is_created_once_and_kept() {
+    let (store, dir) = open_creds().await;
+    let id = store.host_id().await.unwrap();
+    assert!(id.starts_with("urn:uuid:"), "{id}");
+    assert_eq!(store.host_id().await.unwrap(), id);
+    drop(store);
+    let reopened = CredentialStore::open(&creds_path(&dir), &[]).await.unwrap();
+    assert_eq!(reopened.host_id().await.unwrap(), id, "survives a reopen");
+}
+
+// --- The credentials db's directory ------------------------------------------------
+
+#[cfg(unix)]
+fn mode(p: &Path) -> u32 {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(p).unwrap().permissions().mode() & 0o777
+}
+
+/// An absent credentials directory is created at 700, whatever the umask lets the
+/// state dir above it be.
+#[cfg(unix)]
+#[tokio::test]
+async fn the_credentials_dir_is_created_private() {
+    let (_store, dir) = open_creds().await;
+    assert_eq!(mode(&dir.path().join("kaibo/credentials")), 0o700);
+}
+
+/// An existing credentials directory open to group or others is changed to 700 before
+/// any credential is written into it.
+#[cfg(unix)]
+#[tokio::test]
+async fn an_open_credentials_dir_is_made_private() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = TempDir::new().unwrap();
+    let creds = dir.path().join("kaibo/credentials");
+    std::fs::create_dir_all(&creds).unwrap();
+    std::fs::set_permissions(&creds, std::fs::Permissions::from_mode(0o755)).unwrap();
+    CredentialStore::open(&creds_path(&dir), &[]).await.unwrap();
+    assert_eq!(mode(&creds), 0o700);
+}
+
+/// A credentials path that is a symlink is refused: kaibo would be making some other
+/// directory private, or storing tokens where it cannot.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_symlinked_credentials_dir_is_refused() {
+    let dir = TempDir::new().unwrap();
+    let elsewhere = dir.path().join("elsewhere");
+    std::fs::create_dir_all(&elsewhere).unwrap();
+    std::fs::create_dir_all(dir.path().join("kaibo")).unwrap();
+    std::os::unix::fs::symlink(&elsewhere, dir.path().join("kaibo/credentials")).unwrap();
+    let err = CredentialStore::open(&creds_path(&dir), &[])
+        .await
+        .err()
+        .expect("a symlink is refused");
+    assert!(matches!(err, StoreError::CredentialsDir(_)), "{err}");
+    assert!(err.to_string().contains("symlink"), "{err}");
+}
+
+/// An ancestor another user could write (not sticky) is refused before the credentials
+/// directory is created or changed: that user could swap it for a symlink mid-check.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_credentials_dir_under_a_shared_writable_ancestor_is_refused() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = TempDir::new().unwrap();
+    let shared = dir.path().join("shared");
+    std::fs::create_dir_all(&shared).unwrap();
+    std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o777)).unwrap();
+    let path = shared.join("kaibo/credentials/creds.db");
+    let err = CredentialStore::open(&path, &[])
+        .await
+        .err()
+        .expect("refused");
+    assert!(matches!(err, StoreError::CredentialsDir(_)), "{err}");
+    assert!(err.to_string().contains("writable by other users"), "{err}");
+    assert!(!shared.join("kaibo/credentials").exists(), "nothing created under it");
+}
+
+/// A path through a symlink in a shared writable directory is resolved once, checked,
+/// and used resolved from then on: swapping the link afterwards cannot move the
+/// credentials db, because kaibo never goes through the link again.
+#[cfg(unix)]
+#[tokio::test]
+async fn the_credentials_db_is_opened_at_the_checked_path_not_through_a_link() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = TempDir::new().unwrap();
+    let safe = dir.path().join("safe");
+    let decoy = dir.path().join("decoy");
+    std::fs::create_dir_all(&safe).unwrap();
+    std::fs::create_dir_all(&decoy).unwrap();
+    let shared = dir.path().join("shared");
+    std::fs::create_dir_all(&shared).unwrap();
+    std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o777)).unwrap();
+    let link = shared.join("state-link");
+    std::os::unix::fs::symlink(&safe, &link).unwrap();
+    let store = CredentialStore::open(&link.join("kaibo/credentials/creds.db"), &[])
+        .await
+        .expect("a link into a safe tree resolves to it");
+    // The other user swaps the link; the open store keeps writing where it was checked.
+    std::fs::remove_file(&link).unwrap();
+    std::os::unix::fs::symlink(&decoy, &link).unwrap();
+    store.put_grant(&grant("plan")).await.unwrap();
+    assert!(safe.join("kaibo/credentials/creds.db").exists());
+    assert!(!decoy.join("kaibo").exists(), "nothing follows the swapped link");
+}
+
+/// A sticky shared ancestor (the `/tmp` shape) is fine: others cannot rename what they
+/// do not own there.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_sticky_shared_ancestor_is_accepted() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = TempDir::new().unwrap();
+    let shared = dir.path().join("sticky");
+    std::fs::create_dir_all(&shared).unwrap();
+    std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o1777)).unwrap();
+    CredentialStore::open(&shared.join("kaibo/credentials/creds.db"), &[])
+        .await
+        .expect("sticky ancestor is accepted");
+}
+
+/// A `creds.db` that is a symlink is refused: the private directory would not cover
+/// where the tokens land.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_symlinked_credentials_db_file_is_refused() {
+    let dir = TempDir::new().unwrap();
+    let creds = dir.path().join("kaibo/credentials");
+    std::fs::create_dir_all(&creds).unwrap();
+    let outside = dir.path().join("outside.db");
+    std::os::unix::fs::symlink(&outside, creds.join("creds.db")).unwrap();
+    let err = CredentialStore::open(&creds_path(&dir), &[])
+        .await
+        .err()
+        .expect("refused");
+    assert!(err.to_string().contains("is a symlink"), "{err}");
+    assert!(!outside.exists(), "nothing written through the link");
+}
+
+/// A `creds.db` with a second hard link is refused: the other name, possibly outside the
+/// private directory, would still reach the tokens.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_hard_linked_credentials_db_file_is_refused() {
+    let dir = TempDir::new().unwrap();
+    let creds = dir.path().join("kaibo/credentials");
+    std::fs::create_dir_all(&creds).unwrap();
+    let outside = dir.path().join("outside.db");
+    std::fs::write(&outside, b"").unwrap();
+    std::fs::hard_link(&outside, creds.join("creds.db-wal")).unwrap();
+    let err = CredentialStore::open(&creds_path(&dir), &[])
+        .await
+        .err()
+        .expect("refused");
+    assert!(err.to_string().contains("hard links"), "{err}");
+}
+
+/// A path that is not valid UTF-8 is refused rather than opened under its lossy
+/// spelling, which would be a different, unchecked path. Linux only: macOS
+/// filesystems reject such names outright.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn a_non_utf8_credentials_path_is_refused_not_respelled() {
+    use std::os::unix::ffi::OsStrExt;
+    let dir = TempDir::new().unwrap();
+    let raw = dir.path().join(std::ffi::OsStr::from_bytes(b"state-\xFF"));
+    let lossy = dir.path().join("state-\u{FFFD}");
+    let err = CredentialStore::open(&raw.join("kaibo/credentials/creds.db"), &[])
+        .await
+        .err()
+        .expect("refused");
+    assert!(err.to_string().contains("not valid UTF-8"), "{err}");
+    assert!(!lossy.exists(), "the lossy spelling is never created or opened");
+}
+
+/// The credentials db obeys the same containment rule as the state db.
+#[tokio::test]
+async fn the_credentials_db_is_refused_inside_an_allowed_tree() {
+    let project = TempDir::new().unwrap();
+    let path = project.path().join("kaibo/credentials/creds.db");
+    let err = CredentialStore::open(&path, &[project.path()])
+        .await
+        .err()
+        .expect("refused inside the project");
+    assert!(matches!(err, StoreError::PathInAllowedTree(_)), "{err}");
+    assert!(!project.path().join("kaibo").exists(), "refused before touching the disk");
+}
+
+/// One file cannot be both dbs: the schemas would mix in one file.
+#[tokio::test]
+async fn one_file_cannot_be_both_the_state_db_and_the_credentials_db() {
+    let (_store, dir) = open(4).await;
+    let err = CredentialStore::open(&dir.path().join("state.db"), &[])
+        .await
+        .err()
+        .expect("refused");
+    assert!(err.to_string().contains("already open as kaibo's state db"), "{err}");
 }

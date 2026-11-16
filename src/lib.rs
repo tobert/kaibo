@@ -45,6 +45,7 @@ pub mod kaish_syntax;
 pub mod mcp_log;
 pub mod media;
 pub mod metrics;
+pub mod oauth;
 pub mod openai_images;
 pub mod orientation;
 pub mod otel_filter;

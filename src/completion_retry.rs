@@ -152,6 +152,16 @@ pub fn is_transient_status(status: u16) -> bool {
     TRANSIENT_TRANSPORT_STATUSES.contains(&status)
 }
 
+/// The error code OpenAI's ChatGPT plan route sends when the plan's included usage is
+/// spent (HTTP 429). Not a rate limit: it lasts until the plan's window resets, so
+/// sending again only fails again.
+pub const PLAN_USAGE_LIMIT_CODE: &str = "subscription_sharing_usage_limit_exceeded";
+
+/// True when a 429's body is the ChatGPT plan's usage limit rather than a rate limit.
+pub fn is_plan_usage_limit(body: Option<&str>) -> bool {
+    body.is_some_and(|b| b.contains(PLAN_USAGE_LIMIT_CODE))
+}
+
 /// Best-effort seconds parsed from a provider's error body when it embeds its own
 /// retry delay — the OpenAI 429 phrasing kaibo has seen: "Rate limit reached … Please
 /// try again in 20s." and "… try again in 1.2s". Returns `None` on anything that
@@ -266,7 +276,8 @@ impl<H: HttpClientExt + Clone + 'static> HttpClientExt for RetryingHttp<H> {
                     Err(error) => error,
                 };
                 let status = error.non_success_status().map(|s| s.as_u16());
-                let transient = status.is_some_and(is_transient_status);
+                let transient = status.is_some_and(is_transient_status)
+                    && !is_plan_usage_limit(error.non_success_body());
                 if !transient || attempt as usize >= TRANSIENT_RETRIES {
                     // Not a transient status, or the allowance is spent: the phase's
                     // failure now, carrying the provider's own words.

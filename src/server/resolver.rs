@@ -260,6 +260,43 @@ impl Resolver {
             );
         }
 
+        // A signed-in backend reads its credential from the state db at request time.
+        // A CLI command opens that db only for `--session` or a batch, so record how to
+        // open it here, where every front door passes; it is opened on first use (the
+        // MCP server has usually opened it already, and then it is reused).
+        // A ChatGPT sign-in aimed anywhere but OpenAI sends the plan's token there.
+        // Allowed (a test server, a faithful proxy), but never silently.
+        for b in config.backends.values() {
+            let base = b
+                .base_url
+                .as_deref()
+                .unwrap_or_default()
+                .trim_end_matches('/');
+            if b.auth == Some(crate::oauth::AuthProfile::Chatgpt)
+                && base != crate::credentials::HOSTED_OPENAI_BASE_URL
+            {
+                tracing::warn!(
+                    backend = %b.name,
+                    base_url = %base,
+                    "backend {:?} signs in to ChatGPT but sets base_url {base:?}, so its ChatGPT \
+                     access token is sent to that host on every request. Remove base_url from \
+                     [backends.{}] to use OpenAI's endpoint",
+                    b.name,
+                    b.name
+                );
+            }
+        }
+        if config.backends.values().any(|b| b.auth.is_some()) {
+            if let Some(path) = &config.persistence.credentials {
+                crate::oauth::grant::register_credentials_spec(
+                    crate::oauth::grant::CredentialsSpec {
+                        path: path.clone(),
+                        allowed: allowed.clone(),
+                    },
+                );
+            }
+        }
+
         Ok(Self {
             config,
             allowed_set: Arc::new(allowed),

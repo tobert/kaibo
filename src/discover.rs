@@ -256,7 +256,17 @@ pub fn discovery_endpoint_page(
             }
         }
     };
-    let key = backend.resolve_key()?;
+    discovery_request_with_key(backend, wire, cursor, backend.resolve_key()?)
+}
+
+/// [`discovery_endpoint_page`] with the credential already in hand: a resolved API
+/// key, or a signed-in backend's current bearer token.
+fn discovery_request_with_key(
+    backend: &Backend,
+    wire: WireKind,
+    cursor: Option<&str>,
+    key: String,
+) -> Result<DiscoveryRequest> {
     match wire {
         WireKind::Openai => {
             let base = backend.resolved_base_url();
@@ -319,6 +329,42 @@ pub fn discovery_endpoint_page(
             })
         }
     }
+}
+
+/// Parse the ChatGPT plan route's catalog. With a plan token, `GET /v1/models` answers
+/// `{ models: [{slug, display_name, visibility, supported_in_api, context_window, ...}] }`
+/// (observed live 2026-11-15), not the Platform's `data`/`id` list. Only entries with
+/// `visibility: "list"` and `supported_in_api` not `false` are ones a plan can call; the
+/// `hide` entries are internal (review/reserve models). `.raw` keeps each item verbatim.
+pub fn parse_chatgpt_plan_models(v: &Value) -> Vec<DiscoveredModel> {
+    v.get("models")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|m| m.get("visibility").and_then(Value::as_str) == Some("list"))
+        .filter(|m| m.get("supported_in_api").and_then(Value::as_bool) != Some(false))
+        .filter_map(|item| {
+            let id = item.get("slug").and_then(Value::as_str)?.to_string();
+            Some(DiscoveredModel {
+                id,
+                display_name: item
+                    .get("display_name")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+                created: None,
+                context_window: item.get("context_window").and_then(Value::as_u64),
+                output_ceiling: None,
+                pricing: None,
+                // `supported_reasoning_levels` lists the effort rungs; a non-empty
+                // list is the catalog saying yes. Absent stays unknown.
+                reasoning: item
+                    .get("supported_reasoning_levels")
+                    .and_then(Value::as_array)
+                    .map(|levels| !levels.is_empty()),
+                raw: item.clone(),
+            })
+        })
+        .collect()
 }
 
 /// Parse an OpenAI-shaped `{ data: [{id, created, owned_by, ...}] }` model list —
@@ -502,12 +548,32 @@ impl ModelListFetcher for HttpModelListFetcher {
             .await
             .map_err(|e| anyhow!("reading model list response body from {}: {e}", req.url))?;
         if !status.is_success() {
-            return Err(anyhow!("model list {status} from {}: {text}", req.url));
+            return Err(ModelListStatus {
+                status: status.as_u16(),
+                message: format!("model list {status} from {}: {text}", req.url),
+            }
+            .into());
         }
         serde_json::from_str(&text)
             .with_context(|| format!("parsing model list JSON from {}: {text}", req.url))
     }
 }
+
+/// A model list endpoint answered with a non-success status. Typed so a signed-in
+/// backend can tell a refused credential (401) from any other failure.
+#[derive(Debug)]
+pub struct ModelListStatus {
+    pub status: u16,
+    message: String,
+}
+
+impl std::fmt::Display for ModelListStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for ModelListStatus {}
 
 /// Fetch every model `backend` advertises, paginating where the provider requires it:
 /// Anthropic loops on `has_more`/`last_id` (`after_id` cursor, `limit=1000`), Gemini
@@ -559,8 +625,31 @@ pub async fn discover_models(
             .await
         }
         WireKind::Openai | WireKind::OpenRouter | WireKind::DeepSeek => {
-            let req = discovery_endpoint(backend)?;
-            let body = fetcher.get_json(&req).await?;
+            let Some(auth) = backend.auth else {
+                let req = discovery_endpoint(backend)?;
+                let body = fetcher.get_json(&req).await?;
+                return Ok(parse_openai_models(&body));
+            };
+            // A signed-in backend lists with its current token, refreshed if due.
+            let source = crate::oauth::TokenSource::for_process(&backend.name, auth)?;
+            let token = source.bearer().await?;
+            let req = discovery_request_with_key(backend, wire, None, token.clone())?;
+            // A 401 gets one refresh and one resend, as a completion call does.
+            let body = match fetcher.get_json(&req).await {
+                Err(e)
+                    if e
+                        .downcast_ref::<ModelListStatus>()
+                        .is_some_and(|s| s.status == 401) =>
+                {
+                    let token = source.after_refusal(&token).await?;
+                    let req = discovery_request_with_key(backend, wire, None, token)?;
+                    fetcher.get_json(&req).await?
+                }
+                other => other?,
+            };
+            if auth == crate::oauth::AuthProfile::Chatgpt {
+                return Ok(parse_chatgpt_plan_models(&body));
+            }
             Ok(parse_openai_models(&body))
         }
     }
@@ -725,6 +814,7 @@ mod tests {
             data_collection: DataCollection::default(),
             prompt_cache: crate::config::PromptCache::default(),
             wire: None,
+            auth: None,
         }
     }
 

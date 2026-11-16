@@ -24,7 +24,7 @@ path = "src/main.rs"
 kaish-kernel = { version = "0.19.0", default-features = false, features = ["localfs"] }
 # `time` is used by the deferred `generate` job's poll cadence (sleep + Instant) —
 # named here rather than inherited from a transitive enabler.
-tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "sync", "time"] }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "sync", "time", "net", "io-util"] }
 async-trait = "0.1"
 anyhow = "1"
 
@@ -223,6 +223,11 @@ tracing-opentelemetry = "0.33"
 # same OTLP/HTTP exporter and inherits the reqwest/TLS reasoning above.
 opentelemetry-appender-tracing = "0.32"
 
+# URL and form encoding for the sign-in flow (src/oauth): the authorize URL, the
+# callback query, and the token endpoint's form body. Already in the lock through
+# reqwest; named here so the dep is ours.
+url = "2"
+
 # sha256 for the media CAS (src/cas.rs): the address IS the digest, so hashing is the
 # one operation the whole design leans on. Pure Rust, no C/asm, already in the lock
 # transitively (via kaish-kernel and rig-core's provider stack) — named here explicitly
@@ -242,12 +247,13 @@ sha2 = "0.10"
 rand = "0.10"
 
 # libc is already in the tree transitively (getrandom); named here explicitly, scoped
-# to unix only so no new build cost lands on Windows. Two uses: local-filesystem
+# to unix only so no new build cost lands on Windows. Three uses: local-filesystem
 # validation for the persistence store (src/store.rs, Linux-only `statfs` — turso's
 # multiprocess-WAL mode is unsupported on network filesystems, where a shared open can
 # silently lose writes) and detaching the MCP server from its launching terminal's
 # process group at startup (src/main.rs `setsid` — a job-control stop on that terminal
-# must not freeze the server too).
+# must not freeze the server too), plus `geteuid` for the credentials directory's
+# ancestor check (src/store.rs `refuse_replaceable_ancestors`).
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
