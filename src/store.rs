@@ -702,9 +702,12 @@ impl CredentialStore {
             .parent()
             .filter(|p| !p.as_os_str().is_empty())
             .ok_or_else(|| StoreError::InvalidStatePath(path.display().to_string()))?;
-        secure_credentials_dir(dir)?;
+        // From here on, only the checked, symlink-free path: the original may route
+        // through a symlink that someone else could replace.
+        let dir = secure_credentials_dir(dir)?;
+        let path = dir.join(path.file_name().unwrap_or_default());
         refuse_symlinked_db_files(&path)?;
-        validate_local_filesystem(dir).map_err(credentials_error)?;
+        validate_local_filesystem(&dir).map_err(credentials_error)?;
         let store = Self {
             db: build_database(&path).await.map_err(credentials_error)?,
         };
@@ -1052,14 +1055,15 @@ fn refuse_symlinked_db_files(path: &Path) -> Result<()> {
 /// is sticky (as `/tmp` is, where others cannot rename what they do not own). Without
 /// this, a user who can write an ancestor could swap the checked directory for a symlink
 /// between the check and the chmod or the open. The same rule as OpenSSH's StrictModes.
+///
+/// `resolved` must be canonical (no symlinks), and the caller must use that same path for
+/// everything after: the walk vouches for the path it walked, not for an unresolved one
+/// that reaches it through a symlink someone else could swap.
 #[cfg(unix)]
-fn refuse_replaceable_ancestors(dir: &Path) -> Result<()> {
+fn refuse_replaceable_ancestors(resolved: &Path, dir: &Path) -> Result<()> {
     use std::os::unix::fs::MetadataExt;
     // SAFETY: geteuid takes no arguments, cannot fail, and touches no memory.
     let me = unsafe { libc::geteuid() };
-    let resolved = dir.canonicalize().map_err(|e| {
-        StoreError::CredentialsDir(format!("resolving credentials directory {}: {e}", dir.display()))
-    })?;
     for ancestor in resolved.ancestors() {
         let meta = std::fs::metadata(ancestor).map_err(|e| {
             StoreError::CredentialsDir(format!("reading {}: {e}", ancestor.display()))
@@ -1099,17 +1103,28 @@ fn refuse_replaceable_ancestors(dir: &Path) -> Result<()> {
 /// other users from reaching any of them. One of two blessed lines each for creating and
 /// re-moding this directory (`tests/no_write_path.rs`). Non-Unix platforms keep the
 /// per-user profile's access control and only create the directory.
-pub fn secure_credentials_dir(dir: &Path) -> Result<()> {
+pub fn secure_credentials_dir(dir: &Path) -> Result<PathBuf> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
         let err = |what: String| StoreError::CredentialsDir(what);
         // The parent first, so its whole chain can be checked before kaibo creates,
-        // changes, or opens anything beneath it.
-        if let Some(parent) = dir.parent().filter(|p| !p.as_os_str().is_empty()) {
-            create_state_dir(parent)?;
-            refuse_replaceable_ancestors(parent)?;
-        }
+        // changes, or opens anything beneath it. Then work only on the canonical path
+        // the check walked.
+        let parent = dir
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .ok_or_else(|| err(format!("{} has no parent directory", dir.display())))?;
+        let name = dir
+            .file_name()
+            .ok_or_else(|| err(format!("{} names no directory", dir.display())))?;
+        create_state_dir(parent)?;
+        let parent = parent.canonicalize().map_err(|e| {
+            err(format!("resolving {}: {e}", parent.display()))
+        })?;
+        refuse_replaceable_ancestors(&parent, dir)?;
+        let dir = parent.join(name);
+        let dir = dir.as_path();
         let meta = match std::fs::symlink_metadata(dir) {
             Ok(meta) => meta,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -1164,11 +1179,12 @@ pub fn secure_credentials_dir(dir: &Path) -> Result<()> {
                  stored sign-ins"
             );
         }
-        Ok(())
+        Ok(dir.to_path_buf())
     }
     #[cfg(not(unix))]
     {
-        create_state_dir(dir)
+        create_state_dir(dir)?;
+        Ok(dir.to_path_buf())
     }
 }
 

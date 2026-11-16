@@ -823,6 +823,34 @@ async fn a_credentials_dir_under_a_shared_writable_ancestor_is_refused() {
     assert!(!shared.join("kaibo/credentials").exists(), "nothing created under it");
 }
 
+/// A path through a symlink in a shared writable directory is resolved once, checked,
+/// and used resolved from then on: swapping the link afterwards cannot move the
+/// credentials db, because kaibo never goes through the link again.
+#[cfg(unix)]
+#[tokio::test]
+async fn the_credentials_db_is_opened_at_the_checked_path_not_through_a_link() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = TempDir::new().unwrap();
+    let safe = dir.path().join("safe");
+    let decoy = dir.path().join("decoy");
+    std::fs::create_dir_all(&safe).unwrap();
+    std::fs::create_dir_all(&decoy).unwrap();
+    let shared = dir.path().join("shared");
+    std::fs::create_dir_all(&shared).unwrap();
+    std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o777)).unwrap();
+    let link = shared.join("state-link");
+    std::os::unix::fs::symlink(&safe, &link).unwrap();
+    let store = CredentialStore::open(&link.join("kaibo/credentials/creds.db"), &[])
+        .await
+        .expect("a link into a safe tree resolves to it");
+    // The other user swaps the link; the open store keeps writing where it was checked.
+    std::fs::remove_file(&link).unwrap();
+    std::os::unix::fs::symlink(&decoy, &link).unwrap();
+    store.put_grant(&grant("plan")).await.unwrap();
+    assert!(safe.join("kaibo/credentials/creds.db").exists());
+    assert!(!decoy.join("kaibo").exists(), "nothing follows the swapped link");
+}
+
 /// A sticky shared ancestor (the `/tmp` shape) is fine: others cannot rename what they
 /// do not own there.
 #[cfg(unix)]
