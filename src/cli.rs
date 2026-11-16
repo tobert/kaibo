@@ -52,7 +52,7 @@ use crate::server::{
     Resolver, BATCH_RECENCY_WINDOW_SECS, CONFIG_EXAMPLE_TOML,
 };
 use crate::session::{SessionStore as MemSessionStore, Sessions};
-use crate::sweep_attach::{SweepAttachSink, SweepConsumer, SweepConsumerKind};
+use crate::sweep_attach::{SweepAttachSink, SweepConsumer};
 use crate::web::WebSession;
 
 /// Exit codes, distinct so an agent caller branches without parsing prose.
@@ -1724,7 +1724,6 @@ async fn deliberate_inner(
             })?;
         let synth_caps = ModelCaps::resolve(synth_backend.kind, &synth_slot.id, synth_slot.vision);
         let consumer = SweepConsumer {
-            kind: SweepConsumerKind::OfflineSynth,
             label: Arc::from(format!(
                 "the offline synth (`{}`) on cast `{}`",
                 synth_slot.id, cast.name
@@ -1734,8 +1733,7 @@ async fn deliberate_inner(
         let sink = (resolver.config.defaults.max_attachments > 0).then(|| {
             Arc::new(SweepAttachSink::new(
                 resolver.config.defaults.max_attachments,
-                consumer.clone(),
-                std::collections::HashSet::new(),
+                consumer,
             ))
         });
         let (mut dossier, usage) = match explore_with(
@@ -1760,7 +1758,6 @@ async fn deliberate_inner(
         }
         let (images, kept) = crate::server::stitch_and_keep(
             &mut dossier,
-            &consumer,
             sink.as_ref(),
             media.as_ref(),
             &args.question,

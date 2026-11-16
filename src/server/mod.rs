@@ -50,7 +50,7 @@ use crate::mcp_log;
 use crate::progress::{NullSink, PhaseEvent, ProgressLog, ProgressSink, TracingSink};
 use crate::sandbox::{builtin_schemas, KaishWorker};
 use crate::session::{SessionStore, Sessions};
-use crate::sweep_attach::{SweepAttachSink, SweepConsumer, SweepConsumerKind};
+use crate::sweep_attach::{SweepAttachSink, SweepConsumer};
 use crate::web::WebSession;
 
 mod cas_read;
@@ -190,13 +190,12 @@ pub(crate) fn deliberate_direct_deadline(synth_backend: &Backend) -> std::time::
 /// 2026-07-26).
 fn stitch_dossier_delivery(
     dossier: &mut String,
-    consumer: &SweepConsumer,
     sink: Option<&std::sync::Arc<SweepAttachSink>>,
 ) -> Vec<crate::attach::Attachment> {
     match sink {
         Some(sink) => {
             let delivery = sink.drain();
-            if let Some(block) = sweep_evidence_block(consumer, &delivery) {
+            if let Some(block) = sweep_evidence_block(&delivery) {
                 dossier.push_str(&block);
             }
             delivery.images()
@@ -215,14 +214,13 @@ fn stitch_dossier_delivery(
 /// handler calls this rather than the two steps by hand.
 pub(crate) fn stitch_and_keep(
     dossier: &mut String,
-    consumer: &SweepConsumer,
     sink: Option<&std::sync::Arc<SweepAttachSink>>,
     store: Option<&Arc<crate::cas::MediaStore>>,
     question: &str,
     cast: &str,
     explorer_model: &str,
 ) -> (Vec<crate::attach::Attachment>, Option<KeptDossier>) {
-    let images = stitch_dossier_delivery(dossier, consumer, sink);
+    let images = stitch_dossier_delivery(dossier, sink);
     let kept = keep_dossier(store, question, dossier, cast, explorer_model);
     (images, kept)
 }
@@ -2392,22 +2390,16 @@ impl KaiboHandler {
             // cap instead of assuming blind.
             let (synth_slot, _synth_backend, synth_caps) = self.batch_synth(&cast)?;
             let consumer = SweepConsumer {
-                kind: SweepConsumerKind::OfflineSynth,
                 label: Arc::from(format!(
                     "the offline synth (`{}`) on cast `{}`",
                     synth_slot.id, cast.name
                 )),
                 vision: synth_caps.vision,
             };
-            // Deliberate's dossier sweep does NOT dedupe against the caller's own attach
-            // list (an empty seed): a caller-attached file reaches the offline synth ONLY
-            // through what the explorer writes (it's a read-WHOLE directive here, never
-            // inlined), so deduping would silently strand it — see SweepAttachSink's doc.
             let sink = (defaults.max_attachments > 0).then(|| {
                 Arc::new(SweepAttachSink::new(
                     defaults.max_attachments,
-                    consumer.clone(),
-                    std::collections::HashSet::new(),
+                    consumer,
                 ))
             });
 
@@ -2446,7 +2438,6 @@ impl KaiboHandler {
             // dossier text. Keeping is never fatal — see `server::dossier`.
             let (images, kept) = stitch_and_keep(
                 &mut dossier,
-                &consumer,
                 sink.as_ref(),
                 self.media_cas.as_ref(),
                 &input.question,
@@ -5619,15 +5610,10 @@ mod tests {
         // The sink and consumer exactly as the `deliberate` handler builds them:
         // offline synth, vision on (the synth's cap is what admits the image).
         let consumer = SweepConsumer {
-            kind: SweepConsumerKind::OfflineSynth,
             label: std::sync::Arc::from("the offline synth (`scripted-synth`)"),
             vision: true,
         };
-        let sink = std::sync::Arc::new(SweepAttachSink::new(
-            8,
-            consumer.clone(),
-            std::collections::HashSet::new(),
-        ));
+        let sink = std::sync::Arc::new(SweepAttachSink::new(8, consumer));
 
         // Route both files through the real tool — the same resolve/read/classify/
         // commit path a live explorer's `attach` call runs.
@@ -5661,7 +5647,6 @@ mod tests {
         let mut dossier = String::from("src/x.rs:1 DOSSIER");
         let (images, kept) = stitch_and_keep(
             &mut dossier,
-            &consumer,
             Some(&sink),
             Some(&store),
             "does the diagram confirm it?",

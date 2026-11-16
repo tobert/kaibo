@@ -39,13 +39,11 @@ use crate::sandbox::KaishWorker;
 /// remove.
 const MAX_NOTE_CHARS: usize = 500;
 
-/// Who reads a sweep's output — decides the vision gate (can this consumer even
-/// receive an image?) and the demotion wording when a file can't be routed (a
-/// consult driver can still `run_kaish` it itself; an offline synth cannot fetch
-/// anything, so a dropped file must be named "unavailable").
+/// Who reads a sweep's output: `deliberate`'s offline synth. It decides the vision
+/// gate (can this consumer even receive an image?). The synth cannot fetch anything
+/// once the dossier is built, so a file that can't be routed is named "unavailable".
 #[derive(Debug, Clone)]
 pub struct SweepConsumer {
-    pub kind: SweepConsumerKind,
     /// e.g. "the synthesis agent (`claude-sonnet-4-6`)" — used verbatim in the tool
     /// description and in receipt lines, so the explorer knows who it's routing to.
     pub label: Arc<str>,
@@ -54,32 +52,16 @@ pub struct SweepConsumer {
     pub vision: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SweepConsumerKind {
-    /// Reads the tool result and can fetch anything itself with `run_kaish` — a
-    /// file that couldn't be routed is still reachable another way.
-    ConsultDriver,
-    /// Reasons offline over the dossier and can fetch NOTHING once the dossier
-    /// phase ends — a file that couldn't be routed is genuinely gone.
-    OfflineSynth,
-}
-
 impl SweepConsumer {
     /// The consumer-shaped line recorded when a path can't get a budget slot — this
     /// is what the *reader* sees (in the evidence block), distinct from the receipt
     /// line the *explorer* sees immediately (which just says "quote it instead").
     fn over_cap_demotion(&self, display: &str, max: usize) -> String {
-        match self.kind {
-            SweepConsumerKind::ConsultDriver => format!(
-                "the explorer could not route `{display}` (its sweep budget of {max} was \
-                 full). You can read it yourself: `cat -n {display}`."
-            ),
-            SweepConsumerKind::OfflineSynth => format!(
-                "**NOT INCLUDED**: `{display}` — the explorer's per-sweep attachment budget \
-                 ({max}) was exhausted. You cannot fetch it; treat its contents as \
-                 unavailable and say so if the question turns on it."
-            ),
-        }
+        format!(
+            "**NOT INCLUDED**: `{display}` — the explorer's per-sweep attachment budget \
+             ({max}) was exhausted. You cannot fetch it; treat its contents as \
+             unavailable and say so if the question turns on it."
+        )
     }
 }
 
@@ -103,8 +85,7 @@ struct State {
     slots: Vec<Slot>,
     /// Canonical paths this sink has itself accepted (`Pending`/`Ready`/`Released`) —
     /// re-attaching one of these is a no-op (`Reservation::Duplicate`), not a fresh
-    /// spend. Kept apart from `already_delivered` below so the two "seen before"
-    /// reasons render distinct receipt lines.
+    /// spend.
     seen: HashSet<PathBuf>,
     /// Consumer-shaped, already-rendered lines for the evidence block — recorded
     /// once, right when a path is refused for a reason the *reader* (not just the
@@ -120,15 +101,11 @@ enum Reservation {
     Accepted(usize),
     /// This sink already accepted this exact path earlier in the sweep.
     Duplicate,
-    /// The caller (the human/agent driving `consult`) already attached this path
-    /// directly — its bytes already reach the consumer another way, so routing it
-    /// again would just double the cost for nothing new.
-    AlreadyDelivered,
     /// The sweep's attach budget is full.
     OverCap,
 }
 
-/// Per-sweep routing state: the budget, the dedupe sets, and the consumer this
+/// Per-sweep routing state: the budget, the dedupe set, and the consumer this
 /// sweep's `attach` calls route to. One sink per sweep (`deliberate`'s dossier
 /// stage), shared by every `attach` call the sweep makes —
 /// including concurrent ones, since rig runs a turn's tool calls with
@@ -137,48 +114,12 @@ pub struct SweepAttachSink {
     state: Mutex<State>,
     max: usize,
     consumer: SweepConsumer,
-    /// Canonical paths the CALLER already attached to this consult/deliberate — seeded
-    /// once at construction, never mutated. `consult` seeds this from its resolved
-    /// `ConsultAttachment`s (their bytes already reach the driver); `deliberate`
-    /// deliberately passes an empty set (its caller-attached files reach the synth
-    /// ONLY through what the explorer writes, so deduping here would strand them).
-    already_delivered: HashSet<PathBuf>,
-}
-
-/// Build the `already_delivered` seed for a sweep from the caller's own attachment
-/// paths, resolved the SAME way [`SweepAttach::attach_one`] resolves what the explorer
-/// asks for: joined against the root when relative, then **canonicalized**.
-///
-/// That canonicalize is the whole point. The sink compares against a canonical path
-/// (`reserve` is handed `canon`), so a seed built by plain `root.join(path)` silently
-/// fails to match whenever the caller's path isn't already in canonical form — a `./`
-/// segment, a `..`, a symlinked file, or a symlinked ancestor inside the root. The
-/// dedupe then misses and the explorer re-routes bytes the reader already has, which is
-/// exactly the duplicate spend seeding exists to prevent. It fails quietly and costs
-/// tokens rather than correctness, which is why it wants a named function with a test
-/// rather than a `.map()` at the call site. (Found by the Gemini Pro review of this PR.)
-///
-/// A path that cannot be canonicalized (deleted between resolution and here) falls back
-/// to the joined form: no worse than before, and the entry is inert either way.
-pub fn delivered_seed<'a>(
-    root: &Path,
-    paths: impl IntoIterator<Item = &'a Path>,
-) -> HashSet<PathBuf> {
-    paths
-        .into_iter()
-        .map(|p| {
-            let joined = if p.is_absolute() {
-                p.to_path_buf()
-            } else {
-                root.join(p)
-            };
-            std::fs::canonicalize(&joined).unwrap_or(joined)
-        })
-        .collect()
 }
 
 impl SweepAttachSink {
-    pub fn new(max: usize, consumer: SweepConsumer, already_delivered: HashSet<PathBuf>) -> Self {
+    /// A caller-attached file reaches `deliberate`'s synth only through what the
+    /// explorer writes or routes, so nothing is pre-marked as delivered.
+    pub fn new(max: usize, consumer: SweepConsumer) -> Self {
         Self {
             state: Mutex::new(State {
                 slots: Vec::new(),
@@ -188,7 +129,6 @@ impl SweepAttachSink {
             }),
             max,
             consumer,
-            already_delivered,
         }
     }
 
@@ -198,9 +138,6 @@ impl SweepAttachSink {
     /// and demotions are consumer-facing text, not a second copy of the path state).
     fn reserve(&self, canon: &Path, display: &str) -> Reservation {
         let mut st = self.state.lock().expect("sweep attach sink poisoned");
-        if self.already_delivered.contains(canon) {
-            return Reservation::AlreadyDelivered;
-        }
         if st.seen.contains(canon) {
             return Reservation::Duplicate;
         }
@@ -399,10 +336,6 @@ impl SweepAttach {
             Reservation::Duplicate => {
                 format!("already attached: {display} — counted once; it's already on its way")
             }
-            Reservation::AlreadyDelivered => format!(
-                "already in front of your reader: {display} — it's already attached directly, \
-                 no need to route it again"
-            ),
             Reservation::OverCap => format!(
                 "not attached: {display} — this sweep's attachment budget ({}) is full; quote \
                  the decisive span in your report instead",
@@ -579,17 +512,8 @@ mod tests {
         KaishWorker::spawn(root).expect("spawn read-only worker")
     }
 
-    fn consult_driver(vision: bool) -> SweepConsumer {
-        SweepConsumer {
-            kind: SweepConsumerKind::ConsultDriver,
-            label: Arc::from("the consult driver (`test-model`)"),
-            vision,
-        }
-    }
-
     fn offline_synth(vision: bool) -> SweepConsumer {
         SweepConsumer {
-            kind: SweepConsumerKind::OfflineSynth,
             label: Arc::from("the offline synth (`test-model`)"),
             vision,
         }
@@ -599,9 +523,8 @@ mod tests {
         root: &Path,
         max: usize,
         consumer: SweepConsumer,
-        already_delivered: HashSet<PathBuf>,
     ) -> (SweepAttach, Arc<SweepAttachSink>) {
-        let sink = Arc::new(SweepAttachSink::new(max, consumer, already_delivered));
+        let sink = Arc::new(SweepAttachSink::new(max, consumer));
         let t = SweepAttach::new(
             worker_over(root),
             root,
@@ -627,7 +550,7 @@ mod tests {
         let root = std::fs::canonicalize(dir.path()).unwrap();
         std::fs::write(root.join("f.rs"), format!("fn x() {{ // {MARKER}\n}}\n")).unwrap();
 
-        let (t, sink) = tool(&root, 8, consult_driver(false), HashSet::new());
+        let (t, sink) = tool(&root, 8, offline_synth(false));
         let receipt = t
             .call(
                 &mut ToolContext::new(),
@@ -661,7 +584,7 @@ mod tests {
         let root = std::fs::canonicalize(dir.path()).unwrap();
         std::fs::write(root.join("f.rs"), "line1\nline2\nline3\n").unwrap();
 
-        let (t, _sink) = tool(&root, 8, consult_driver(false), HashSet::new());
+        let (t, _sink) = tool(&root, 8, offline_synth(false));
         let receipt = t
             .call(
                 &mut ToolContext::new(),
@@ -688,7 +611,7 @@ mod tests {
         let root = std::fs::canonicalize(dir.path()).unwrap();
         std::fs::write(root.join("f.rs"), "body\n").unwrap();
 
-        let (t, _sink) = tool(&root, 8, consult_driver(false), HashSet::new());
+        let (t, _sink) = tool(&root, 8, offline_synth(false));
         t.call(
             &mut ToolContext::new(),
             SweepAttachArgs {
@@ -716,128 +639,6 @@ mod tests {
         );
     }
 
-    /// A path the CALLER already attached (seeded into `already_delivered`, the
-    /// `consult` dedupe case) is refused with a distinct reason and never delivered.
-    #[tokio::test]
-    async fn a_path_the_caller_already_attached_is_deduped_with_a_reason() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = std::fs::canonicalize(dir.path()).unwrap();
-        std::fs::write(root.join("README.md"), "hello\n").unwrap();
-        let canon = std::fs::canonicalize(root.join("README.md")).unwrap();
-
-        let mut seed = HashSet::new();
-        seed.insert(canon);
-        let (t, sink) = tool(&root, 8, consult_driver(false), seed);
-        let receipt = t
-            .call(
-                &mut ToolContext::new(),
-                SweepAttachArgs {
-                    paths: vec!["README.md".into()],
-                    note: None,
-                },
-            )
-            .await
-            .unwrap();
-
-        assert!(
-            receipt.contains("already in front of your reader: README.md"),
-            "{receipt}"
-        );
-        assert!(sink.drain().attachments.is_empty(), "nothing delivered");
-    }
-
-    /// The seed must be built the way `attach_one` resolves paths — canonicalized —
-    /// or the dedupe misses whenever the caller's own path wasn't already canonical.
-    ///
-    /// This is the shape the bug took: `consult` seeded with a plain `root.join(path)`,
-    /// while `reserve` compares against a canonicalized path, so a caller attachment
-    /// written as `./README.md` (or through a symlink) failed to match and the explorer
-    /// re-routed bytes the driver already had. Silent, and it only cost tokens — which is
-    /// why it needs a test rather than trust. Each case here fails against a
-    /// join-only seed.
-    #[tokio::test]
-    async fn the_delivered_seed_dedupes_non_canonical_caller_paths() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = std::fs::canonicalize(dir.path()).unwrap();
-        std::fs::write(root.join("README.md"), "hello\n").unwrap();
-        #[cfg(unix)]
-        std::os::unix::fs::symlink(root.join("README.md"), root.join("LINK.md")).unwrap();
-
-        // The caller's spellings: a `./` segment, a `..` round-trip, and (on unix) a
-        // symlink — all naming the one real file the explorer will ask for as README.md.
-        let mut spellings: Vec<&Path> =
-            vec![Path::new("./README.md"), Path::new("sub/../README.md")];
-        #[cfg(unix)]
-        spellings.push(Path::new("LINK.md"));
-        std::fs::create_dir_all(root.join("sub")).unwrap();
-
-        for spelling in spellings {
-            let seed = delivered_seed(&root, [spelling]);
-            let (t, sink) = tool(&root, 8, consult_driver(false), seed);
-            let receipt = t
-                .call(
-                    &mut ToolContext::new(),
-                    SweepAttachArgs {
-                        paths: vec!["README.md".into()],
-                        note: None,
-                    },
-                )
-                .await
-                .unwrap();
-            assert!(
-                receipt.contains("already in front of your reader"),
-                "a caller path spelled {spelling:?} must still dedupe README.md, got: {receipt}"
-            );
-            assert!(
-                sink.drain().attachments.is_empty(),
-                "nothing may be delivered twice (spelling {spelling:?})"
-            );
-        }
-    }
-
-    /// An absolute caller path seeds correctly too, and a path that cannot be
-    /// canonicalized (deleted between resolution and seeding) falls back to the joined
-    /// form rather than panicking or dropping the entry.
-    #[test]
-    fn the_delivered_seed_handles_absolute_and_missing_paths() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = std::fs::canonicalize(dir.path()).unwrap();
-        std::fs::write(root.join("a.txt"), "x").unwrap();
-
-        let abs = root.join("a.txt");
-        let seed = delivered_seed(&root, [abs.as_path(), Path::new("gone.txt")]);
-        assert!(seed.contains(&std::fs::canonicalize(&abs).unwrap()));
-        assert!(
-            seed.contains(&root.join("gone.txt")),
-            "an uncanonicalizable path keeps its joined form — inert, but never dropped"
-        );
-    }
-
-    /// `deliberate` seeds an EMPTY `already_delivered` set (its no-dedupe decision —
-    /// a caller-attached file reaches the offline synth ONLY through what the
-    /// explorer writes), so the same path must attach cleanly with no seed.
-    #[tokio::test]
-    async fn an_empty_delivered_seed_lets_deliberate_attach_a_caller_file() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = std::fs::canonicalize(dir.path()).unwrap();
-        std::fs::write(root.join("README.md"), "hello\n").unwrap();
-
-        let (t, sink) = tool(&root, 8, offline_synth(false), HashSet::new());
-        let receipt = t
-            .call(
-                &mut ToolContext::new(),
-                SweepAttachArgs {
-                    paths: vec!["README.md".into()],
-                    note: None,
-                },
-            )
-            .await
-            .unwrap();
-
-        assert!(receipt.contains("attached: README.md"), "{receipt}");
-        assert_eq!(sink.drain().attachments.len(), 1);
-    }
-
     /// Past `max_attachments`, an extra distinct file is demoted loudly: refused in
     /// the receipt (told to quote it instead) AND recorded as a consumer-shaped
     /// demotion for the evidence block.
@@ -848,7 +649,7 @@ mod tests {
         std::fs::write(root.join("a.rs"), "a\n").unwrap();
         std::fs::write(root.join("b.rs"), "b\n").unwrap();
 
-        let (t, sink) = tool(&root, 1, consult_driver(false), HashSet::new());
+        let (t, sink) = tool(&root, 1, offline_synth(false));
         let receipt = t
             .call(
                 &mut ToolContext::new(),
@@ -870,17 +671,16 @@ mod tests {
         assert_eq!(delivery.demotions.len(), 1, "{:?}", delivery.demotions);
     }
 
-    /// The over-cap demotion's WORDING differs by consumer: a consult driver is
-    /// told it can still fetch the file itself; an offline synth is told the file
-    /// is simply unavailable, since it can fetch nothing once the dossier is built.
+    /// The over-cap demotion tells the offline synth the file is simply unavailable:
+    /// it can fetch nothing once the dossier is built.
     #[tokio::test]
-    async fn the_consult_demotion_offers_run_kaish_and_the_deliberate_one_says_not_included() {
+    async fn the_over_cap_demotion_says_not_included_and_unfetchable() {
         let dir = tempfile::tempdir().unwrap();
         let root = std::fs::canonicalize(dir.path()).unwrap();
         std::fs::write(root.join("a.rs"), "a\n").unwrap();
         std::fs::write(root.join("b.rs"), "b\n").unwrap();
 
-        let (t, sink) = tool(&root, 1, consult_driver(false), HashSet::new());
+        let (t, sink) = tool(&root, 1, offline_synth(false));
         t.call(
             &mut ToolContext::new(),
             SweepAttachArgs {
@@ -890,22 +690,9 @@ mod tests {
         )
         .await
         .unwrap();
-        let consult_demotion = sink.drain().demotions.remove(0);
-        assert!(consult_demotion.contains("run_kaish") || consult_demotion.contains("cat -n"));
-
-        let (t2, sink2) = tool(&root, 1, offline_synth(false), HashSet::new());
-        t2.call(
-            &mut ToolContext::new(),
-            SweepAttachArgs {
-                paths: vec!["a.rs".into(), "b.rs".into()],
-                note: None,
-            },
-        )
-        .await
-        .unwrap();
-        let synth_demotion = sink2.drain().demotions.remove(0);
-        assert!(synth_demotion.contains("NOT INCLUDED"));
-        assert!(synth_demotion.contains("cannot fetch"));
+        let demotion = sink.drain().demotions.remove(0);
+        assert!(demotion.contains("NOT INCLUDED"), "{demotion}");
+        assert!(demotion.contains("cannot fetch"), "{demotion}");
     }
 
     /// An image routed to a consumer that can't see it is refused loudly, naming the
@@ -916,7 +703,7 @@ mod tests {
         let root = std::fs::canonicalize(dir.path()).unwrap();
         std::fs::write(root.join("shot.png"), fake_png(16)).unwrap();
 
-        let (t, sink) = tool(&root, 8, consult_driver(false), HashSet::new());
+        let (t, sink) = tool(&root, 8, offline_synth(false));
         let receipt = t
             .call(
                 &mut ToolContext::new(),
@@ -929,7 +716,7 @@ mod tests {
             .unwrap();
 
         assert!(receipt.contains("not attached: shot.png"), "{receipt}");
-        assert!(receipt.contains("the consult driver"), "{receipt}");
+        assert!(receipt.contains("the offline synth"), "{receipt}");
         assert!(receipt.contains("reads text only"), "{receipt}");
         assert!(sink.drain().attachments.is_empty());
     }
@@ -943,7 +730,7 @@ mod tests {
         let bytes = fake_png(16);
         std::fs::write(root.join("shot.png"), &bytes).unwrap();
 
-        let (t, sink) = tool(&root, 8, consult_driver(true), HashSet::new());
+        let (t, sink) = tool(&root, 8, offline_synth(true));
         let receipt = t
             .call(
                 &mut ToolContext::new(),
@@ -982,7 +769,7 @@ mod tests {
             .join("secret.txt");
         std::fs::write(&stray, "shh").unwrap();
 
-        let (t, sink) = tool(&root, 8, consult_driver(false), HashSet::new());
+        let (t, sink) = tool(&root, 8, offline_synth(false));
         let receipt = t
             .call(
                 &mut ToolContext::new(),
@@ -1010,7 +797,7 @@ mod tests {
         let link = root.join("link_out");
         std::os::unix::fs::symlink(outside.path(), &link).unwrap();
 
-        let (t, sink) = tool(&root, 8, consult_driver(false), HashSet::new());
+        let (t, sink) = tool(&root, 8, offline_synth(false));
         let receipt = t
             .call(
                 &mut ToolContext::new(),
@@ -1033,7 +820,7 @@ mod tests {
         let root = std::fs::canonicalize(dir.path()).unwrap();
         std::fs::create_dir(root.join("sub")).unwrap();
 
-        let (t, sink) = tool(&root, 8, consult_driver(false), HashSet::new());
+        let (t, sink) = tool(&root, 8, offline_synth(false));
         let receipt = t
             .call(
                 &mut ToolContext::new(),
@@ -1064,7 +851,7 @@ mod tests {
         let root = std::fs::canonicalize(dir.path()).unwrap();
         std::fs::write(root.join("mystery.bin"), [0x00, 0xFF, 0xFE, 0xFD]).unwrap();
 
-        let (t, sink) = tool(&root, 8, consult_driver(false), HashSet::new());
+        let (t, sink) = tool(&root, 8, offline_synth(false));
         let receipt = t
             .call(
                 &mut ToolContext::new(),
@@ -1089,7 +876,7 @@ mod tests {
         let big = "a".repeat(DEFAULT_MAX_TEXT_BYTES + 1);
         std::fs::write(root.join("big.txt"), &big).unwrap();
 
-        let (t, sink) = tool(&root, 8, consult_driver(false), HashSet::new());
+        let (t, sink) = tool(&root, 8, offline_synth(false));
         let receipt = t
             .call(
                 &mut ToolContext::new(),
@@ -1114,7 +901,7 @@ mod tests {
         let root = std::fs::canonicalize(dir.path()).unwrap();
         std::fs::write(root.join("f.rs"), "body\n").unwrap();
 
-        let (t, _sink) = tool(&root, 8, consult_driver(false), HashSet::new());
+        let (t, _sink) = tool(&root, 8, offline_synth(false));
         let err = t
             .call(
                 &mut ToolContext::new(),
@@ -1130,7 +917,7 @@ mod tests {
         // Within the cap, even a note containing a `</file>` lookalike is accepted
         // here (the sink stores it raw) — the renderer, not the sink, is what must
         // neutralize it before it reaches a prompt (`sweep_evidence_block`'s tests).
-        let (t2, sink2) = tool(&root, 8, consult_driver(false), HashSet::new());
+        let (t2, sink2) = tool(&root, 8, offline_synth(false));
         t2.call(
             &mut ToolContext::new(),
             SweepAttachArgs {
@@ -1155,7 +942,7 @@ mod tests {
         std::fs::write(root.join("a.rs"), "a\n").unwrap();
         std::fs::write(root.join("b.rs"), "b\n").unwrap();
 
-        let (t, sink) = tool(&root, 1, consult_driver(false), HashSet::new());
+        let (t, sink) = tool(&root, 1, offline_synth(false));
         let mut ctx_a = ToolContext::new();
         let mut ctx_b = ToolContext::new();
         let (r1, r2) = tokio::join!(

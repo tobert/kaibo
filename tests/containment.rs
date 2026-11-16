@@ -1043,9 +1043,7 @@ async fn a_repo_above_the_allowed_tree_does_not_widen_the_boundary() {
 
 use kaibo::progress::NullSink;
 use kaibo::sandbox::KaishWorker;
-use kaibo::sweep_attach::{
-    SweepAttach, SweepAttachArgs, SweepAttachSink, SweepConsumer, SweepConsumerKind,
-};
+use kaibo::sweep_attach::{SweepAttach, SweepAttachArgs, SweepAttachSink, SweepConsumer};
 use rig_agent::tool::{Tool, ToolContext};
 use std::sync::Arc;
 
@@ -1053,11 +1051,9 @@ fn attach_tool_over(root: &Path) -> SweepAttach {
     let sink = Arc::new(SweepAttachSink::new(
         8,
         SweepConsumer {
-            kind: SweepConsumerKind::ConsultDriver,
-            label: Arc::from("the consult driver (`test-model`)"),
+            label: Arc::from("the offline synth (`test-model`)"),
             vision: false,
         },
-        std::collections::HashSet::new(),
     ));
     SweepAttach::new(
         KaishWorker::spawn(root).expect("spawn read-only worker"),

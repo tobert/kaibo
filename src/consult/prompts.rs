@@ -4,7 +4,7 @@ use crate::attach::Attachment;
 use crate::config::ModelRole;
 use crate::kaish_syntax::kaish_syntax_core;
 use crate::session::QaTurn;
-use crate::sweep_attach::{SweepConsumer, SweepConsumerKind, SweepDelivery};
+use crate::sweep_attach::SweepDelivery;
 
 /// Splice the operator's house rules (if any) onto a phase preamble. The base
 /// preamble functions stay pure (and their tests byte-for-byte stable); this is
@@ -706,7 +706,7 @@ pub fn explorer_attachment_directive(attached: &[ConsultAttachment]) -> Option<S
 /// place, so preamble and toolset can't drift apart. Positive framing: attach is
 /// cheaper and more accurate than transcribing a span, not a fallback for when
 /// writing fails.
-pub fn explorer_attach_directive(max: usize, consumer: &SweepConsumer) -> String {
+pub fn explorer_attach_directive(max: usize, consumer: &crate::sweep_attach::SweepConsumer) -> String {
     format!(
         "\n\nYou also have `attach`. kaibo reads the file you name and sends its full \
          bytes alongside your report to {}, without the bytes entering your context. \
@@ -728,24 +728,14 @@ pub fn explorer_attach_directive(max: usize, consumer: &SweepConsumer) -> String
 /// report/dossier byte-for-byte what it was before this feature existed.
 ///
 /// Demotions arrive from [`SweepAttachSink`](crate::sweep_attach::SweepAttachSink)
-/// already rendered and consumer-shaped (it built them with the same `consumer` this
-/// fn receives, at the moment a path was refused) — this just lists them; the
-/// consumer param otherwise picks the section header, so a driver sees "routed to
-/// you" framing and an offline synth sees "included in this dossier" framing.
-pub fn sweep_evidence_block(consumer: &SweepConsumer, delivery: &SweepDelivery) -> Option<String> {
+/// already rendered for the offline synth (built at the moment a path was refused);
+/// this just lists them under the dossier header.
+pub fn sweep_evidence_block(delivery: &SweepDelivery) -> Option<String> {
     if delivery.is_empty() {
         return None;
     }
-    let header = match consumer.kind {
-        SweepConsumerKind::ConsultDriver => {
-            "\n\n--- Files the explorer routed to you this sweep (their full bytes ride \
-             with this tool result) ---\n"
-        }
-        SweepConsumerKind::OfflineSynth => {
-            "\n\n--- Files the explorer routed into this dossier (their full bytes are \
-             included below) ---\n"
-        }
-    };
+    let header = "\n\n--- Files the explorer routed into this dossier (their full bytes are \
+                  included below) ---\n";
     let mut block = String::new();
     block.push_str(header);
 
@@ -1176,7 +1166,7 @@ mod tests {
             // the same way the house-rules framing once sat outside this guard.
             (
                 "explorer attach directive",
-                explorer_attach_directive(8, &consult_driver_consumer()),
+                explorer_attach_directive(8, &offline_synth_consumer()),
             ),
             ("research", research_preamble()),
             ("web directive (report)", web_directive("report")),
@@ -1587,17 +1577,8 @@ mod tests {
         );
     }
 
-    fn consult_driver_consumer() -> SweepConsumer {
-        SweepConsumer {
-            kind: SweepConsumerKind::ConsultDriver,
-            label: std::sync::Arc::from("the consult driver (`claude-sonnet-4-6`)"),
-            vision: false,
-        }
-    }
-
-    fn offline_synth_consumer() -> SweepConsumer {
-        SweepConsumer {
-            kind: SweepConsumerKind::OfflineSynth,
+    fn offline_synth_consumer() -> crate::sweep_attach::SweepConsumer {
+        crate::sweep_attach::SweepConsumer {
             label: std::sync::Arc::from("the offline synth (`gpt-5.6-sol`)"),
             vision: false,
         }
@@ -1608,7 +1589,7 @@ mod tests {
     /// name so a model reading the preamble connects the prose to the toolset.
     #[test]
     fn the_attach_directive_names_the_budget_and_the_routing() {
-        let d = explorer_attach_directive(5, &consult_driver_consumer());
+        let d = explorer_attach_directive(5, &offline_synth_consumer());
         assert!(d.contains("`attach`"), "{d}");
         assert!(d.contains("5 files"), "{d}");
         // Both cross-family reviewers converged here: a weak explorer must be told
@@ -1617,7 +1598,7 @@ mod tests {
         assert!(d.contains("never the contents"), "{d}");
         assert!(d.contains("delivering, not reading"), "{d}");
         assert!(
-            d.contains("the consult driver (`claude-sonnet-4-6`)"),
+            d.contains("the offline synth (`gpt-5.6-sol`)"),
             "{d}"
         );
     }
@@ -1634,7 +1615,7 @@ mod tests {
             }],
             ..SweepDelivery::default()
         };
-        let block = sweep_evidence_block(&consult_driver_consumer(), &delivery)
+        let block = sweep_evidence_block(&delivery)
             .expect("a non-empty delivery renders a block");
         assert_eq!(
             block.matches("<file path=\"src/foo.rs\">").count(),
@@ -1662,7 +1643,7 @@ mod tests {
             ],
             ..SweepDelivery::default()
         };
-        let block = sweep_evidence_block(&offline_synth_consumer(), &delivery)
+        let block = sweep_evidence_block(&delivery)
             .expect("a non-empty delivery renders a block");
         assert!(block.contains("NOT INCLUDED"), "{block}");
         assert!(block.contains("cannot fetch"), "{block}");
@@ -1674,7 +1655,7 @@ mod tests {
     #[test]
     fn an_empty_delivery_renders_no_block() {
         assert!(
-            sweep_evidence_block(&consult_driver_consumer(), &SweepDelivery::default()).is_none()
+            sweep_evidence_block(&SweepDelivery::default()).is_none()
         );
     }
 
@@ -1735,8 +1716,7 @@ mod tests {
     /// number; ending it on the report keeps the obligation in the closing position.
     #[test]
     fn the_attach_directive_ends_on_the_report() {
-        let consumer = SweepConsumer {
-            kind: SweepConsumerKind::ConsultDriver,
+        let consumer = crate::sweep_attach::SweepConsumer {
             label: std::sync::Arc::from("the synthesis agent (`m`)"),
             vision: false,
         };

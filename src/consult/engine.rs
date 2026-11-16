@@ -2998,10 +2998,9 @@ mod tests {
     use super::super::prompts::sweep_evidence_block;
     use super::super::shaping::{thinking_params, ModelShape, ThinkingStyleOverride};
     use super::*;
-    use crate::sweep_attach::{SweepConsumer, SweepConsumerKind};
+    use crate::sweep_attach::SweepConsumer;
     use rig_agent::tool::Tool;
     use rig_core::message::DocumentSourceKind;
-    use std::collections::HashSet;
     use std::time::Duration;
 
     use crate::credentials::ProviderKind;
@@ -4352,15 +4351,10 @@ mod tests {
         let dir = project_with_marker();
         let cfg = ExploreConfig::default();
         let consumer = SweepConsumer {
-            kind: SweepConsumerKind::OfflineSynth,
             label: Arc::from("the offline synth (`test-model`)"),
             vision: false,
         };
-        let sink = Arc::new(SweepAttachSink::new(
-            cfg.max_attachments,
-            consumer.clone(),
-            HashSet::new(),
-        ));
+        let sink = Arc::new(SweepAttachSink::new(cfg.max_attachments, consumer));
 
         let (mut dossier, _usage) = explore_with(
             "what's the relevant module?",
@@ -4380,7 +4374,7 @@ mod tests {
         );
 
         let delivery = sink.drain();
-        if let Some(block) = sweep_evidence_block(&consumer, &delivery) {
+        if let Some(block) = sweep_evidence_block(&delivery) {
             dossier.push_str(&block);
         }
 
