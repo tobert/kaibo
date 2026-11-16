@@ -651,9 +651,13 @@ async fn models_lists_a_signed_in_backend_with_its_token_and_plan_visibility() {
     let (base, seen) = serve(vec![(
         "200 OK",
         "application/json",
-        json!({"object": "list", "data": [
-            {"id": "gpt-6.1-sol", "object": "model", "visibility": "list"},
-            {"id": "internal-only", "object": "model", "visibility": "hide"},
+        // The plan route's catalog, as observed live 2026-11-15: a `models` array
+        // keyed by `slug`, not the Platform's `data`/`id`.
+        json!({"models": [
+            {"slug": "gpt-6.1-sol", "display_name": "GPT-6.1 Sol", "visibility": "list",
+             "context_window": 500000, "supported_in_api": true},
+            {"slug": "internal-only", "visibility": "hide", "supported_in_api": true},
+            {"slug": "codex-only", "visibility": "list", "supported_in_api": false},
         ]})
         .to_string(),
     )])

@@ -319,6 +319,42 @@ fn discovery_request_with_key(
     }
 }
 
+/// Parse the ChatGPT plan route's catalog. With a plan token, `GET /v1/models` answers
+/// `{ models: [{slug, display_name, visibility, supported_in_api, context_window, ...}] }`
+/// (observed live 2026-11-15), not the Platform's `data`/`id` list. Only entries with
+/// `visibility: "list"` and `supported_in_api` not `false` are ones a plan can call; the
+/// `hide` entries are internal (review/reserve models). `.raw` keeps each item verbatim.
+pub fn parse_chatgpt_plan_models(v: &Value) -> Vec<DiscoveredModel> {
+    v.get("models")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|m| m.get("visibility").and_then(Value::as_str) == Some("list"))
+        .filter(|m| m.get("supported_in_api").and_then(Value::as_bool) != Some(false))
+        .filter_map(|item| {
+            let id = item.get("slug").and_then(Value::as_str)?.to_string();
+            Some(DiscoveredModel {
+                id,
+                display_name: item
+                    .get("display_name")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+                created: None,
+                context_window: item.get("context_window").and_then(Value::as_u64),
+                output_ceiling: None,
+                pricing: None,
+                // `supported_reasoning_levels` lists the effort rungs; a non-empty
+                // list is the catalog saying yes. Absent stays unknown.
+                reasoning: item
+                    .get("supported_reasoning_levels")
+                    .and_then(Value::as_array)
+                    .map(|levels| !levels.is_empty()),
+                raw: item.clone(),
+            })
+        })
+        .collect()
+}
+
 /// Parse an OpenAI-shaped `{ data: [{id, created, owned_by, ...}] }` model list —
 /// shared by `Openai`, `OpenRouter`, and `DeepSeek` (all three speak the OpenAI wire).
 /// Defensive: a missing/wrong-typed field is `None`, never a panic; `.raw` keeps each
@@ -567,17 +603,9 @@ pub async fn discover_models(
                 .bearer()
                 .await?;
             let req = discovery_request_with_key(backend, wire, None, token)?;
-            let mut body = fetcher.get_json(&req).await?;
+            let body = fetcher.get_json(&req).await?;
             if auth == crate::oauth::AuthProfile::Chatgpt {
-                // SIWC lists every model id; only `visibility: "list"` entries are the
-                // ones a plan can call.
-                if let Some(data) = body.get_mut("data").and_then(Value::as_array_mut) {
-                    data.retain(|m| {
-                        m.get("visibility")
-                            .and_then(Value::as_str)
-                            .is_none_or(|v| v == "list")
-                    });
-                }
+                return Ok(parse_chatgpt_plan_models(&body));
             }
             Ok(parse_openai_models(&body))
         }
