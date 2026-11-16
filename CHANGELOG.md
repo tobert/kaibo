@@ -17,6 +17,7 @@ record. Each later release appends a new section at the top.
 
 ### Security
 - `kaibo login` listens once on `127.0.0.1` for the browser's sign-in redirect; it is the only socket kaibo opens, and the MCP server never opens it.
+- Sign-ins live in their own `credentials/creds.db` under kaibo's state dir, in a directory kaibo keeps at mode 700 (a looser mode is fixed and logged).
 - `rmcp` 3.9.0 fixes RUSTSEC-2026-0457, -0461, and -0462; none reaches the transports kaibo builds today.
 - `tokio` 1.54.1 fixes RUSTSEC-2026-0386 (`AsyncFd` constructors accepted any file descriptor); kaibo calls no `AsyncFd` itself.
 - A launch directory that holds `$HOME` (home, an ancestor, or `/`) is no longer inferred as scope, so a path-less call fails until `--root` names a workspace such as `~/src`.

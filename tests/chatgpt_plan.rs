@@ -13,13 +13,12 @@
 //! one its signed-in arms read (`oauth::grant`), exactly as the MCP server does. Each
 //! test uses its own backend name.
 
-use std::num::NonZeroUsize;
 use std::sync::{Arc, Mutex};
 
 use kaibo::config::{Config, ModelRole};
 use kaibo::consult::{oneshot, Arm, PhaseContext};
 use kaibo::oauth::{AuthProfile, Grant};
-use kaibo::store::SessionStore;
+use kaibo::store::CredentialStore;
 use serde_json::{json, Value};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
@@ -172,18 +171,14 @@ fn token_reply(access: &str, refresh: &str) -> Reply {
 }
 
 /// The process's one state db (see the module doc).
-async fn store() -> &'static SessionStore {
-    static STORE: OnceCell<(SessionStore, tempfile::TempDir)> = OnceCell::const_new();
+async fn store() -> &'static CredentialStore {
+    static STORE: OnceCell<(CredentialStore, tempfile::TempDir)> = OnceCell::const_new();
     &STORE
         .get_or_init(|| async {
             let dir = tempfile::TempDir::new().unwrap();
-            let store = SessionStore::open(
-                &dir.path().join("state.db"),
-                NonZeroUsize::new(8).unwrap(),
-                &[],
-            )
-            .await
-            .expect("open store");
+            let store = CredentialStore::open(&dir.path().join("credentials/creds.db"), &[])
+                .await
+                .expect("open credentials db");
             (store, dir)
         })
         .await

@@ -475,7 +475,7 @@ impl Profile {
 pub async fn sign_in(
     profile: &Profile,
     backend: &str,
-    store: &crate::store::SessionStore,
+    store: &crate::store::CredentialStore,
     http: &reqwest::Client,
     token_url: &str,
     timeout: Duration,

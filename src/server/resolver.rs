@@ -286,13 +286,14 @@ impl Resolver {
                 );
             }
         }
-        if config.persistence.enabled && config.backends.values().any(|b| b.auth.is_some()) {
-            if let Some(path) = &config.persistence.path {
-                crate::oauth::grant::register_store_spec(crate::oauth::grant::StoreSpec {
-                    path: path.clone(),
-                    capacity: config.defaults.session_capacity,
-                    allowed: allowed.clone(),
-                });
+        if config.backends.values().any(|b| b.auth.is_some()) {
+            if let Some(path) = &config.persistence.credentials {
+                crate::oauth::grant::register_credentials_spec(
+                    crate::oauth::grant::CredentialsSpec {
+                        path: path.clone(),
+                        allowed: allowed.clone(),
+                    },
+                );
             }
         }
 

@@ -43,7 +43,7 @@ use http::{HeaderValue, Request, Response, StatusCode};
 use rig_core::http_client::{self, HttpClientExt, LazyBody};
 
 use super::{form_body, post_form, AuthProfile, Flow, TokenEndpointError, TokenResponse};
-use crate::store::SessionStore;
+use crate::store::CredentialStore;
 
 /// Refresh when the access token has fewer than this many seconds left, so a request
 /// never leaves with a token that expires in flight.
@@ -145,40 +145,36 @@ pub fn not_signed_in(backend: &str, auth: AuthProfile) -> anyhow::Error {
     )
 }
 
-/// How to open the state db when a signed-in backend needs it and this process has
-/// not opened it yet. Recorded by `Resolver::from_config`.
+/// How to open the credentials db when a signed-in backend needs it and this process
+/// has not opened it yet. Recorded by `Resolver::from_config`.
 #[derive(Debug, Clone)]
-pub struct StoreSpec {
-    /// The state db path (`[persistence] path`).
+pub struct CredentialsSpec {
+    /// The credentials db path (`PersistenceConfig::credentials`).
     pub path: std::path::PathBuf,
-    /// Session capacity, as the other open sites pass it.
-    pub capacity: std::num::NonZeroUsize,
     /// The canonical allowed set, for the store's containment check.
     pub allowed: Vec<std::path::PathBuf>,
 }
 
-static STORE_SPEC: OnceLock<StoreSpec> = OnceLock::new();
+static CREDENTIALS_SPEC: OnceLock<CredentialsSpec> = OnceLock::new();
 
-/// Record how to open the state db for signed-in backends (first caller wins).
-pub fn register_store_spec(spec: StoreSpec) {
-    let _ = STORE_SPEC.set(spec);
+/// Record how to open the credentials db for signed-in backends (first caller wins).
+pub fn register_credentials_spec(spec: CredentialsSpec) {
+    let _ = CREDENTIALS_SPEC.set(spec);
 }
 
-/// This process's state db: the one it already opened, else opened now from the
-/// registered [`StoreSpec`]. `None` when persistence is off.
-async fn process_store() -> Result<Option<SessionStore>> {
-    let Some(spec) = STORE_SPEC.get() else {
-        // No spec recorded: whatever this process opened, if anything.
-        return Ok(crate::store::process_store());
+/// This process's credentials db: opened once from the registered [`CredentialsSpec`],
+/// else whichever one this process already opened. `None` when neither exists.
+async fn process_credentials() -> Result<Option<CredentialStore>> {
+    let Some(spec) = CREDENTIALS_SPEC.get() else {
+        return Ok(crate::store::process_credentials());
     };
-    // Opened once per process from the spec. `SessionStore::open` shares an already
-    // open handle for the same path, so this never builds a second `Database`, and
-    // a process that opened some other db first still reads the configured one.
-    static OPENED: tokio::sync::OnceCell<SessionStore> = tokio::sync::OnceCell::const_new();
+    // `CredentialStore::open` shares an already-open handle for the same path, so this
+    // never builds a second `Database`.
+    static OPENED: tokio::sync::OnceCell<CredentialStore> = tokio::sync::OnceCell::const_new();
     let store = OPENED
         .get_or_try_init(|| async {
             let allowed: Vec<&std::path::Path> = spec.allowed.iter().map(|p| p.as_path()).collect();
-            SessionStore::open(&spec.path, spec.capacity, &allowed).await
+            CredentialStore::open(&spec.path, &allowed).await
         })
         .await?;
     Ok(Some(store.clone()))
@@ -197,8 +193,8 @@ fn local_lock(backend: &str) -> Arc<tokio::sync::Mutex<()>> {
 pub struct TokenSource {
     backend: String,
     auth: AuthProfile,
-    /// Set for an explicit store; `None` reads this process's store at first use.
-    store: Option<SessionStore>,
+    /// Set for an explicit store; `None` reads this process's credentials db at first use.
+    store: Option<CredentialStore>,
     http: reqwest::Client,
 }
 
@@ -216,7 +212,7 @@ impl TokenSource {
     pub fn new(
         backend: &str,
         auth: AuthProfile,
-        store: SessionStore,
+        store: CredentialStore,
         http: reqwest::Client,
     ) -> Self {
         Self {
@@ -227,9 +223,9 @@ impl TokenSource {
         }
     }
 
-    /// A source over this process's state db. Built at arm construction, which never
-    /// fails for want of a store: the store is found (or opened) at the first request,
-    /// and a process with persistence off refuses there, naming why.
+    /// A source over this process's credentials db. Built at arm construction, which
+    /// never fails for want of a store: the store is found (or opened) at the first
+    /// request, and a process that cannot locate one refuses there, naming why.
     pub fn for_process(backend: &str, auth: AuthProfile) -> Result<Self> {
         Ok(Self {
             backend: backend.to_string(),
@@ -239,17 +235,17 @@ impl TokenSource {
         })
     }
 
-    async fn store(&self) -> Result<SessionStore> {
+    async fn store(&self) -> Result<CredentialStore> {
         if let Some(store) = &self.store {
             return Ok(store.clone());
         }
-        process_store().await?.ok_or_else(|| {
+        process_credentials().await?.ok_or_else(|| {
             anyhow!(
-                "backend {:?} uses `auth = \"{}\"`, which keeps its sign-in in kaibo's state \
-                 db, and this kaibo has no state db open — persistence is off \
-                 (`--no-persistence`, `KAIBO_NO_PERSISTENCE`, or `[persistence] enabled = \
-                 false`) or another kaibo holds it on a single-process platform. Turn \
-                 persistence on, or use a backend with an API key",
+                "backend {:?} uses `auth = \"{}\"`, which keeps its sign-in in kaibo's \
+                 credentials db under $XDG_STATE_HOME/kaibo/credentials (or \
+                 ~/.local/state/kaibo/credentials), and neither XDG_STATE_HOME nor HOME is \
+                 set for this kaibo. Set HOME in the environment that starts kaibo, or use a \
+                 backend with an API key",
                 self.backend,
                 self.auth
             )
@@ -336,7 +332,7 @@ impl TokenSource {
 
     async fn refresh_holding_lease(
         &self,
-        store: &SessionStore,
+        store: &CredentialStore,
         holder: &str,
         grant: Grant,
     ) -> Result<String> {
@@ -406,10 +402,10 @@ impl TokenSource {
 impl TokenSource {
     /// Store a rotated pair, trying again once if the write fails (`Busy` from another
     /// writer is the usual cause). Ok(false) means the lease lapsed and another holder
-    /// took over, the same as [`SessionStore::finish_refresh`].
+    /// took over, the same as [`CredentialStore::finish_refresh`].
     async fn store_rotated(
         &self,
-        store: &SessionStore,
+        store: &CredentialStore,
         holder: &str,
         fresh: &Grant,
     ) -> crate::store::Result<bool> {

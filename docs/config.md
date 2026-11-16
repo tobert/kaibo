@@ -141,7 +141,8 @@ synth = "gpt-plan/<current GPT id>"
 
 `auth` replaces the key with a sign-in. Run `kaibo login gpt-plan` once. kaibo prints a
 URL; open it in a browser on the same machine and approve. kaibo stores the credential
-in its state db and reads it there on every request.
+in its credentials db, `$XDG_STATE_HOME/kaibo/credentials/creds.db` (else
+`~/.local/state/kaibo/credentials/creds.db`), and reads it there on every request.
 
 | `auth` | kind | what it uses | expiry |
 |---|---|---|---|
@@ -155,9 +156,10 @@ in its state db and reads it there on every request.
 - Only a person runs `kaibo login`. A model call on a backend nobody signed in is
   refused with "run `kaibo login <backend>`". A model call can trigger a refresh, the
   same way it can trigger `api_key_cmd`.
-- Persistence must be on (`[persistence]`): the state db holds the sign-in. kaibo
-  creates the state dir with your umask, often `755`; `kaibo login` warns when other
-  users can read it. `chmod 700 ~/.local/state/kaibo` restricts it to you.
+- The credentials db is separate from the state db, so sign-ins work with persistence
+  off. Its `credentials/` directory is kept at mode `700`: kaibo creates it that way,
+  changes a looser existing mode to `700` and logs a warning, and refuses to store a
+  sign-in when the path is a symlink or the mode cannot be changed.
 - The sign-in listens for the browser on `127.0.0.1`, port 1455 for ChatGPT and 3000
   for OpenRouter, or any free port when that one is busy. A `base_url` other than
   OpenAI's on a `chatgpt` backend sends the plan token to that host; kaibo warns at

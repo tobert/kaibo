@@ -116,9 +116,11 @@ surface rule in the invariants).
   through `Backend::resolve_key` at client construction, which the model-facing kaish
   (sandbox lever 3, unchanged) can never reach. The model can *trigger* it by calling a
   tool on a cmd-backed backend, but cannot control its argv or environment. A sign-in
-  (`auth`, `src/oauth/`) follows the same line: only `kaibo login` writes a grant into the
-  store, and a model call can trigger a refresh against the token endpoint stored with the
-  grant, never choose it.
+  (`auth`, `src/oauth/`) follows the same line: only `kaibo login` writes a grant, into the
+  credentials db (`CredentialStore` in `src/store.rs`, a separate file at a fixed XDG path
+  in a directory kept at mode 700, under the store's containment and single-open-helper
+  rules), and a model call can trigger a refresh against the token endpoint stored with
+  the grant, never choose it.
 - **Persistence engine (turso) — do not weaken.** Pure-Rust `turso`, **exact-pinned**
   (`=0.8.x` — `.db-tshm` format and API both drift between releases) with
   **`default-features = false`** (defaults pull mimalloc's global-allocator hijack + fts)

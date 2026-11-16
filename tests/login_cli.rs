@@ -75,14 +75,43 @@ fn login_refuses_a_keyed_backend_with_the_fix() {
     );
 }
 
+/// Sign-ins do not depend on session persistence: they live in their own credentials
+/// db, whose directory kaibo creates private.
 #[test]
-fn login_needs_persistence_and_says_so() {
+fn sign_in_works_with_persistence_off_and_keeps_its_dir_private() {
     let home = tempfile::tempdir().unwrap();
-    let out = kaibo(home.path(), &["--no-persistence", "login", "plan"]);
-    assert_eq!(out.status.code(), Some(3), "{}", text(&out));
+    let out = kaibo(home.path(), &["--no-persistence", "login", "--status"]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
     assert!(
-        String::from_utf8_lossy(&out.stderr).contains("persistence is off"),
+        String::from_utf8_lossy(&out.stdout).contains("not signed in"),
         "{}",
+        text(&out)
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = home.path().join("state/kaibo/credentials");
+        let mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700, "{}", dir.display());
+    }
+}
+
+/// A credentials directory left open to other users is made private, and kaibo says so.
+#[cfg(unix)]
+#[test]
+fn an_open_credentials_dir_is_fixed_and_logged() {
+    use std::os::unix::fs::PermissionsExt;
+    let home = tempfile::tempdir().unwrap();
+    let dir = home.path().join("state/kaibo/credentials");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let out = kaibo(home.path(), &["login", "--status"]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+    let mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o700);
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("mode 700"),
+        "the change is logged: {}",
         text(&out)
     );
 }

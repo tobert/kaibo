@@ -1242,6 +1242,11 @@ pub struct PersistenceConfig {
     /// could be resolved (no `$XDG_STATE_HOME`/`$HOME`) — `enabled` with no resolvable path
     /// is a loud load error, never a silent in-project fallback.
     pub path: Option<PathBuf>,
+    /// Where sign-ins live: `$XDG_STATE_HOME/kaibo/credentials/creds.db`, else
+    /// `~/.local/state/kaibo/credentials/creds.db`. Not a config key, and independent of
+    /// `enabled`: a signed-in backend works with persistence off. `None` only when
+    /// neither `$XDG_STATE_HOME` nor `$HOME` is set.
+    pub credentials: Option<PathBuf>,
 }
 
 impl Default for PersistenceConfig {
@@ -1249,6 +1254,7 @@ impl Default for PersistenceConfig {
         Self {
             enabled: true,
             path: default_state_db_path(),
+            credentials: default_credentials_path(),
         }
     }
 }
@@ -3633,7 +3639,11 @@ fn merge_persistence(raw: RawPersistence) -> Result<PersistenceConfig> {
              --no-persistence."
         );
     }
-    Ok(PersistenceConfig { enabled, path })
+    Ok(PersistenceConfig {
+        enabled,
+        path,
+        credentials: default_credentials_path(),
+    })
 }
 
 /// Resolve `[cas]`. A missing `dir` falls back to the XDG data default; a missing
@@ -4240,6 +4250,19 @@ pub fn default_state_db_path() -> Option<PathBuf> {
             .join("kaibo")
             .join("state.db")
     })
+}
+
+/// The credentials db's fixed path: a `credentials/` directory beside the default state
+/// db, which kaibo keeps at mode 700 (`store::secure_credentials_dir`).
+pub fn default_credentials_path() -> Option<PathBuf> {
+    let state = if let Some(xdg) = std::env::var_os("XDG_STATE_HOME").filter(|s| !s.is_empty()) {
+        PathBuf::from(xdg)
+    } else {
+        PathBuf::from(std::env::var_os("HOME")?)
+            .join(".local")
+            .join("state")
+    };
+    Some(state.join("kaibo").join("credentials").join("creds.db"))
 }
 
 /// Expand a leading `~` or `~/...` to `$HOME`. Leaves every other path untouched —

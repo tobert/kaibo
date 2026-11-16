@@ -57,7 +57,7 @@
 //!   fails everywhere, including inside the blessed files, on any line lacking that
 //!   file's own marker;
 //! - the total number of blessed marker lines tree-wide is pinned to an **exact count**
-//!   (`EXPECTED_BLESSED_LINES`, currently 6), so a new write site — in an existing blessed
+//!   (`EXPECTED_BLESSED_LINES`, currently 8), so a new write site — in an existing blessed
 //!   file or a new one — can't quietly ride in behind an existing marker without this test
 //!   failing (`blessed_marker_count_matches_exactly`).
 //!
@@ -86,6 +86,10 @@ const FORBIDDEN: &[&str] = &[
     "fs::rename(",
     ".write_all(",
     ".write(", // io::Write::write — broad on purpose; production code has no reason to.
+    // Changing a mode or making a directory with one: a permission change is a write to
+    // the filesystem even when no byte moves.
+    "set_permissions(",
+    "DirBuilder::new(",
 ];
 
 /// The blessed exceptions, each pinned to one file and one marker comment. A line is
@@ -122,6 +126,19 @@ const BLESSED: &[Blessed] = &[
         // The reply to the browser's one request, on the loopback socket it opened.
         needles: &[".write_all("],
     },
+    Blessed {
+        file: "store.rs",
+        marker: "credentials-dir-create: blessed sign-in store amendment (AGENTS.md)",
+        // The credentials directory, created at mode 700 before any token goes in it.
+        needles: &["DirBuilder::new("],
+    },
+    Blessed {
+        file: "store.rs",
+        marker: "credentials-dir-mode: blessed sign-in store amendment (AGENTS.md)",
+        // Tightening an existing credentials directory to 700. Only this directory, and
+        // only toward private: see `secure_credentials_dir`.
+        needles: &["set_permissions("],
+    },
 ];
 
 /// One blessed write site: which file may carry it, the marker its line must show, and
@@ -144,9 +161,10 @@ struct Blessed {
 /// the `create_new` open, and the `write_all` of the bytes — see `src/cas.rs`'s module
 /// doc and the count breakdown in this file's module doc) + 1 in `cli.rs` (`kaibo cas
 /// read` handing an artifact's bytes to stdout) + 1 in `callback.rs` (the sign-in
-/// callback's reply to the browser). Pinned so a new write site can't silently ride in
-/// behind an existing marker.
-const EXPECTED_BLESSED_LINES: usize = 6;
+/// callback's reply to the browser) + 2 more in `store.rs` (creating the credentials
+/// directory at mode 700, and tightening an existing one to 700). Pinned so a new write
+/// site can't silently ride in behind an existing marker.
+const EXPECTED_BLESSED_LINES: usize = 8;
 
 fn rs_files(dir: &Path, out: &mut Vec<PathBuf>) {
     for entry in std::fs::read_dir(dir).expect("read src dir") {
@@ -378,6 +396,25 @@ fn teeth_callback_reply_is_narrow() {
     assert!(!scan_source("callback.rs", &laundered).is_empty());
     assert!(!scan_source("server.rs", &reply).is_empty());
     assert!(!scan_source("callback.rs", "    stream.write_all(b).await?;\n").is_empty());
+}
+
+/// The two credentials-directory markers each excuse only their own call: the create
+/// marker cannot excuse a chmod, the mode marker cannot excuse a mkdir, and neither
+/// excuses anything outside `store.rs`. An unmarked chmod anywhere fails.
+#[test]
+fn teeth_credentials_dir_markers_are_narrow() {
+    let create = BLESSED[4].marker;
+    let mode = BLESSED[5].marker;
+    let mkdir = format!("    std::fs::DirBuilder::new().mode(0o700).create(dir) // {create}\n");
+    let chmod = format!("    std::fs::set_permissions(dir, p) // {mode}\n");
+    assert!(scan_source("store.rs", &mkdir).is_empty());
+    assert!(scan_source("store.rs", &chmod).is_empty());
+    let swapped = format!("    std::fs::set_permissions(dir, p) // {create}\n");
+    assert!(!scan_source("store.rs", &swapped).is_empty());
+    let swapped = format!("    std::fs::DirBuilder::new().create(dir) // {mode}\n");
+    assert!(!scan_source("store.rs", &swapped).is_empty());
+    assert!(!scan_source("cas.rs", &chmod).is_empty());
+    assert!(!scan_source("cli.rs", "    std::fs::set_permissions(p, m)?;\n").is_empty());
 }
 
 /// A forbidden call inside a `#[cfg(test)]` module is ignored (fixtures may write).

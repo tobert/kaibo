@@ -53,11 +53,16 @@
 //! **Any future second open-site is a data-loss bug**, not a refactor — route every open
 //! through [`build_database`].
 //!
-//! Within one process, a path is built at most once: [`SessionStore::open`] records
-//! every `Database` it builds by resolved path and hands the same handle to a later
-//! open of that path, under an async lock so two concurrent opens cannot both build
-//! one. A CLI command can open the store for a `--session` and again for a signed-in
-//! backend's credential (`oauth::grant`) and still hold one handle.
+//! Within one process, a path is built at most once: [`SessionStore::open`] and
+//! [`CredentialStore::open`] record every `Database` they build by resolved path and
+//! hand the same handle to a later open of that path, under an async lock so two
+//! concurrent opens cannot both build one.
+//!
+//! **Two db files, one open helper.** The state db holds sessions and batch handles.
+//! Sign-ins live in a separate credentials db ([`CredentialStore`]) inside a
+//! `credentials/` directory kaibo keeps at mode 700 ([`secure_credentials_dir`]), so a
+//! token is never in a file other local users can read, and turning persistence off
+//! does not turn sign-in off. Both open through [`build_database`].
 //!
 //! On Windows (and any non-64-bit-Unix target) MP mode is unavailable, so the store runs
 //! default single-process mode: a concurrent second open fails loudly with a clear kaibo
@@ -88,7 +93,7 @@ pub(crate) const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Current on-disk schema version. Bump + add a migration arm when the shape changes;
 /// migrations are forward-only and applied through [`SessionStore::migrate`].
-pub const SCHEMA_VERSION: i64 = 3;
+pub const SCHEMA_VERSION: i64 = 2;
 
 /// How long a batch handle is kept before it's pruned. Provider batches expire around 30
 /// days (Anthropic/Gemini both), so a handle older than that names a batch the provider has
@@ -172,6 +177,10 @@ pub enum StoreError {
     /// rather than opening onto a path that can't hold the db.
     #[error("state dir: {0}")]
     StateDir(String),
+    /// The credentials directory could not be created, is not a real directory, or is
+    /// open to other users and could not be made private (see [`secure_credentials_dir`]).
+    #[error("{0}")]
+    CredentialsDir(String),
     /// The store observed an impossible internal state (an aggregate query returning no
     /// row, etc.) — surfaced loudly rather than papered over.
     #[error("corrupt store: {0}")]
@@ -213,25 +222,94 @@ fn now() -> i64 {
         .unwrap_or(0)
 }
 
-/// Every state db this process opened, by resolved path, first-opened first. A later
-/// [`SessionStore::open`] of the same path shares the handle; see there.
-static OPENED: std::sync::Mutex<Vec<(PathBuf, Database)>> = std::sync::Mutex::new(Vec::new());
+/// Which schema a registered `Database` carries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DbKind {
+    State,
+    Credentials,
+}
+
+/// Every db this process opened, by resolved path, first-opened first. A later open of
+/// the same path shares the handle; see [`registered`].
+static OPENED: std::sync::Mutex<Vec<(PathBuf, DbKind, Database)>> =
+    std::sync::Mutex::new(Vec::new());
 
 /// Held across the check-then-build in [`SessionStore::open`], so two concurrent opens
 /// of one path cannot both miss [`OPENED`] and both build a `Database`.
 static OPENING: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
-fn opened() -> std::sync::MutexGuard<'static, Vec<(PathBuf, Database)>> {
+fn opened() -> std::sync::MutexGuard<'static, Vec<(PathBuf, DbKind, Database)>> {
     OPENED.lock().unwrap_or_else(|p| p.into_inner())
 }
 
-/// The state db this process opened first, if any — the one signed-in backends read
-/// their credentials from when no persistence spec is recorded (`oauth::grant`).
-pub fn process_store() -> Option<SessionStore> {
-    opened().first().map(|(_, db)| SessionStore {
-        db: db.clone(),
-        capacity: crate::config::Defaults::default().session_capacity.get(),
-    })
+/// The handle this process already built for `resolved`, if any. Opening one file as
+/// both kinds is refused: the schemas would mix in one file.
+fn registered(resolved: &Path, kind: DbKind) -> Result<Option<Database>> {
+    match opened().iter().find(|(p, _, _)| p == resolved) {
+        None => Ok(None),
+        Some((_, k, db)) if *k == kind => Ok(Some(db.clone())),
+        Some(_) => Err(StoreError::InvalidStatePath(format!(
+            "{}: this file is already open as kaibo's {}, so it cannot also be the {}",
+            resolved.display(),
+            if kind == DbKind::State { "credentials db" } else { "state db" },
+            if kind == DbKind::State { "state db" } else { "credentials db" },
+        ))),
+    }
+}
+
+/// The credentials db this process opened first, if any — what a signed-in backend
+/// reads when no credentials path was recorded (`oauth::grant`).
+pub fn process_credentials() -> Option<CredentialStore> {
+    opened()
+        .iter()
+        .find(|(_, k, _)| *k == DbKind::Credentials)
+        .map(|(_, _, db)| CredentialStore { db: db.clone() })
+}
+
+/// Absolutize `path`, require a file name, and refuse it if it resolves into any
+/// allowed tree. Returns the absolute path and the resolved path the registry keys on.
+fn checked_db_path(path: &Path, allowed_trees: &[&Path]) -> Result<(PathBuf, PathBuf)> {
+    // Absolutize up front so containment only ever compares absolute paths. A *relative*
+    // db path whose parent doesn't exist would otherwise fall through the lexical
+    // fallback still relative, and `starts_with` an absolute allowed tree trivially
+    // misses it — the db then landing inside the project via cwd (Gemini review,
+    // finding 1). Everything after (containment, dir creation, turso open) uses this one
+    // absolute path.
+    let path = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map_err(|e| {
+                StoreError::InvalidStatePath(format!(
+                    "{}: cannot resolve current dir to absolutize a relative state db path: {e}",
+                    path.display()
+                ))
+            })?
+            .join(path)
+    };
+
+    // The db must be a file, not a bare directory: a filename-less path (a trailing
+    // `/`, `.`, `..`, or `/`) would let the containment compare below inspect only the
+    // *parent* while the db itself lands AT the directory — so refuse it loudly up
+    // front. `file_name()` is None for exactly those cases.
+    let file_name = path
+        .file_name()
+        .filter(|n| !n.is_empty())
+        .ok_or_else(|| StoreError::InvalidStatePath(path.display().to_string()))?;
+
+    // Containment — before we touch the disk at all, so a path aimed inside a project is
+    // refused with zero side effect. Compare the resolved parent *plus the file name*
+    // (the full db path), not just the parent: a path that equals an allowed tree has a
+    // parent *above* the tree yet the db would land inside it, and only the full-path
+    // compare catches that.
+    let resolved_full = resolve_existing_parent(&path).join(file_name);
+    for tree in allowed_trees {
+        let tree_resolved = tree.canonicalize().unwrap_or_else(|_| normalize(tree));
+        if resolved_full.starts_with(&tree_resolved) {
+            return Err(StoreError::PathInAllowedTree(path.display().to_string()));
+        }
+    }
+    Ok((path, resolved_full))
 }
 
 /// A capacity-bounded, LRU-evicting persistent store of consult sessions plus a registry
@@ -270,58 +348,13 @@ impl SessionStore {
         capacity: NonZeroUsize,
         allowed_trees: &[&Path],
     ) -> Result<Self> {
-        // Absolutize up front so containment only ever compares absolute paths. A *relative*
-        // db path whose parent doesn't exist would otherwise fall through the lexical
-        // fallback still relative, and `starts_with` an absolute allowed tree trivially
-        // misses it — the db then landing inside the project via cwd (Gemini review,
-        // finding 1). Everything below (containment, dir creation, turso open) uses this one
-        // absolute path.
-        let path = if path.is_absolute() {
-            path.to_path_buf()
-        } else {
-            std::env::current_dir()
-                .map_err(|e| {
-                    StoreError::InvalidStatePath(format!(
-                        "{}: cannot resolve current dir to absolutize a relative state db path: {e}",
-                        path.display()
-                    ))
-                })?
-                .join(path)
-        };
+        let (path, resolved_full) = checked_db_path(path, allowed_trees)?;
         let path = path.as_path();
 
-        // The state db must be a file, not a bare directory: a filename-less path (a
-        // trailing `/`, `.`, `..`, or `/`) would let the containment compare below inspect
-        // only the *parent* while the db itself lands AT the directory — so refuse it loudly
-        // up front. `file_name()` is None for exactly those cases.
-        let file_name = path
-            .file_name()
-            .filter(|n| !n.is_empty())
-            .ok_or_else(|| StoreError::InvalidStatePath(path.display().to_string()))?;
-
-        // Containment — before we touch the disk at all, so a path aimed inside a project is
-        // refused with zero side effect. Compare the resolved parent *plus the file name*
-        // (the full db path), not just the parent: a path that equals an allowed tree has a
-        // parent *above* the tree yet the db would land inside it, and only the full-path
-        // compare catches that.
-        let resolved_full = resolve_existing_parent(path).join(file_name);
-        for tree in allowed_trees {
-            let tree_resolved = tree.canonicalize().unwrap_or_else(|_| normalize(tree));
-            if resolved_full.starts_with(&tree_resolved) {
-                return Err(StoreError::PathInAllowedTree(path.display().to_string()));
-            }
-        }
-
         // One `Database` per file per process: when this process already opened this
-        // db, share that handle instead of building a second one. Every open goes
-        // through here, so a CLI command that opens the store for a session and again
-        // for a signed-in backend's credential still holds one handle.
+        // db, share that handle instead of building a second one.
         let _opening = OPENING.lock().await;
-        if let Some(db) = opened()
-            .iter()
-            .find(|(p, _)| *p == resolved_full)
-            .map(|(_, db)| db.clone())
-        {
+        if let Some(db) = registered(&resolved_full, DbKind::State)? {
             return Ok(Self {
                 db,
                 capacity: capacity.get(),
@@ -348,7 +381,7 @@ impl SessionStore {
         store.migrate().await?;
         // Recorded only once migrated, so a later open of this path (above) shares a
         // handle that is ready to use.
-        opened().push((resolved_full.clone(), store.db.clone()));
+        opened().push((resolved_full.clone(), DbKind::State, store.db.clone()));
         // Sweep batch handles the provider has already expired (TTL). One prune at open
         // clears anything that aged out while kaibo was down, so `job_list` never serializes
         // long-dead handles even on a store that hasn't seen a `put_batch` in a while.
@@ -380,7 +413,6 @@ impl SessionStore {
             match version {
                 0 => Self::apply_v1(&conn).await?,
                 1 => Self::apply_v2(&conn).await?,
-                2 => Self::apply_v3(&conn).await?,
                 other => {
                     return Err(StoreError::Corrupt(format!(
                         "no migration from schema version {other} (this binary knows up to \
@@ -440,38 +472,6 @@ impl SessionStore {
     async fn apply_v2(conn: &Connection) -> Result<()> {
         conn.execute_batch("ALTER TABLE batch_handles ADD COLUMN submitted_count INTEGER;")
             .await?;
-        Ok(())
-    }
-
-    /// v2 → v3: the sign-in tables. `oauth_grants` holds one credential per `auth`
-    /// backend (written only by `kaibo login`, refreshed in place under a lease — see
-    /// `oauth::grant`); `meta` holds this machine's SIWC `ext_agent_host_id`, created
-    /// on first sign-in and kept so later sign-ins name the same host.
-    async fn apply_v3(conn: &Connection) -> Result<()> {
-        conn.execute_batch(
-            r#"
-            CREATE TABLE IF NOT EXISTS oauth_grants (
-                backend       TEXT    PRIMARY KEY,
-                auth          TEXT    NOT NULL,
-                client_id     TEXT,
-                token_url     TEXT    NOT NULL,
-                access_token  TEXT    NOT NULL,
-                refresh_token TEXT,
-                expires_at    INTEGER,
-                account       TEXT,
-                scopes        TEXT,
-                updated_at    INTEGER NOT NULL,
-                lease_holder  TEXT,
-                lease_until   INTEGER
-            ) STRICT;
-
-            CREATE TABLE IF NOT EXISTS meta (
-                key   TEXT PRIMARY KEY,
-                value TEXT NOT NULL
-            ) STRICT;
-            "#,
-        )
-        .await?;
         Ok(())
     }
 
@@ -672,7 +672,106 @@ impl SessionStore {
     }
 }
 
-// --- Sign-in grants (`oauth`) ---------------------------------------------------
+// --- Sign-in grants (`oauth`): the credentials db -------------------------------
+
+/// Current schema version of the credentials db (its own sequence, apart from the
+/// state db's [`SCHEMA_VERSION`]).
+pub const CREDENTIALS_SCHEMA_VERSION: i64 = 1;
+
+/// kaibo's stored sign-ins: one credential per `auth` backend, refreshed in place under
+/// a lease (see `oauth::grant`), plus this machine's SIWC host id. A separate db file in
+/// a mode-700 directory; see the module doc. `Clone`-cheap like [`SessionStore`].
+#[derive(Clone)]
+pub struct CredentialStore {
+    db: Database,
+}
+
+impl CredentialStore {
+    /// Open (creating it, and its private directory, if absent) the credentials db at
+    /// `path`. The same containment rule as the state db applies: a path that resolves
+    /// into an allowed tree is refused before anything touches the disk. The parent
+    /// directory is made private first ([`secure_credentials_dir`]): created at mode 700,
+    /// or tightened to 700 with a warning in the log, or refused when it cannot be.
+    pub async fn open(path: &Path, allowed_trees: &[&Path]) -> Result<Self> {
+        let (path, resolved_full) = checked_db_path(path, allowed_trees)?;
+        let _opening = OPENING.lock().await;
+        if let Some(db) = registered(&resolved_full, DbKind::Credentials)? {
+            return Ok(Self { db });
+        }
+        let dir = path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .ok_or_else(|| StoreError::InvalidStatePath(path.display().to_string()))?;
+        secure_credentials_dir(dir)?;
+        validate_local_filesystem(dir)?;
+        let store = Self {
+            db: build_database(&path).await?,
+        };
+        store.migrate().await?;
+        opened().push((resolved_full, DbKind::Credentials, store.db.clone()));
+        Ok(store)
+    }
+
+    async fn conn(&self) -> Result<Connection> {
+        let conn = self.db.connect()?;
+        let _ = conn.busy_timeout(BUSY_TIMEOUT);
+        Ok(conn)
+    }
+
+    async fn migrate(&self) -> Result<()> {
+        let conn = self.conn().await?;
+        let _ = conn.pragma_update("journal_mode", "WAL").await;
+        let mut version = user_version(&conn).await?;
+        while version < CREDENTIALS_SCHEMA_VERSION {
+            match version {
+                0 => Self::apply_v1(&conn).await?,
+                other => {
+                    return Err(StoreError::Corrupt(format!(
+                        "no migration from credentials schema version {other} (this binary \
+                         knows up to {CREDENTIALS_SCHEMA_VERSION}) — the credentials db is \
+                         newer than the binary"
+                    )))
+                }
+            }
+            version += 1;
+            conn.pragma_update("user_version", version).await?;
+        }
+        Ok(())
+    }
+
+    /// v1 (from empty): the sign-in tables. `oauth_grants` holds one credential per `auth`
+    /// backend (written only by `kaibo login`, refreshed in place under a lease — see
+    /// `oauth::grant`); `meta` holds this machine's SIWC `ext_agent_host_id`, created
+    /// on first sign-in and kept so later sign-ins name the same host.
+    async fn apply_v1(conn: &Connection) -> Result<()> {
+        conn.execute_batch(
+            r#"
+            CREATE TABLE IF NOT EXISTS oauth_grants (
+                backend       TEXT    PRIMARY KEY,
+                auth          TEXT    NOT NULL,
+                client_id     TEXT,
+                token_url     TEXT    NOT NULL,
+                access_token  TEXT    NOT NULL,
+                refresh_token TEXT,
+                expires_at    INTEGER,
+                account       TEXT,
+                scopes        TEXT,
+                updated_at    INTEGER NOT NULL,
+                lease_holder  TEXT,
+                lease_until   INTEGER
+            ) STRICT;
+
+            CREATE TABLE IF NOT EXISTS meta (
+                key   TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            ) STRICT;
+            "#,
+        )
+        .await?;
+        Ok(())
+    }
+
+}
 
 const GRANT_COLUMNS: &str = "backend, auth, client_id, token_url, access_token, refresh_token, \
                              expires_at, account, scopes";
@@ -728,7 +827,7 @@ fn row_to_grant(row: &turso::Row) -> Result<crate::oauth::Grant> {
     })
 }
 
-impl SessionStore {
+impl CredentialStore {
     /// The stored sign-in for `backend`, if any.
     pub async fn get_grant(&self, backend: &str) -> Result<Option<crate::oauth::Grant>> {
         let conn = self.conn().await?;
@@ -909,6 +1008,89 @@ impl SessionStore {
 pub fn create_state_dir(dir: &Path) -> Result<()> {
     std::fs::create_dir_all(dir) // state-dir-create: blessed by the read-only invariant amendment
         .map_err(|e| StoreError::StateDir(format!("creating state dir {}: {e}", dir.display())))
+}
+
+/// Make `dir` a directory only its owner can enter, before any credential goes in it.
+///
+/// - Absent: its parents come from [`create_state_dir`], and `dir` itself is created at
+///   mode 700.
+/// - Present at a mode that lets group or others in: changed to 700, and the change is
+///   logged at `warn`.
+/// - Not a real directory (a symlink or a file), or a mode kaibo cannot change: refused.
+///
+/// The directory mode is what protects the tokens. turso creates the db and its `-wal`
+/// and `-tshm` side files under the process umask, often 644, and a 700 directory keeps
+/// other users from reaching any of them. One of two blessed lines each for creating and
+/// re-moding this directory (`tests/no_write_path.rs`). Non-Unix platforms keep the
+/// per-user profile's access control and only create the directory.
+pub fn secure_credentials_dir(dir: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+        let err = |what: String| StoreError::CredentialsDir(what);
+        let meta = match std::fs::symlink_metadata(dir) {
+            Ok(meta) => meta,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                if let Some(parent) = dir.parent().filter(|p| !p.as_os_str().is_empty()) {
+                    create_state_dir(parent)?;
+                }
+                match std::fs::DirBuilder::new().mode(0o700).create(dir) // credentials-dir-create: blessed sign-in store amendment (AGENTS.md)
+                {
+                    Ok(()) => {}
+                    // Another kaibo created it first; the checks below still apply.
+                    Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+                    Err(e) => {
+                        return Err(err(format!(
+                            "kaibo could not create its credentials directory {}: {e}. Check \
+                             the permissions of its parent directory",
+                            dir.display()
+                        )))
+                    }
+                }
+                std::fs::symlink_metadata(dir).map_err(|e| {
+                    err(format!("reading credentials directory {}: {e}", dir.display()))
+                })?
+            }
+            Err(e) => {
+                return Err(err(format!(
+                    "reading credentials directory {}: {e}",
+                    dir.display()
+                )))
+            }
+        };
+        if !meta.is_dir() {
+            return Err(err(format!(
+                "kaibo keeps sign-ins in {}, and that path is a symlink or a file, not a \
+                 directory, so kaibo cannot make it private. Move it aside; kaibo creates the \
+                 directory at mode 700 on the next sign-in",
+                dir.display()
+            )));
+        }
+        let mode = meta.permissions().mode() & 0o777;
+        if mode & 0o077 != 0 {
+            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)) // credentials-dir-mode: blessed sign-in store amendment (AGENTS.md)
+                .map_err(|e| {
+                    err(format!(
+                        "kaibo's credentials directory {} has mode {mode:o}, so other users on \
+                         this machine could read the sign-ins in it, and kaibo could not \
+                         change it to 700: {e}. Run `chmod 700 {}`, then try again",
+                        dir.display(),
+                        dir.display()
+                    ))
+                })?;
+            tracing::warn!(
+                dir = %dir.display(),
+                was = %format!("{mode:o}"),
+                "changed kaibo's credentials directory to mode 700 so only its owner can read \
+                 stored sign-ins"
+            );
+        }
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        create_state_dir(dir)
+    }
 }
 
 /// The ONE and ONLY place that calls turso's [`Builder`]. See the module doc-comment:

@@ -3379,28 +3379,23 @@ async fn batch_list_inner(args: &BatchListArgs, resolver: &Resolver) -> Result<i
 /// *every* queried backend's discovery call failed (a per-backend error inside an
 /// otherwise-successful sweep is reported inline and is NOT fatal — matching `batch
 /// list`'s inline-error convention), else 0.
-/// Open the state db for a sign-in command, or say why it cannot be opened.
-async fn open_sign_in_store(resolver: &Resolver) -> Result<crate::store::SessionStore, String> {
-    let persistence = &resolver.config.persistence;
-    let path = match (&persistence.enabled, &persistence.path) {
-        (true, Some(path)) => path.clone(),
-        _ => {
-            return Err(
-                "kaibo keeps sign-ins in its state db, and persistence is off for this \
-                 run (`--no-persistence`, `KAIBO_NO_PERSISTENCE`, or `[persistence] enabled = \
-                 false`). Run without that setting so kaibo can store the sign-in."
-                    .to_string(),
-            )
-        }
+/// Open the credentials db for a sign-in command, or say why it cannot be opened.
+async fn open_sign_in_store(resolver: &Resolver) -> Result<crate::store::CredentialStore, String> {
+    let Some(path) = resolver.config.persistence.credentials.clone() else {
+        return Err(
+            "kaibo keeps sign-ins under $XDG_STATE_HOME/kaibo/credentials (or \
+             ~/.local/state/kaibo/credentials), and neither XDG_STATE_HOME nor HOME is set. \
+             Set HOME and run again."
+                .to_string(),
+        );
     };
     let allowed = resolver.allowed_set();
     let refs: Vec<&std::path::Path> = allowed.iter().map(PathBuf::as_path).collect();
-    crate::store::SessionStore::open(&path, resolver.config.defaults.session_capacity, &refs)
+    crate::store::CredentialStore::open(&path, &refs)
         .await
         .map_err(|e| {
             format!(
-                "kaibo could not open its state db at {} to store the sign-in: {e}. Fix the \
-                 path or its permissions, or name another with --state-db",
+                "kaibo could not open its credentials db at {}: {e}",
                 path.display()
             )
         })
@@ -3561,15 +3556,6 @@ pub async fn run_login(common: CommonArgs, args: LoginArgs) -> i32 {
                     .map(|a| format!(" as {a}"))
                     .unwrap_or_default()
             );
-            if let Some(warning) = resolver
-                .config
-                .persistence
-                .path
-                .as_deref()
-                .and_then(state_dir_exposure)
-            {
-                eprintln!("{warning}");
-            }
             EXIT_OK
         }
         Err(e) => {
@@ -3579,31 +3565,6 @@ pub async fn run_login(common: CommonArgs, args: LoginArgs) -> i32 {
             );
             EXIT_CONSULT_FAILURE
         }
-    }
-}
-
-/// A warning when the state db's directory lets other local users in, now that it holds
-/// a sign-in. Reads the mode only; changing it is the operator's call.
-fn state_dir_exposure(db: &std::path::Path) -> Option<String> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let dir = db.parent()?;
-        let mode = std::fs::metadata(dir).ok()?.permissions().mode();
-        (mode & 0o077 != 0).then(|| {
-            format!(
-                "warning: kaibo's state dir {} has mode {:o}, so other users on this machine \
-                 can read the stored sign-in. Run `chmod 700 {}` to restrict it to you.",
-                dir.display(),
-                mode & 0o777,
-                dir.display()
-            )
-        })
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = db;
-        None
     }
 }
 
