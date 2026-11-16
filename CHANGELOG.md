@@ -48,6 +48,8 @@ record. Each later release appends a new section at the top.
 - `prompt_cache = "short" | "long" | "off"` on an `anthropic` or `openrouter` backend sets the cache retention; `short` is the default.
 
 ### Changed
+- The explorer's report is evidence for another model or agent to reason from, not a verdict: it adds `Connections` and `OpenQuestions` sections, and `SummaryOfFindings` becomes `Summary`.
+- Explorer and `consult` preambles read what each claim needs (a whole file or a span) instead of whole files first; attached files are still read whole.
 - Moves to kaish 0.19.0: `ls -l`, `stat`, and `date` in the model's shell print GNU's formats, `ls -A` lists hidden files, and `%` is a word character (`printf %s`).
 - The `configure` prompt recommends a workspace root such as `~/src` and asks for the user's clear yes before scoping to `~`, `$HOME`, or `/`.
 - The built-in `anthropic` cast sets `consult = "solo"`: the Sonnet reads the code itself, and the Haiku explorer serves `explore` only.

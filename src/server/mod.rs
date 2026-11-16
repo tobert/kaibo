@@ -2335,10 +2335,10 @@ impl KaiboHandler {
     }
 
     #[tool(
-        description = "Survey a codebase and get back a structured, cited report — not an \
-            answer. A fast, cheap model sweeps the project READ-ONLY (grep, whole-file \
-            reads) and returns a summary of findings, the relevant locations with \
-            `file:line`, and the trail it followed. `attach` names text files it must \
+        description = "Survey a codebase and get back a structured, cited report of \
+            evidence — not an answer. A fast model sweeps the project READ-ONLY (grep and \
+            targeted reads) and returns a summary, the relevant locations with \
+            `file:line`, how they connect, what remains open, and the trail it followed. `attach` names text files it must \
             read whole during the sweep. The evidence-gathering half of `consult`, \
             exposed directly: map unfamiliar code, or assemble a cited survey to reason \
             over yourself. For a synthesized answer instead, use `consult`."
@@ -5003,8 +5003,9 @@ override on `consult`, since it runs no explorer there.
 
 `consult` hands back an *answer* — a synthesis agent investigates and concludes. `explore`
 hands back the *evidence*: it's the fast, cheap explorer half of `consult`, run on its
-own, so you get the structured cited report — a summary of findings, the relevant
-`file:line` locations, and the trail the explorer followed — with no synthesis on top.
+own, so you get the structured cited report — a summary, the relevant `file:line`
+locations, how they connect, what remains open, and the trail the explorer followed —
+with no synthesis on top.
 Reach for `explore` to map unfamiliar code, or to assemble a grounded survey you'll reason
 over yourself (or hand to another model). It reads the repo itself, like `consult`, so the
 same `path` / `cast` / `explorer_model` / `explorer_backend` arguments apply, plus `attach`
@@ -5374,8 +5375,8 @@ fn render_prompts_resource(config: &Config, cast: Option<&Cast>) -> String {
         );
         out.push_str(&deliberation_prompt(
             "<your question>",
-            "<the explorer's cited dossier — SummaryOfFindings, RelevantLocations with \
-             file:line snippets, ExplorationTrace>",
+            "<the explorer's cited dossier — Summary, RelevantLocations with file:line \
+             snippets, Connections, OpenQuestions, ExplorationTrace>",
         ));
         out.push_str("\n```\n");
     }
