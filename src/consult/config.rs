@@ -115,15 +115,18 @@ pub struct ResearchConfig {
     pub web: Arc<crate::web::WebSession>,
 }
 
-/// The `consult` driver's config: the shared investigation fields ([`ExploreConfig`])
-/// plus what only the synth driver loop needs — how many turns its own loop gets, and the
-/// caller's attached files (inlined within the budget, demoted to read-whole
-/// directives past it).
+/// The `consult` driver's config: preamble layering and liveness, the sandbox limits
+/// and web session its reads run under, how many turns its loop gets, and the caller's
+/// attached files (inlined within the budget, demoted to read-whole directives past it).
 #[derive(Debug, Clone)]
 pub struct ConsultConfig {
-    /// Preamble/liveness, sandbox limits, and the web session. The explorer-only fields
-    /// (`explorer_max_turns`, `max_attachments`) go unread here.
-    pub explore: ExploreConfig,
+    /// Preamble layering and liveness — shared with every other phase.
+    pub phase: PhaseContext,
+    /// Read-only sandbox limits for the driver's kaish worker.
+    pub sandbox: SandboxConfig,
+    /// The call's web session, when the caller asked for the web (`web: true`) and the
+    /// operator allows it. `None` (the default) is the project-only consult.
+    pub web: Option<Arc<crate::web::WebSession>>,
     /// Bounds the consult's *whole* driver loop (every read is its own), so it must
     /// be generous — a multi-part question blew the old 8.
     pub synth_max_turns: usize,
@@ -142,17 +145,17 @@ pub struct ConsultConfig {
     /// operator enabled `[artifacts]`, this call asked with `save_artifacts`, and the
     /// media CAS is live. `None` is byte-for-byte the pre-artifact consult.
     ///
-    /// It rides **this** rung, not [`ExploreConfig`], and that placement is the
-    /// enforcement of "driver-loop only": `deliberate`'s dossier stage is built from
-    /// the explore rung, which has no field to read, so its explorer cannot be handed
-    /// the tool by accident.
+    /// [`ExploreConfig`] has no such field, and that is the enforcement of "driver-loop
+    /// only": `deliberate`'s dossier explorer cannot be handed the tool by accident.
     pub artifacts: Option<Arc<crate::artifact::ArtifactSink>>,
 }
 
 impl Default for ConsultConfig {
     fn default() -> Self {
         Self {
-            explore: ExploreConfig::default(),
+            phase: PhaseContext::default(),
+            sandbox: SandboxConfig::default(),
+            web: None,
             synth_max_turns: crate::config::Defaults::default().synth_max_turns,
             attachments: Vec::new(),
             artifacts: None,

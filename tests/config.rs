@@ -2832,7 +2832,7 @@ fn an_audio_only_cast_can_generate() {
     )
     .expect("an audio-only cast loads");
     assert!(c.cast_can_generate("voice"));
-    assert!(!c.cast_can_explore("voice"));
+    assert!(!c.cast_has_explorer("voice"));
 }
 
 /// Stability's audio routes make it an audio backend as well as an image one.

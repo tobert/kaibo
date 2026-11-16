@@ -4,7 +4,7 @@
 // The scripted responders return rig's (large) `ProviderError`, as rig's own seams do.
 #![allow(clippy::result_large_err)]
 
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use kaibo::config::{default_models, Config, Defaults, ModelRole, ModelSlot};
 use kaibo::consult::{
@@ -831,17 +831,14 @@ type Responder = Arc<
         + Sync,
 >;
 
-/// A record of one inbound request. The tests count these to prove the loop ran.
-#[derive(Debug, Clone)]
-struct Seen;
-
 /// A scripted client that serves exactly ONE model. If the consult loop ever
 /// routes another model id here, the call panics.
 #[derive(Clone)]
 struct ScriptedClient {
     expect_model: String,
     responder: Responder,
-    log: Arc<Mutex<Vec<Seen>>>,
+    /// How many requests this client served; the tests count them to prove the loop ran.
+    served: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl ScriptedClient {
@@ -858,13 +855,13 @@ impl ScriptedClient {
         Self {
             expect_model: expect_model.to_string(),
             responder: Arc::new(responder),
-            log: Arc::new(Mutex::new(Vec::new())),
+            served: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }
     }
 
-    /// Every request this client served, in call order.
-    fn seen(&self) -> Vec<Seen> {
-        self.log.lock().expect("scripted log poisoned").clone()
+    /// How many requests this client served.
+    fn served(&self) -> usize {
+        self.served.load(std::sync::atomic::Ordering::SeqCst)
     }
 }
 
@@ -900,10 +897,8 @@ impl rig_core::driver::Transport<rig_core::test_utils::MockScript> for ScriptedT
             self.client.expect_model
         );
         self.client
-            .log
-            .lock()
-            .expect("scripted log poisoned")
-            .push(Seen);
+            .served
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let responder = self.client.responder.clone();
         rig_core::driver::Opening::new(async move {
             let response = responder(&request)?;
@@ -991,8 +986,8 @@ fn request_has_tool_result_image(req: &rig_core::completion::CompletionRequest) 
 
 /// True if any user message carries an *image part* (not a tool-result image). This
 /// is exactly what a base64 envelope must become on a transport that can't carry an
-/// image in a tool result — the openai user-turn channel. The recorder (`Seen`)
-/// captures only text, so the assertion has to walk `req.chat_history` here.
+/// image in a tool result — the openai user-turn channel. The client keeps only a
+/// request count, so the assertion has to walk `req.chat_history` here.
 fn request_has_user_image(req: &rig_core::completion::CompletionRequest) -> bool {
     use rig_core::completion::message::{Message, UserContent};
     req.chat_history.iter().any(|m| match &**m {
@@ -1106,7 +1101,7 @@ async fn a_blind_synth_is_not_offered_view_image() {
     .await
     .expect("blind consult should succeed");
     assert!(
-        !synth_client.seen().is_empty(),
+        synth_client.served() > 0,
         "the synth client was driven"
     );
 }
@@ -1183,9 +1178,9 @@ async fn an_openai_vlm_sees_an_image_on_the_user_turn_channel() {
     );
     // The loop broke and resumed: a view_image turn, then a separate resumed turn.
     assert!(
-        synth_client.seen().len() >= 2,
+        synth_client.served() >= 2,
         "the loop must have broken on view_image and resumed: {} request(s)",
-        synth_client.seen().len()
+        synth_client.served()
     );
 }
 
@@ -1357,7 +1352,7 @@ async fn oneshot_answers_from_pasted_context() {
 // thinkingConfig shape (the thinkingLevel the whole 3-line takes).
 #[tokio::test]
 #[ignore = "hits the DeepSeek API (consult); run with --ignored and a key"]
-async fn two_phase_consult_via_deepseek() {
+async fn consult_via_deepseek() {
     if let Err(e) = load(ProviderKind::DeepSeek) {
         panic!("no DeepSeek credential for live test: {e}");
     }
@@ -1409,7 +1404,7 @@ async fn oneshot_via_builtin_anthropic_synths() {
 
 #[tokio::test]
 #[ignore = "hits the Gemini API (consult); run with --ignored and a key"]
-async fn two_phase_consult_via_gemini() {
+async fn consult_via_gemini() {
     if let Err(e) = load(ProviderKind::Gemini) {
         panic!("no Gemini credential for live test: {e}");
     }
@@ -1434,7 +1429,7 @@ async fn two_phase_consult_via_gemini() {
 
 #[tokio::test]
 #[ignore = "hits the Anthropic API (consult); run with --ignored and a key"]
-async fn two_phase_consult_answers_from_the_real_tree() {
+async fn consult_via_anthropic_answers_from_the_real_tree() {
     // Surface a clear message if the credential is missing, before the API call.
     if let Err(e) = load(ProviderKind::Anthropic) {
         panic!("no Anthropic credential for live test: {e}");

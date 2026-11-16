@@ -121,10 +121,7 @@ fn idle_session() -> Arc<WebSession> {
 
 fn consult_cfg(web: Option<Arc<WebSession>>) -> ConsultConfig {
     ConsultConfig {
-        explore: ExploreConfig {
-            web,
-            ..ExploreConfig::default()
-        },
+        web,
         ..ConsultConfig::default()
     }
 }

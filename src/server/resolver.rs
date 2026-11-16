@@ -883,8 +883,7 @@ impl Resolver {
         Ok(out)
     }
 
-    /// Resolve attachments for a sweep-only tool (`explore`, `deliberate`'s dossier
-    /// stage): read-WHOLE directives, never inlined bytes — budget 0, so no file is read
+    /// Resolve attachments for `deliberate`'s dossier survey: read-WHOLE directives, never inlined bytes — budget 0, so no file is read
     /// here at all. Images are refused up front: the sweep toolset carries no `view_image`,
     /// so naming one would send the explorer down a dead end (`cat` refuses binary).
     /// Uses the resolver's own sandbox config for the read-only VFS.
@@ -892,15 +891,14 @@ impl Resolver {
         &self,
         root: &Path,
         attach: &[String],
-        tool: &str,
     ) -> Result<Vec<crate::consult::ConsultAttachment>, McpError> {
         let attachments =
             Self::resolve_consult_attachments(root, attach, 0, &self.config.sandbox).await?;
         if let Some(img) = attachments.iter().find(|a| a.is_image()) {
             return Err(McpError::invalid_params(
                 format!(
-                    "attached file {} is an image, and {tool} refuses image attachments: \
-                     its survey reads files through the shell, which has no image tool, \
+                    "attached file {} is an image, and `deliberate` refuses image \
+                     attachments: its survey reads files through the shell, which has no image tool, \
                      whatever the cast's models can see. Attach the image to `consult` or \
                      `oneshot` with a cast whose synth reads images (`kaibo://config` shows \
                      `vision = true` on the slot)",

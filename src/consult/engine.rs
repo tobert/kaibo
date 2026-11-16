@@ -2723,10 +2723,10 @@ pub async fn oneshot(
 fn consult_tools(root: &Path, cfg: &ConsultConfig, synth: &Arm) -> Result<Vec<DynamicTool>> {
     // run_kaish for the consult model's own reads — carries the sink so its reads show
     // up as progress.
-    let worker = KaishWorker::spawn_with(root, cfg.explore.sandbox.clone())?;
+    let worker = KaishWorker::spawn_with(root, cfg.sandbox.clone())?;
     let mut tools: Vec<DynamicTool> = vec![traced(RunKaish::with_progress(
         worker.clone(),
-        cfg.explore.phase.progress.clone(),
+        cfg.phase.progress.clone(),
     ))];
     // The driver's own web tools are added by `run_with_web` in `consult_with`, which
     // also picks native or kaibo-run. The driver loop runs on the *synth* arm, so
@@ -2770,7 +2770,7 @@ pub(crate) async fn explore_with(
     }
     with_call_deadline(
         cfg.phase.call_deadline,
-        "explore",
+        "the deliberate dossier survey",
         run_explore_phase(
             explorer,
             &preamble,
@@ -2863,16 +2863,16 @@ pub(crate) async fn consult_with(
     cfg: &ConsultConfig,
 ) -> Result<ConsultOutput> {
     let (answer, usage) = with_call_deadline(
-        cfg.explore.phase.call_deadline,
+        cfg.phase.call_deadline,
         "consult",
         run_with_web(
             synth,
-            cfg.explore.web.as_ref(),
+            cfg.web.as_ref(),
             WebTools::Both,
             &consult_driver_preamble(cfg),
             Message::user(user_prompt.to_string()),
             cfg.synth_max_turns,
-            cfg.explore.phase.progress.clone(),
+            cfg.phase.progress.clone(),
             ModelRole::Synth,
             // Rebuilt per call (main loop, and again if run_phase forces a final turn).
             &|| consult_tools(root, cfg, synth),
@@ -2895,11 +2895,11 @@ pub(crate) async fn consult_with(
 fn consult_driver_preamble(cfg: &ConsultConfig) -> String {
     let mut preamble = resolve_phase_preamble(
         Phase::Consult,
-        &cfg.explore.phase.prompts,
-        cfg.explore.phase.orientation.as_deref(),
-        cfg.explore.phase.house_rules.as_deref(),
+        &cfg.phase.prompts,
+        cfg.phase.orientation.as_deref(),
+        cfg.phase.house_rules.as_deref(),
     );
-    if cfg.explore.web.is_some() {
+    if cfg.web.is_some() {
         preamble.push_str(&web_directive("answer"));
         preamble.push_str("\n\n");
         preamble.push_str(closing_obligation(Phase::Consult));
@@ -3125,12 +3125,9 @@ mod tests {
             .on_model(SYNTH, |_req| Ok(text_response("done")))
             .build();
         let cfg = ConsultConfig {
-            explore: ExploreConfig {
-                phase: PhaseContext {
-                    house_rules: Some(Arc::from(MARKER)),
-                    ..PhaseContext::default()
-                },
-                ..ExploreConfig::default()
+            phase: PhaseContext {
+                house_rules: Some(Arc::from(MARKER)),
+                ..PhaseContext::default()
             },
             ..ConsultConfig::default()
         };
@@ -3187,16 +3184,13 @@ mod tests {
             .build();
         let dir = tempdir().unwrap();
         let cfg = ConsultConfig {
-            explore: ExploreConfig {
-                phase: PhaseContext {
-                    prompts: PromptOverrides {
-                        consult: Some(CUSTOM.to_string()),
-                        ..PromptOverrides::default()
-                    },
-                    house_rules: Some(Arc::from(HOUSE)),
-                    ..PhaseContext::default()
+            phase: PhaseContext {
+                prompts: PromptOverrides {
+                    consult: Some(CUSTOM.to_string()),
+                    ..PromptOverrides::default()
                 },
-                ..ExploreConfig::default()
+                house_rules: Some(Arc::from(HOUSE)),
+                ..PhaseContext::default()
             },
             ..ConsultConfig::default()
         };
@@ -4441,7 +4435,7 @@ mod tests {
         // The synth's very first completion never returns; the explorer is never reached.
         let client = ScriptedClient::builder().hang_model(SYNTH).build();
         let mut cfg = ConsultConfig::default();
-        cfg.explore.phase.call_deadline = Duration::from_millis(50);
+        cfg.phase.call_deadline = Duration::from_millis(50);
 
         let outcome = tokio::time::timeout(
             Duration::from_secs(5),
@@ -4951,12 +4945,9 @@ mod tests {
                 .to_params(8192, None, None, "max");
         let sink = Arc::new(RecordingSink::default());
         let cfg = ConsultConfig {
-            explore: ExploreConfig {
-                phase: PhaseContext {
-                    progress: sink.clone(),
-                    ..PhaseContext::default()
-                },
-                ..ExploreConfig::default()
+            phase: PhaseContext {
+                progress: sink.clone(),
+                ..PhaseContext::default()
             },
             ..ConsultConfig::default()
         };

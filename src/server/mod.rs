@@ -1670,17 +1670,13 @@ impl KaiboHandler {
     }
 
     /// Shim over [`Resolver::resolve_sweep_attachments`] — the resolution glue lives on
-    /// the shared resolver so the CLI `explore` front door runs the same sweep-attach
-    /// resolution + image refusal.
+    /// the shared resolver so `kaibo deliberate` runs the same resolution + image refusal.
     async fn resolve_sweep_attachments(
         &self,
         root: &std::path::Path,
         attach: &[String],
-        tool: &str,
     ) -> Result<Vec<crate::consult::ConsultAttachment>, McpError> {
-        self.resolver
-            .resolve_sweep_attachments(root, attach, tool)
-            .await
+        self.resolver.resolve_sweep_attachments(root, attach).await
     }
 
     /// Shim over [`Resolver::gate_consult_image_attachments`] — the resolution glue
@@ -1982,19 +1978,15 @@ impl KaiboHandler {
             &cast.name,
         )?;
         let cfg = ConsultConfig {
-            explore: ExploreConfig {
-                phase: PhaseContext {
-                    progress: progress.clone(),
-                    house_rules: self.house_rules(&root)?,
-                    prompts: self.resolved_prompts(&cast),
-                    orientation: self.orientation(&root).await?,
-                    call_deadline: defaults.call_deadline,
-                },
-                explorer_max_turns: defaults.explorer_max_turns,
-                sandbox: self.config.sandbox.clone(),
-                max_attachments: defaults.max_attachments,
-                web: self.web_if_asked(input.web, "consult", synth.has_native_web())?,
+            phase: PhaseContext {
+                progress: progress.clone(),
+                house_rules: self.house_rules(&root)?,
+                prompts: self.resolved_prompts(&cast),
+                orientation: self.orientation(&root).await?,
+                call_deadline: defaults.call_deadline,
             },
+            sandbox: self.config.sandbox.clone(),
+            web: self.web_if_asked(input.web, "consult", synth.has_native_web())?,
             synth_max_turns: defaults.synth_max_turns,
             attachments,
             artifacts: self.artifact_sink(
@@ -2061,7 +2053,7 @@ impl KaiboHandler {
             &cast.name,
             &synth.model,
             &out.usage,
-            cfg.explore.web.as_deref(),
+            cfg.web.as_deref(),
         );
         Ok(CallToolResult::success(vec![ContentBlock::text(answer)]))
     }
@@ -2118,20 +2110,16 @@ impl KaiboHandler {
         // clone of this exact handle, so what it reads is what the running phase emitted.
         let progress_log = self.job_progress_log();
         let cfg = ConsultConfig {
-            explore: ExploreConfig {
-                phase: PhaseContext {
-                    progress: progress_log.clone(),
-                    house_rules: self.house_rules(&root)?,
-                    prompts: self.resolved_prompts(&cast),
-                    orientation: self.orientation(&root).await?,
-                    call_deadline: defaults.call_deadline,
-                },
-                explorer_max_turns: defaults.explorer_max_turns,
-                sandbox: self.config.sandbox.clone(),
-                max_attachments: defaults.max_attachments,
-                // Refused here, before a job exists, like `save_artifacts` below.
-                web: self.web_if_asked(input.web, "consult_submit", synth.has_native_web())?,
+            phase: PhaseContext {
+                progress: progress_log.clone(),
+                house_rules: self.house_rules(&root)?,
+                prompts: self.resolved_prompts(&cast),
+                orientation: self.orientation(&root).await?,
+                call_deadline: defaults.call_deadline,
             },
+            sandbox: self.config.sandbox.clone(),
+            // Refused here, before a job exists, like `save_artifacts` below.
+            web: self.web_if_asked(input.web, "consult_submit", synth.has_native_web())?,
             synth_max_turns: defaults.synth_max_turns,
             attachments,
             // Same two-key gate as the sync lane, and refused here for the same reason —
@@ -2169,7 +2157,7 @@ impl KaiboHandler {
                         &cast_name,
                         &synth_model,
                         &out.usage,
-                        cfg.explore.web.as_deref(),
+                        cfg.web.as_deref(),
                     );
                     Ok(JobResult { answer })
                 }
@@ -2220,7 +2208,7 @@ impl KaiboHandler {
         let cast = self.resolve_cast(input.cast)?;
         // The explorer slot runs research when the cast has one; a cast without one runs
         // it on its synth, which must then answer interactively.
-        let (role, label) = if self.config.cast_can_explore(&cast.name) {
+        let (role, label) = if self.config.cast_has_explorer(&cast.name) {
             (ModelRole::Explorer, "explorer")
         } else {
             self.require_interactive_cast(&cast, "research")?;
@@ -2368,7 +2356,7 @@ impl KaiboHandler {
             // their content flows to the offline synth through the dossier it writes.
             let defaults = &self.config.defaults;
             let attachments = self
-                .resolve_sweep_attachments(&root, &input.attach, "deliberate")
+                .resolve_sweep_attachments(&root, &input.attach)
                 .await?;
             let cfg = ExploreConfig {
                 phase: PhaseContext {
@@ -5770,20 +5758,20 @@ mod tests {
         );
     }
 
-    /// `explore` refuses an image attachment on every cast, and says why: its survey
+    /// `deliberate` refuses an image attachment on every cast, and says why: its survey
     /// reads through the shell, which has no image tool. The reason must not blame the
     /// cast's models — the built-in `deepseek` explorer is itself sighted — and the
     /// refusal names the tools that do take an image.
     #[tokio::test]
-    async fn explore_refuses_an_image_for_its_toolset_not_its_models() {
+    async fn deliberate_refuses_an_image_for_its_toolset_not_its_models() {
         let root = tempfile::tempdir().unwrap();
         let root_canon = std::fs::canonicalize(root.path()).unwrap();
         let png_sig = [0x89u8, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
         std::fs::write(root_canon.join("shot.png"), png_sig).unwrap();
         let err = handler()
-            .resolve_sweep_attachments(&root_canon, &["shot.png".to_string()], "explore")
+            .resolve_sweep_attachments(&root_canon, &["shot.png".to_string()])
             .await
-            .expect_err("an image attachment to explore is refused");
+            .expect_err("an image attachment to deliberate is refused");
         let msg = err.message.to_string();
         assert!(msg.contains("shot.png"), "names the file: {msg}");
         assert!(
@@ -8645,7 +8633,7 @@ enabled = false
                 "decide" => cast.slot(crate::config::ModelRole::Decision).is_some(),
                 // `research` runs the explorer, else an interactive synth.
                 "research" => {
-                    h.config.cast_can_explore(&cast.name)
+                    h.config.cast_has_explorer(&cast.name)
                         || h.require_interactive_cast(cast, tool).is_ok()
                 }
                 other => panic!("unmapped cast-taking tool `{other}` — add its gate here"),

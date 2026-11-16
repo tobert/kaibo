@@ -1539,7 +1539,7 @@ impl Config {
     /// synth belongs to `batch_submit`/`deliberate`, and a cast with no synth (image-only
     /// or explorer-only) has no model to answer with. (`explore` is deliberately *not*
     /// here — it runs only the explorer, so it takes any cast with one via
-    /// [`cast_can_explore`](Self::cast_can_explore), interactive or not.) One of the per-tool
+    /// [`cast_has_explorer`](Self::cast_has_explorer), interactive or not.) One of the per-tool
     /// cast predicates the enum roster and the gates share (see `server.rs::CAST_ENUM_RULES`).
     pub fn cast_is_interactive(&self, name: &str) -> bool {
         self.casts
@@ -1580,7 +1580,7 @@ impl Config {
     /// slot, or on an interactive synth when the cast has no explorer. Live web access is
     /// the tool's other gate, applied in `live_tools`.
     pub fn cast_can_research(&self, name: &str) -> bool {
-        self.cast_can_explore(name) || self.cast_is_interactive(name)
+        self.cast_has_explorer(name) || self.cast_is_interactive(name)
     }
 
     /// Whether `name`'s `research` arm (the explorer slot, else the synth) runs on a
@@ -1599,7 +1599,9 @@ impl Config {
                 .is_some_and(|b| crate::web::native::NativeWeb::for_kind(b.kind).is_some())
     }
 
-    pub fn cast_can_explore(&self, name: &str) -> bool {
+    /// Whether canonical cast `name` carries an `explorer` slot: what `deliberate`'s
+    /// dossier needs, and the slot `research` prefers over the synth.
+    pub fn cast_has_explorer(&self, name: &str) -> bool {
         self.casts
             .get(name)
             .is_some_and(|c| c.slot(ModelRole::Explorer).is_some())

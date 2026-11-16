@@ -892,7 +892,6 @@ pub async fn run_consult(common: CommonArgs, args: ConsultArgs) -> i32 {
     let session_capacity = config.defaults.session_capacity;
     let inline_budget = config.defaults.inline_attach_budget;
     let call_deadline = config.defaults.call_deadline;
-    let default_explorer_turns = config.defaults.explorer_max_turns;
     let default_synth_turns = config.defaults.synth_max_turns;
     let sandbox = config.sandbox.clone();
     let resolver = match Resolver::from_config(Arc::new(config)) {
@@ -911,7 +910,6 @@ pub async fn run_consult(common: CommonArgs, args: ConsultArgs) -> i32 {
         &resolver,
         inline_budget,
         call_deadline,
-        default_explorer_turns,
         default_synth_turns,
         &sandbox,
         &persistence,
@@ -974,7 +972,6 @@ async fn resolve_and_run(
     resolver: &Resolver,
     inline_budget: usize,
     call_deadline: std::time::Duration,
-    default_explorer_turns: usize,
     default_synth_turns: usize,
     sandbox: &crate::sandbox::SandboxConfig,
     persistence: &crate::config::PersistenceConfig,
@@ -1031,24 +1028,20 @@ async fn resolve_and_run(
     };
 
     let cfg = ConsultConfig {
-        explore: ExploreConfig {
-            phase: PhaseContext {
-                progress: Arc::new(TerminalSink),
-                house_rules: resolver.house_rules(&root).map_err(SetupError::setup)?,
-                prompts: resolver.resolved_prompts(&cast),
-                orientation: resolver
-                    .orientation(&root)
-                    .await
-                    .map_err(SetupError::setup)?,
-                call_deadline,
-            },
-            explorer_max_turns: default_explorer_turns,
-            sandbox: sandbox.clone(),
-            max_attachments: resolver.config.defaults.max_attachments,
-            web: resolver
-                .web_if_asked(args.web, "consult", synth.has_native_web())
+        phase: PhaseContext {
+            progress: Arc::new(TerminalSink),
+            house_rules: resolver.house_rules(&root).map_err(SetupError::setup)?,
+            prompts: resolver.resolved_prompts(&cast),
+            orientation: resolver
+                .orientation(&root)
+                .await
                 .map_err(SetupError::setup)?,
+            call_deadline,
         },
+        sandbox: sandbox.clone(),
+        web: resolver
+            .web_if_asked(args.web, "consult", synth.has_native_web())
+            .map_err(SetupError::setup)?,
         synth_max_turns: default_synth_turns,
         attachments,
         // No client key on this front door (see `load_config`), so no sink and no
@@ -1072,7 +1065,7 @@ async fn resolve_and_run(
                 &out,
                 &cast.name,
                 &synth.model,
-                cfg.explore.web.as_deref(),
+                cfg.web.as_deref(),
             );
             Ok(EXIT_OK)
         }
@@ -1472,7 +1465,7 @@ async fn research_inner(
         .map_err(SetupError::usage)?;
     // The same slot choice as the MCP tool: the explorer when the cast has one, else an
     // interactive synth.
-    let (role, label) = if resolver.config.cast_can_explore(&cast.name) {
+    let (role, label) = if resolver.config.cast_has_explorer(&cast.name) {
         (ModelRole::Explorer, "explorer")
     } else {
         resolver
@@ -1684,7 +1677,7 @@ async fn deliberate_inner(
             .map_err(SetupError::setup)?;
         let explorer_model = explorer.model.clone();
         let attachments = resolver
-            .resolve_sweep_attachments(&root, &args.attach, "deliberate")
+            .resolve_sweep_attachments(&root, &args.attach)
             .await
             .map_err(SetupError::setup)?;
         let cfg = ExploreConfig {
@@ -3724,7 +3717,6 @@ mod tests {
         config.root = Some(dir.path().to_path_buf());
         let inline_budget = config.defaults.inline_attach_budget;
         let call_deadline = config.defaults.call_deadline;
-        let et = config.defaults.explorer_max_turns;
         let st = config.defaults.synth_max_turns;
         let sandbox = config.sandbox.clone();
         let persistence = config.persistence.clone();
@@ -3753,7 +3745,6 @@ mod tests {
             &resolver,
             inline_budget,
             call_deadline,
-            et,
             st,
             &sandbox,
             &persistence,
