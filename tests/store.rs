@@ -803,6 +803,59 @@ async fn a_symlinked_credentials_dir_is_refused() {
     assert!(err.to_string().contains("symlink"), "{err}");
 }
 
+/// An ancestor another user could write (not sticky) is refused before the credentials
+/// directory is created or changed: that user could swap it for a symlink mid-check.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_credentials_dir_under_a_shared_writable_ancestor_is_refused() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = TempDir::new().unwrap();
+    let shared = dir.path().join("shared");
+    std::fs::create_dir_all(&shared).unwrap();
+    std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o777)).unwrap();
+    let path = shared.join("kaibo/credentials/creds.db");
+    let err = CredentialStore::open(&path, &[])
+        .await
+        .err()
+        .expect("refused");
+    assert!(matches!(err, StoreError::CredentialsDir(_)), "{err}");
+    assert!(err.to_string().contains("writable by other users"), "{err}");
+    assert!(!shared.join("kaibo/credentials").exists(), "nothing created under it");
+}
+
+/// A sticky shared ancestor (the `/tmp` shape) is fine: others cannot rename what they
+/// do not own there.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_sticky_shared_ancestor_is_accepted() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = TempDir::new().unwrap();
+    let shared = dir.path().join("sticky");
+    std::fs::create_dir_all(&shared).unwrap();
+    std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o1777)).unwrap();
+    CredentialStore::open(&shared.join("kaibo/credentials/creds.db"), &[])
+        .await
+        .expect("sticky ancestor is accepted");
+}
+
+/// A `creds.db` that is a symlink is refused: the private directory would not cover
+/// where the tokens land.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_symlinked_credentials_db_file_is_refused() {
+    let dir = TempDir::new().unwrap();
+    let creds = dir.path().join("kaibo/credentials");
+    std::fs::create_dir_all(&creds).unwrap();
+    let outside = dir.path().join("outside.db");
+    std::os::unix::fs::symlink(&outside, creds.join("creds.db")).unwrap();
+    let err = CredentialStore::open(&creds_path(&dir), &[])
+        .await
+        .err()
+        .expect("refused");
+    assert!(err.to_string().contains("is a symlink"), "{err}");
+    assert!(!outside.exists(), "nothing written through the link");
+}
+
 /// The credentials db obeys the same containment rule as the state db.
 #[tokio::test]
 async fn the_credentials_db_is_refused_inside_an_allowed_tree() {

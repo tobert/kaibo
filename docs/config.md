@@ -159,7 +159,9 @@ in its credentials db, `$XDG_STATE_HOME/kaibo/credentials/creds.db` (else
 - The credentials db is separate from the state db, so sign-ins work with persistence
   off. Its `credentials/` directory is kept at mode `700`: kaibo creates it that way,
   changes a looser existing mode to `700` and logs a warning, and refuses to store a
-  sign-in when the path is a symlink or the mode cannot be changed.
+  sign-in when the directory or `creds.db` is a symlink, when the mode cannot be
+  changed, or when a directory above it is owned by another user or writable by others
+  without the sticky bit.
 - The sign-in listens for the browser on `127.0.0.1`, port 1455 for ChatGPT and 3000
   for OpenRouter, or any free port when that one is busy. A `base_url` other than
   OpenAI's on a `chatgpt` backend sends the plan token to that host; kaibo warns at

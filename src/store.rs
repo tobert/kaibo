@@ -703,9 +703,10 @@ impl CredentialStore {
             .filter(|p| !p.as_os_str().is_empty())
             .ok_or_else(|| StoreError::InvalidStatePath(path.display().to_string()))?;
         secure_credentials_dir(dir)?;
-        validate_local_filesystem(dir)?;
+        refuse_symlinked_db_files(&path)?;
+        validate_local_filesystem(dir).map_err(credentials_error)?;
         let store = Self {
-            db: build_database(&path).await?,
+            db: build_database(&path).await.map_err(credentials_error)?,
         };
         store.migrate().await?;
         opened().push((resolved_full, DbKind::Credentials, store.db.clone()));
@@ -1010,6 +1011,81 @@ pub fn create_state_dir(dir: &Path) -> Result<()> {
         .map_err(|e| StoreError::StateDir(format!("creating state dir {}: {e}", dir.display())))
 }
 
+/// The state-db errors that name persistence as a way out, reworded for the
+/// credentials db, which persistence does not control.
+fn credentials_error(e: StoreError) -> StoreError {
+    match e {
+        StoreError::SingleProcessLocked(path) => StoreError::CredentialsDir(format!(
+            "the kaibo credentials db {path} is already open by another process. On this \
+             platform it is single-process: close the other kaibo (MCP server or CLI) and \
+             try again, or use a backend with an API key"
+        )),
+        StoreError::NetworkFilesystem(dir) => StoreError::CredentialsDir(format!(
+            "the kaibo credentials directory {dir} is on a network filesystem (NFS/CIFS), \
+             where its database can silently lose writes. Set XDG_STATE_HOME to a directory \
+             on a local disk, or use a backend with an API key"
+        )),
+        other => other,
+    }
+}
+
+/// Refuse a credentials db, or one of its `-wal`/`-tshm` side files, that is a symlink:
+/// the private directory would not cover where the tokens actually land.
+fn refuse_symlinked_db_files(path: &Path) -> Result<()> {
+    let name = path.file_name().unwrap_or_default().to_string_lossy().into_owned();
+    for suffix in ["", "-wal", "-tshm", "-shm"] {
+        let file = path.with_file_name(format!("{name}{suffix}"));
+        if std::fs::symlink_metadata(&file).is_ok_and(|m| m.file_type().is_symlink()) {
+            return Err(StoreError::CredentialsDir(format!(
+                "kaibo keeps sign-ins in {}, and that file is a symlink, so the tokens would \
+                 be stored outside kaibo's private credentials directory. Remove the symlink; \
+                 kaibo creates the file on the next sign-in",
+                file.display()
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Refuse a credentials directory whose ancestors another user could change: each one
+/// must be owned by this user or by root, and not writable by group or others unless it
+/// is sticky (as `/tmp` is, where others cannot rename what they do not own). Without
+/// this, a user who can write an ancestor could swap the checked directory for a symlink
+/// between the check and the chmod or the open. The same rule as OpenSSH's StrictModes.
+#[cfg(unix)]
+fn refuse_replaceable_ancestors(dir: &Path) -> Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    // SAFETY: geteuid takes no arguments, cannot fail, and touches no memory.
+    let me = unsafe { libc::geteuid() };
+    let resolved = dir.canonicalize().map_err(|e| {
+        StoreError::CredentialsDir(format!("resolving credentials directory {}: {e}", dir.display()))
+    })?;
+    for ancestor in resolved.ancestors() {
+        let meta = std::fs::metadata(ancestor).map_err(|e| {
+            StoreError::CredentialsDir(format!("reading {}: {e}", ancestor.display()))
+        })?;
+        let mode = meta.mode();
+        let sticky = mode & 0o1000 != 0;
+        let owner_ok = meta.uid() == me || meta.uid() == 0;
+        let open_to_others = mode & 0o022 != 0 && !sticky;
+        if !owner_ok || open_to_others {
+            return Err(StoreError::CredentialsDir(format!(
+                "kaibo will not store sign-ins under {}: {} is {}, so another user could \
+                 replace the credentials directory. Set XDG_STATE_HOME to a directory only you \
+                 and root control, or fix that directory's owner or mode",
+                dir.display(),
+                ancestor.display(),
+                if owner_ok {
+                    format!("writable by other users (mode {:o})", mode & 0o7777)
+                } else {
+                    format!("owned by another user (uid {})", meta.uid())
+                }
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Make `dir` a directory only its owner can enter, before any credential goes in it.
 ///
 /// - Absent: its parents come from [`create_state_dir`], and `dir` itself is created at
@@ -1028,12 +1104,15 @@ pub fn secure_credentials_dir(dir: &Path) -> Result<()> {
     {
         use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
         let err = |what: String| StoreError::CredentialsDir(what);
+        // The parent first, so its whole chain can be checked before kaibo creates,
+        // changes, or opens anything beneath it.
+        if let Some(parent) = dir.parent().filter(|p| !p.as_os_str().is_empty()) {
+            create_state_dir(parent)?;
+            refuse_replaceable_ancestors(parent)?;
+        }
         let meta = match std::fs::symlink_metadata(dir) {
             Ok(meta) => meta,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                if let Some(parent) = dir.parent().filter(|p| !p.as_os_str().is_empty()) {
-                    create_state_dir(parent)?;
-                }
                 match std::fs::DirBuilder::new().mode(0o700).create(dir) // credentials-dir-create: blessed sign-in store amendment (AGENTS.md)
                 {
                     Ok(()) => {}

@@ -247,12 +247,13 @@ sha2 = "0.10"
 rand = "0.10"
 
 # libc is already in the tree transitively (getrandom); named here explicitly, scoped
-# to unix only so no new build cost lands on Windows. Two uses: local-filesystem
+# to unix only so no new build cost lands on Windows. Three uses: local-filesystem
 # validation for the persistence store (src/store.rs, Linux-only `statfs` — turso's
 # multiprocess-WAL mode is unsupported on network filesystems, where a shared open can
 # silently lose writes) and detaching the MCP server from its launching terminal's
 # process group at startup (src/main.rs `setsid` — a job-control stop on that terminal
-# must not freeze the server too).
+# must not freeze the server too), plus `geteuid` for the credentials directory's
+# ancestor check (src/store.rs `refuse_replaceable_ancestors`).
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
