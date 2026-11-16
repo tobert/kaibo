@@ -730,7 +730,7 @@ impl Resolver {
         cast.resolved_prompts(&self.config.prompts)
     }
 
-    /// Resolve caller-named `consult`/`explore` attachments: attach means *the model
+    /// Resolve caller-named `consult` attachments: attach means *the model
     /// sees the bytes*. A text file within `budget` (cumulative, caller order) is read
     /// server-side and inlined into the driver prompt; a text file past it is demoted
     /// to a named path the prompt directs the model to read WHOLE through its shell.
@@ -982,7 +982,7 @@ fn synthless_cast_refusal(cast: &Cast, tool: &str) -> String {
     };
     // The tools a synth-less cast can still staff, by the slot each one runs.
     let mut fits: Vec<&str> = [
-        (ModelRole::Explorer, "`explore`"),
+        (ModelRole::Explorer, "`research`"),
         (ModelRole::Image, "`generate`"),
         (ModelRole::Audio, "`generate`"),
         (ModelRole::Decision, "`decide`"),

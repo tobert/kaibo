@@ -92,7 +92,7 @@ pub struct Defaults {
     /// overridable per backend (a slow local model wants more rope than a hosted
     /// API). See [`Backend::request_timeout`].
     pub request_timeout: Duration,
-    /// Wall-clock ceiling on one *whole* interactive call (`consult`/`explore`/
+    /// Wall-clock ceiling on one *whole* interactive call (`consult`/
     /// `oneshot`). Unlike `request_timeout` (one HTTP call, enforced down in reqwest
     /// via rig), this is a kaibo-owned `tokio::time` backstop over the entire prompt
     /// loop — the brake that fires when the per-request deadline doesn't (a wedged
@@ -100,7 +100,7 @@ pub struct Defaults {
     /// a stalled backend aborts a call loudly instead of hanging the caller's session
     /// indefinitely. Keep it comfortably above the largest `request_timeout` a call
     /// can reach, so it never cuts a legitimately slow single completion. It bounds the
-    /// interactive loop tools — `consult`/`explore`/`oneshot` and the async
+    /// interactive loop tools — `consult`/`oneshot` and the async
     /// `consult_submit`. `deliberate`'s direct lane (one completion) is bounded instead
     /// by its synth backend's `request_timeout`, and the batch lane by nothing in-process
     /// (provider queue). See [`crate::consult::PhaseContext::call_deadline`].
@@ -1537,9 +1537,7 @@ impl Config {
     /// `consult_submit`, `oneshot`): it has a synth slot, and that synth runs
     /// interactively. The mirror of `require_interactive_cast`'s acceptance: an offline
     /// synth belongs to `batch_submit`/`deliberate`, and a cast with no synth (image-only
-    /// or explorer-only) has no model to answer with. (`explore` is deliberately *not*
-    /// here — it runs only the explorer, so it takes any cast with one via
-    /// [`cast_has_explorer`](Self::cast_has_explorer), interactive or not.) One of the per-tool
+    /// or explorer-only) has no model to answer with. One of the per-tool
     /// cast predicates the enum roster and the gates share (see `server.rs::CAST_ENUM_RULES`).
     pub fn cast_is_interactive(&self, name: &str) -> bool {
         self.casts
@@ -1567,15 +1565,6 @@ impl Config {
             .is_some_and(|c| c.synth_lane().is_some() && c.slot(ModelRole::Explorer).is_some())
     }
 
-    /// Whether canonical cast `name` can staff an `explore` call: it carries an **explorer**
-    /// slot — the *only* thing `explore` runs. Independent of the synth lane, because
-    /// `explore` never touches the synth: a `deliberate`/`direct` cast's explorer is as valid
-    /// as an interactive cast's (an explorer always runs interactively by construction). So
-    /// `explore` advertises *more* casts than the interactive tools — pointing it at a
-    /// deliberate cast runs that team's (often smarter) explorer standalone, handy for
-    /// evaluating the explorer or for a stronger sweep than the caller's own. A synth-only
-    /// cast (no explorer — `gemini-batch`/`oneshot`-only casts) can't, and is correctly
-    /// left out (it would fault at the explorer-arm resolve).
     /// Whether canonical cast `name` can staff a `research` call: it runs on the explorer
     /// slot, or on an interactive synth when the cast has no explorer. Live web access is
     /// the tool's other gate, applied in `live_tools`.

@@ -1,11 +1,8 @@
-//! The per-phase config ladder, mirroring the tool ladder it drives
-//! (`run_kaish` → `explore` → `consult`, with `deliberate`'s dossier stage sharing
-//! the `explore` rung). Each rung adds exactly what its phase needs on top of the
-//! one below — so a phase's signature names its config type and that alone tells a
-//! reader what it touches, instead of every phase sharing one bundle and carrying
-//! fields inert to it (the shape this replaced: `explore`/`deliberate` filled
-//! `synth_max_turns`/`attachments` with dummies just to satisfy a two-phase
-//! `consult`'s type, and `oneshot` filled four).
+//! The per-phase configs. Every phase shares [`PhaseContext`]; each phase's own type
+//! adds exactly what that phase needs ([`ExploreConfig`] for `deliberate`'s dossier
+//! survey, [`ConsultConfig`] for the consult driver, [`ResearchConfig`] for `research`),
+//! so a phase's signature names its config type and that alone tells a reader what it
+//! touches, instead of every phase sharing one bundle and carrying fields inert to it.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -27,7 +24,8 @@ pub struct PhaseContext {
     pub prompts: PromptOverrides,
     /// The static repo-orientation block (assembled `[orientation]` map), or `None`.
     /// `Arc<str>` so cloning per phase is cheap. Server-set per call from the
-    /// resolved root (only for the exploring tools — `explore`/`consult`); `Default`
+    /// resolved root (only for the project-reading phases — `consult` and `deliberate`'s
+    /// dossier survey); `Default`
     /// is `None`, so offline tests run the unchanged preamble.
     pub orientation: Option<Arc<str>>,
     /// Operator house rules (assembled `AGENTS.md` / user files) to splice into
@@ -50,7 +48,7 @@ pub struct PhaseContext {
     /// stopped local backend parked a consult ~17h). This is a kaibo-owned `tokio::time`
     /// timer that doesn't trust the transport: a call past it aborts loudly rather than
     /// hanging a caller's session. Every model-driven phase carries it — that's why it
-    /// rides the base rung. It bounds `consult`/`explore`/`oneshot` and the async
+    /// rides the base rung. It bounds `consult`/`oneshot`, the dossier survey, and the async
     /// `consult_submit`; `deliberate`'s direct lane sets it to its synth backend's own
     /// `request_timeout` (one completion), and the batch lane holds no in-process wait.
     pub call_deadline: Duration,

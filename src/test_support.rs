@@ -25,7 +25,7 @@
 //! (preamble, chat history, `tool_choice`, …) rather than on "which call number is
 //! this". That matters because rig can execute a turn's tool calls concurrently: a
 //! queue-pop mock ("the Nth call returns the Nth step") would be correct today and
-//! race the day a driver turn emits two `explore` calls or someone bumps tool
+//! race the day a driver turn emits two `run_kaish` calls or someone bumps tool
 //! concurrency. Branching on content is immune to that — and it also handles the
 //! finalize replay for free (`tool_choice == None` ⇒ "answer now"), since the mock
 //! reads the same signal the real model would.
@@ -74,7 +74,7 @@ pub struct RecordedRequest {
     pub model: String,
     /// The agent preamble (role framing) as rig forwarded it.
     pub preamble: Option<String>,
-    /// Names of the tools declared on this request, e.g. `["run_kaish", "explore"]`.
+    /// Names of the tools declared on this request, e.g. `["run_kaish", "view_image"]`.
     pub tool_names: Vec<String>,
     /// Concatenated text of every `User` message in the history (oldest→newest),
     /// joined by newlines — enough to assert a prior turn's Q&A reached the prompt.
@@ -90,7 +90,7 @@ pub struct RecordedRequest {
     /// `Some(ToolChoice::None)` marks the forced finalize turn after a turn-cap hit.
     pub tool_choice: Option<ToolChoice>,
     /// The raw chat history rig forwarded, images and all. `transcript`/`user_text`
-    /// only extract `Text` content, so an image (a `view_image`/`explore` tool
+    /// only extract `Text` content, so an image (a `view_image` tool
     /// result, or a user `Image` turn from the break-rewrite path) is invisible to
     /// them — a test that must see whether an image actually reached a request
     /// needs this instead (with the `any_tool_result_image`/`user_image_messages`

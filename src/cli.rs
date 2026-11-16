@@ -1477,7 +1477,7 @@ async fn research_inner(
     let web = resolver
         .web_session(
             "research",
-            "Use `kaibo consult` or `kaibo explore` to answer from the project instead.",
+            "Use `kaibo consult` to answer from the project instead.",
             arm.has_native_web(),
         )
         .map_err(SetupError::setup)?;

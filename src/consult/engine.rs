@@ -1676,9 +1676,8 @@ fn rewrite_tool_image_history(history: Vec<Message>) -> Vec<Message> {
         for part in content {
             match part {
                 // Key on the RESULT still carrying an image — not the tool's name or
-                // id. Fully general: the next image-bearing tool (today: `view_image`
-                // and a sweep's `explore` result carrying a routed image) needs no
-                // edit here. A result already acked to text (an earlier break, or an
+                // id. Fully general: the next image-bearing tool (today only
+                // `view_image`) needs no edit here. A result already acked to text (an earlier break, or an
                 // already-inserted image turn) holds no `ToolResultContent::Image`, so
                 // it falls through untouched — the idempotency that makes re-running
                 // this safe.
@@ -2115,7 +2114,7 @@ where
             // finish and hands back `output: ""` (its own
             // `prompt_request_stops_cleanly_on_empty_terminal_turn` pins that as intended),
             // so the check has to live here — the one seam every phase runs through, which
-            // is what makes `consult`/`oneshot`/`explore`/`deliberate` inherit it at once.
+            // is what makes `consult`/`oneshot`/`deliberate` inherit it at once.
             // The shape that produced it in the wild: a reasoning model whose last choice
             // carried only a `Reasoning` block, which rig's text extraction filters out.
             Ok(resp) => {
@@ -2478,8 +2477,8 @@ pub(crate) async fn run_completion(
 /// alongside `run_kaish` (sharing the same kernel `view_image` shares with
 /// `run_kaish` in `consult_tools`) and appends [`explorer_attach_directive`] to the
 /// preamble in the same place, so preamble and toolset can never drift apart.
-/// `None` (the top-level `explore` tool, v1) is byte-for-byte the old behavior —
-/// same preamble, same two-line toolset.
+/// `None` (`max_attachments = 0`) leaves the preamble and the `{run_kaish}` toolset
+/// as they are.
 #[allow(clippy::too_many_arguments)] // each arg is a distinct, named loop input
 /// `web_search` and `web_fetch` over the call's one [`WebSession`], traced like every
 /// other tool in a phase's toolset.
@@ -2793,8 +2792,8 @@ pub(crate) async fn explore_with(
 /// when it doesn't fire — a wedged local server holding a pooled keep-alive, rig's
 /// split send-then-body read. On elapse the call aborts loudly instead of hanging the
 /// caller's session indefinitely (the 2026-07-02 ~17h park a stopped local backend
-/// caused). The interactive loop tools pass `call_deadline` here (`consult`/`explore`/
-/// `oneshot` and the async `consult_submit`); `deliberate`'s direct lane passes a
+/// caused). The interactive loop tools pass `call_deadline` here (`consult`, `oneshot`,
+/// `deliberate`'s dossier survey, and the async `consult_submit`); `deliberate`'s direct lane passes a
 /// deadline sized to its synth backend's `request_timeout` instead (one completion, so
 /// `request_timeout` is its natural bound). The batch lane calls this not at all — kaibo
 /// holds no wait there, the deliberation runs on the provider's queue.
@@ -3248,7 +3247,7 @@ mod tests {
     }
 
     /// `oneshot` is the *thin* path: it must hand the model NO tools — no `run_kaish`,
-    /// no `explore`, no `view_image`. The caller owns the context; there is no
+    /// no `view_image`. The caller owns the context; there is no
     /// codebase access. Pin the empty toolset so a regression that wires a shell back
     /// in (re-collapsing oneshot into consult) fails here.
     #[tokio::test]
@@ -4022,24 +4021,16 @@ mod tests {
         );
     }
 
-    /// `consult` is one model doing its own reads. The driver is offered `run_kaish` and
-    /// never `explore`, its preamble says nothing about a team or a sweep, and the loop
-    /// still reaches a real kaish read and an answer. If an `explore` tool leaked back
-    /// in, or the preamble promised a teammate the model cannot reach, this fails.
+    /// The consult loop end to end, offline: the synth reads a real file through
+    /// `run_kaish`, the read comes back into its transcript, and its next turn is the
+    /// cited answer.
     #[tokio::test]
-    async fn a_consult_without_an_explorer_reads_for_itself() {
-        const SYNTH: &str = "solo-synth";
+    async fn consult_reads_through_run_kaish_and_answers_with_a_citation() {
+        const SYNTH: &str = "synth-model";
 
         let client = ScriptedClient::builder()
             .on_model(SYNTH, |req| {
-                assert!(
-                    has_tool(req, "run_kaish"),
-                    "solo driver must have run_kaish"
-                );
-                assert!(
-                    !has_tool(req, "explore"),
-                    "the driver must not be offered explore"
-                );
+                assert!(has_tool(req, "run_kaish"), "the synth reads with run_kaish");
                 if !transcript_text(req).contains("target_marker() {}") {
                     Ok(tool_call_response(
                         "t-read",
@@ -4061,28 +4052,17 @@ mod tests {
             &cfg,
         )
         .await
-        .expect("a solo consult should succeed");
+        .expect("the consult should succeed");
 
         assert!(out.answer.contains("src/foo.rs:1"), "got {:?}", out.answer);
-        let reqs = client.requests_for(SYNTH);
-        let preamble = reqs[0].preamble.as_deref().unwrap_or("");
-        for absent in ["`explore`", "two-model team", "explorer"] {
-            assert!(
-                !preamble.contains(absent),
-                "the solo preamble must not mention {absent}: {preamble}"
-            );
-        }
-        assert!(
-            preamble.contains("You are the synthesis agent"),
-            "the solo driver keeps its role: {preamble}"
-        );
+        assert_eq!(client.requests_for(SYNTH).len(), 2, "one read, then the answer");
     }
 
-    // --- The explorer `attach` tool, wired into the recomposed consult loop ------
+    // --- The explorer phase behind `deliberate`'s dossier --------------------------
 
-    /// `explore` (v1) never offers `attach` — the top-level tool passes `None`
-    /// straight through to `run_explore_phase`, so the toolset stays exactly
-    /// `{run_kaish}`.
+    /// With no attach sink (`max_attachments = 0`) the explorer is never offered
+    /// `attach`: `None` passes straight through to `run_explore_phase`, so the toolset
+    /// stays exactly `{run_kaish}`.
     #[tokio::test]
     async fn the_top_level_explore_sweep_offers_no_attach_tool() {
         const EXPLORER: &str = "explorer-model";
@@ -4090,7 +4070,7 @@ mod tests {
             .on_model(EXPLORER, |req| {
                 assert!(
                     !has_tool(req, "attach"),
-                    "the top-level explore tool must not offer attach"
+                    "no attach sink means no attach tool"
                 );
                 Ok(text_response("REPORT"))
             })
@@ -4124,12 +4104,7 @@ mod tests {
         let client = ScriptedClient::builder()
             // A single-phase sweep: grep once against real kaish, then write the report.
             .on_model(EXPLORER, |req| {
-                // Explorer-only — `run_kaish`, and no nested `explore`.
                 assert!(has_tool(req, "run_kaish"), "explorer must have run_kaish");
-                assert!(
-                    !has_tool(req, "explore"),
-                    "the explorer phase has no nested explore"
-                );
                 let seen = transcript_text(req);
                 if !seen.contains("target_marker() {}") {
                     Ok(tool_call_response(
@@ -4178,8 +4153,8 @@ mod tests {
         );
     }
 
-    /// The top-level `explore` tool's attachments land the same way: a read-WHOLE
-    /// directive appended to the explorer preamble — never inlined bytes.
+    /// `deliberate`'s caller-attached files reach the explorer as a read-WHOLE
+    /// directive appended to its preamble — never inlined bytes.
     #[tokio::test]
     async fn explore_with_appends_the_attachment_directive() {
         const EXPLORER: &str = "explorer-model";
@@ -4269,8 +4244,7 @@ mod tests {
 
     /// The `direct` lane: `deliberate_direct` runs the offline synth as ONE toolless
     /// turn over the dossier and returns its deliberation. Teeth: the synth must be
-    /// toolless (no `run_kaish`/`explore` — it reasons over the handed dossier, it
-    /// does not investigate), the dossier must reach it, and the result is the synth's
+    /// toolless (it reasons over the handed dossier, it does not investigate), the dossier must reach it, and the result is the synth's
     /// answer. This is the local-lane execution the `direct` cast finally routes to.
     #[tokio::test]
     async fn deliberate_direct_runs_one_toolless_turn_over_the_dossier() {
@@ -4279,7 +4253,7 @@ mod tests {
         let client = ScriptedClient::builder()
             .on_model(SYNTH, |req| {
                 assert!(
-                    !has_tool(req, "run_kaish") && !has_tool(req, "explore"),
+                    req.tools.is_empty(),
                     "the direct synth deliberates toolless over the dossier"
                 );
                 let seen = transcript_text(req);
@@ -4462,8 +4436,8 @@ mod tests {
         );
     }
 
-    /// The same wall-clock backstop guards `explore`, not just `consult`: a wedged
-    /// explorer must abort by `call_deadline`. Guards against a refactor dropping the
+    /// The same wall-clock backstop guards the dossier survey, not just `consult`: a
+    /// wedged explorer must abort by `call_deadline`. Guards against a refactor dropping the
     /// wrap from `explore_with` specifically (it shares `with_call_deadline`, but the
     /// call site is its own). Same outer-guard teeth as the consult version.
     #[tokio::test]
@@ -7090,7 +7064,6 @@ mod tests {
                     Err(provider_error("overloaded_error"))
                 }
             })
-            .on_model("explorer-model", |_r| Ok(text_response("unused")))
             .build();
 
         let dir = project_with_marker();
@@ -7136,7 +7109,6 @@ mod tests {
                     Ok(text_response("ANSWER: see the artifact."))
                 }
             })
-            .on_model("explorer-model", |_r| Ok(text_response("unused")))
             .build();
 
         let dir = project_with_marker();
@@ -7188,7 +7160,6 @@ mod tests {
                     Ok(text_response("ANSWER: the corpus is in the artifact."))
                 }
             })
-            .on_model("explorer-model", |_req| Ok(text_response("unused")))
             .build();
 
         let dir = project_with_marker();
@@ -7498,20 +7469,20 @@ mod tests {
     }
 
     /// The generalization's whole point: any tool's result carrying an image (here a
-    /// tool named `explore`, standing in for any non-`view_image` tool) gets EXACTLY
+    /// tool named `other_tool`, standing in for any non-`view_image` tool) gets EXACTLY
     /// the same user-turn-channel treatment as `view_image` — no per-tool `if`,
     /// because the rewrite keys on the result, not the tool's name.
     #[test]
-    fn rewrite_moves_an_explore_result_image_onto_a_separate_user_image_turn() {
+    fn rewrite_moves_another_tools_result_image_onto_a_separate_user_image_turn() {
         let assistant = assistant_calling(vec![tc(
-            "explore-1",
-            "explore",
+            "other-1",
+            "other_tool",
             json!({ "question": "what does the diagram show?" }),
         )]);
         let result = Message::User {
             content: vec![UserContent::ToolResult(tool_result(
-                "explore-1",
-                "explore",
+                "other-1",
+                "other_tool",
                 vec![
                     ToolResultContent::text("attached: docs/arch.png (image/png, 4.0 KiB)"),
                     ToolResultContent::Image(Image {
@@ -7525,7 +7496,7 @@ mod tests {
 
         assert!(
             !any_tool_result_image(&out),
-            "the explore result's image must leave the tool-result channel: {out:?}"
+            "the other tool's image must leave the tool-result channel: {out:?}"
         );
         assert_eq!(
             user_image_messages(&out),
@@ -7535,9 +7506,9 @@ mod tests {
         assert!(
             out.iter().any(|m| matches!(m, Message::User { content }
                 if content.iter().any(|c| matches!(c, UserContent::ToolResult(tr)
-                    if &*tr.call.wire() == "explore-1"
+                    if &*tr.call.wire() == "other-1"
                     && tr.content.iter().all(|rc| matches!(rc, ToolResultContent::Text(_))))))),
-            "the explore tool_use stays answered by a text-only result: {out:?}"
+            "the other tool's tool_use stays answered by a text-only result: {out:?}"
         );
     }
 
@@ -7549,14 +7520,14 @@ mod tests {
     fn rewrite_moves_both_images_when_two_tools_carry_them() {
         let assistant = assistant_calling(vec![
             tc("vi", ViewImage::NAME, json!({ "path": "shot.png" })),
-            tc("ex", "explore", json!({ "question": "diagram?" })),
+            tc("ot", "other_tool", json!({ "question": "diagram?" })),
         ]);
         let results = Message::User {
             content: vec![
                 vi_result("vi"),
                 UserContent::ToolResult(tool_result(
-                    "ex",
-                    "explore",
+                    "ot",
+                    "other_tool",
                     vec![
                         ToolResultContent::text("attached: docs/arch.png (image/png, 4.0 KiB)"),
                         ToolResultContent::Image(Image {
@@ -7578,7 +7549,7 @@ mod tests {
             2,
             "each image gets its own user Image turn: {out:?}"
         );
-        for id in ["vi", "ex"] {
+        for id in ["vi", "ot"] {
             assert!(
                 out.iter().any(|m| matches!(m, Message::User { content }
                     if content.iter().any(|c| matches!(c, UserContent::ToolResult(tr)
@@ -7607,8 +7578,7 @@ src/view_image.rs:177: json!({"response": note, "parts": [{"type":"image", "data
         let envelope = json!({"response": "r", "parts": [{"type": "image", "data": "ZmFrZQ=="}]});
         assert!(!tool_output_carries_image(&ToolOutput::json(envelope)));
 
-        // A genuinely declared image part — the block `view_image` and a routed
-        // `explore` result emit — does carry.
+        // A genuinely declared image part — the block `view_image` emits — does carry.
         let with_image = ToolOutput::content(vec![
             ToolResultContent::text("note"),
             ToolResultContent::Image(Image {

@@ -1275,7 +1275,7 @@ impl KaiboHandler {
     /// TOML was really testing "my fixture **plus** whatever keys happen to be in the
     /// developer's environment." That passes on CI and fails on the maintainer's laptop
     /// (or the reverse) — the flakiest kind of test, and it hid real behavior here: the
-    /// gate correctly dropped `deliberate` everywhere, but `explore`/`batch_submit`
+    /// gate correctly dropped `deliberate` everywhere, but `batch_submit`
     /// looked ungated because ambient keys made a built-in cast usable. Tests pass a
     /// closure that answers for exactly the keys the fixture means to have; production
     /// passes the real environment. Deliberately a closure rather than `set_var`, which
@@ -1762,7 +1762,7 @@ impl KaiboHandler {
     /// explore → offline synth, so the synth must run on the batch or direct lane
     /// (an interactive synth belongs to `consult`). The other half — a *missing
     /// explorer* — is caught when the explorer arm is resolved (`arm` errors, naming
-    /// the gap), the same way `explore` leans on it; here we only need the synth-lane
+    /// the gap); here we only need the synth-lane
     /// half. A synth-only batch cast (`anthropic-batch`) passes this but fails at the
     /// explorer resolve, which is the honest error (no dossier phase to staff).
     fn require_deliberate_cast(&self, cast: &Cast) -> Result<(), McpError> {
@@ -2349,8 +2349,7 @@ impl KaiboHandler {
             let explorer_model = explorer.model.clone();
 
             // The dossier is built synchronously, on the live progress sink: the caller
-            // waits through this bounded (minutes) explorer sweep, exactly as `explore`
-            // does, so a thin/failed dossier is a clean error *before* any offline tokens
+            // waits through this bounded (minutes) explorer sweep, so a thin/failed dossier is a clean error *before* any offline tokens
             // are spent. Only the deliberation (Stage 2) is handed off async. Attachments
             // reach the dossier-builder as read-WHOLE directives (the sweep semantics), so
             // their content flows to the offline synth through the dossier it writes.
@@ -5554,7 +5553,7 @@ mod tests {
     /// `request_timeout` (+ margin), NOT the interactive `call_deadline`. This is the
     /// decision that keeps a slow local `deliberate` from forcing the interactive
     /// ceiling high: give that model 3h of `request_timeout` and the direct job inherits
-    /// it, while `consult`/`explore`/`oneshot` stay bounded at the tight `call_deadline`.
+    /// it, while `consult`/`oneshot` stay bounded at the tight `call_deadline`.
     #[test]
     fn deliberate_direct_deadline_tracks_request_timeout_not_call_deadline() {
         let cfg = crate::config::Config::builtin();
@@ -8829,7 +8828,7 @@ enabled = false
             "no `synth` slot",
             "`consult`",
             "`explorer`",
-            "`explore`",
+            "`research`",
         ] {
             assert!(msg.contains(needle), "refusal must name {needle}: {msg}");
         }
@@ -8845,7 +8844,7 @@ enabled = false
     /// keeps real key files, so a naive fixture passes on her box and fails in CI). The
     /// keyless `openai-local` needs the extra `key_optional = false`: without a required
     /// credential it resolves to a *placeholder* and stays `LocalUnverified`, which counts
-    /// as usable — and that is what kept `explore` looking ungated even under an empty
+    /// as usable — and that is what kept explorer-only tools looking ungated even under an empty
     /// environment, since the built-in local casts all carry explorer slots.
     const NO_BUILTIN_CASTS: &str = r#"
         [backends.anthropic]
@@ -8861,7 +8860,7 @@ enabled = false
         api_key_file = "/nonexistent-kaibo-test/openai"
     "#;
 
-    /// A cast fixture with an interactive team and nothing else — so `explore` has an
+    /// A cast fixture with an interactive team and nothing else — so `research` has an
     /// explorer, `consult`/`oneshot` have an interactive synth, and NOTHING can staff
     /// `batch_submit` or `deliberate` (both need an offline synth lane).
     /// `NO_BUILTIN_CASTS` followed by `rest`. A plain concatenation rather than
@@ -9126,7 +9125,7 @@ enabled = false
             "every refusal names what the caller can reach instead: {msg}"
         );
 
-        // Unstaffable: `explore` needs an explorer slot, and this cast has none. The
+        // Unstaffable: `deliberate` needs an explorer slot, and this cast has none. The
         // operator changed nothing, so naming a flag here would send them to the wrong
         // knob entirely.
         let h = hermetic_handler_from_toml(&with_no_builtin_casts(
