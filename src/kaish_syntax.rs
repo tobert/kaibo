@@ -816,8 +816,8 @@ mod tests {
     }
 
     /// The two reading idioms that follow a grep hit: a wide span around a match in a
-    /// large file, and `file` to learn what a file is before reading it. Whole-file
-    /// reading stays the default and is asserted next door; these are the follow-ups.
+    /// large file, and `file` to learn what a file is before reading it. Reading is
+    /// sized to the claim (pinned in `consult::prompts`); these are the read idioms.
     ///
     /// The span is pinned quoted because that form is correct on every kaish kaibo has
     /// run. What this test deliberately no longer asserts is the *rule* — kaish 0.14

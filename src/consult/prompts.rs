@@ -1134,6 +1134,7 @@ mod tests {
             ("consult", consult_preamble()),
             ("consult solo", consult_solo_preamble()),
             ("shell addendum", crate::kaish_syntax::KAISH_SANDBOX_ADDENDUM.to_string()),
+            ("sandbox doc", crate::kaish_syntax::kaibo_sandbox_doc()),
         ] {
             for retired in [
                 "Read files WHOLE",
