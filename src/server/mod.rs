@@ -2015,7 +2015,7 @@ impl KaiboHandler {
             debugging, architecture, \"what does this change break\" — and get a grounded \
             answer with `file:line` citations. A synthesis agent (DeepSeek, Gemini, \
             Anthropic, OpenRouter, or local — pick with `cast`) drives a READ-ONLY shell over \
-            the project: it reads the real, current source, delegates broad sweeps to a fast \
+            the project: it reads the real, current source, delegates broad sweeps to an \
             explorer when its cast runs a team, and answers with evidence, never modifying anything. Describe your \
             intent in prose; kaibo locates the code itself, so you don't paste files or \
             diffs. `attach` puts specific files in front of it; `session_id` threads a \
@@ -2497,7 +2497,7 @@ impl KaiboHandler {
 
     #[tool(
         description = "Put a top model's deepest reasoning on your codebase without holding \
-            a session open. A fast model first investigates the project READ-ONLY and \
+            a session open. An explorer model first investigates the project READ-ONLY and \
             assembles a cited dossier (you wait for this — minutes); a heavyweight synth \
             then deliberates offline over that evidence — a frontier model on the \
             provider's batch lane (max thinking, half price) or a big local model taking \

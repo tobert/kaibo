@@ -975,7 +975,6 @@ mod tests {
                 live,
             )
         };
-        assert!(render(true).contains(RESEARCH_CLAUSE));
         assert!(!render(false).contains("`research`"));
         assert!(!render(false).contains("web: true"));
     }

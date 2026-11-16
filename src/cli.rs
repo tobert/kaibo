@@ -441,8 +441,8 @@ pub struct OneshotArgs {
 }
 
 /// `kaibo explore` — a cited survey report (the evidence-gathering half of consult): a
-/// model sweeps the project READ-ONLY and returns findings + `file:line` locations +
-/// the trail it followed, not a synthesized answer.
+/// model sweeps the project READ-ONLY and returns a summary, `file:line` locations, how
+/// they connect, what remains open, and the trail it followed, not a synthesized answer.
 #[derive(Args, Debug)]
 pub struct ExploreArgs {
     /// What to survey or map. Say in prose what you want mapped — kaibo's explorer
