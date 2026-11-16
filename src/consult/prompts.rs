@@ -327,10 +327,8 @@ pub fn resolve_phase_preamble(
 /// Explorer preamble: gather and organize evidence for the reader. The report, not
 /// the answer, is the deliverable: located, read, cited, and connected, with the
 /// verdict left to the reader (Amy, 2026-11-15: "its role is to produce a dossier, not
-/// the analysis"). Reading is sized to the claim. The whole-file-first directive this
-/// replaced (2026-07 to 2026-11) was tuned for lite explorers grazing in small slices;
-/// the Haiku/Luna/Flash floor reads well without it. Composes the
-/// shared [`kaish_syntax_core`] so the shell idioms and exit-code contract are
+/// the analysis"). Reading is sized to the claim, with no default of whole files or of
+/// small slices. Composes the shared [`kaish_syntax_core`] so the shell idioms and exit-code contract are
 /// stated in exactly one place.
 ///
 /// Opens a *role* rather than a capability: this model is the **explorer**, the name
@@ -1109,7 +1107,6 @@ mod tests {
 
     /// Reading is sized to the claim: a whole file when it is needed in full, a span
     /// around a match otherwise, and spans for a file too large to come back whole.
-    /// Attachments are the one place "whole" stays a rule: the caller chose those files.
     #[test]
     fn reading_is_sized_to_the_claim() {
         let p = report_preamble(ReportReader::SynthesisAgent);
@@ -1124,6 +1121,39 @@ mod tests {
             p.contains("grep -n SYMBOL FILE") && p.contains("sed -n '1200,2400p'"),
             "a truncated read continues in targeted spans: {p}"
         );
+    }
+
+    /// The reading rule has one voice. The explorer and consult preambles say to read what
+    /// each claim needs, and the `[orientation]` file map is spliced in after them, so the
+    /// map is the last reading guidance a model sees. This composes the real map under
+    /// every project-reading phase and checks that it neither tells the model to read
+    /// whole files by default nor restates the rule in other words than the preamble.
+    #[tokio::test]
+    async fn the_composed_prompt_gives_one_reading_rule() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("small.rs"), "fn main() {}\n").unwrap();
+        std::fs::write(dir.path().join("huge.rs"), "x\n".repeat(200_000)).unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let map = crate::orientation::OrientationConfig::default()
+            .assemble(&root, crate::sandbox::SandboxConfig::default())
+            .await
+            .unwrap()
+            .expect("a non-empty repo yields a map");
+        assert!(
+            map.contains("read in spans"),
+            "the fixture must exercise the marked-file text too: {map}"
+        );
+        for phase in Phase::ALL.into_iter().filter(|p| p.reads_project()) {
+            let composed =
+                resolve_phase_preamble(phase, &PromptOverrides::default(), Some(&map), None);
+            for whole_first in ["read those whole", "never guess", "go straight to reading"] {
+                assert!(
+                    !composed.contains(whole_first),
+                    "{phase:?}: the file map restates reading as {whole_first:?}, against the \
+                     preamble's claim-sized rule:\n{composed}"
+                );
+            }
+        }
     }
 
     /// Every `sed` range kaibo puts in front of a model is quoted, and this sweeps every
