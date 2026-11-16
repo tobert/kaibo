@@ -57,6 +57,20 @@ pub const LEASE_SECS: i64 = 45;
 // flight. The token request's own timeout bounds it.
 const _: () = assert!((super::TOKEN_REQUEST_TIMEOUT.as_secs() as i64) < LEASE_SECS);
 
+/// How many times a refresh tries to store the rotated pair before giving it up. A
+/// write that fails `Busy` (another kaibo writing the store) usually succeeds on the
+/// next try, and losing a rotated pair costs the operator a sign-in.
+const STORE_ROTATED_ATTEMPTS: u32 = 2;
+const STORE_ROTATED_PAUSE: Duration = Duration::from_millis(500);
+
+// The whole refresh — token request plus every store attempt — must also end inside
+// the lease, so a takeover never presents the refresh token this one just spent.
+const _: () = assert!(
+    (super::TOKEN_REQUEST_TIMEOUT.as_secs()
+        + STORE_ROTATED_ATTEMPTS as u64 * (crate::store::BUSY_TIMEOUT.as_secs() + 1))
+        < LEASE_SECS as u64
+);
+
 /// How long a waiter polls for another process's refresh before giving up.
 const WAIT_FOR_REFRESH: Duration = Duration::from_secs(60);
 
@@ -328,12 +342,24 @@ impl TokenSource {
     ) -> Result<String> {
         match refresh(&self.http, &grant).await {
             Ok(fresh) => {
-                let finished = match store.finish_refresh(holder, &fresh).await {
+                let finished = match self.store_rotated(store, holder, &fresh).await {
                     Ok(finished) => finished,
                     Err(e) => {
-                        let _ = store.release_refresh_lease(&self.backend, holder).await;
+                        // The provider has rotated the pair and the store still holds
+                        // the spent refresh token. Releasing the lease would let the
+                        // next caller present it, and a reused refresh token can get
+                        // the whole grant revoked. Remove the grant instead, so the
+                        // next call asks for a sign-in rather than replaying it.
+                        let removed = store.delete_grant_held(&self.backend, holder).await;
+                        tracing::warn!(
+                            backend = %self.backend,
+                            removed = ?removed.as_ref().ok(),
+                            "a refreshed sign-in could not be stored"
+                        );
                         return Err(anyhow::Error::from(e).context(format!(
-                            "storing backend {:?}'s refreshed sign-in",
+                            "the provider refreshed backend {:?}'s sign-in, but kaibo could \
+                             not store the new credential in its state db, so the stored one \
+                             is spent. Run `kaibo login {0}` in a terminal to sign in again",
                             self.backend
                         )));
                     }
@@ -353,8 +379,16 @@ impl TokenSource {
                     .is_some_and(TokenEndpointError::grant_is_dead);
                 if dead {
                     // Revoked, expired, or the app was disconnected: the grant can never
-                    // work again, so drop it and say how to sign in again.
-                    let _ = store.delete_grant(&self.backend).await;
+                    // work again, so drop it and say how to sign in again. Only while we
+                    // still hold the lease: a `kaibo login` that finished during this
+                    // refresh cleared it, and its new grant is the one to use.
+                    if !store.delete_grant_held(&self.backend, holder).await? {
+                        if let Ok(current) = self.load().await {
+                            if !current.needs_refresh(None, now()) {
+                                return Ok(current.access_token);
+                            }
+                        }
+                    }
                     return Err(anyhow!(
                         "the provider no longer accepts backend {:?}'s sign-in ({e}) — it was \
                          revoked, expired after 30 days unused, or the app was disconnected. \
@@ -364,6 +398,31 @@ impl TokenSource {
                 }
                 let _ = store.release_refresh_lease(&self.backend, holder).await;
                 Err(e.context(format!("refreshing backend {:?}'s sign-in", self.backend)))
+            }
+        }
+    }
+}
+
+impl TokenSource {
+    /// Store a rotated pair, trying again once if the write fails (`Busy` from another
+    /// writer is the usual cause). Ok(false) means the lease lapsed and another holder
+    /// took over, the same as [`SessionStore::finish_refresh`].
+    async fn store_rotated(
+        &self,
+        store: &SessionStore,
+        holder: &str,
+        fresh: &Grant,
+    ) -> crate::store::Result<bool> {
+        let mut attempt = 1;
+        loop {
+            match store.finish_refresh(holder, fresh).await {
+                Ok(finished) => return Ok(finished),
+                Err(e) if attempt >= STORE_ROTATED_ATTEMPTS => return Err(e),
+                Err(e) => {
+                    tracing::warn!(backend = %self.backend, attempt, "storing a refreshed sign-in failed: {e}");
+                    attempt += 1;
+                    tokio::time::sleep(STORE_ROTATED_PAUSE).await;
+                }
             }
         }
     }

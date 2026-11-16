@@ -696,6 +696,40 @@ async fn one_holder_at_a_time_takes_the_refresh_lease() {
         .unwrap());
 }
 
+/// A refresh that finds its grant dead removes it only while it still holds the lease.
+/// `kaibo login` replacing the row clears the lease, so a refresh that started on the
+/// old grant cannot delete the new sign-in when its `invalid_grant` arrives late.
+#[tokio::test]
+async fn a_stale_refresh_cannot_delete_a_newer_sign_in() {
+    let (store, _d) = open(4).await;
+    store.put_grant(&grant("plan")).await.unwrap();
+    assert!(store
+        .claim_refresh_lease("plan", "old-refresh", 100, 60)
+        .await
+        .unwrap());
+    // The operator signs in again while that refresh is in flight.
+    let mut newer = grant("plan");
+    newer.access_token = "at-new".into();
+    newer.refresh_token = Some("rt-new".into());
+    store.put_grant(&newer).await.unwrap();
+    assert!(
+        !store
+            .delete_grant_held("plan", "old-refresh")
+            .await
+            .unwrap(),
+        "the old holder's lease was cleared by the new sign-in"
+    );
+    assert_eq!(store.get_grant("plan").await.unwrap(), Some(newer));
+
+    // The current holder can remove a dead grant.
+    assert!(store
+        .claim_refresh_lease("plan", "current", 100, 60)
+        .await
+        .unwrap());
+    assert!(store.delete_grant_held("plan", "current").await.unwrap());
+    assert!(store.get_grant("plan").await.unwrap().is_none());
+}
+
 #[tokio::test]
 async fn the_host_id_is_created_once_and_kept() {
     let (store, dir) = open(4).await;

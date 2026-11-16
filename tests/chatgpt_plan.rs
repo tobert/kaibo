@@ -112,10 +112,15 @@ async fn serve_queue(replies: Vec<Reply>) -> (String, Arc<Mutex<Vec<Seen>>>, Que
                     .join("\n");
                 let body = text[head_end + 4..head_end + 4 + length].to_string();
                 log.lock().unwrap().push(Seen {
-                    path,
+                    path: path.clone(),
                     headers,
                     body,
                 });
+                if path == "/oauth/token" {
+                    // Hold a refresh open long enough for concurrent callers to pile up
+                    // behind it, the window a double-spend would need.
+                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                }
                 let (status, ctype, body) = replies.lock().unwrap().pop_front().unwrap_or((
                     "500 Internal Server Error",
                     "text/plain",
@@ -376,10 +381,14 @@ async fn concurrent_callers_share_one_refresh() {
         .unwrap();
 
     let arm = Arc::new(plan_arm("plan-concurrent", &base));
-    let calls = (0..4).map(|_| {
-        let arm = arm.clone();
-        tokio::spawn(async move { oneshot("q", &[], &arm, &PhaseContext::default()).await })
-    });
+    // Spawn all four before awaiting any, so they overlap: the token endpoint holds
+    // its reply (see `serve`), and the other three arrive while the refresh is open.
+    let calls: Vec<_> = (0..4)
+        .map(|_| {
+            let arm = arm.clone();
+            tokio::spawn(async move { oneshot("q", &[], &arm, &PhaseContext::default()).await })
+        })
+        .collect();
     for call in calls {
         call.await.unwrap().expect("every caller answers");
     }
@@ -687,6 +696,41 @@ async fn models_lists_a_signed_in_backend_with_its_token_and_plan_visibility() {
 }
 
 #[tokio::test]
+async fn models_refreshes_once_when_the_plan_refuses_the_token() {
+    let store = store().await;
+    let (base, seen) = serve(vec![
+        ("401 Unauthorized", "application/json", json!({"error": {"code": "invalid_token"}}).to_string()),
+        token_reply("at-new", "rt-new"),
+        (
+            "200 OK",
+            "application/json",
+            json!({"models": [{"slug": "gpt-6.1-sol", "visibility": "list"}]}).to_string(),
+        ),
+    ])
+    .await;
+    // Not due for refresh by its clock: only the 401 says the token is bad.
+    store
+        .put_grant(&grant("plan-models-401", &base, "at-old", 3600))
+        .await
+        .unwrap();
+    let cfg = Config::from_toml_str(&format!(
+        "[backends.plan-models-401]\nkind = \"openai\"\nauth = \"chatgpt\"\nbase_url = \"{base}/v1\"\n"
+    ))
+    .unwrap();
+    let backend = cfg.resolve_backend("plan-models-401").unwrap();
+    let fetcher = kaibo::discover::HttpModelListFetcher::new(std::time::Duration::from_secs(10));
+    let models = kaibo::discover::discover_models(backend, &fetcher)
+        .await
+        .expect("lists after one refresh");
+    assert_eq!(models.len(), 1);
+    let seen = seen.lock().unwrap();
+    let paths: Vec<_> = seen.iter().map(|s| s.path.as_str()).collect();
+    assert_eq!(paths, ["/v1/models", "/oauth/token", "/v1/models"]);
+    assert_eq!(seen[0].bearer().as_deref(), Some("at-old"));
+    assert_eq!(seen[2].bearer().as_deref(), Some("at-new"));
+}
+
+#[tokio::test]
 async fn openrouter_sign_in_mints_and_stores_a_key() {
     let store = store().await;
     let (base, seen) = serve(vec![(
@@ -765,9 +809,11 @@ async fn a_plan_limit_inside_the_stream_names_the_plan() {
     .await
     .expect_err("a failed stream is an error");
     let msg = format!("{err:#}");
+    // The failure renderer recognizes a spent plan only by this exact code, read from
+    // the same `{err:#}` string, so the code itself has to survive the stream path.
     assert!(
-        msg.contains("subscription_sharing_usage_limit_exceeded") || msg.contains("usage limit"),
-        "{msg}"
+        msg.contains(kaibo::completion_retry::PLAN_USAGE_LIMIT_CODE),
+        "the plan-limit code must reach the renderer: {msg}"
     );
     eprintln!("mid-stream plan limit surfaces as: {msg}");
 }

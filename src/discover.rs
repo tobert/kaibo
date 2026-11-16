@@ -548,12 +548,32 @@ impl ModelListFetcher for HttpModelListFetcher {
             .await
             .map_err(|e| anyhow!("reading model list response body from {}: {e}", req.url))?;
         if !status.is_success() {
-            return Err(anyhow!("model list {status} from {}: {text}", req.url));
+            return Err(ModelListStatus {
+                status: status.as_u16(),
+                message: format!("model list {status} from {}: {text}", req.url),
+            }
+            .into());
         }
         serde_json::from_str(&text)
             .with_context(|| format!("parsing model list JSON from {}: {text}", req.url))
     }
 }
+
+/// A model list endpoint answered with a non-success status. Typed so a signed-in
+/// backend can tell a refused credential (401) from any other failure.
+#[derive(Debug)]
+pub struct ModelListStatus {
+    pub status: u16,
+    message: String,
+}
+
+impl std::fmt::Display for ModelListStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for ModelListStatus {}
 
 /// Fetch every model `backend` advertises, paginating where the provider requires it:
 /// Anthropic loops on `has_more`/`last_id` (`after_id` cursor, `limit=1000`), Gemini
@@ -611,11 +631,22 @@ pub async fn discover_models(
                 return Ok(parse_openai_models(&body));
             };
             // A signed-in backend lists with its current token, refreshed if due.
-            let token = crate::oauth::TokenSource::for_process(&backend.name, auth)?
-                .bearer()
-                .await?;
-            let req = discovery_request_with_key(backend, wire, None, token)?;
-            let body = fetcher.get_json(&req).await?;
+            let source = crate::oauth::TokenSource::for_process(&backend.name, auth)?;
+            let token = source.bearer().await?;
+            let req = discovery_request_with_key(backend, wire, None, token.clone())?;
+            // A 401 gets one refresh and one resend, as a completion call does.
+            let body = match fetcher.get_json(&req).await {
+                Err(e)
+                    if e
+                        .downcast_ref::<ModelListStatus>()
+                        .is_some_and(|s| s.status == 401) =>
+                {
+                    let token = source.after_refusal(&token).await?;
+                    let req = discovery_request_with_key(backend, wire, None, token)?;
+                    fetcher.get_json(&req).await?
+                }
+                other => other?,
+            };
             if auth == crate::oauth::AuthProfile::Chatgpt {
                 return Ok(parse_chatgpt_plan_models(&body));
             }

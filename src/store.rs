@@ -84,7 +84,7 @@ use turso::{Builder, Connection, Database, Value};
 /// Per-connection busy budget. A single turso `Connection` refuses *concurrent* use, so
 /// the store mints a fresh connection per operation; this bounds how long one waits when
 /// another connection holds a write lock before it gives up with `Busy`.
-const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
+pub(crate) const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Current on-disk schema version. Bump + add a migration arm when the shape changes;
 /// migrations are forward-only and applied through [`SessionStore::migrate`].
@@ -795,6 +795,21 @@ impl SessionStore {
             .execute(
                 "DELETE FROM oauth_grants WHERE backend = ?1",
                 [backend.to_string()],
+            )
+            .await?;
+        Ok(n > 0)
+    }
+
+    /// Remove `backend`'s sign-in only while `holder` holds its refresh lease: the
+    /// path a refresh takes when the provider says the grant is dead. A `kaibo login`
+    /// that replaced the row meanwhile cleared the lease, so its new grant survives.
+    /// True if a grant was removed.
+    pub async fn delete_grant_held(&self, backend: &str, holder: &str) -> Result<bool> {
+        let conn = self.conn().await?;
+        let n = conn
+            .execute(
+                "DELETE FROM oauth_grants WHERE backend = ?1 AND lease_holder = ?2",
+                (backend.to_string(), holder.to_string()),
             )
             .await?;
         Ok(n > 0)
