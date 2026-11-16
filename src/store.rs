@@ -1058,16 +1058,32 @@ fn refuse_symlinked_db_files(path: &Path) -> Result<()> {
 ///
 /// `resolved` must be canonical (no symlinks), and the caller must use that same path for
 /// everything after: the walk vouches for the path it walked, not for an unresolved one
-/// that reaches it through a symlink someone else could swap.
+/// that reaches it through a symlink someone else could swap. The walk does not follow
+/// links, so a component swapped after the canonicalize is refused rather than judged by
+/// its target. Once every component passes, none can be replaced by another user: each
+/// one's parent is this user's or root's, and not open to others unless sticky.
 #[cfg(unix)]
 fn refuse_replaceable_ancestors(resolved: &Path, dir: &Path) -> Result<()> {
     use std::os::unix::fs::MetadataExt;
     // SAFETY: geteuid takes no arguments, cannot fail, and touches no memory.
     let me = unsafe { libc::geteuid() };
     for ancestor in resolved.ancestors() {
-        let meta = std::fs::metadata(ancestor).map_err(|e| {
+        // Not following links: a canonical path has none, so a link here means a
+        // component was swapped after the canonicalize, and its target says nothing
+        // about who can replace it.
+        let meta = std::fs::symlink_metadata(ancestor).map_err(|e| {
             StoreError::CredentialsDir(format!("reading {}: {e}", ancestor.display()))
         })?;
+        if meta.file_type().is_symlink() {
+            return Err(StoreError::CredentialsDir(format!(
+                "kaibo will not store sign-ins under {}: {} changed into a symlink while kaibo \
+                 was checking it, so another user may be redirecting the path. Check who can \
+                 write {}, then try again",
+                dir.display(),
+                ancestor.display(),
+                ancestor.parent().unwrap_or(ancestor).display()
+            )));
+        }
         let mode = meta.mode();
         let sticky = mode & 0o1000 != 0;
         let owner_ok = meta.uid() == me || meta.uid() == 0;
@@ -1537,6 +1553,24 @@ fn validate_local_filesystem(_dir: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The ancestor walk does not follow links: a component that is a symlink, as one
+    /// swapped in after the canonicalize would be, is refused even when its target is a
+    /// private directory this user owns.
+    #[cfg(unix)]
+    #[test]
+    fn the_ancestor_walk_refuses_a_symlinked_component() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let private = dir.path().join("private");
+        std::fs::create_dir_all(&private).unwrap();
+        let canonical = dir.path().canonicalize().unwrap();
+        std::os::unix::fs::symlink(canonical.join("private"), canonical.join("swapped")).unwrap();
+        refuse_replaceable_ancestors(&canonical.join("private"), &private)
+            .expect("a real private chain passes");
+        let err = refuse_replaceable_ancestors(&canonical.join("swapped"), &private)
+            .expect_err("a symlinked component is refused");
+        assert!(err.to_string().contains("changed into a symlink"), "{err}");
+    }
 
     /// The one carve-out from fatal open errors rests on this text match (and the platform
     /// gate, pinned below), so pin it: the
