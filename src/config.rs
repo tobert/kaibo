@@ -5,8 +5,8 @@
 //! [`ProviderKind`] wire protocol plus base URL, key source, and request timeout)
 //! and a [`Cast`] (a *composition*: a named assignment of models to
 //! [`ModelRole`]s, freely spanning backends). Calls pick casts; backends are
-//! reachable only through a cast's slots. That indirection is what lets "a cheap
-//! local deepseek explorer feeding a claude synth" be one named thing — the old fused
+//! reachable only through a cast's slots. That indirection is what lets "a local
+//! deepseek explorer feeding a claude synth" be one named thing — the old fused
 //! `Profile` couldn't say it. See `docs/casts.md` (the contract for this split).
 //!
 //! ## Layering
@@ -152,8 +152,8 @@ impl Default for Defaults {
             // cap is no longer fatal — `run_phase` forces one final answer-now turn
             // from the partial transcript rather than discarding the work. So we'd
             // rather give the loop room (100 goes quickly in the explorer) than have
-            // it bail early. The explorer sweeps breadth; the synth driver both
-            // delegates sweeps and reads spans, so it gets the larger budget.
+            // it bail early. The consult driver does every read itself, so it gets the
+            // larger budget.
             explorer_max_turns: 100,
             synth_max_turns: 200,
             max_tokens: 16384,
@@ -341,27 +341,6 @@ impl Lane {
         match self {
             Self::Batch => "batch",
             Self::Direct => "direct",
-        }
-    }
-}
-
-/// How a cast runs `consult`, set by the cast's `consult` key.
-///
-/// `Solo`: the synth reads the code itself through `run_kaish`, and no explorer model is
-/// called. `Team`: the synth delegates broad surveys to the cast's explorer. A cast that
-/// leaves the key out follows its slots (see [`Cast::consult_solo`]).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ConsultMode {
-    Solo,
-    Team,
-}
-
-impl ConsultMode {
-    /// The TOML spelling (`consult = "…"`), used in load errors and `kaibo://config`.
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Solo => "solo",
-            Self::Team => "team",
         }
     }
 }
@@ -1032,23 +1011,9 @@ pub struct Cast {
     pub name: String,
     /// The role table: which slot serves each [`ModelRole`].
     pub slots: BTreeMap<ModelRole, ModelSlot>,
-    /// The cast's `consult = "solo" | "team"` setting, if it gave one. `None` follows
-    /// the slots: team when an explorer slot exists, solo when it does not.
-    pub consult: Option<ConsultMode>,
 }
 
 impl Cast {
-    /// Whether `consult` and `consult_submit` run single-stage on this cast: the synth
-    /// reads for itself and no explorer model is resolved. An explicit `consult` key
-    /// decides; without one, a cast runs solo exactly when it has no explorer slot. The
-    /// explorer slot stays in place for `explore` and `deliberate`.
-    pub fn consult_solo(&self) -> bool {
-        match self.consult {
-            Some(mode) => mode == ConsultMode::Solo,
-            None => self.slot(ModelRole::Explorer).is_none(),
-        }
-    }
-
     /// The slot serving `role`, if configured. `None` means the capability is
     /// absent; the *caller* decides whether that's an error for its tool.
     pub fn slot(&self, role: ModelRole) -> Option<&ModelSlot> {
@@ -1719,8 +1684,7 @@ impl Config {
     /// tools. The gate `research` is advertised behind.
     pub fn web_live(&self, get_env: impl Fn(&str) -> Option<String>, usable: &[String]) -> bool {
         self.web.enabled
-            && (self.web_usable(get_env)
-                || usable.iter().any(|c| self.cast_researches_natively(c)))
+            && (self.web_usable(get_env) || usable.iter().any(|c| self.cast_researches_natively(c)))
     }
 
     pub fn resolve_backend(&self, name: &str) -> Result<&Backend> {
@@ -2107,11 +2071,10 @@ impl Config {
             let base_url_legal = matches!(
                 b.kind.class(),
                 credentials::ProviderClass::Media(_) | credentials::ProviderClass::Web(_)
-            )
-                || matches!(
-                    b.kind,
-                    ProviderKind::Openai | ProviderKind::Anthropic | ProviderKind::Gemini
-                );
+            ) || matches!(
+                b.kind,
+                ProviderKind::Openai | ProviderKind::Anthropic | ProviderKind::Gemini
+            );
             if !base_url_legal && b.base_url.is_some() {
                 bail!(
                     "backend {:?} (kind {:?}) sets base_url, but only the `openai`, \
@@ -2234,19 +2197,13 @@ impl Config {
             let cast = casts.entry(name.clone()).or_insert_with(|| Cast {
                 name: name.clone(),
                 slots: BTreeMap::new(),
-                consult: None,
             });
             if let Some(raw_mode) = rc.consult.as_deref() {
-                cast.consult = Some(match raw_mode.trim().to_ascii_lowercase().as_str() {
-                    "solo" => ConsultMode::Solo,
-                    "team" => ConsultMode::Team,
-                    _ => bail!(
-                        "cast {name:?}: consult = {raw_mode:?} is not a mode — use \"solo\" \
-                         (the synth reads the code itself) or \"team\" (the synth delegates \
-                         to the explorer), or remove the key to follow the slots; \
-                         `kaibo example-config` shows the shape"
-                    ),
-                });
+                bail!(
+                    "cast {name:?}: consult = {raw_mode:?} is no longer a cast key. `consult` \
+                     always runs the synth alone, reading the code itself, so there is no \
+                     mode to choose. Delete the `consult` line from [casts.{name}]."
+                );
             }
             for (role, raw_slot) in rc.slots() {
                 let mut slot = raw_slot
@@ -2297,19 +2254,7 @@ impl Config {
         // Resolve every slot's backend ref through the alias map (stored canonical),
         // and validate the slot. Unknown backend → loud error naming the known set.
         for cast in casts.values_mut() {
-            let Cast {
-                name,
-                slots,
-                consult,
-            } = cast;
-            if *consult == Some(ConsultMode::Team) && !slots.contains_key(&ModelRole::Explorer) {
-                bail!(
-                    "cast {name:?}: consult = \"team\" needs an explorer slot to delegate \
-                     to, and this cast has none — add `explorer = \"backend/model-id\"` to \
-                     [casts.{name}], or set consult = \"solo\" (or remove the key) so the \
-                     synth reads the code itself; `kaibo example-config` shows the shape"
-                );
-            }
+            let Cast { name, slots } = cast;
             for (role, slot) in slots.iter_mut() {
                 if !backends.contains_key(&slot.backend) {
                     match backend_aliases.get(&slot.backend) {
@@ -2673,9 +2618,6 @@ impl Config {
         if disable.consult {
             self.tools.consult = false;
         }
-        if disable.explore {
-            self.tools.explore = false;
-        }
         if disable.deliberate {
             self.tools.deliberate = false;
         }
@@ -2723,7 +2665,6 @@ impl Config {
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ToolDisables {
     pub consult: bool,
-    pub explore: bool,
     pub deliberate: bool,
     pub oneshot: bool,
     pub run_kaish: bool,
@@ -2890,17 +2831,7 @@ fn builtin_casts() -> BTreeMap<String, Cast> {
                 },
             ),
         ]);
-        // Claude reads the code itself: with one model there is one prompt cache, and the
-        // Haiku explorer stays for `explore` and the `deliberate` dossier.
-        let consult = matches!(kind, ProviderKind::Anthropic).then_some(ConsultMode::Solo);
-        m.insert(
-            name.clone(),
-            Cast {
-                name,
-                slots,
-                consult,
-            },
-        );
+        m.insert(name.clone(), Cast { name, slots });
     }
     // The offline batch lane's built-in casts (synth slot `lane = Batch`): staffed by
     // a single big, slow, capable synth — the model whose latency is *free* in batch
@@ -2919,7 +2850,6 @@ fn builtin_casts() -> BTreeMap<String, Cast> {
         gemini_batch.clone(),
         Cast {
             name: gemini_batch,
-            consult: None,
             slots: BTreeMap::from([(
                 ModelRole::Synth,
                 ModelSlot {
@@ -2938,7 +2868,6 @@ fn builtin_casts() -> BTreeMap<String, Cast> {
         anthropic_batch.clone(),
         Cast {
             name: anthropic_batch,
-            consult: None,
             slots: BTreeMap::from([(
                 ModelRole::Synth,
                 ModelSlot {
@@ -3154,11 +3083,8 @@ struct RawContext {
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawPrompts {
-    /// Replaces the explorer preamble — standalone `explore`, the nested `explore′`
-    /// sweep inside `consult`, and `deliberate`'s dossier pass all read it. The
-    /// built-in varies one opening by who receives the report; an override replaces
-    /// that too, so it must read correctly for a report handed to a synth AND for one
-    /// that goes straight back to the caller.
+    /// Replaces the explorer preamble — `deliberate`'s dossier pass reads it. The
+    /// report goes to the offline synth.
     explorer: Option<String>,
     /// Replaces the `consult` driver preamble.
     consult: Option<String>,
@@ -3210,7 +3136,6 @@ struct RawServer {
 #[serde(deny_unknown_fields)]
 struct RawTools {
     consult: Option<bool>,
-    explore: Option<bool>,
     deliberate: Option<bool>,
     oneshot: Option<bool>,
     run_kaish: Option<bool>,
@@ -3397,7 +3322,8 @@ struct RawCast {
     batch: Option<bool>,
     explorer: Option<RawSlot>,
     synth: Option<RawSlot>,
-    /// `"solo"` or `"team"`: how `consult` runs on this cast. See [`ConsultMode`].
+    /// Removed: `consult` always runs the synth alone. Still parsed so a config that
+    /// sets it gets a refusal naming the key rather than a generic unknown-key error.
     consult: Option<String>,
     /// The production slot — a text-to-image model. See [`ModelRole::Image`].
     image: Option<RawSlot>,
@@ -3806,7 +3732,6 @@ fn merge_tools(raw: RawTools) -> ToolGating {
     let d = ToolGating::default();
     ToolGating {
         consult: raw.consult.unwrap_or(d.consult),
-        explore: raw.explore.unwrap_or(d.explore),
         deliberate: raw.deliberate.unwrap_or(d.deliberate),
         oneshot: raw.oneshot.unwrap_or(d.oneshot),
         run_kaish: raw.run_kaish.unwrap_or(d.run_kaish),
@@ -3870,9 +3795,6 @@ fn apply_raw_env(raw: &mut RawConfig, get: &impl Fn(&str) -> Option<String>) -> 
     let tools = server.tools.get_or_insert_with(Default::default);
     if env_flag(get, "KAIBO_NO_CONSULT") {
         tools.consult = Some(false);
-    }
-    if env_flag(get, "KAIBO_NO_EXPLORE") {
-        tools.explore = Some(false);
     }
     if env_flag(get, "KAIBO_NO_DELIBERATE") {
         tools.deliberate = Some(false);
@@ -4670,98 +4592,28 @@ mod tests {
         );
     }
 
-    // --- built-in equivalence -------------------------------------------------
-
-    /// `consult = "solo"` makes a cast with an explorer run `consult` single-stage; the
-    /// explorer slot stays for `explore` and `deliberate`. Without the key the slots
-    /// decide, and `"team"` is the explicit spelling of the default.
+    /// The removed cast key `consult` is refused at load, naming the cast, the key, and
+    /// the fix, for "solo" and "team" alike: neither mode exists any more.
     #[test]
-    fn consult_key_decides_the_mode_and_defaults_follow_the_slots() {
-        let cfg = Config::from_toml_str(
-            r#"
-            [casts.s]
-            explorer = "anthropic/claude-haiku-4-5"
-            synth    = "anthropic/claude-opus-4-8"
-            consult  = "solo"
-
-            [casts.t]
-            explorer = "anthropic/claude-haiku-4-5"
-            synth    = "anthropic/claude-opus-4-8"
-            consult  = "team"
-
-            [casts.d]
-            explorer = "anthropic/claude-haiku-4-5"
-            synth    = "anthropic/claude-opus-4-8"
-
-            [casts.nox]
-            synth    = "anthropic/claude-opus-4-8"
-            "#,
-        )
-        .unwrap();
-        let solo = |n: &str| cfg.resolve_cast(n).unwrap().consult_solo();
-        assert!(solo("s"));
-        assert!(
-            cfg.resolve_cast("s")
-                .unwrap()
-                .slot(ModelRole::Explorer)
-                .is_some(),
-            "solo keeps the explorer slot for `explore`"
-        );
-        assert!(cfg.cast_can_explore("s"));
-        assert!(!solo("t"));
-        assert!(!solo("d"), "default with an explorer is team");
-        assert!(solo("nox"), "default without an explorer is solo");
-    }
-
-    /// An unknown value is refused, naming the legal values.
-    #[test]
-    fn consult_key_rejects_an_unknown_value() {
-        let err = Config::from_toml_str(
-            "[casts.x]\nexplorer = \"anthropic/h\"\nsynth = \"anthropic/o\"\nconsult = \"duo\"",
-        )
-        .unwrap_err()
-        .to_string();
-        for needle in ["\"x\"", "\"duo\"", "\"solo\"", "\"team\""] {
-            assert!(err.contains(needle), "must contain {needle}: {err}");
-        }
-    }
-
-    /// `"team"` with no explorer slot is refused at load, naming the key and the fix.
-    #[test]
-    fn consult_team_without_an_explorer_is_refused() {
-        let err = Config::from_toml_str("[casts.x]\nsynth = \"anthropic/o\"\nconsult = \"team\"")
+    fn the_removed_consult_cast_key_is_refused_naming_the_fix() {
+        for mode in ["solo", "team"] {
+            let err = Config::from_toml_str(&format!(
+                "[casts.x]\nexplorer = \"anthropic/h\"\nsynth = \"anthropic/o\"\nconsult = \"{mode}\""
+            ))
             .unwrap_err()
             .to_string();
-        for needle in [
-            "consult = \"team\"",
-            "explorer slot",
-            "explorer = ",
-            "kaibo example-config",
-        ] {
-            assert!(err.contains(needle), "must contain {needle}: {err}");
+            for needle in [
+                "\"x\"",
+                "no longer a cast key",
+                "Delete the `consult` line",
+                "[casts.x]",
+            ] {
+                assert!(err.contains(needle), "{mode}: must contain {needle}: {err}");
+            }
         }
     }
 
-    /// The built-in `anthropic` cast runs `consult` solo and keeps its explorer; no other
-    /// built-in cast changes. A user re-declaring the cast's models keeps the mode, and
-    /// `consult = "team"` takes the old behavior back.
-    #[test]
-    fn builtin_anthropic_cast_is_solo_and_the_rest_are_unchanged() {
-        let cfg = Config::from_toml_str("").unwrap();
-        let a = cfg.resolve_cast("anthropic").unwrap();
-        assert!(a.consult_solo());
-        assert!(a.slot(ModelRole::Explorer).is_some(), "keeps its explorer");
-        for n in ["deepseek", "gemini", "openrouter", "openai-local"] {
-            let c = cfg.resolve_cast(n).unwrap();
-            assert!(!c.consult_solo(), "{n} stays team");
-        }
-        let retuned =
-            Config::from_toml_str("[casts.anthropic]\nsynth = \"anthropic/claude-opus-4-8\"")
-                .unwrap();
-        assert!(retuned.resolve_cast("anthropic").unwrap().consult_solo());
-        let back = Config::from_toml_str("[casts.anthropic]\nconsult = \"team\"").unwrap();
-        assert!(!back.resolve_cast("anthropic").unwrap().consult_solo());
-    }
+    // --- built-in equivalence -------------------------------------------------
 
     /// A missing config file is a non-error and `cast = "anthropic"` reproduces
     /// today's behavior: the same default models on the same-named backend.

@@ -17,7 +17,6 @@ log = "kaibo=info"                  # RUST_LOG wins
 # Tools also need a usable cast. Full table: kaibo://config/guide, "Tool gating".
 [server.tools]
 consult = true                     # includes consult_submit
-explore = true
 deliberate = true                   # requires explorer + offline synth
 oneshot = true
 run_kaish = true
@@ -180,11 +179,6 @@ auth = "chatgpt"                    # or "openrouter" on an openrouter-kind back
 [casts.chimera]
 explorer = "deepseek/deepseek-flash"
 synth = "gemini/gemini-pro-latest"
-
-[casts.opus-solo]
-explorer = "anthropic/<current Haiku id>"
-synth = "anthropic/<current Opus id>"
-consult = "solo"                    # or "team"; default: team with an explorer; see docs/config.md
 
 [casts.local-only]
 explorer = "gemma/Gemma-4-E4B-it-GGUF"

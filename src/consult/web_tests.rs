@@ -14,7 +14,6 @@ use tokio::net::TcpListener;
 
 use super::config::{ConsultConfig, ExploreConfig, PhaseContext, ResearchConfig};
 use super::engine::{consult_with, explore_with, research_with, Arm};
-use super::prompts::ReportReader;
 use super::shaping::ModelCaps;
 use crate::test_support::{
     has_tool, preamble, text_response, tool_call_response, transcript_text, ScriptedClient,
@@ -22,7 +21,7 @@ use crate::test_support::{
 use crate::web::{WebApi, WebClient, WebSession};
 
 const SYNTH: &str = "capable-synth";
-const EXPLORER: &str = "cheap-explorer";
+const EXPLORER: &str = "explorer-model";
 
 fn arm(client: &ScriptedClient, model: &str) -> Arm {
     Arm::new(
@@ -141,7 +140,7 @@ async fn research_searches_fetches_and_reports() {
             assert!(
                 preamble(req)
                     .unwrap()
-                    .starts_with("You are the explorer. An agent working outside kaibo asked a question that the web"),
+                    .starts_with("You are the explorer agent. A client agent working outside kaibo asked a question"),
                 "research runs on its own preamble"
             );
             let seen = transcript_text(req);
@@ -190,69 +189,6 @@ async fn research_searches_fetches_and_reports() {
     assert_eq!(web.sources()[0].url, "https://example.com/turso");
 }
 
-/// A team consult with the web: each delegated sweep gets both web tools and the
-/// directive; the driver gets `web_fetch` alone (one known page) and the note that its
-/// explorer searches.
-#[tokio::test]
-async fn a_team_consult_gives_search_to_the_sweep_and_fetch_to_the_driver() {
-    let client = ScriptedClient::builder()
-        .on_model(SYNTH, |req| {
-            assert!(
-                !has_tool(req, "web_search"),
-                "searching stays with the sweep"
-            );
-            assert!(
-                has_tool(req, "web_fetch"),
-                "the driver can read one known page"
-            );
-            assert!(
-                preamble(req)
-                    .unwrap()
-                    .ends_with("your next turn is that answer, written out in full."),
-                "the obligation is restated after the web note"
-            );
-            assert!(
-                preamble(req)
-                    .unwrap()
-                    .contains("This call also gives your explorer the web"),
-                "the driver is told its explorer can search"
-            );
-            if !transcript_text(req).contains("REPORT") {
-                Ok(tool_call_response(
-                    "e1",
-                    "explore",
-                    json!({ "question": "q" }),
-                ))
-            } else {
-                Ok(text_response("ANSWER"))
-            }
-        })
-        .on_model(EXPLORER, |req| {
-            assert!(has_tool(req, "run_kaish"));
-            assert!(has_tool(req, "web_search") && has_tool(req, "web_fetch"));
-            assert!(
-                preamble(req)
-                    .unwrap()
-                    .contains("This call also gives you the web"),
-                "the sweep carries the web directive"
-            );
-            Ok(text_response("REPORT"))
-        })
-        .build();
-    let dir = tempdir().unwrap();
-    let out = consult_with(
-        "q",
-        dir.path(),
-        Some(&arm(&client, EXPLORER)),
-        &arm(&client, SYNTH),
-        &consult_cfg(Some(idle_session())),
-    )
-    .await
-    .unwrap();
-    assert_eq!(out.answer, "ANSWER");
-    assert_eq!(client.requests_for(EXPLORER).len(), 1, "the sweep ran");
-}
-
 /// A solo consult with the web: the driver searches itself.
 #[tokio::test]
 async fn a_solo_consult_driver_gets_the_web_itself() {
@@ -272,7 +208,6 @@ async fn a_solo_consult_driver_gets_the_web_itself() {
     consult_with(
         "q",
         dir.path(),
-        None,
         &arm(&client, SYNTH),
         &consult_cfg(Some(idle_session())),
     )
@@ -280,39 +215,20 @@ async fn a_solo_consult_driver_gets_the_web_itself() {
     .unwrap();
 }
 
-/// Without the web, nothing changes: no web tool anywhere, no directive.
+/// Without the web, nothing changes: no web tool, no directive.
 #[tokio::test]
 async fn a_consult_without_the_web_has_no_web_tools_or_directive() {
     let client = ScriptedClient::builder()
         .on_model(SYNTH, |req| {
-            assert!(!has_tool(req, "web_search"));
-            assert!(!preamble(req).unwrap().contains("the web"));
-            if !transcript_text(req).contains("REPORT") {
-                Ok(tool_call_response(
-                    "e1",
-                    "explore",
-                    json!({ "question": "q" }),
-                ))
-            } else {
-                Ok(text_response("ANSWER"))
-            }
-        })
-        .on_model(EXPLORER, |req| {
             assert!(!has_tool(req, "web_search") && !has_tool(req, "web_fetch"));
-            assert!(!preamble(req).unwrap().contains("gives you the web"));
-            Ok(text_response("REPORT"))
+            assert!(!preamble(req).unwrap().contains("the web"));
+            Ok(text_response("ANSWER"))
         })
         .build();
     let dir = tempdir().unwrap();
-    consult_with(
-        "q",
-        dir.path(),
-        Some(&arm(&client, EXPLORER)),
-        &arm(&client, SYNTH),
-        &consult_cfg(None),
-    )
-    .await
-    .unwrap();
+    consult_with("q", dir.path(), &arm(&client, SYNTH), &consult_cfg(None))
+        .await
+        .unwrap();
 }
 
 /// `deliberate`'s dossier stage runs through `explore_with`; with the web on, its
@@ -341,7 +257,6 @@ async fn a_dossier_survey_with_the_web_gets_the_tools() {
         &cfg,
         &[],
         None,
-        ReportReader::SynthesisAgent,
     )
     .await
     .unwrap();
@@ -477,7 +392,11 @@ async fn gemini_research_declares_built_in_tools_and_tallies_the_reply() {
     assert_eq!(sources[0].url, "https://turso.tech/blog/turso-0.8.0");
     assert_eq!(sources[0].fetched_flag(), Some(true));
     assert_eq!(sources[1].title, "github.com");
-    assert_eq!(sources[1].fetched_flag(), None, "a redirect link is provider-cited");
+    assert_eq!(
+        sources[1].fetched_flag(),
+        None,
+        "a redirect link is provider-cited"
+    );
     assert_eq!(web.footer(), "web: 2 searches, 1 fetch via gemini (native)");
 }
 
@@ -509,46 +428,6 @@ async fn native_off_keeps_kaibo_tools() {
     research_with("q", None, &native_arm(&client, EXPLORER), &cfg)
         .await
         .unwrap();
-}
-
-/// A team consult with a native synth and a kaibo-run explorer: the driver declares the
-/// provider's fetch tool alone, the sweep gets kaibo's two tools.
-#[tokio::test]
-async fn a_native_team_driver_gets_only_the_provider_fetch_tool() {
-    let client = ScriptedClient::builder()
-        .on_model(SYNTH, |req| {
-            assert_eq!(native_types(req), vec!["web_fetch_20250910"]);
-            assert!(
-                !has_tool(req, "web_fetch"),
-                "no kaibo fetch beside the native one"
-            );
-            if !transcript_text(req).contains("REPORT") {
-                Ok(tool_call_response(
-                    "e1",
-                    "explore",
-                    json!({ "question": "q" }),
-                ))
-            } else {
-                Ok(text_response("ANSWER"))
-            }
-        })
-        .on_model(EXPLORER, |req| {
-            assert!(native_types(req).is_empty());
-            assert!(has_tool(req, "web_search") && has_tool(req, "web_fetch"));
-            Ok(text_response("REPORT"))
-        })
-        .build();
-    let dir = tempdir().unwrap();
-    let out = consult_with(
-        "q",
-        dir.path(),
-        Some(&arm(&client, EXPLORER)),
-        &native_arm(&client, SYNTH),
-        &consult_cfg(Some(idle_session())),
-    )
-    .await
-    .unwrap();
-    assert_eq!(out.answer, "ANSWER");
 }
 
 /// An Anthropic `pause_turn` (a server-tool turn the provider stopped early) does not end
@@ -625,17 +504,9 @@ async fn the_native_cap_follows_the_shared_budget_across_turns() {
             web: Some(Arc::clone(&web)),
             ..ExploreConfig::default()
         };
-        explore_with(
-            "q",
-            dir.path().to_path_buf(),
-            &a,
-            &cfg,
-            &[],
-            None,
-            ReportReader::SynthesisAgent,
-        )
-        .await
-        .unwrap();
+        explore_with("q", dir.path().to_path_buf(), &a, &cfg, &[], None)
+            .await
+            .unwrap();
         assert_eq!(web.remaining(), (7, 10), "{kind:?}");
     }
 }

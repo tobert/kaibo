@@ -36,7 +36,7 @@ pub struct PhaseContext {
     /// needs the resolved root to read the files); the `Default` is `None`, so
     /// every offline test runs the unchanged preamble.
     pub house_rules: Option<Arc<str>>,
-    /// Where the phase's liveness goes: each delegated sweep and direct kaish read
+    /// Where the phase's liveness goes: each kaish read
     /// emits a [`PhaseEvent`](crate::progress::PhaseEvent) here. The server installs
     /// an adapter that renders these as MCP progress notifications when the caller
     /// asked for them; otherwise it's [`NullSink`], a no-op — so a stateless
@@ -70,24 +70,24 @@ impl Default for PhaseContext {
 
 /// What a read-only investigation needs on top of [`PhaseContext`]: sandbox limits
 /// for the kaish worker(s) it spawns, and how many turns one explorer sweep gets.
-/// `explore` and `deliberate`'s dossier stage need exactly this.
+/// `deliberate`'s dossier stage needs exactly this, and `consult` carries it for the
+/// shared fields (preamble layering, liveness, sandbox, web).
 #[derive(Debug, Clone)]
 pub struct ExploreConfig {
     /// Preamble layering and liveness — shared with every other phase.
     pub phase: PhaseContext,
-    /// Bounds each explorer sweep — it's cheap, let it rip.
+    /// Bounds each explorer sweep.
     pub explorer_max_turns: usize,
     /// Read-only sandbox limits applied to every kaish worker this phase spawns.
     pub sandbox: SandboxConfig,
     /// Cap on how many files ONE sweep may route with its `attach` tool — the bytes
     /// ride ALONGSIDE the sweep's report to whoever reads it, without entering the
-    /// explorer's own context. Rides `ExploreConfig` (not `ConsultConfig`) because
-    /// `deliberate`'s dossier stage — which has no synth driver loop — uses this rung
-    /// too. `0` means "don't inject the tool at all".
+    /// explorer's own context. Only `deliberate`'s dossier stage reads it. `0` means
+    /// "don't inject the tool at all".
     pub max_attachments: usize,
     /// The call's web session, when the caller asked for the web (`web: true`) and the
-    /// operator allows it. `Some` gives every explorer survey on this call `web_search`
-    /// and `web_fetch` plus the web directive, all drawing on the one budget. `None`
+    /// operator allows it. `Some` gives the phase (the explorer survey, or the consult
+    /// driver) `web_search` and `web_fetch` plus the web directive, all drawing on the one budget. `None`
     /// (the default) is byte-for-byte the project-only survey.
     pub web: Option<Arc<crate::web::WebSession>>,
 }
@@ -115,25 +115,23 @@ pub struct ResearchConfig {
     pub web: Arc<crate::web::WebSession>,
 }
 
-/// The full two-phase `consult`: an investigation ([`ExploreConfig`]) plus what
-/// only the synth driver loop needs — how many turns its own loop gets, and the
+/// The `consult` driver's config: the shared investigation fields ([`ExploreConfig`])
+/// plus what only the synth driver loop needs — how many turns its own loop gets, and the
 /// caller's attached files (inlined within the budget, demoted to read-whole
 /// directives past it).
 #[derive(Debug, Clone)]
 pub struct ConsultConfig {
-    /// The investigation half: preamble/liveness plus explorer sweep bounds and
-    /// sandbox limits, shared verbatim with the standalone `explore` tool.
+    /// Preamble/liveness, sandbox limits, and the web session. The explorer-only fields
+    /// (`explorer_max_turns`, `max_attachments`) go unread here.
     pub explore: ExploreConfig,
-    /// Bounds the recomposed consult's *whole* driver loop (it delegates sweeps AND
-    /// reads spans), so it must be generous — a multi-part question blew the old 8.
+    /// Bounds the consult's *whole* driver loop (every read is its own), so it must
+    /// be generous — a multi-part question blew the old 8.
     pub synth_max_turns: usize,
     /// Caller-attached files, resolved server-side: attach means *the model sees the
     /// bytes*. A text file within the inline budget carries its full body (inlined
     /// numbered into the driver prompt); one past the budget is demoted to a
     /// read-it-WHOLE directive; an image routes to `view_image` (per
-    /// [`ConsultAttachment`]'s variants). Every text attachment also reaches the
-    /// delegated `explore′` sweeps as a preamble directive to read it whole — a sweep
-    /// is a fresh agent that never saw the driver prompt. The server validates each
+    /// [`ConsultAttachment`]'s variants). The server validates each
     /// path lands under the consult's root and classifies by content before filling
     /// this. `Default` is empty.
     pub attachments: Vec<ConsultAttachment>,
@@ -145,10 +143,9 @@ pub struct ConsultConfig {
     /// media CAS is live. `None` is byte-for-byte the pre-artifact consult.
     ///
     /// It rides **this** rung, not [`ExploreConfig`], and that placement is the
-    /// enforcement of "v1 is driver-loop only": a delegated `explore′` sweep is built
-    /// from the explore rung, which has no field to read, so a sweep cannot be handed
-    /// the tool by accident. `deliberate`'s dossier stage shares that rung and is
-    /// likewise out of reach.
+    /// enforcement of "driver-loop only": `deliberate`'s dossier stage is built from
+    /// the explore rung, which has no field to read, so its explorer cannot be handed
+    /// the tool by accident.
     pub artifacts: Option<Arc<crate::artifact::ArtifactSink>>,
 }
 

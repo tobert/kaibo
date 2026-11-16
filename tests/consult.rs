@@ -46,23 +46,6 @@ fn builtin_arm(cast: &str, role: ModelRole) -> Arm {
     arm_from(&cfg, cast, role)
 }
 
-/// A throwaway explorer arm for the driver-only `view_image` tests. These tests pin
-/// the two-stage toolset, so they pass an explorer arm; they never make the driver
-/// delegate a sweep, so it is never invoked — it just has to exist. Shares the
-/// synth's scripted client under a model id the test never scripts.
-fn unused_explorer(client: &ScriptedClient) -> Arm {
-    Arm::new(
-        client.clone(),
-        "unused-explorer",
-        16384,
-        None,
-        ModelCaps {
-            vision: false,
-            tool_result_images: true,
-        },
-    )
-}
-
 #[test]
 fn consult_seed_context_is_framed_as_trusted_evidence() {
     // The seam that absorbed standalone `synthesize`: caller `context` rides the
@@ -752,7 +735,12 @@ fn model_caps_classify_per_kind_and_honor_the_override() {
         );
     }
     assert!(
-        !ModelCaps::resolve(ProviderKind::OpenRouter, "google/gemini-4-argon", Some(false)).vision
+        !ModelCaps::resolve(
+            ProviderKind::OpenRouter,
+            "google/gemini-4-argon",
+            Some(false)
+        )
+        .vision
     );
     assert!(
         !ModelCaps::resolve(
@@ -803,10 +791,9 @@ fn model_caps_classify_per_kind_and_honor_the_override() {
 }
 
 #[test]
-fn builtin_openai_cast_is_cheap_gemma_explorer_strong_gemma_synth() {
+fn builtin_openai_cast_is_small_gemma_explorer_large_gemma_synth() {
     // The chosen mapping for the local default endpoint: small E4B drives the
-    // tool-heavy exploration, the larger 26B writes the answer — the cheap-
-    // explorer/strong-synth pattern, local edition.
+    // tool-heavy exploration, the larger 26B writes the answer.
     let (explorer, synth) = default_models(ProviderKind::Openai);
     assert_eq!(explorer, "Gemma-4-E4B-it-GGUF");
     assert_eq!(synth, "Gemma-4-26B-A4B-it-GGUF");
@@ -838,25 +825,18 @@ fn builtin_openai_cast_is_cheap_gemma_explorer_strong_gemma_synth() {
 type Responder = Arc<
     dyn Fn(
             &rig_core::completion::CompletionRequest,
-        ) -> Result<
-            rig_core::completion::CompletionResponse,
-            rig_core::error::ProviderError,
-        > + Send
+        )
+            -> Result<rig_core::completion::CompletionResponse, rig_core::error::ProviderError>
+        + Send
         + Sync,
 >;
 
-/// A snapshot of one inbound request: which model the loop addressed and the
-/// request shape that rode along — enough to prove per-arm routing and shaping.
+/// A record of one inbound request. The tests count these to prove the loop ran.
 #[derive(Debug, Clone)]
-struct Seen {
-    preamble: Option<String>,
-    max_tokens: Option<u64>,
-    additional_params: Option<Value>,
-}
+struct Seen;
 
 /// A scripted client that serves exactly ONE model. If the consult loop ever
-/// routes another model id here, the call panics — the teeth of the
-/// mixed-cast routing test: two of these stand in for two distinct backends.
+/// routes another model id here, the call panics.
 #[derive(Clone)]
 struct ScriptedClient {
     expect_model: String,
@@ -869,10 +849,9 @@ impl ScriptedClient {
     where
         F: Fn(
                 &rig_core::completion::CompletionRequest,
-            ) -> Result<
-                rig_core::completion::CompletionResponse,
-                rig_core::error::ProviderError,
-            > + Send
+            )
+                -> Result<rig_core::completion::CompletionResponse, rig_core::error::ProviderError>
+            + Send
             + Sync
             + 'static,
     {
@@ -924,16 +903,7 @@ impl rig_core::driver::Transport<rig_core::test_utils::MockScript> for ScriptedT
             .log
             .lock()
             .expect("scripted log poisoned")
-            .push(Seen {
-                preamble: request.chat_history.iter().find_map(|m| match &**m {
-                    rig_core::completion::message::Message::System { content } => {
-                        Some(content.clone())
-                    }
-                    _ => None,
-                }),
-                max_tokens: request.max_tokens,
-                additional_params: request.additional_params.clone(),
-            });
+            .push(Seen);
         let responder = self.client.responder.clone();
         rig_core::driver::Opening::new(async move {
             let response = responder(&request)?;
@@ -1000,173 +970,6 @@ fn tool_calls_response(calls: &[(&str, &str, Value)]) -> rig_core::completion::C
 /// True if the request declares a tool named `name`.
 fn has_tool(req: &rig_core::completion::CompletionRequest, name: &str) -> bool {
     req.tools.iter().any(|t| &*t.name == name)
-}
-
-/// Everything the model was shown in user turns — `User` text *and* tool-result
-/// text — oldest→newest, so a responder can branch on a report's arrival.
-fn transcript_text(req: &rig_core::completion::CompletionRequest) -> String {
-    use rig_core::completion::message::{Message, ToolResultContent, UserContent};
-    req.chat_history
-        .iter()
-        .filter_map(|m| match &**m {
-            Message::User { content } => Some(
-                content
-                    .iter()
-                    .filter_map(|c| match c {
-                        UserContent::Text(t) => Some(t.text.clone()),
-                        UserContent::ToolResult(tr) => Some(
-                            tr.content
-                                .iter()
-                                .filter_map(|rc| match rc {
-                                    ToolResultContent::Text(t) => Some(t.text.clone()),
-                                    _ => None,
-                                })
-                                .collect::<Vec<_>>()
-                                .join("\n"),
-                        ),
-                        _ => None,
-                    })
-                    .collect::<Vec<_>>()
-                    .join("\n"),
-            ),
-            _ => None,
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
-/// The mixed-cast proof, offline: a consult whose explorer arm and synth arm ride
-/// two *different* clients — two backends in miniature, each refusing to serve any
-/// model but its own — through the public `consult` seam. The driver delegates a
-/// sweep to `explore′` (which must land on the explorer's client), the report
-/// crosses back, and the answer concludes on the synth's client. Each phase also
-/// carries ITS arm's request shape (`max_tokens`, `additional_params`), per-arm by
-/// construction — the chimera promise of docs/casts.md, proven with no network.
-#[tokio::test]
-async fn mixed_cast_consult_routes_each_phase_to_its_own_client() {
-    // Fabricated ids: routing keys, not real models. A real id here would read as a
-    // claim about that model's caps, which these hand-built arms set themselves.
-    const EXPLORER_MODEL: &str = "deepseek-explorer";
-    const SYNTH_MODEL: &str = "claude-sonnet-4-6";
-    const REPORT: &str = "MIXED_REPORT: src/foo.rs:1 fn target_marker";
-
-    let explorer_client = ScriptedClient::new(EXPLORER_MODEL, |req| {
-        // The delegated sweep: run_kaish only, no nested explore′.
-        assert!(has_tool(req, "run_kaish"), "explorer gets run_kaish");
-        assert!(!has_tool(req, "explore"), "explorer must not nest explore′");
-        Ok(text_response(REPORT))
-    });
-    let synth_client = ScriptedClient::new(SYNTH_MODEL, |req| {
-        assert!(
-            has_tool(req, "run_kaish") && has_tool(req, "explore"),
-            "the driver gets both tools"
-        );
-        if transcript_text(req).contains("MIXED_REPORT") {
-            // The cross-client report came back → answer.
-            Ok(text_response("ANSWER: target_marker at src/foo.rs:1"))
-        } else {
-            // Delegate a sweep — this must run on the *other* client.
-            Ok(tool_call_response(
-                "t-explore",
-                "explore",
-                json!({ "question": "find target_marker" }),
-            ))
-        }
-    });
-
-    // Each arm carries its own request shape, as `Arm::from_slot` would fit per slot
-    // (a DeepSeek-shaped explorer, an adaptive-Anthropic synth).
-    let explorer_params = json!({ "thinking": { "type": "enabled" }, "reasoning_effort": "high" });
-    let synth_params = json!({ "thinking": { "type": "adaptive" } });
-    let explorer = Arm::new(
-        explorer_client.clone(),
-        EXPLORER_MODEL,
-        8192,
-        Some(explorer_params.clone()),
-        ModelCaps {
-            vision: false,
-            tool_result_images: true,
-        },
-    );
-    let synth = Arm::new(
-        synth_client.clone(),
-        SYNTH_MODEL,
-        16384,
-        Some(synth_params.clone()),
-        ModelCaps {
-            vision: true,
-            tool_result_images: true,
-        },
-    );
-
-    let dir = tempfile::tempdir().unwrap();
-    std::fs::create_dir(dir.path().join("src")).unwrap();
-    std::fs::write(dir.path().join("src/foo.rs"), "fn target_marker() {}\n").unwrap();
-
-    let out = consult(
-        "Where is target_marker defined?",
-        None,
-        dir.path(),
-        Some(&explorer),
-        &synth,
-        &ConsultConfig::default(),
-        None,
-    )
-    .await
-    .expect("mixed-cast scripted consult should succeed");
-
-    assert!(
-        out.answer.contains("src/foo.rs:1"),
-        "the synth's final text is the answer, got: {:?}",
-        out.answer
-    );
-    assert!(
-        out.report.contains("MIXED_REPORT"),
-        "the cross-client sweep's report aggregated, got: {:?}",
-        out.report
-    );
-
-    // Routing teeth: both clients actually served (each one panics inside
-    // `completion` on any other model id, so non-empty logs + a green run mean
-    // every phase landed on exactly its own client).
-    let e = explorer_client.seen();
-    let s = synth_client.seen();
-    assert!(!e.is_empty(), "the explorer client was driven");
-    assert!(!s.is_empty(), "the synth client was driven");
-
-    // Per-arm request shaping: each phase carried ITS arm's params and headroom.
-    for r in &e {
-        assert_eq!(
-            r.additional_params.as_ref(),
-            Some(&explorer_params),
-            "explorer requests carry the explorer arm's params"
-        );
-        assert_eq!(r.max_tokens, Some(8192), "explorer headroom is its arm's");
-    }
-    for r in &s {
-        assert_eq!(
-            r.additional_params.as_ref(),
-            Some(&synth_params),
-            "synth requests carry the synth arm's params"
-        );
-        assert_eq!(r.max_tokens, Some(16384), "synth headroom is its arm's");
-    }
-
-    // Role framing crossed with the routing: the explorer's client saw the report
-    // preamble, the synth's client the consult-driver preamble.
-    assert!(
-        e[0].preamble.as_deref().unwrap_or("").contains("explorer"),
-        "explorer client got the report preamble: {:?}",
-        e[0].preamble
-    );
-    assert!(
-        s[0].preamble
-            .as_deref()
-            .unwrap_or("")
-            .contains("You also have `explore`"),
-        "synth client got the consult preamble: {:?}",
-        s[0].preamble
-    );
 }
 
 /// True if any tool result in the request history carried an *image* part. The
@@ -1247,7 +1050,6 @@ async fn a_vision_synth_sees_an_image_through_view_image() {
         "What does the diagram show?",
         None,
         &root,
-        Some(&unused_explorer(&synth_client)),
         &synth,
         &ConsultConfig::default(),
         None,
@@ -1297,7 +1099,6 @@ async fn a_blind_synth_is_not_offered_view_image() {
         "anything",
         None,
         dir.path(),
-        Some(&unused_explorer(&synth_client)),
         &synth,
         &ConsultConfig::default(),
         None,
@@ -1368,7 +1169,6 @@ async fn an_openai_vlm_sees_an_image_on_the_user_turn_channel() {
         "What does the diagram show?",
         None,
         &root,
-        Some(&unused_explorer(&synth_client)),
         &synth,
         &ConsultConfig::default(),
         None,
@@ -1434,7 +1234,6 @@ async fn an_openai_vlm_co_tool_call_view_image_and_run_kaish_resumes_cleanly() {
         "What does the diagram show?",
         None,
         &root,
-        Some(&unused_explorer(&synth_client)),
         &synth,
         &ConsultConfig::default(),
         None,
@@ -1498,11 +1297,8 @@ async fn secondary_local_cast_from_user_config_runs() {
     assert!(!answer.trim().is_empty(), "expected a non-empty answer");
 }
 
-// The recomposed consult (one loop, {run_kaish, explore′}) on the weakest target —
-// the §2.1 weak-model validation. Asserts a grounded answer; the aggregated report
-// is non-empty iff the model chose to delegate to explore′, which we log but do NOT
-// assert (Gemma may read directly — a fixed pipeline is more robust for weak models,
-// per the panel; if delegation proves shaky here, that's a note, not a failure).
+// The consult loop on the weakest target — the §2.1 weak-model validation. Asserts a
+// grounded answer.
 #[tokio::test]
 #[ignore = "hits the local OpenAI-compatible (Gemma) server (consult, one loop); run with --ignored while it's up"]
 async fn recomposed_consult_runs_against_local_gemma() {
@@ -1513,7 +1309,6 @@ async fn recomposed_consult_runs_against_local_gemma() {
         "How does kaibo stop the explorer from deleting real files? Name the mechanism and the file.",
         None,
         root,
-        Some(&builtin_arm("openai-local", ModelRole::Explorer)),
         &builtin_arm("openai-local", ModelRole::Synth),
         &cfg,
         None,
@@ -1521,11 +1316,6 @@ async fn recomposed_consult_runs_against_local_gemma() {
     .await
     .expect("consult against local gemma should succeed");
 
-    eprintln!(
-        "=== explore′ delegated {} time(s); aggregated report ===\n{}\n",
-        out.report.matches("---").count() + if out.report.is_empty() { 0 } else { 1 },
-        out.report
-    );
     eprintln!("=== ANSWER ===\n{}\n", out.answer);
 
     let lower = out.answer.to_lowercase();
@@ -1575,7 +1365,6 @@ async fn two_phase_consult_via_deepseek() {
         "How does kaibo stop the explorer from deleting real files? Name the mechanism and the file.",
         None,
         env!("CARGO_MANIFEST_DIR"),
-        Some(&builtin_arm("deepseek", ModelRole::Explorer)),
         &builtin_arm("deepseek", ModelRole::Synth),
         &ConsultConfig::default(),
         None,
@@ -1600,10 +1389,9 @@ async fn oneshot_via_builtin_anthropic_synths() {
     if let Err(e) = load(ProviderKind::Anthropic) {
         panic!("no Anthropic credential for live test: {e}");
     }
-    let cfg = Config::from_toml_str(
-        "[backends.anthropic]\napi_key_file = \"~/.anthropic-key.txt\"\n",
-    )
-    .expect("config with an Anthropic key file");
+    let cfg =
+        Config::from_toml_str("[backends.anthropic]\napi_key_file = \"~/.anthropic-key.txt\"\n")
+            .expect("config with an Anthropic key file");
     for cast in ["anthropic", "anthropic-batch"] {
         let arm = arm_from(&cfg, cast, ModelRole::Synth);
         let (answer, _usage) = oneshot(
@@ -1629,7 +1417,6 @@ async fn two_phase_consult_via_gemini() {
         "How does kaibo stop the explorer from deleting real files? Name the mechanism and the file.",
         None,
         env!("CARGO_MANIFEST_DIR"),
-        Some(&builtin_arm("gemini", ModelRole::Explorer)),
         &builtin_arm("gemini", ModelRole::Synth),
         &ConsultConfig::default(),
         None,
@@ -1660,7 +1447,6 @@ async fn two_phase_consult_answers_from_the_real_tree() {
         "How does kaibo stop the explorer from deleting real files? Name the mechanism and the file.",
         None,
         root,
-        Some(&builtin_arm("anthropic", ModelRole::Explorer)),
         &builtin_arm("anthropic", ModelRole::Synth),
         &cfg,
         None,
@@ -1668,7 +1454,6 @@ async fn two_phase_consult_answers_from_the_real_tree() {
     .await
     .expect("consult should succeed");
 
-    eprintln!("=== REPORT (explorer) ===\n{}\n", out.report);
     eprintln!("=== ANSWER (synth) ===\n{}\n", out.answer);
 
     let lower = out.answer.to_lowercase();
@@ -1696,20 +1481,12 @@ async fn openrouter_consult_round_trips() {
     let backend = cfg
         .resolve_backend("openrouter")
         .expect("openrouter backend");
-    let explorer_slot = cfg
-        .resolve_cast("openrouter")
-        .unwrap()
-        .require_slot(ModelRole::Explorer)
-        .unwrap()
-        .clone();
     let synth_slot = cfg
         .resolve_cast("openrouter")
         .unwrap()
         .require_slot(ModelRole::Synth)
         .unwrap()
         .clone();
-    let explorer = Arm::from_slot(backend, &explorer_slot, ModelRole::Explorer, &cfg.defaults)
-        .expect("explorer arm on openrouter");
     let synth = Arm::from_slot(backend, &synth_slot, ModelRole::Synth, &cfg.defaults)
         .expect("synth arm on openrouter");
 
@@ -1717,7 +1494,6 @@ async fn openrouter_consult_round_trips() {
         "How does kaibo stop the explorer from deleting real files? Name the mechanism and the file.",
         None,
         env!("CARGO_MANIFEST_DIR"),
-        Some(&explorer),
         &synth,
         &ConsultConfig::default(),
         None,
@@ -1828,8 +1604,6 @@ async fn adaptive_only_anthropic_model_round_trips() {
     let cfg = Config::builtin();
     let backend = cfg.resolve_backend("anthropic").expect("anthropic backend");
     let slot = ModelSlot::bare("anthropic", "claude-opus-4-8");
-    let explorer = Arm::from_slot(backend, &slot, ModelRole::Explorer, &cfg.defaults)
-        .expect("explorer arm on opus 4.8");
     let synth = Arm::from_slot(backend, &slot, ModelRole::Synth, &cfg.defaults)
         .expect("synth arm on opus 4.8");
 
@@ -1837,7 +1611,6 @@ async fn adaptive_only_anthropic_model_round_trips() {
         "How does kaibo stop the explorer from deleting real files? Name the mechanism and the file.",
         None,
         env!("CARGO_MANIFEST_DIR"),
-        Some(&explorer),
         &synth,
         &ConsultConfig::default(),
         None,

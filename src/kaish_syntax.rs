@@ -156,7 +156,7 @@ fn kaibo_lead() -> &'static str {
      local casts use local endpoints. The project stays READ-ONLY. `consult` is the front door; kaibo \
      finds and reads the current code, then answers with file:line citations. \
      Say what you did or want to know; no pasted files or diffs needed. \
-     `explore` returns a cited survey report. `oneshot` answers from supplied context \
+     `oneshot` answers from supplied context \
      with no codebase access. `run_kaish` drives the read-only shell directly. \
      `deliberate` reasons offline over a dossier. \
      `consult_submit` and `batch_submit` return handles for `job_wait`/`job_get`."
@@ -316,7 +316,7 @@ fn casts_section(config: &Config, usable: &[(String, CastUsability)]) -> String 
             // key-gated, so it holds for every usable cast.
             //
             // A cast with no synth answers no text tool, so its line says which tool it
-            // does serve (`generate` for a media slot, `explore` for an explorer slot)
+            // does serve (`generate` for a media slot, `research` for an explorer slot)
             // and names that slot's model instead. A bare name there read as a team
             // whose answering model was merely unknown. A name that does not resolve
             // still renders bare.
@@ -326,7 +326,7 @@ fn casts_section(config: &Config, usable: &[(String, CastUsability)]) -> String 
                     return Some(slot);
                 }
                 let mut serves: Vec<&str> = [
-                    (ModelRole::Explorer, "`explore`"),
+                    (ModelRole::Explorer, "`research`"),
                     (ModelRole::Image, "`generate`"),
                     (ModelRole::Audio, "`generate`"),
                     (ModelRole::Decision, "`decide`"),
@@ -1247,7 +1247,6 @@ mod tests {
             "local-direct".to_string(),
             Cast {
                 name: "local-direct".to_string(),
-                consult: None,
                 slots: std::collections::BTreeMap::from([
                     (
                         ModelRole::Explorer,
@@ -1319,7 +1318,6 @@ mod tests {
                 name.clone(),
                 Cast {
                     name: name.clone(),
-                    consult: None,
                     slots: std::collections::BTreeMap::from([(ModelRole::Synth, synth)]),
                 },
             );
@@ -1358,7 +1356,6 @@ mod tests {
                 name.to_string(),
                 Cast {
                     name: name.to_string(),
-                    consult: None,
                     slots: std::collections::BTreeMap::from([(role, ModelSlot::bare(backend, id))]),
                 },
             );
@@ -1381,8 +1378,8 @@ mod tests {
             "an image-only cast names `generate` and its image model:\n{text}"
         );
         assert!(
-            text.contains("- `scout` (`explore` only) → deepseek/deepseek-flash"),
-            "an explorer-only cast names `explore` and its explorer model:\n{text}"
+            text.contains("- `scout` (`research` only) → deepseek/deepseek-flash"),
+            "an explorer-only cast names `research` and its explorer model:\n{text}"
         );
     }
 
@@ -1448,7 +1445,6 @@ mod tests {
                 name.clone(),
                 Cast {
                     name: name.clone(),
-                    consult: None,
                     slots: std::collections::BTreeMap::from([(
                         ModelRole::Synth,
                         ModelSlot::bare("openrouter", "~google/gemini-flash-latest"),
@@ -1575,7 +1571,6 @@ mod tests {
                 name.clone(),
                 Cast {
                     name: name.clone(),
-                    consult: None,
                     slots: std::collections::BTreeMap::from([(
                         ModelRole::Synth,
                         ModelSlot::bare("deepseek", "deepseek-flash"),

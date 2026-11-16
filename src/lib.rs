@@ -2,8 +2,8 @@
 //!
 //! kaibo augments a calling agent (Claude, etc.) with a team of models, lending one
 //! kind of help over MCP: **consultation** — grounded, cited answers about a codebase.
-//! A **synthesis agent** reads precise spans and delegates broad sweeps to a cheap *explorer*
-//! sub-agent, all driving a read-only [`kaish`] kernel via `run_kaish(script)` (`cat`,
+//! A **synthesis agent** reads the project itself, driving a read-only [`kaish`] kernel
+//! via `run_kaish(script)` (`cat`,
 //! `grep`, `find`, `jq`, pipelines, the lot). The `consult` and toolless `oneshot` tools
 //! are both costumes over one primitive, [`consult::run_phase`]. The team *perceives*
 //! what fuses into its reasoning (image input today, via `view_image`); when kaibo

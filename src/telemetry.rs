@@ -3,8 +3,8 @@
 //! kaibo barely needs to instrument anything: rig already emits the GenAI span
 //! tree from inside its agent loop — an `invoke_agent` span per phase, a `chat`
 //! span per turn (carrying `gen_ai.request.model` and every `gen_ai.usage.*` token
-//! field), and a `tool` span per tool call. Our `run_kaish` and delegated
-//! `explore′` sweeps are rig tools, so they show up as tool spans for free; the
+//! field), and a `tool` span per tool call. Our `run_kaish` and `view_image` are
+//! rig tools, so they show up as tool spans for free; the
 //! spans the MCP handlers open around each phase and on `run_phase` (see `server.rs`
 //! / `consult.rs`) just give that tree named kaibo parents. This module's whole job
 //! is to *export* it: stand up the OTLP/HTTP exporters and hand `main`'s subscriber
@@ -22,9 +22,9 @@
 //!
 //! The read boundary refusing a path is the third, and the one where the asymmetry
 //! bites hardest: a refusal usually happens *before* the handler has a phase to open
-//! a span around, so the logs signal is the only road it travels. That covers four of
-//! the five tools that resolve a root (`consult`, `consult_submit`, `explore`,
-//! `deliberate`) and every attachment refusal besides. `run_kaish` is the exception —
+//! a span around, so the logs signal is the only road it travels. That covers three of
+//! the four tools that resolve a root (`consult`, `consult_submit`, `deliberate`) and
+//! every attachment refusal besides. `run_kaish` is the exception —
 //! its span brackets the whole call, so a refused shell call closes a `run_kaish` span
 //! with `outcome = "refused"` and reaches traces too. See
 //! `server/resolver.rs::containment_error`.
@@ -34,7 +34,7 @@
 //! a filter ([`crate::otel_filter`]); metrics need none, because no metric in the GenAI
 //! conventions has a content-bearing attribute. That is what makes `traces = false,
 //! metrics = true` a real posture rather than a compromise: an operator gets kaibo's
-//! spend, latency, and delegation with no prompt able to leave by that road. The
+//! spend, latency, and tool use with no prompt able to leave by that road. The
 //! instruments and the counting rules live in [`crate::metrics`]; this module only
 //! stands up the exporter. Note the shape difference — traces and logs install
 //! subscriber *layers*, while metrics installs a **global meter provider**, which is

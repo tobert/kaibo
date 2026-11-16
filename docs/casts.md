@@ -14,7 +14,7 @@ floor up. Two symptoms surfaced it:
 
 1. **A profile is one `kind`, so a team is locked to one family.** Roles bind to
    a profile, and a profile is a single connection — so a *chimera* (a deepseek
-   explorer feeding a claude synth: cheap local surveys, a hosted answer) had no
+   explorer feeding a claude synth: local surveys, a hosted answer) had no
    spelling at all. One composed team, two families, one name — the fused profile
    can't say it.
 2. **The vocabulary confused its only user.** "Profile" meant *connection* in
@@ -94,10 +94,8 @@ Rules, in the loud-over-silent house style:
 - **A cast may omit roles.** Built-ins always carry explorer+synth; a user
   cast that omits one is valid config — the tool that needs the missing role
   fails loudly *at call time*, naming the gap ("cast `lite` has no synth
-  slot"). Absent = capability absent. The one exception is `consult`, which
-  runs single-stage on a synth-only cast, or on any cast with `consult = "solo"`
-  (the built-in `anthropic` cast): the synth reads everything itself, is not
-  offered `explore`, and no explorer model is called.
+  slot"). Absent = capability absent. `consult` and `oneshot` need only the
+  synth; `deliberate` needs the explorer too.
 - **`[profiles]` is deleted, not deprecated.** A config that still says
   `[profiles.x]` gets a load error pointing at this doc. Amy is the only
   user; git history is the record.
@@ -140,8 +138,7 @@ before pinning one:
   the lever here: kaibo already enables thinking at high effort by default on
   every wire that supports it, so the reliable lever is model capability.
   Prefer a pro-tier explorer for a long survey that must complete (a
-  `deliberate` dossier build); a flash tier fits interactive surveys, where the
-  consult driver absorbs a failed delegation and answers from its own reads.
+  `deliberate` dossier build).
 - **Match the explorer to its provider's rate ceiling, not its synth's
   family.** A survey with whole-file attachments can request 100k+ tokens per
   minute; against a tight org TPM ceiling the survey rate-limits, and a retry
@@ -153,7 +150,8 @@ before pinning one:
 ## How a call maps
 
 All the chimera-ness happens in one resolution step at the server boundary.
-`consult()` never learns about backends — it receives resolved **arms**:
+A tool never learns about backends — it receives resolved **arms**. `deliberate` shows
+both:
 
 ```
 server.rs: resolve_cast("chimera")
@@ -166,10 +164,10 @@ server.rs: resolve_cast("chimera")
      └─ Arm { client: rig(gemini backend), model, thinkingLevel params,
               caps: vision=true → toolset gains view_image }
 
-consult(question, root, arms, cfg, session)
-└─ run_phase(synth_arm): loop over {run_kaish, explore′, view_image…}
-     └─ explore′ delegates each survey to run_phase(explorer_arm)
-        — different client, different wire protocol, same loop primitive
+deliberate(question, root, arms, cfg)
+├─ run_phase(explorer_arm): the dossier survey over {run_kaish, attach}
+└─ the offline synth reasons over the dossier on synth_arm
+   — different client, different wire protocol
 ```
 
 `cast = "claude"` walks the identical pipeline with boring resolution: the
@@ -236,8 +234,7 @@ synth slot's lane now classifies the cast, per `docs/config.md`.)
    *slot's* backend kind), loud errors (unknown backend ref, `[profiles]`
    tombstone, empty model id), alias collisions.
 2. **Arms through consult.** Per-phase clients behind the `Arm` seam; the
-   offline mock proves a mixed cast drives each phase on its own client and
-   that the explore′ delegation crosses backends correctly.
+   offline mock proves a mixed cast drives each phase on its own client.
 3. **Server surface.** `cast` param (a stale `provider` is a loud unknown-field
    error — the alias was retired one cycle after the rename), `run_kaish` cast
    arg, resource render, `docs/config.md` rewrite, tool descriptions.

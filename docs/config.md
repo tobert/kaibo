@@ -336,32 +336,10 @@ built-ins carry `synth` only; none carries a media slot. A user cast that omits 
 valid config, and the tool needing the missing role fails at call time naming the gap
 (`cast "lite" has no synth slot`). Absent means the capability is absent.
 
-**Single-stage `consult` (`consult = "solo" | "team"`).** A solo `consult` is one
-model: the synth does every read itself through `run_kaish`, and it is not offered
-`explore`. Its preamble is the `consult` driver's, with the delegation paragraph replaced
-by one on searching with `grep -rn`; a `[prompts] consult` override applies to both. No
-explorer model is resolved or called. The provenance footer names only the synth, and the
-CLI `--json` envelope sets `models.explorer` to `null`.
-
-The cast's `consult` key picks the mode. Without it, a cast with an `explorer` slot runs
-`team` (the synth may delegate surveys to the explorer) and a cast without one runs
-`solo`. `consult = "solo"` on a cast that has an `explorer` slot keeps that slot for
-`explore`, and for `deliberate` when the synth is offline. An `explorer_model` override on
-such a cast is refused, because `consult` would not use it. `consult = "team"` on a cast
-with no `explorer` slot is a load error. The built-in `anthropic` cast sets
-`consult = "solo"`; restate `consult = "team"` on it to get the old behavior back. The key
-survives a re-declaration of the cast's slots. `kaibo://config` shows each cast's
-configured mode under `consult` (a per-call `explorer_model` with `explorer_backend` on a cast that is solo only for lack of an explorer slot adds one and runs team).
-
-```toml
-[casts.flash-solo]                  # no explorer, so solo by default
-synth = { backend = "deepseek", id = "deepseek-flash", effort = "xhigh" }
-
-[casts.opus-solo]                   # keeps the explorer for `explore`
-explorer = "anthropic/<current Haiku id>"
-synth    = "anthropic/<current Opus id>"
-consult  = "solo"
-```
+**What each slot runs.** `consult`, `consult_submit`, and `oneshot` run the `synth` slot
+alone: the `consult` synth does every read itself through `run_kaish`. The `explorer` slot
+builds `deliberate`'s dossier and runs `research` (the synth runs `research` on a cast with
+no explorer). A cast with no `explorer` slot is valid for every tool except `deliberate`.
 
 **Slot references.** An unknown backend in a slot is a load error naming the known
 backends. An empty model id is rejected at load, since it would otherwise surface as an
@@ -429,7 +407,7 @@ level and per slot.
 `slow_chat_secs` is the mark at which one model call on an async job is promoted to the
 calling model as a warning that `job_wait` returns. A running job's `job_get` line shows
 each role's latency either way, as `synth chat: last 107 s, p50 98 s over 9 calls`. A
-synchronous `consult` or `explore` shows every call's time in its progress notifications
+synchronous `consult` shows every call's time in its progress notifications
 instead. A retried call is timed per attempt, so the number is the provider's time and
 never kaibo's backoff wait. The single-shot tools (`oneshot`, `deliberate`'s direct lane)
 make one call and report nothing until it returns.
@@ -534,13 +512,13 @@ rung a model does not take comes back as that provider's own error naming what i
 does take.
 
 **`call_deadline_secs`.** Whole-call wall-clock ceiling on an interactive
-`consult`/`explore`/`oneshot`, and the backstop for when the per-request
+`consult`/`oneshot`, and the backstop for when the per-request
 `request_timeout` does not fire (a stalled response body, a pooled keep-alive to a
 wedged backend). Past it the call aborts with a clean tool-result error. Keep it above
 the largest `request_timeout` a call can reach so it never cuts a legitimately slow
 single completion; operators running a >30-minute local model should raise it.
 
-It bounds `consult`, `explore`, `oneshot`, and async `consult_submit`. Two in-process
+It bounds `consult`, `oneshot`, and async `consult_submit`. Two in-process
 paths sit outside it by nature:
 
 - **`deliberate`'s direct lane** is one long completion, bounded instead by its synth
@@ -614,9 +592,6 @@ not OpenAI Platform's own but should still take the Responses shape; see
 | `gemini-batch` | — | `gemini/gemini-pro-latest` | `batch` |
 | `anthropic-batch` | — | an Opus | `batch` |
 
-The built-in `anthropic` cast also sets `consult = "solo"`: its Sonnet reads the code
-itself and the Haiku serves `explore`. Every other built-in cast keeps the `team` default.
-
 Where a provider serves no undated alias, the table names the family. The exact ids this
 build dials are in `kaibo://config` (`kaibo config`), and kaibo releases move them.
 
@@ -643,7 +618,7 @@ resolves. Naming a new backend or cast after one is a collision error.
 
 | lane | meaning | staffs |
 |---|---|---|
-| *(unset)* | interactive | `consult`, `explore`, `oneshot`, `consult_submit` |
+| *(unset)* | interactive | `consult`, `oneshot`, `consult_submit` |
 | `batch` | a provider batch API job | `batch_submit`, `deliberate` |
 | `direct` | one long completion kaibo drives itself | `deliberate` |
 
@@ -653,9 +628,6 @@ Rules:
   cast whose synth is on an offline lane, and `batch_submit` refuses a cast whose synth
   is not specifically `lane = "batch"`. A big offline-tuned model is never run
   interactively by accident, and the reverse.
-- `explore` is exempt: it runs only the explorer arm, which is always interactive, so a
-  deliberate or direct cast's explorer is valid there. It needs an `explorer` slot and
-  nothing more.
 - A `batch`-lane synth must sit on a batch-capable backend: Anthropic, Gemini,
   OpenRouter, or a hosted OpenAI Platform backend. A local OpenAI-compatible server has
   no Batch API, so declaring `lane = "batch"` on a slot elsewhere is a load error.
@@ -821,8 +793,7 @@ Which cast shape staffs which tool:
 
 | tool | needs |
 |---|---|
-| `consult`, `consult_submit`, `oneshot` | a cast with a `synth` slot that answers **interactively** (no offline lane). A cast runs `consult` single-stage when it has no `explorer` slot or sets `consult = "solo"`. |
-| `explore` | a cast with an `explorer` slot |
+| `consult`, `consult_submit`, `oneshot` | a cast with a `synth` slot that answers **interactively** (no offline lane) |
 | `batch_submit` | a cast whose synth runs on `lane = "batch"` (or the `batch = true` sugar) |
 | `deliberate` | a cast with an `explorer` **and** an offline synth (`lane = "batch"` or `lane = "direct"`) |
 | `generate` | a cast with an `image` slot (kind `stability`, `openai-images`, `gemini-media`, `dashscope`, or `bfl`) or an `audio` slot (kind `gemini-media` or `stability`) — plus `[cas]` on |
@@ -838,7 +809,7 @@ No built-in cast has a media slot or pairs an explorer with an offline synth, so
 
 | key | tools it staffs | config needed |
 |---|---|---|
-| DeepSeek, Anthropic, Gemini, or OpenRouter, or a local endpoint | `consult`, `explore`, `oneshot` | none beyond the key source |
+| DeepSeek, Anthropic, Gemini, or OpenRouter, or a local endpoint | `consult`, `consult_submit`, `oneshot` | none beyond the key source |
 | a hosted OpenAI Platform key | the same three | a new `openai` backend and cast, as `[backends.gpt]` and `[casts.gpt]` show |
 | Anthropic, Gemini, OpenRouter, or a hosted OpenAI Platform key | also `batch_submit` | a cast whose synth has `lane = "batch"`; `anthropic-batch` and `gemini-batch` are built in |
 | any of the above | also `deliberate` | a cast pairing an `explorer` with an offline synth: `lane = "batch"` on the four keys above, or `lane = "direct"` on any backend |
@@ -956,11 +927,10 @@ kaibo emits six instruments, all histograms, all named by the conventions:
 | `gen_ai.client.operation.duration` | How long one provider call took, including calls that failed |
 | `gen_ai.invoke_agent.duration` | How long a whole phase took, end to end |
 | `gen_ai.invoke_agent.inference_calls` | How many turns a phase used — a phase pinned at its turn cap shows as pile-up |
-| `gen_ai.invoke_agent.tool_calls` | **Did the consult driver delegate**, or read everything itself |
-| `gen_ai.execute_tool.duration` | How long one `run_kaish` / `explore′` / `view_image` took |
+| `gen_ai.invoke_agent.tool_calls` | How many tool calls a phase made |
+| `gen_ai.execute_tool.duration` | How long one `run_kaish` / `view_image` took |
 
-Agent metrics carry `gen_ai.agent.name`: `synth` or `explorer`. A delegated survey
-counts as an explorer invocation; the synth's tool-call count includes its delegation.
+Agent metrics carry `gen_ai.agent.name`: `synth` or `explorer`.
 Histogram buckets follow the GenAI conventions.
 
 If a nonstandard traces endpoint prevents metrics-endpoint derivation, an omitted
@@ -1194,7 +1164,7 @@ web phase is native needs no `[web]` key. Otherwise `research` is not advertised
 even while `enabled = false`.
 
 `max_searches` and `max_fetches` count requests per kaibo call, shared across every
-phase in it: a consult driver that delegates five surveys has one budget, not five. A
+phase in it. A
 request over a cap is refused with a message the model reads. Both caps at 0 with
 `enabled = true` is a load error; use `enabled = false`.
 
@@ -1205,9 +1175,8 @@ zero included. `deliberate` puts both in the dossier and in its
 acknowledgment. One call may also bring at most 160,000 characters of page text into
 context (each page is cut at 40,000), because the transcript is re-sent each turn.
 
-On a team cast, delegated surveys search and the `consult` driver gets `web_fetch` alone,
-to read one page whose address it already has. On a solo cast the driver gets both
-tools.
+The `consult` synth gets both tools; so does `deliberate`'s explorer while it builds the
+dossier.
 
 Each web request has a 60-second deadline, or the backend's `request_timeout` if that is
 shorter, and two retries on 408, 429, and 5xx.
@@ -1229,8 +1198,7 @@ Files are read when a phase builds its preamble. Set `project_files = []` to opt
 Project symlink or `..` escapes are refused. User files are operator-selected context:
 their contents reach the model without making those paths available in kaish.
 
-House rules reach codebase-reading phases: consult, its delegated surveys, standalone
-explore, and deliberate's explorer. Toolless oneshot and offline synths get no automatic
+House rules reach codebase-reading phases: consult and deliberate's explorer. Toolless oneshot and offline synths get no automatic
 project context. CLI file lists replace the lower-layer list; use config or an empty
 env value to express an empty list.
 
@@ -1247,12 +1215,12 @@ description intact. House rules still append.
 
 | key | phase |
 |---|---|
-| `explorer` | every survey, whether its report goes to the caller or a synth |
+| `explorer` | `deliberate`'s dossier survey |
 | `consult` | consult driver |
 | `oneshot` | toolless answer |
 | `batch` | offline synth |
 
-Write an explorer override suitable for both report audiences. An override replaces
+An override replaces
 kaibo's tuned framing, including evidence and completion obligations; read the whole
 result with `kaibo://prompts`.
 

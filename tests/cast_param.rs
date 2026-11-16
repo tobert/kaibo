@@ -7,7 +7,7 @@
 //! silent drop into the default cast (serde drops unknown fields, a textbook silent
 //! fallback). These tests pin that end state.
 
-use kaibo::server::{ConsultInput, DeliberateInput, ExploreInput, OneshotInput, RunKaishInput};
+use kaibo::server::{ConsultInput, DeliberateInput, OneshotInput, RunKaishInput};
 use serde_json::json;
 
 #[test]
@@ -19,10 +19,6 @@ fn cast_is_the_canonical_spelling_and_optional() {
     let o: OneshotInput = serde_json::from_value(json!({ "prompt": "q", "cast": "chimera" }))
         .expect("oneshot takes cast");
     assert_eq!(o.cast.as_deref(), Some("chimera"));
-
-    let e: ExploreInput = serde_json::from_value(json!({ "question": "q", "cast": "chimera" }))
-        .expect("explore takes cast");
-    assert_eq!(e.cast.as_deref(), Some("chimera"));
 
     let b: DeliberateInput = serde_json::from_value(json!({ "question": "q", "cast": "fable" }))
         .expect("deliberate takes cast");
@@ -42,11 +38,11 @@ fn cast_is_the_canonical_spelling_and_optional() {
 fn a_typoed_argument_is_a_loud_error_not_a_silent_default_run() {
     // A misspelled override on consult.
     let err = serde_json::from_value::<ConsultInput>(
-        json!({ "question": "q", "explorer_modle": "claude-haiku-4-5" }),
+        json!({ "question": "q", "synth_modle": "claude-haiku-4-5" }),
     )
     .expect_err("a typo'd consult argument must be rejected");
     assert!(
-        err.to_string().contains("explorer_modle"),
+        err.to_string().contains("synth_modle"),
         "the error must name the unknown field, got: {err}"
     );
 
@@ -60,19 +56,13 @@ fn a_typoed_argument_is_a_loud_error_not_a_silent_default_run() {
         .expect_err("oneshot rejects unknown fields");
     serde_json::from_value::<RunKaishInput>(json!({ "script": "ls", "paht": "/tmp" }))
         .expect_err("run_kaish rejects unknown fields");
-    // explore's single-phase surface holds it too: a misspelled explorer override
-    // must fault, not silently run the configured explorer.
-    let err = serde_json::from_value::<ExploreInput>(
-        json!({ "question": "q", "explorer_modle": "claude-haiku-4-5" }),
-    )
-    .expect_err("a typo'd explore argument must be rejected");
-    assert!(
-        err.to_string().contains("explorer_modle"),
-        "the error must name the unknown field, got: {err}"
-    );
-    // A synth-side arg has no home on explore (single-phase) — it must not vanish.
-    serde_json::from_value::<ExploreInput>(json!({ "question": "q", "synth_model": "x" }))
-        .expect_err("explore has no synth args — synth_model must not silently vanish");
+    // The removed explorer arguments are refused on consult by name, not dropped: a
+    // caller still sending them learns the call would not have used them.
+    for removed in ["explorer_model", "explorer_backend", "include_report"] {
+        let err = serde_json::from_value::<ConsultInput>(json!({ "question": "q", removed: "x" }))
+            .expect_err("a removed consult argument must be rejected");
+        assert!(err.to_string().contains(removed), "names {removed}: {err}");
+    }
     // deliberate carries both explorer and synth overrides, but a session_id (it has no
     // session) or a typo must still fault, not run on defaults.
     serde_json::from_value::<DeliberateInput>(json!({ "question": "q", "session_id": "s" }))

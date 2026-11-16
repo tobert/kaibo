@@ -193,7 +193,7 @@ fn file_declared_aliases_resolve_at_both_levels() {
 
 #[test]
 fn a_chimera_cast_spans_backends_with_both_slot_forms() {
-    // The use case the split exists for (docs/casts.md "Why"): a cheap local deepseek
+    // The use case the split exists for (docs/casts.md "Why"): a local deepseek
     // explorer feeding a claude synth — one composed thing selected by one name.
     let c = Config::from_toml_str(
         r#"
@@ -964,7 +964,6 @@ fn cli_cast_wins_over_env_and_file() {
     assert_eq!(c.root.as_deref(), Some(std::path::Path::new("/tmp/proj")));
     // Only oneshot is dropped; the rest stay enabled.
     assert!(c.tools.consult);
-    assert!(c.tools.explore);
     assert!(c.tools.deliberate);
     assert!(!c.tools.oneshot);
     assert!(c.tools.run_kaish);
@@ -3290,7 +3289,10 @@ fn a_decision_slot_on_openrouter_loads_and_is_neither_reasoning_nor_media() {
     let slot = cast
         .slot(kaibo::config::ModelRole::Decision)
         .expect("decision slot resolves");
-    assert_eq!((slot.backend.as_str(), slot.id.as_str()), ("orx", "typesafe/jev-1.13"));
+    assert_eq!(
+        (slot.backend.as_str(), slot.id.as_str()),
+        ("orx", "typesafe/jev-1.13")
+    );
     assert!(c.cast_can_decide("judge"));
     let role = kaibo::config::ModelRole::Decision;
     assert!(!role.is_reasoning() && !role.is_media());
@@ -3374,10 +3376,8 @@ fn web_defaults_to_on_with_the_deepseek_backend() {
 
 #[test]
 fn web_reads_its_stanza() {
-    let c = Config::from_toml_str(
-        "[web]\nenabled = false\nmax_searches = 3\nmax_fetches = 0\n",
-    )
-    .unwrap();
+    let c = Config::from_toml_str("[web]\nenabled = false\nmax_searches = 3\nmax_fetches = 0\n")
+        .unwrap();
     assert!(!c.web.enabled);
     assert_eq!((c.web.max_searches, c.web.max_fetches), (3, 0));
 }
@@ -3390,8 +3390,7 @@ fn a_web_backend_without_search_apis_is_refused_at_load() {
     assert!(err.contains("only a `deepseek` or `exa`"), "{err}");
     assert!(err.contains("[web] enabled = false"), "{err}");
     // Checked even while web is off, so the typo shows when it is written.
-    let err = Config::from_toml_str("[web]\nenabled = false\nbackend = \"nope\"\n")
-        .unwrap_err();
+    let err = Config::from_toml_str("[web]\nenabled = false\nbackend = \"nope\"\n").unwrap_err();
     assert!(format!("{err:#}").contains("names no backend"), "{err:#}");
 }
 
@@ -3436,7 +3435,10 @@ fn web_caps_of_zero_and_zero_are_refused_while_enabled() {
         .unwrap_err()
         .to_string();
     assert!(err.contains("allows no web call"), "{err}");
-    assert!(Config::from_toml_str("[web]\nenabled = false\nmax_searches = 0\nmax_fetches = 0\n").is_ok());
+    assert!(
+        Config::from_toml_str("[web]\nenabled = false\nmax_searches = 0\nmax_fetches = 0\n")
+            .is_ok()
+    );
 }
 
 #[test]
@@ -3449,7 +3451,10 @@ fn web_is_usable_only_with_a_key_and_the_flag() {
     assert!(c.web_usable(keyed));
     assert!(!c.web_usable(none), "no key, no web");
     let off = Config::from_toml_str(&format!("{KEYED}[web]\nenabled = false\n")).unwrap();
-    assert!(!off.web_usable(keyed), "the operator's off switch wins over a key");
+    assert!(
+        !off.web_usable(keyed),
+        "the operator's off switch wins over a key"
+    );
 }
 
 // --- Sign-in backends (`auth`) ----------------------------------------------------

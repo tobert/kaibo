@@ -71,7 +71,6 @@ async fn run_command(common: CommonArgs, command: Command) -> i32 {
         Command::Serve(_) => unreachable!("serve is dispatched directly in main, before this fn"),
         Command::Consult(args) => kaibo::cli::run_consult(common, args).await,
         Command::Oneshot(args) => kaibo::cli::run_oneshot(common, args).await,
-        Command::Explore(args) => kaibo::cli::run_explore(common, args).await,
         Command::Research(args) => kaibo::cli::run_research(common, args).await,
         Command::Deliberate(args) => kaibo::cli::run_deliberate(common, args).await,
         Command::Kaish(args) => kaibo::cli::run_kaish(common, args).await,

@@ -3,7 +3,7 @@
 //!
 //! A long `consult` is mostly silent: rig owns the inner LLM loop, so the only
 //! places kaibo can observe forward motion are the boundaries it *does* control —
-//! a tool call (`run_kaish`, a delegated `explore′` sweep), a phase start/finish,
+//! a tool call (`run_kaish`), a phase start/finish,
 //! the turn-cap recovery. Each emits a [`PhaseEvent`]. A [`ProgressSink`] is
 //! whatever turns those into liveness: in the server it's the adapter that renders
 //! them as MCP `notifications/progress` (see `server.rs`); in tests it's a
@@ -21,18 +21,14 @@ use std::time::Duration;
 
 /// A semantic step in a running phase. The sink decides how (or whether) to surface
 /// it; the loop just announces what it's doing. Ordered roughly by when they fire,
-/// but a sink must not assume any particular sequence — a phase may delegate zero
-/// sweeps, read zero spans, or hit its turn cap.
+/// but a sink must not assume any particular sequence — a phase may read zero spans
+/// or hit its turn cap.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PhaseEvent {
     /// A top-level tool began (`consult` / `oneshot`).
     PhaseStarted { phase: &'static str },
     /// The model ran a kaish script directly — a precise read.
     KaishRun { script: String },
-    /// The model delegated a broad sweep to the `explore′` sub-agent.
-    SweepStarted { question: String },
-    /// A delegated sweep returned (it either reported or failed — both end it).
-    SweepFinished,
     /// A sweep routed a workspace file's bytes past itself to its report's reader
     /// with the `attach` tool. The one beat that lets an operator actually observe
     /// the pattern the generous `max_attachments` default exists to watch for.
@@ -82,10 +78,6 @@ impl PhaseEvent {
         match self {
             PhaseEvent::PhaseStarted { phase } => format!("starting {phase}"),
             PhaseEvent::KaishRun { script } => format!("running kaish: {}", brief(script, 80)),
-            PhaseEvent::SweepStarted { question } => {
-                format!("exploring: {}", brief(question, 80))
-            }
-            PhaseEvent::SweepFinished => "sweep complete".to_string(),
             PhaseEvent::Attached { path } => format!("attached {path} to the report"),
             PhaseEvent::WebSearched { query } => format!("searching the web: {}", brief(query, 80)),
             PhaseEvent::WebFetched { url } => format!("fetching {}", brief(url, 100)),
@@ -375,7 +367,6 @@ mod tests {
             PhaseEvent::PhaseFinished { phase: "consult" }.message(),
             "consult complete"
         );
-        assert_eq!(PhaseEvent::SweepFinished.message(), "sweep complete");
         assert!(PhaseEvent::TurnCapReached
             .message()
             .contains("research limit"));
@@ -385,13 +376,6 @@ mod tests {
             }
             .message(),
             "running kaish: grep -rn TODO src"
-        );
-        assert_eq!(
-            PhaseEvent::SweepStarted {
-                question: "where is the sandbox?".into()
-            }
-            .message(),
-            "exploring: where is the sandbox?"
         );
         // Under ten seconds keeps a decimal (explorer calls live there); from ten on,
         // whole seconds.
@@ -445,7 +429,7 @@ mod tests {
     #[test]
     fn null_sink_swallows_events() {
         // No panic, no state — the no-op contract.
-        NullSink.emit(PhaseEvent::SweepFinished);
+        NullSink.emit(PhaseEvent::TurnCapReached);
     }
 
     /// The Warn-bar convention: `TurnCapReached` and a slow chat call promote to the
@@ -483,10 +467,6 @@ mod tests {
         for event in [
             PhaseEvent::PhaseStarted { phase: "consult" },
             PhaseEvent::PhaseFinished { phase: "consult" },
-            PhaseEvent::SweepStarted {
-                question: "q".into(),
-            },
-            PhaseEvent::SweepFinished,
             PhaseEvent::KaishRun {
                 script: "cat -n x".into(),
             },
@@ -523,10 +503,6 @@ mod tests {
         sink.emit(PhaseEvent::KaishRun {
             script: "grep -rn TODO .".into(),
         });
-        sink.emit(PhaseEvent::SweepStarted {
-            question: "where?".into(),
-        });
-        sink.emit(PhaseEvent::SweepFinished);
         sink.emit(PhaseEvent::TurnCapReached);
         // Both branches of the chat beat: under the mark and past it.
         sink.emit(PhaseEvent::ChatCompleted {
@@ -561,10 +537,6 @@ mod tests {
         sink.emit(PhaseEvent::KaishRun {
             script: "grep -rn TODO .".into(),
         });
-        sink.emit(PhaseEvent::SweepStarted {
-            question: "where?".into(),
-        });
-        sink.emit(PhaseEvent::SweepFinished);
         sink.emit(PhaseEvent::TurnCapReached);
         sink.emit(PhaseEvent::ChatCompleted {
             agent: "synth",
@@ -632,12 +604,12 @@ mod tests {
         assert_eq!(log.latest(), Some(("starting consult".to_string(), 1)));
 
         // A second beat replaces the message and advances the count.
-        log.emit(PhaseEvent::SweepStarted {
-            question: "where is the sandbox?".into(),
+        log.emit(PhaseEvent::KaishRun {
+            script: "grep -rn sandbox src".into(),
         });
         assert_eq!(
             log.latest(),
-            Some(("exploring: where is the sandbox?".to_string(), 2))
+            Some(("running kaish: grep -rn sandbox src".to_string(), 2))
         );
     }
 
@@ -677,7 +649,7 @@ mod tests {
         }
         let counter = Arc::new(Counter::default());
         let log = ProgressLog::new(counter.clone());
-        log.emit(PhaseEvent::SweepFinished);
+        log.emit(PhaseEvent::TurnCapReached);
         log.emit(PhaseEvent::PhaseFinished { phase: "consult" });
         assert_eq!(counter.0.load(std::sync::atomic::Ordering::SeqCst), 2);
         // And it still recorded the last one for `job_get`.

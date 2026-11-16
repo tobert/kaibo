@@ -1,13 +1,13 @@
 //! `attach` — a routing verb for the explorer sub-agent: aim a workspace file's full
 //! bytes past the sweep itself at whoever reads its report.
 //!
-//! A sweep (`explore′` inside `consult`, or `deliberate`'s dossier stage) often finds
+//! A sweep (`deliberate`'s dossier stage) often finds
 //! a file where the whole thing IS the evidence — a config, a small module, a diagram.
 //! Without this tool the only way to get those bytes to the reader is to transcribe
 //! them into the report, which spends the explorer's own budget and can drift from the
 //! real source. `attach` instead reads the file once, server-side, and routes its bytes
 //! to ride ALONGSIDE the report — never through the explorer's own context — landing in
-//! the consult driver's tool result or `deliberate`'s dossier, per [`SweepConsumer`].
+//! `deliberate`'s dossier, per [`SweepConsumer`].
 //!
 //! **Structural shape, mirroring [`crate::view_image`] and
 //! [`crate::server::resolver::Resolver::resolve_consult_attachments`] with no new
@@ -129,8 +129,8 @@ enum Reservation {
 }
 
 /// Per-sweep routing state: the budget, the dedupe sets, and the consumer this
-/// sweep's `attach` calls route to. One sink per sweep (nested `explore′` sub-agent,
-/// or `deliberate`'s dossier stage), shared by every `attach` call the sweep makes —
+/// sweep's `attach` calls route to. One sink per sweep (`deliberate`'s dossier
+/// stage), shared by every `attach` call the sweep makes —
 /// including concurrent ones, since rig runs a turn's tool calls with
 /// `buffer_unordered`.
 pub struct SweepAttachSink {
@@ -265,8 +265,8 @@ impl SweepAttachSink {
     }
 
     /// Collect everything this sweep routed — every committed attachment, every
-    /// consumer-shaped demotion, every note — for the caller (`RunExplore::call` /
-    /// `deliberate`'s dossier stage) to fold into the report/dossier via
+    /// consumer-shaped demotion, every note — for the caller (`deliberate`'s
+    /// dossier stage) to fold into the report/dossier via
     /// [`crate::consult::sweep_evidence_block`]. Idempotent to call more than once
     /// (a `Mutex` snapshot), though a sweep only ever drains once, after it returns.
     pub fn drain(&self) -> SweepDelivery {
