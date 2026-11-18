@@ -4260,7 +4260,11 @@ impl rmcp::ServerHandler for KaiboHandler {
             self.config
                 .default_cast_usability(|k| std::env::var(k).ok()),
             &self.config.usable_casts(|k| std::env::var(k).ok()),
-            self.tool_router.has_route("research"),
+            &self
+                .advertised_tools()
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
         ))
     }
 
@@ -10171,6 +10175,27 @@ enabled = false
         );
     }
 
+    /// The handshake pitches only the tools the router advertises: with `consult` and
+    /// its async sibling switched off, the instructions drop the front-door sentence and
+    /// the `consult_submit` handle clause, and still name `oneshot`.
+    #[test]
+    fn the_handshake_does_not_pitch_a_tool_the_router_dropped() {
+        let mut config = Config::builtin();
+        config.tools.consult = false;
+        // Blank environment: `get_info` reads cast usability from it, and the setup
+        // banner (shown with no keys) would change what the text contains.
+        let handler = KaiboHandler::new_with_env(config, |_| None).expect("handler builds");
+        let text = handler.get_info().instructions.expect("instructions");
+        assert!(
+            !text.contains("`consult` is the front door") && !text.contains("`consult_submit`"),
+            "`consult` is off, so the lead must not pitch it:\n{text}"
+        );
+        assert!(
+            text.contains("`oneshot` answers from supplied context"),
+            "a live tool is still named:\n{text}"
+        );
+    }
+
     /// `setLevel` actually moves the shared floor the drain reads. Starts at the
     /// default (info); raising it to `error` stores the higher rank.
     #[test]
@@ -11255,9 +11280,7 @@ enabled = false
             None,
             false,
             crate::config::CastUsability::Ready,
-            &[],
-            true,
-        );
+            &[], crate::kaish_syntax::HANDSHAKE_TOOLS);
         // The scope section must name each allowed path.
         assert!(
             text.contains("/projects/myapp"),
@@ -11287,9 +11310,7 @@ enabled = false
             Some(&root),
             false,
             crate::config::CastUsability::Ready,
-            &[],
-            true,
-        );
+            &[], crate::kaish_syntax::HANDSHAKE_TOOLS);
         assert!(
             text.contains("/projects/myapp"),
             "scope section must name the configured root:\n{text}"
@@ -11313,9 +11334,7 @@ enabled = false
             Some(&root),
             true,
             crate::config::CastUsability::Ready,
-            &[],
-            true,
-        );
+            &[], crate::kaish_syntax::HANDSHAKE_TOOLS);
         assert!(
             text.contains("/work/space"),
             "scope section must name the inferred root:\n{text}"
@@ -11337,9 +11356,7 @@ enabled = false
             None,
             false,
             crate::config::CastUsability::Ready,
-            &[],
-            true,
-        );
+            &[], crate::kaish_syntax::HANDSHAKE_TOOLS);
         // Must explain that every call must pass a path.
         assert!(
             text.to_lowercase().contains("every call") || text.contains("no default"),
