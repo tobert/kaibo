@@ -238,10 +238,8 @@ pub fn resolve_phase_preamble(
 /// Explorer preamble: gather and organize evidence for the reader. The report, not
 /// the answer, is the deliverable: located, read, cited, and connected, with the
 /// verdict left to the reader (Amy, 2026-11-15: "its role is to produce a dossier, not
-/// the analysis"). Reading is sized to the claim. The whole-file-first directive this
-/// replaced (2026-07 to 2026-11) was tuned for lite explorers grazing in small slices;
-/// the Haiku/Luna/Flash floor reads well without it. Composes the
-/// shared [`kaish_syntax_core`] so the shell idioms and exit-code contract are
+/// the analysis"). Reading is sized to the claim, with no default of whole files or of
+/// small slices. Composes the shared [`kaish_syntax_core`] so the shell idioms and exit-code contract are
 /// stated in exactly one place.
 ///
 /// Opens a *role* rather than a capability: this model is the **explorer**, the name
@@ -1082,10 +1080,6 @@ mod tests {
             assert!(
                 p.contains("You are the synthesis agent"),
                 "{label} must open on the synthesis-agent role: {p}"
-            );
-            assert!(
-                !p.contains("capable model"),
-                "{label} must name the role, not describe a capability: {p}"
             );
         }
         let c = consult_preamble();

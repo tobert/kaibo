@@ -52,7 +52,7 @@ record. Each later release appends a new section at the top.
 - The `consult` synth's preamble opens by naming who asked: another agent, which acts on the answer.
 - `kaibo consult --json` reports `models` as `{ "synth": … }`; the `explorer` key is gone.
 - The explorer's report is evidence for another model or agent to reason from, not a verdict: it adds `Connections` and `OpenQuestions` sections, and `SummaryOfFindings` becomes `Summary`.
-- Explorer and `consult` preambles read what each claim needs (a whole file or a span) instead of whole files first; attached files are still read whole.
+- Explorer and `consult` preambles read what each claim needs (a whole file or a span) instead of whole files first, and the `[orientation]` file map no longer says to read unmarked files whole; attached files are still read whole.
 - Moves to kaish 0.19.0: `ls -l`, `stat`, and `date` in the model's shell print GNU's formats, `ls -A` lists hidden files, and `%` is a word character (`printf %s`).
 - The `configure` prompt recommends a workspace root such as `~/src` and asks for the user's clear yes before scoping to `~`, `$HOME`, or `/`.
 - The built-in `gemini` cast's synth is `gemini/gemini-pro-latest` (explorer stays `gemini/gemini-flash-latest`).

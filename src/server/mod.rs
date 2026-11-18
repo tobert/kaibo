@@ -2260,7 +2260,7 @@ impl KaiboHandler {
 
     #[tool(
         description = "Put a top model's deepest reasoning on your codebase without holding \
-            a session open. A fast model first investigates the project READ-ONLY and \
+            a session open. An explorer model first investigates the project READ-ONLY and \
             assembles a cited dossier (you wait for this — minutes); a heavyweight synth \
             then deliberates offline over that evidence — a frontier model on the \
             provider's batch lane (max thinking, half price) or a big local model taking \

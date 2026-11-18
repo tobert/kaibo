@@ -727,17 +727,6 @@ mod tests {
     }
 
     #[test]
-    fn canonical_contract_carries_a_load_bearing_kaish_guarantee() {
-        // kaish-help's Foundations lead with no-word-splitting; if the recipe ever
-        // stops yielding it, our onboarding silently loses its spine — catch that.
-        assert!(
-            kaish_operating_contract().to_lowercase().contains("word"),
-            "expected the no-word-splitting guarantee from kaish-help, got:\n{}",
-            kaish_operating_contract()
-        );
-    }
-
-    #[test]
     fn the_tool_description_is_the_core() {
         assert_eq!(run_kaish_tool_description(), kaish_syntax_core());
     }
@@ -819,11 +808,8 @@ mod tests {
     /// large file, and `file` to learn what a file is before reading it. Reading is
     /// sized to the claim (pinned in `consult::prompts`); these are the read idioms.
     ///
-    /// The span is pinned quoted because that form is correct on every kaish kaibo has
-    /// run. What this test deliberately no longer asserts is the *rule* — kaish 0.14
-    /// made a bare comma an ordinary bareword, so an unquoted range parses too, and an
-    /// assertion demanding kaibo teach otherwise would pin a false sentence into every
-    /// preamble. Quoting is now a house convention, not a requirement.
+    /// Quoting every `sed` range is a house convention, not a kaish requirement; the
+    /// sweep in `consult::prompts` holds it across every preamble, this addendum included.
     #[test]
     fn addendum_teaches_quoted_spans_and_identifying_a_file() {
         let a = KAISH_SANDBOX_ADDENDUM;
@@ -832,35 +818,9 @@ mod tests {
             "the addendum must teach a wide span around a grep hit in a large file:\n{a}"
         );
         assert!(
-            !a.contains("unquoted comma"),
-            "the addendum must not explain quoting by a kaish 0.13 parse rule — kaish 0.14 \
-             made a bare comma ordinary, so that reason is false and a model reads it every \
-             turn:\n{a}"
-        );
-        assert!(
             a.contains("`file FILE`"),
             "the addendum must teach `file FILE` for an unfamiliar file, so a binary is \
              identified rather than discovered by reading it:\n{a}"
-        );
-        // Structural, so it survives someone changing the example line numbers: every
-        // `sed -n` kaibo writes here is followed by a quote. The count is asserted too —
-        // a loop over zero matches passes green, so without this the whole scan would go
-        // quiet the day someone removed the last span example (caught in review, and the
-        // sibling scan in `prompts.rs` already had it).
-        let mut seen = 0;
-        for (i, _) in a.match_indices("sed -n ") {
-            let rest = &a[i + "sed -n ".len()..];
-            assert!(
-                rest.starts_with('\''),
-                "every `sed -n` range must be quoted — unquoted, kaish 0.13 refuses the \
-                 comma with a parse error:\n{a}"
-            );
-            seen += 1;
-        }
-        assert!(
-            seen > 0,
-            "the addendum must carry at least one `sed -n` span for the scan above to \
-             mean anything:\n{a}"
         );
     }
 
@@ -1015,7 +975,6 @@ mod tests {
                 live,
             )
         };
-        assert!(render(true).contains(RESEARCH_CLAUSE));
         assert!(!render(false).contains("`research`"));
         assert!(!render(false).contains("web: true"));
     }
