@@ -21,4 +21,10 @@ targets = [
 version = 2
 # An entry here silences one advisory. Each one names the advisory, the reason it does not
 # apply to kaibo, and the date to look again. Prefer a dependency bump.
-ignore = []
+ignore = [
+    # chrono and chrono-tz are unmaintained (chronotope/chrono#1768): no vulnerability, and
+    # no fixed version exists. rmcp, schemars (via rig), and kaish-kernel pull them in.
+    # Look again when those move to jiff, or by 2027-02-18.
+    { id = "RUSTSEC-2026-0543", reason = "chrono unmaintained; no vulnerability; pulled in by rmcp, schemars, kaish-kernel" },
+    { id = "RUSTSEC-2026-0555", reason = "chrono-tz unmaintained; no vulnerability; pulled in by kaish-kernel" },
+]
