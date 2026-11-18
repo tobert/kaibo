@@ -10177,7 +10177,7 @@ enabled = false
 
     /// The handshake pitches only the tools the router advertises: with `consult` and
     /// its async sibling switched off, the instructions drop the front-door sentence and
-    /// the `consult_submit` handle clause, and still name `explore`.
+    /// the `consult_submit` handle clause, and still name `oneshot`.
     #[test]
     fn the_handshake_does_not_pitch_a_tool_the_router_dropped() {
         let mut config = Config::builtin();
@@ -10191,7 +10191,7 @@ enabled = false
             "`consult` is off, so the lead must not pitch it:\n{text}"
         );
         assert!(
-            text.contains("`explore` returns a cited survey report."),
+            text.contains("`oneshot` answers from supplied context"),
             "a live tool is still named:\n{text}"
         );
     }

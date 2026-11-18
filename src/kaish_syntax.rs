@@ -1109,8 +1109,8 @@ mod tests {
         );
     }
 
-    /// A cast with no synth is tagged only with tools the server advertises: `--no-explore`
-    /// or `[cas] enabled = false` must not leave "`explore` only" or "`generate` only" in
+    /// A cast with no synth is tagged only with tools the server advertises: `--no-research`
+    /// or `[cas] enabled = false` must not leave "`research` only" or "`generate` only" in
     /// the roster. A cast left serving nothing is dropped, unless it is the default.
     #[test]
     fn roster_tags_name_only_the_tools_that_are_live() {
@@ -1123,7 +1123,6 @@ mod tests {
                 name.to_string(),
                 Cast {
                     name: name.to_string(),
-                    consult: None,
                     slots: std::collections::BTreeMap::from([(role, ModelSlot::bare(backend, id))]),
                 },
             );
@@ -1151,18 +1150,18 @@ mod tests {
             .collect();
         let text = render(&no_generate);
         assert!(
-            !text.contains("flux") && text.contains("- `scout` (`explore` only)"),
+            !text.contains("flux") && text.contains("- `scout` (`research` only)"),
             "`generate` is off, so the image-only cast is dropped and the explorer cast stays:\n{text}"
         );
         let no_explore: Vec<&str> = HANDSHAKE_TOOLS
             .iter()
             .copied()
-            .filter(|t| *t != "explore")
+            .filter(|t| *t != "research")
             .collect();
         let text = render(&no_explore);
         assert!(
             !text.contains("scout") && text.contains("- `flux` (`generate` only)"),
-            "`explore` is off, so the explorer-only cast is dropped and the image cast stays:\n{text}"
+            "`research` is off, so the explorer-only cast is dropped and the image cast stays:\n{text}"
         );
     }
 
