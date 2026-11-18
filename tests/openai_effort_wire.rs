@@ -119,13 +119,15 @@ async fn sent_body_with(
 
 /// The GPT 6 ids OpenAI served on 2026-11-10 (`kaibo models --backend <openai>`). The
 /// live probe `openai_effort_ceiling_is_per_model_live` in `tests/consult.rs` measures
-/// the same five; keep the two lists together.
-const GPT6_IDS: [&str; 5] = [
+/// the first five. The 6.2 ids (listed 2026-11-18) are wire-only until the probe measures their floor.
+const GPT6_IDS: [&str; 7] = [
     "gpt-6-sol",
     "gpt-6-luna",
     "gpt-6-astra",
     "gpt-6.1-sol",
     "gpt-6.1-terra",
+    "gpt-6.2-sol",
+    "gpt-6.2-astra",
 ];
 
 #[tokio::test]
