@@ -15,6 +15,8 @@ record. Each later release appends a new section at the top.
 
 ## [Unreleased]
 
+## [0.7.0] — 2026-11-18
+
 ### Security
 - `kaibo login` listens once on `127.0.0.1` for the browser's sign-in redirect; it is the only socket kaibo opens, and the MCP server never opens it.
 - Sign-ins live in their own `credentials/creds.db` under kaibo's state dir, in a directory kaibo keeps at mode 700 (a looser mode is fixed and logged).
@@ -52,7 +54,7 @@ record. Each later release appends a new section at the top.
 - The `consult` synth's preamble opens by naming who asked: another agent, which acts on the answer.
 - `kaibo consult --json` reports `models` as `{ "synth": … }`; the `explorer` key is gone.
 - The explorer's report is evidence for another model or agent to reason from, not a verdict: it adds `Connections` and `OpenQuestions` sections, and `SummaryOfFindings` becomes `Summary`.
-- Explorer and `consult` preambles read what each claim needs (a whole file or a span) instead of whole files first, and the `[orientation]` file map no longer says to read unmarked files whole; attached files are still read whole.
+- Explorer and `consult` preambles read what each claim needs (a whole file or a span) instead of whole files first; the `[orientation]` file map agrees, and attached files are still read whole.
 - The handshake names only the tools the server advertises, so `--no-consult`, an unstaffed cast, or a missing web backend no longer leaves a dead tool in the pitch.
 - Moves to kaish 0.19.0: `ls -l`, `stat`, and `date` in the model's shell print GNU's formats, `ls -A` lists hidden files, and `%` is a word character (`printf %s`).
 - The `configure` prompt recommends a workspace root such as `~/src` and asks for the user's clear yes before scoping to `~`, `$HOME`, or `/`.
