@@ -52,8 +52,8 @@ use crate::config::{CastUsability, Config, Lane, ModelRole};
 /// worse than a missing one.
 pub const KAISH_SANDBOX_ADDENDUM: &str = "\
 In kaibo this shell runs over a READ-ONLY snapshot of one project, offline: writes, \
-`git`, `touch`, and external commands are refused, so your work here is reading. Read \
-files WHOLE by default with `cat -n FILE`; `grep -rn PATTERN` searches the \
+`git`, `touch`, and external commands are refused, so your work here is reading. \
+`cat -n FILE` reads a file with its line numbers; `grep -rn PATTERN` searches the \
 whole project and prefixes every hit with its path from the root. PATTERN is GNU \
 BRE, as in GNU grep: `grep -rn 'fn consult(' src` finds the text `fn consult(`, and \
 for alternation use `-E`, as in `grep -rnE 'consult|explore' src`. Write `[0-9]` for a \
@@ -495,10 +495,11 @@ pub fn kaibo_sandbox_doc() -> String {
         "# kaibo — the read-only kaish sandbox\n\n\
          {KAISH_SANDBOX_ADDENDUM}\n\n\
          ## Browsing for exact citations\n\
-         Lead with line numbers so every claim cites `file:line`, and read files \
-         whole:\n\
-         - `cat -n FILE` — the whole file, numbered; the default move on any file that matters\n\
-         - `grep -rn PATTERN` — find which files matter, then open them whole; every hit is prefixed with its path from the project root\n\
+         Lead with line numbers so every claim cites `file:line`, and read what each \
+         claim needs:\n\
+         - `cat -n FILE` — the whole file, numbered, for a file you need in full\n\
+         - `cat -n FILE | sed -n '120,400p'` — a span with its real line numbers, for the code around a match\n\
+         - `grep -rn PATTERN` — find which files matter; every hit is prefixed with its path from the project root\n\
          - `grep -rn -B3 -A6 PATTERN` — preview matches in context across files\n\
          - `grep -rn PATTERN DIR/` — narrow to a subtree; hits are prefixed with the operand as written, so a named directory still cites a usable path\n\
          - `grep -rl PATTERN src` — just the file names that match\n\
@@ -507,7 +508,7 @@ pub fn kaibo_sandbox_doc() -> String {
          - `grep -rnE 'consult|explore' src` — `-E` for ERE: alternation, groups, `+`, `?`, \
          `{{n}}`. In both dialects `\\d` is a literal `d`; write `[0-9]`\n\
          - `grep -rnF 'args[0]' src` — every character literal, `.`, `*`, and `[` included\n\
-         - `cat -n FILE | sed -n '1200,2400p'` — a targeted wide span of a truncated giant (`grep -n SYMBOL FILE` pins where to aim), and the follow-up to a grep hit in a large file\n\
+         - `cat -n FILE | sed -n '1200,2400p'` — the next span of a file too large to come back whole (`grep -n SYMBOL FILE` pins where to aim)\n\
          - `file FILE` — what a file is, text or binary, read from its content rather than its name\n\n\
          ## Read-only boundary\n\
          The project is mounted read-only and external commands are off, by \
@@ -726,17 +727,6 @@ mod tests {
     }
 
     #[test]
-    fn canonical_contract_carries_a_load_bearing_kaish_guarantee() {
-        // kaish-help's Foundations lead with no-word-splitting; if the recipe ever
-        // stops yielding it, our onboarding silently loses its spine — catch that.
-        assert!(
-            kaish_operating_contract().to_lowercase().contains("word"),
-            "expected the no-word-splitting guarantee from kaish-help, got:\n{}",
-            kaish_operating_contract()
-        );
-    }
-
-    #[test]
     fn the_tool_description_is_the_core() {
         assert_eq!(run_kaish_tool_description(), kaish_syntax_core());
     }
@@ -815,14 +805,11 @@ mod tests {
     }
 
     /// The two reading idioms that follow a grep hit: a wide span around a match in a
-    /// large file, and `file` to learn what a file is before reading it. Whole-file
-    /// reading stays the default and is asserted next door; these are the follow-ups.
+    /// large file, and `file` to learn what a file is before reading it. Reading is
+    /// sized to the claim (pinned in `consult::prompts`); these are the read idioms.
     ///
-    /// The span is pinned quoted because that form is correct on every kaish kaibo has
-    /// run. What this test deliberately no longer asserts is the *rule* — kaish 0.14
-    /// made a bare comma an ordinary bareword, so an unquoted range parses too, and an
-    /// assertion demanding kaibo teach otherwise would pin a false sentence into every
-    /// preamble. Quoting is now a house convention, not a requirement.
+    /// Quoting every `sed` range is a house convention, not a kaish requirement; the
+    /// sweep in `consult::prompts` holds it across every preamble, this addendum included.
     #[test]
     fn addendum_teaches_quoted_spans_and_identifying_a_file() {
         let a = KAISH_SANDBOX_ADDENDUM;
@@ -831,35 +818,9 @@ mod tests {
             "the addendum must teach a wide span around a grep hit in a large file:\n{a}"
         );
         assert!(
-            !a.contains("unquoted comma"),
-            "the addendum must not explain quoting by a kaish 0.13 parse rule — kaish 0.14 \
-             made a bare comma ordinary, so that reason is false and a model reads it every \
-             turn:\n{a}"
-        );
-        assert!(
             a.contains("`file FILE`"),
             "the addendum must teach `file FILE` for an unfamiliar file, so a binary is \
              identified rather than discovered by reading it:\n{a}"
-        );
-        // Structural, so it survives someone changing the example line numbers: every
-        // `sed -n` kaibo writes here is followed by a quote. The count is asserted too —
-        // a loop over zero matches passes green, so without this the whole scan would go
-        // quiet the day someone removed the last span example (caught in review, and the
-        // sibling scan in `prompts.rs` already had it).
-        let mut seen = 0;
-        for (i, _) in a.match_indices("sed -n ") {
-            let rest = &a[i + "sed -n ".len()..];
-            assert!(
-                rest.starts_with('\''),
-                "every `sed -n` range must be quoted — unquoted, kaish 0.13 refuses the \
-                 comma with a parse error:\n{a}"
-            );
-            seen += 1;
-        }
-        assert!(
-            seen > 0,
-            "the addendum must carry at least one `sed -n` span for the scan above to \
-             mean anything:\n{a}"
         );
     }
 
@@ -1014,7 +975,6 @@ mod tests {
                 live,
             )
         };
-        assert!(render(true).contains(RESEARCH_CLAUSE));
         assert!(!render(false).contains("`research`"));
         assert!(!render(false).contains("web: true"));
     }

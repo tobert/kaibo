@@ -325,8 +325,10 @@ pub fn resolve_phase_preamble(
 }
 
 /// Explorer preamble: gather and organize evidence for the reader. The report, not
-/// the answer, is the deliverable. Composes the
-/// shared [`kaish_syntax_core`] so the shell idioms and exit-code contract are
+/// the answer, is the deliverable: located, read, cited, and connected, with the
+/// verdict left to the reader (Amy, 2026-11-15: "its role is to produce a dossier, not
+/// the analysis"). Reading is sized to the claim, with no default of whole files or of
+/// small slices. Composes the shared [`kaish_syntax_core`] so the shell idioms and exit-code contract are
 /// stated in exactly one place.
 ///
 /// Opens a *role* rather than a capability: this model is the **explorer**, the name
@@ -357,37 +359,38 @@ pub fn report_preamble(reader: ReportReader) -> String {
         "{opening} The tools named in this request are your complete set. Every shell \
          command is one `run_kaish` call: the tool name is always `run_kaish`, and the \
          command goes inside its `script` argument. {core}\n\n\
-         Read files WHOLE. `cat -n FILE` is your default command for any file the \
-         question touches. One read gives you the whole file with its exact line \
-         numbers, so each part arrives with the text around it. You do not have to \
-         guess how big a file is. The project file list \
-         gives each file's size and marks the few files that will not come back whole. \
-         Read whole every file it does not mark. When a file carries no size, read it \
-         whole anyway and let the result tell you otherwise. Prefer the bigger read. \
-         Reading too much costs you one read. Reading too little costs you every read \
-         after it.\n\n\
-         Use `grep -rn PATTERN` to find which files matter; `-B4 -A8` shows a preview \
-         around each match. Once grep names a file, open that file whole. When the \
-         file is large, read a wide span around each match instead, with \
-         `cat -n FILE | sed -n '120,400p'`. That keeps the real line numbers, so your \
-         citation stays exact. A file so large that a whole read comes back truncated \
-         (exit 3) returns its start and its end; read the rest in spans, with \
-         `grep -n SYMBOL FILE` for the line numbers and `cat -n FILE | sed -n \
-         '1200,2400p'` for each span. About 1,200 lines fits in one read. Those are \
-         the exceptions. The default is the whole file.\n\n\
+         Your report is the evidence for an answer, not the answer itself. {they} \
+         reasons from it. Your work is to put everything that reasoning needs in front \
+         of {them}: the right locations, read accurately, cited exactly, and connected \
+         to each other. State what the code does. Leave the verdict on whether it is \
+         correct, safe, or well designed to {them}, and point out what looks \
+         inconsistent or surprising as an observation with its citation.\n\n\
+         Read what each claim needs. `grep -rn PATTERN` finds which files matter; \
+         `-B4 -A8` shows a preview around each match. Then read the code itself: \
+         `cat -n FILE` for a file you need in full, or `cat -n FILE | sed -n \
+         '120,400p'` for the span around a match. Both keep the real line numbers, so \
+         your citation stays exact. The project file list gives each file's size and \
+         marks the files too large to come back whole. A read that comes back \
+         truncated (exit 3) returns its start and its end; read the rest in spans, \
+         with `grep -n SYMBOL FILE` for the line numbers and `cat -n FILE | sed -n \
+         '1200,2400p'` for each span. About 1,200 lines fits in one read.\n\n\
          Read holistically. The question tells you where to start reading, not where \
          to stop. Read the text around each relevant location, not only the lines the \
-         question names. Follow each key name to where it is defined and to every \
-         place it appears. When something confuses you, keep reading until it is \
+         question names. Follow each key name to where it is defined and to the \
+         places that use it. When something confuses you, keep reading until it is \
          clear; a confusing section often holds the detail the question depends on. \
          Your report is the only view of this project {them} receives. Anything \
          you leave out {gap}.\n\n\
          Write a report in these sections for {them}:\n\
-         - SummaryOfFindings: what you concluded. Separate what you read from what \
-         you infer and from what remains unknown.\n\
+         - Summary: what the evidence shows, as plain statements of fact. Separate \
+         what you read from what you infer and from what remains unknown.\n\
          - RelevantLocations: for each location that matters, the concrete \
          `file:line`, the key names there (functions, types, fields, headings), a \
          short verbatim snippet, and what it means for the question.\n\
+         - Connections: how those locations fit together, such as what calls what, \
+         where a value comes from and where it goes, and which tests cover the path.\n\
+         - OpenQuestions: what the files do not settle, what would settle it, and \
+         anything that looks inconsistent.\n\
          - ExplorationTrace: the path you took, when it helps {them} trust the \
          result.\n\
          Ground every claim in an exact `file:line`. {they} trusts your citations and \
@@ -931,10 +934,11 @@ pub fn consult_preamble() -> String {
     driver_preamble(
         "You are the synthesis agent on a two-model team.",
         "\n\n\
-         You also have `explore`. It sends a broad sweep to the fast explorer on your \
-         team, which searches the repository on the same read-only shell and returns \
-         a curated report: RelevantLocations with `file:line`, key symbols, and \
-         snippets. Delegate a sweep when a question needs breadth, such as finding \
+         You also have `explore`. It sends a broad sweep to the explorer on your team, \
+         which searches the repository on the same read-only shell and returns a \
+         cited report of evidence: the relevant locations with `file:line`, key \
+         symbols, snippets, how they connect, and what remains open. The conclusions \
+         stay yours. Delegate a sweep when a question needs breadth, such as finding \
          where something lives or gathering the relevant files. One `explore` call \
          searches far more of the repository than you can read in one turn, which \
          leaves you more turns for close reading and reasoning.\n\n\
@@ -956,22 +960,20 @@ pub fn consult_solo_preamble() -> String {
 }
 
 /// The body both `consult` drivers share. `role` opens it; `reads` is the paragraph
-/// that says how this driver gets its evidence, and it ends just before the
-/// whole-file reading guidance.
+/// that says how this driver gets its evidence, and it ends just before the reading
+/// guidance.
 fn driver_preamble(role: &str, reads: &str) -> String {
     let core = kaish_syntax_core();
     format!(
         "{role} You investigate a project \
          tree and write the answer that another agent will act on. Ground every claim in \
          evidence and cite the concrete `file:line`. {core}{reads} \
-         Read files WHOLE with `cat -n FILE`; nearly every file comes back whole in \
-         one command. The project file list gives each file's size, so read \
-         whole every file it does not mark, and when you have no size read whole \
-         anyway and let the result tell you otherwise. Reading too much costs you one \
-         read. Reading too little costs you every read after it. For a file too large \
-         to come back whole, run `grep -n SYMBOL FILE` for the line numbers you need, \
-         then read a wide span around each one with `cat -n FILE | sed -n \
-         '1200,2400p'`.\n\n\
+         Read what each claim needs: `cat -n FILE` for a file you need in full, or \
+         `cat -n FILE | sed -n '120,400p'` for a span. Both keep the real line \
+         numbers your citations need. The project file list gives each file's size \
+         and marks the files too large to come back whole. For one of those, run \
+         `grep -n SYMBOL FILE` for the line numbers you need, then read a wide span \
+         around each one with `cat -n FILE | sed -n '1200,2400p'`.\n\n\
          The caller may give you context: a diff or change summary, a prior report, \
          or pasted source. Treat it as trusted starting evidence. When it cites a \
          concrete `file:line`, trust that citation instead of re-deriving it. Spend \
@@ -1053,37 +1055,32 @@ mod tests {
         );
     }
 
-    /// The explorer preamble carries the behaviors we measured into it — the
-    /// whole-file-FIRST reading directive (the lite-explorer win, 48→23 turns;
-    /// sharpened 2026-07-03 after watching a live sweep graze in small slices),
-    /// grep framed as the locator rather than the reading tool, and the three
-    /// report sections the synth side now expects. Pure and offline; pins the
-    /// prose so a future edit can't silently drop any of it (the synth preambles
-    /// are written against this shape).
+    /// The explorer preamble pins its job and its report shape. The job is evidence
+    /// for someone else's reasoning, not the answer (Amy, 2026-11-15: "its role is to
+    /// produce a dossier, not the analysis"), so the report carries the connections
+    /// and the open questions as well as the locations, and leaves the verdict to its
+    /// reader. Pure and offline; the synth preambles are written against this shape.
     #[test]
-    fn report_preamble_keeps_the_reading_directive_and_report_shape() {
+    fn report_preamble_hands_over_evidence_in_the_report_shape() {
         let p = report_preamble(ReportReader::SynthesisAgent);
-        // Reading strategy: whole files by default, wide spans only for a
-        // truncated giant, grep to find which files matter.
-        assert!(p.contains("cat -n FILE"), "whole-file read idiom: {p}");
         assert!(
-            p.contains("Read files WHOLE"),
-            "whole-first is the lead directive: {p}"
+            p.contains("Your report is the evidence for an answer, not the answer itself."),
+            "the explorer's job is evidence, not the verdict: {p}"
         );
         assert!(
-            p.contains("grep -n SYMBOL FILE") && p.contains("sed -n '1200,2400p'"),
-            "truncation stages into targeted wide spans: {p}"
+            p.contains("as an observation with its citation"),
+            "what looks wrong is reported as an observation: {p}"
         );
         assert!(
             p.contains("which files matter"),
             "grep framed as the locator: {p}"
         );
         // Identity, in the code's own vocabulary: this is the *explorer* half of the
-        // pair and its counterpart is the *synthesis agent* — never "a synthesizer",
-        // never "a capable model". The three phases that share this preamble include
-        // `deliberate`'s dossier build, whose offline synth never sees the code at
-        // all, so "the only view" is literal there — which is why the sweep is told
-        // to read holistically rather than to the edges of the question.
+        // pair and its counterpart is the *synthesis agent*. The phases that share
+        // this preamble include `deliberate`'s dossier build, whose offline synth
+        // never sees the code at all, so "the only view" is literal there — which is
+        // why the sweep is told to read holistically rather than to the edges of the
+        // question.
         assert!(
             p.contains("You are the explorer") && p.contains("the synthesis agent"),
             "explorer names its own role and its counterpart's: {p}"
@@ -1097,71 +1094,66 @@ mod tests {
             p.contains("your last turn is the report itself"),
             "the explorer owns writing the report it was reading for: {p}"
         );
-        // The report template the consult driver preamble is written
-        // against — keep the three section names in lockstep with those.
-        for section in ["SummaryOfFindings", "RelevantLocations", "ExplorationTrace"] {
+        for section in [
+            "Summary:",
+            "RelevantLocations:",
+            "Connections:",
+            "OpenQuestions:",
+            "ExplorationTrace:",
+        ] {
             assert!(p.contains(section), "missing report section {section}: {p}");
         }
     }
 
-    /// The follow-up to a grep hit, when the file is large: a wide span around the
-    /// match, numbered, instead of the whole file. The whole-file default is
-    /// deliberate and pinned above; this is the branch off it, so both sentences must
-    /// survive together — the preamble says "open that file whole" first and reaches
-    /// for a span second.
+    /// Reading is sized to the claim: a whole file when it is needed in full, a span
+    /// around a match otherwise, and spans for a file too large to come back whole.
     #[test]
-    fn explorer_reads_a_wide_span_around_a_grep_hit_in_a_large_file() {
+    fn reading_is_sized_to_the_claim() {
         let p = report_preamble(ReportReader::SynthesisAgent);
+        assert!(p.contains("Read what each claim needs."), "{p}");
         assert!(
-            p.contains("Once grep names a file, open that file whole."),
-            "whole-file stays the default follow-up to a grep hit: {p}"
+            p.contains("`cat -n FILE` for a file you need in full")
+                && p.contains("`cat -n FILE | sed -n '120,400p'` for the span around a match")
+                && p.contains("keep the real line numbers"),
+            "whole file or span, both with real line numbers: {p}"
         );
         assert!(
-            p.contains("When the file is large, read a wide span around each match instead"),
-            "a large file gets a span around the match rather than a whole read: {p}"
+            p.contains("grep -n SYMBOL FILE") && p.contains("sed -n '1200,2400p'"),
+            "a truncated read continues in targeted spans: {p}"
         );
+    }
+
+    /// The reading rule has one voice. The explorer and consult preambles say to read what
+    /// each claim needs, and the `[orientation]` file map is spliced in after them, so the
+    /// map is the last reading guidance a model sees. This composes the real map under
+    /// every project-reading phase and checks that it neither tells the model to read
+    /// whole files by default nor restates the rule in other words than the preamble.
+    #[tokio::test]
+    async fn the_composed_prompt_gives_one_reading_rule() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("small.rs"), "fn main() {}\n").unwrap();
+        std::fs::write(dir.path().join("huge.rs"), "x\n".repeat(200_000)).unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let map = crate::orientation::OrientationConfig::default()
+            .assemble(&root, crate::sandbox::SandboxConfig::default())
+            .await
+            .unwrap()
+            .expect("a non-empty repo yields a map");
         assert!(
-            p.contains("instead, with `cat -n FILE | sed -n '120,400p'`."),
-            "the span example must be written with the range QUOTED, as every other \
-             `sed -n` example in the preamble is: {p}"
+            map.contains("read in spans"),
+            "the fixture must exercise the marked-file text too: {map}"
         );
-        assert!(
-            p.contains("keeps the real line numbers"),
-            "the span idiom must say why it is piped through `cat -n`, which is the \
-             exact citation: {p}"
-        );
-        // The whole-file default is stated in four registers, not once. Amy's call
-        // (2026-08-12): "give the instructions a couple different ways ... the
-        // weights are the weights, we can only nudge them." A month of traces put
-        // the median read at 1,837 bytes against a preamble that already said "read
-        // WHOLE" plainly, so a single clear statement is measurably not enough. Each
-        // of these says the same rule a different way, and the last one re-anchors
-        // it *after* the exceptions, where a reader would otherwise stop.
-        for (register, phrase) in [
-            ("imperative", "Read files WHOLE."),
-            (
-                "data-anchored",
-                "You do not have to guess how big a file is.",
-            ),
-            ("cost", "Prefer the bigger read."),
-            (
-                "re-anchor after the exceptions",
-                "The default is the whole file.",
-            ),
-        ] {
-            assert!(
-                p.contains(phrase),
-                "the whole-file rule must survive in its {register} form ({phrase:?}): {p}"
-            );
+        for phase in Phase::ALL.into_iter().filter(|p| p.reads_project()) {
+            let composed =
+                resolve_phase_preamble(phase, &PromptOverrides::default(), Some(&map), None);
+            for whole_first in ["read those whole", "never guess", "go straight to reading"] {
+                assert!(
+                    !composed.contains(whole_first),
+                    "{phase:?}: the file map restates reading as {whole_first:?}, against the \
+                     preamble's claim-sized rule:\n{composed}"
+                );
+            }
         }
-        let whole_at = p
-            .find("open that file whole")
-            .expect("whole-file directive");
-        let span_at = p.find("When the file is large").expect("span directive");
-        assert!(
-            whole_at < span_at,
-            "whole reads first, the span is the branch off it: {p}"
-        );
     }
 
     /// Every `sed` range kaibo puts in front of a model is quoted, and this sweeps every
@@ -1253,10 +1245,6 @@ mod tests {
                 p.contains("You are the synthesis agent"),
                 "{label} must open on the synthesis-agent role: {p}"
             );
-            assert!(
-                !p.contains("capable model"),
-                "{label} must name the role, not describe a capability: {p}"
-            );
         }
         let c = consult_preamble();
         assert!(
@@ -1266,7 +1254,7 @@ mod tests {
         // The other half of the team is named the same way from both sides, so the
         // pair reads as one vocabulary: driver → explorer, explorer → synthesis agent.
         assert!(
-            c.contains("the fast explorer on your team"),
+            c.contains("the explorer on your team"),
             "the driver names its explorer counterpart: {c}"
         );
         assert!(
@@ -1278,11 +1266,8 @@ mod tests {
     /// Standalone `explore` hands its report straight back to the calling agent, so the
     /// preamble must not promise a synthesis agent that will not exist on that call.
     ///
-    /// This is the failing-first half of the bug it fixes: before `ReportReader`, all
-    /// three explorer tools were told "The synthesis agent writes the final answer from
-    /// what you found", which is true for the `consult` sweep and `deliberate`'s dossier
-    /// and false for `explore`. A model that believes a downstream rewrite is coming can
-    /// reasonably leave a thread for the rewriter to pull; on `explore` nobody pulls it.
+    /// A model that believes a downstream rewrite is coming can reasonably leave a
+    /// thread for the rewriter to pull; on `explore` nobody pulls it.
     #[test]
     fn the_calling_agent_is_never_promised_a_synthesis_agent() {
         let p = report_preamble(ReportReader::CallingAgent);
@@ -1307,8 +1292,7 @@ mod tests {
             "the reader's name is capitalized where it opens a sentence: {p}"
         );
 
-        // The counterpart still says what it always said — this fix narrows one claim,
-        // it does not delete the two-model framing where that framing is true.
+        // The sweep and dossier readers keep the two-model framing, where it is true.
         let synth = report_preamble(ReportReader::SynthesisAgent);
         assert!(
             synth.contains("The synthesis agent writes the final answer from what you found"),

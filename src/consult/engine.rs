@@ -2737,7 +2737,7 @@ impl Tool for RunExplore {
     }
 
     fn description(&self) -> String {
-        "Delegate a broad sweep to the fast explorer on your team. It \
+        "Delegate a broad sweep to the explorer on your team. It \
          searches the repository on a read-only kaish shell and reports back \
          with concrete `file:line` citations. Give it a focused question. Use \
          `explore` when a question needs breadth, and use `run_kaish` to read \

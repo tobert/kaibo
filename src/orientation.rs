@@ -244,14 +244,12 @@ fn kb(bytes: u64) -> u64 {
 /// should do instead — the whole point is to convert "what's here?" turns into
 /// direct reads.
 ///
-/// **Sizes are here to remove a guess.** Measured over 16,105 real reads (a month of
-/// traces, 2026-08-12), the median read delivered 1,837 bytes — about 45 lines —
-/// while whole-file reads truncated only 1.8% of the time. Models were reading in
-/// small windows to avoid a risk that almost never materialized, because from inside
-/// the sandbox a file's size is unknown until it has been read. Publishing the size
-/// turns that judgment call into a comparison, and marking the files that would
-/// truncate puts the exception on the line it applies to instead of in prose the
-/// reader has to hold.
+/// **Sizes are here to remove a guess.** From inside the sandbox a file's size is
+/// unknown until it has been read, so a model cannot tell whether one `cat -n` will
+/// come back whole. Publishing the size turns that into a comparison, and marking the
+/// files that would truncate puts the exception on the line it applies to instead of
+/// in prose the reader has to hold. The text does not tell the model how much to read;
+/// that is sized to the claim in the explorer and consult preambles.
 ///
 /// The mark is computed per file from its real bytes and lines
 /// ([`numbered_output_bytes`]), never from a fraction of the cap, so an unmarked file
@@ -265,16 +263,15 @@ fn render_full_list(
     s.push_str(
         "PROJECT FILES. The project's complete file list (read-only; hidden config \
          included, build/VCS dirs excluded). You already have the whole layout here, \
-         so go straight to reading the files the question touches with `cat -n FILE`, \
-         and use `grep -rn` to find where something lives inside them.\n",
+         so go straight to the files the question touches: `cat -n FILE` reads one with \
+         its line numbers, and `grep -rn` finds where something lives inside them.\n",
     );
     if !metrics.is_empty() {
         s.push_str(
-            "Each file's size is given, and every file listed WITHOUT a mark comes back \
-             WHOLE from one `cat -n FILE`. That is most of this list, so read those \
-             whole and never guess. The files that would not fit are marked `read in \
-             spans`; for those, `grep -n SYMBOL FILE` first, then read a wide span \
-             around each hit with `cat -n FILE | sed -n '1200,2400p'`.\n",
+            "Each file's size is given. A file listed WITHOUT a mark comes back whole \
+             from one `cat -n FILE`. A file marked `read in spans` would not fit in one \
+             read; for those, `grep -n SYMBOL FILE` first, then read the span around \
+             each hit with `cat -n FILE | sed -n '1200,2400p'`.\n",
         );
     }
     // One column, so the sizes line up and the marked files stand out down the page.
@@ -448,15 +445,10 @@ mod tests {
         assert!(out.contains("README.md"), "lists the readme: {out}");
     }
 
-    /// Every listed file carries its size, and the block promises a whole read for
-    /// every file it does not mark.
-    ///
-    /// This is the feature's whole point: measured over 16,105 real reads, the median
-    /// delivered 1,837 bytes while whole-file reads truncated 1.8% of the time —
-    /// models hedge because a file's size is unknowable from inside the sandbox until
-    /// it has been read. A map without sizes leaves that guess in place.
+    /// Every listed file carries its size, and the block says an unmarked file comes
+    /// back whole. A map without sizes leaves the model guessing whether a read fits.
     #[tokio::test]
-    async fn the_file_list_publishes_sizes_and_promises_a_whole_read() {
+    async fn the_file_list_publishes_sizes_and_says_unmarked_files_read_whole() {
         let dir = tempdir().unwrap();
         write(dir.path(), "small.rs", &"x\n".repeat(100)); // 200 B
         let canon = std::fs::canonicalize(dir.path()).unwrap();
@@ -472,8 +464,8 @@ mod tests {
             "each file is listed with a size: {out}"
         );
         assert!(
-            out.contains("WITHOUT a mark comes back WHOLE"),
-            "the block states the promise the mark makes exact: {out}"
+            out.contains("WITHOUT a mark comes back whole"),
+            "the block says what the absence of a mark means: {out}"
         );
         let line = out
             .lines()
