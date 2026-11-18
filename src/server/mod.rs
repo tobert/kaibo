@@ -39,7 +39,7 @@ use tracing::Instrument;
 use crate::config::{Backend, Cast, Config, Lane, ModelRole, ModelSlot};
 use crate::consult::{
     consult, explore_with, oneshot, research_with, sweep_evidence_block, Arm, ConsultConfig,
-    ExploreConfig, ModelCaps, PhaseContext, PromptOverrides, ReportReader, ResearchConfig,
+    ExploreConfig, ModelCaps, PhaseContext, PromptOverrides, ResearchConfig,
 };
 use crate::explorer::format_output;
 use crate::jobs::{CancelOutcome, JobResult, JobState, JobStore};
@@ -50,7 +50,7 @@ use crate::mcp_log;
 use crate::progress::{NullSink, PhaseEvent, ProgressLog, ProgressSink, TracingSink};
 use crate::sandbox::{builtin_schemas, KaishWorker};
 use crate::session::{SessionStore, Sessions};
-use crate::sweep_attach::{SweepAttachSink, SweepConsumer, SweepConsumerKind};
+use crate::sweep_attach::{SweepAttachSink, SweepConsumer};
 use crate::web::WebSession;
 
 mod cas_read;
@@ -79,13 +79,13 @@ pub(crate) use dossier::{
     KeptDossier,
 };
 use render::{
-    batch_poll_brief, consult_answer_text, consult_result, consultation_failed,
-    consultation_failed_with_artifacts, consultation_failure_text_with_artifacts, fmt_usage,
-    is_batch_handle, parse_batch_handle, render_job, render_jobs_section, render_wait,
-    wait_level_floor, wait_level_label, dossier_web_record,
+    batch_poll_brief, consult_answer_text, consultation_failed, consultation_failed_with_artifacts,
+    consultation_failure_text_with_artifacts, dossier_web_record, fmt_usage, is_batch_handle,
+    parse_batch_handle, render_job, render_jobs_section, render_wait, wait_level_floor,
+    wait_level_label,
 };
 pub(crate) use render::{
-    batch_within_window, consult_models, consultation_failure_text, now_epoch_secs,
+    batch_within_window, consult_header, consultation_failure_text, now_epoch_secs,
     with_provenance, with_web_sources, with_web_usage, BATCH_RECENCY_WINDOW_SECS,
 };
 
@@ -190,13 +190,12 @@ pub(crate) fn deliberate_direct_deadline(synth_backend: &Backend) -> std::time::
 /// 2026-07-26).
 fn stitch_dossier_delivery(
     dossier: &mut String,
-    consumer: &SweepConsumer,
     sink: Option<&std::sync::Arc<SweepAttachSink>>,
 ) -> Vec<crate::attach::Attachment> {
     match sink {
         Some(sink) => {
             let delivery = sink.drain();
-            if let Some(block) = sweep_evidence_block(consumer, &delivery) {
+            if let Some(block) = sweep_evidence_block(&delivery) {
                 dossier.push_str(&block);
             }
             delivery.images()
@@ -215,14 +214,13 @@ fn stitch_dossier_delivery(
 /// handler calls this rather than the two steps by hand.
 pub(crate) fn stitch_and_keep(
     dossier: &mut String,
-    consumer: &SweepConsumer,
     sink: Option<&std::sync::Arc<SweepAttachSink>>,
     store: Option<&Arc<crate::cas::MediaStore>>,
     question: &str,
     cast: &str,
     explorer_model: &str,
 ) -> (Vec<crate::attach::Attachment>, Option<KeptDossier>) {
-    let images = stitch_dossier_delivery(dossier, consumer, sink);
+    let images = stitch_dossier_delivery(dossier, sink);
     let kept = keep_dossier(store, question, dossier, cast, explorer_model);
     (images, kept)
 }
@@ -236,9 +234,6 @@ pub(crate) fn stitch_and_keep(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ToolGating {
     pub consult: bool,
-    /// The single-phase `explore` sweep — its own gate, independent of `consult`
-    /// (which carries its own explorer inside the driver loop).
-    pub explore: bool,
     /// The `deliberate` tool (explore → offline synth) — its own gate. The offline
     /// deliberation rides the batch (or job) collect verbs, but the tool that *starts*
     /// one is gated here, independent of `consult`/`batch`.
@@ -270,7 +265,6 @@ impl Default for ToolGating {
     fn default() -> Self {
         Self {
             consult: true,
-            explore: true,
             deliberate: true,
             oneshot: true,
             run_kaish: true,
@@ -294,7 +288,6 @@ impl ToolGating {
     pub fn enabled(&self, name: &str) -> bool {
         match name {
             "consult" | "consult_submit" => self.consult,
-            "explore" => self.explore,
             "deliberate" => self.deliberate,
             "oneshot" => self.oneshot,
             "run_kaish" => self.run_kaish,
@@ -310,7 +303,6 @@ impl ToolGating {
     /// True iff every tool is disabled — the zero-tool server we refuse to start.
     pub fn all_disabled(&self) -> bool {
         !self.consult
-            && !self.explore
             && !self.deliberate
             && !self.oneshot
             && !self.run_kaish
@@ -350,17 +342,6 @@ pub struct ConsultInput {
     #[serde(default)]
     pub cast: Option<String>,
 
-    /// Override the explorer (investigation) model id. See `kaibo://tools` for override
-    /// semantics (ids are verbatim; pair with `explorer_backend` to also retarget).
-    /// Refused on a cast with `consult = "solo"`, which runs no explorer.
-    #[serde(default)]
-    pub explorer_model: Option<String>,
-
-    /// Run the explorer override on this backend (name or alias). Requires
-    /// `explorer_model`. See `kaibo://tools`.
-    #[serde(default)]
-    pub explorer_backend: Option<String>,
-
     /// Override the synthesis agent's (final-answer) model id. See `kaibo://tools` for override
     /// semantics (pair with `synth_backend` to also retarget).
     #[serde(default)]
@@ -377,19 +358,11 @@ pub struct ConsultInput {
     #[serde(default)]
     pub session_id: Option<String>,
 
-    /// Attach the explorer's aggregated report as `structured_content` alongside the
-    /// answer, for debugging the hand-off. Off by default (it can be large; an empty
-    /// report means no sweep ran: the synth read everything itself, the cast runs
-    /// `consult` solo, or the cast has no explorer).
-    #[serde(default)]
-    pub include_report: bool,
-
     /// Workspace files (under the project root) to put in front of the investigation.
     /// Text files are INLINED whole (numbered, up to the inline budget; larger ones the
     /// model is directed to read whole through its shell), images open via `view_image`
-    /// (so an attached image needs a vision-capable cast) — and every delegated explorer
-    /// sweep is directed to read them too. Hand it the files a question centers on, or
-    /// the whole files a change touched. See `kaibo://tools`.
+    /// (so an attached image needs a vision-capable cast). Hand it the files a question
+    /// centers on, or the whole files a change touched. See `kaibo://tools`.
     #[serde(default)]
     pub attach: Vec<String>,
 
@@ -401,13 +374,11 @@ pub struct ConsultInput {
 
     /// Let this call search and read the web for what the project cannot answer — a
     /// dependency's docs or changelog, an advisory, a spec. Off by default: a code review
-    /// stays on the code. The explorer searches (on a solo cast, the synth does), with its
-    /// provider's own web tools or the `[web]` backend's (DeepSeek or Exa); the provider
-    /// reads each page on its servers,
+    /// stays on the code. The synth searches with its provider's own web tools or the
+    /// `[web]` backend's (DeepSeek or Exa); the provider reads each page on its servers,
     /// so nothing on your network is opened. To have a page read, give its full URL in
     /// `question` or `context`. kaibo lists the pages read and the search results cited
-    /// after the answer. See
-    /// `kaibo://tools`.
+    /// after the answer. See `kaibo://tools`.
     #[serde(default)]
     pub web: bool,
 }
@@ -430,45 +401,6 @@ pub struct ResearchInput {
     /// this param's `enum`; `kaibo://config` lists every cast and backend.
     #[serde(default)]
     pub cast: Option<String>,
-}
-
-/// Arguments to the `explore` tool: a single-phase explorer sweep. Explorer-only —
-/// no synth, session, or context (explore reads the repo itself and returns the
-/// cited report, not a synthesized answer). `attach` becomes a directive to read
-/// each named file whole during the sweep.
-#[derive(Debug, Deserialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
-pub struct ExploreInput {
-    /// What to survey or map. Say in prose what you want charted — kaibo's explorer
-    /// locates and reads the real, current code itself and reports back with citations.
-    pub question: String,
-
-    /// Workspace files (under the project root) central to the survey: the explorer
-    /// is directed to read each one WHOLE as part of its sweep. Text only — it reads
-    /// through the shell, so attach images to `consult` with a vision cast instead.
-    #[serde(default)]
-    pub attach: Vec<String>,
-
-    /// Absolute path to the project to explore. Optional when the server has a default
-    /// root; must be at-or-under an allowed tree, or a linked git worktree of one
-    /// (`kaibo://config` shows the set).
-    #[serde(default)]
-    pub path: Option<String>,
-
-    /// Which cast (model team) runs this call; omit for the server's default. Pick from
-    /// this param's `enum`; `kaibo://config` lists every cast and backend.
-    #[serde(default)]
-    pub cast: Option<String>,
-
-    /// Override the explorer (investigation) model id. See `kaibo://tools` for override
-    /// semantics (ids are verbatim; pair with `explorer_backend` to also retarget).
-    #[serde(default)]
-    pub explorer_model: Option<String>,
-
-    /// Run the explorer override on this backend (name or alias). Requires
-    /// `explorer_model`. See `kaibo://tools`.
-    #[serde(default)]
-    pub explorer_backend: Option<String>,
 }
 
 /// Arguments to the `deliberate` tool: `explore → offline synth`. The explorer runs
@@ -1018,21 +950,13 @@ type CastEnumRule = (
 /// budget-limited display (it caps the line count and always lists the default, usable or
 /// not) — a presentation choice distinct from tool eligibility.
 const CAST_ENUM_RULES: &[CastEnumRule] = &[
-    // `consult` runs single-stage on a solo cast (the synth reads for itself) and
-    // `oneshot` runs the synth alone, so all three need only an interactive synth.
+    // `consult` and `oneshot` both run the synth alone, so all three need only an
+    // interactive synth.
     (
         &["consult", "consult_submit", "oneshot"],
         Config::cast_is_interactive,
         "a cast with a `synth` slot that answers interactively (a synth with no offline \
          `lane`)",
-    ),
-    // `explore` runs only the explorer, so it advertises *any* cast with one — including
-    // `deliberate`/`direct` casts, whose (often smarter) explorers are useful standalone.
-    // Its own rule, broader than the interactive tools' (which also need an interactive synth).
-    (
-        &["explore"],
-        Config::cast_can_explore,
-        "a cast with an `explorer` slot",
     ),
     // `research` runs on the explorer slot, or on an interactive synth when the cast has
     // no explorer. Live web access is its other gate, applied in `live_tools`.
@@ -1160,7 +1084,6 @@ pub(crate) fn cast_requirement_for(name: &str) -> Option<&'static str> {
 fn gating_key_for(name: &str) -> Option<&'static str> {
     match name {
         "consult" | "consult_submit" => Some("consult"),
-        "explore" => Some("explore"),
         "deliberate" => Some("deliberate"),
         "oneshot" => Some("oneshot"),
         "run_kaish" => Some("run_kaish"),
@@ -1176,10 +1099,9 @@ fn gating_key_for(name: &str) -> Option<&'static str> {
 /// Every `#[tool]` route name kaibo can advertise — the fixed universe [`live_tools`]
 /// filters. `KaiboHandler::new` asserts each really exists on the router, so a renamed
 /// tool method fails the build rather than leaving a gate quietly inert.
-pub(crate) const ALL_TOOL_NAMES: [&str; 17] = [
+pub(crate) const ALL_TOOL_NAMES: [&str; 16] = [
     "consult",
     "consult_submit",
-    "explore",
     "deliberate",
     "oneshot",
     "run_kaish",
@@ -1236,7 +1158,6 @@ pub(crate) fn live_tools(config: &Config, usable: &[String], web_live: bool) -> 
     let gating = &config.tools;
 
     let consult_live = gating.consult && can_staff("consult");
-    let explore_live = gating.explore && can_staff("explore");
     let deliberate_live = gating.deliberate && can_staff("deliberate");
     let oneshot_live = gating.oneshot && can_staff("oneshot");
     let batch_live = gating.batch && can_staff("batch_submit");
@@ -1272,9 +1193,6 @@ pub(crate) fn live_tools(config: &Config, usable: &[String], web_live: bool) -> 
         // flag and the same interactive-cast requirement. (A dedicated flag per shape
         // is a plausible split if anyone ever needs only one of the two gated alone.)
         (consult_live, "consult_submit"),
-        // The single-phase explorer sweep — its own gate, and the broadest cast rule
-        // (any cast with an explorer, interactive or not).
-        (explore_live, "explore"),
         (deliberate_live, "deliberate"),
         (oneshot_live, "oneshot"),
         // No cast, no model: the read-only shell is always staffable.
@@ -1357,7 +1275,7 @@ impl KaiboHandler {
     /// TOML was really testing "my fixture **plus** whatever keys happen to be in the
     /// developer's environment." That passes on CI and fails on the maintainer's laptop
     /// (or the reverse) — the flakiest kind of test, and it hid real behavior here: the
-    /// gate correctly dropped `deliberate` everywhere, but `explore`/`batch_submit`
+    /// gate correctly dropped `deliberate` everywhere, but `batch_submit`
     /// looked ungated because ambient keys made a built-in cast usable. Tests pass a
     /// closure that answers for exactly the keys the fixture means to have; production
     /// passes the real environment. Deliberately a closure rather than `set_var`, which
@@ -1752,17 +1670,13 @@ impl KaiboHandler {
     }
 
     /// Shim over [`Resolver::resolve_sweep_attachments`] — the resolution glue lives on
-    /// the shared resolver so the CLI `explore` front door runs the same sweep-attach
-    /// resolution + image refusal.
+    /// the shared resolver so `kaibo deliberate` runs the same resolution + image refusal.
     async fn resolve_sweep_attachments(
         &self,
         root: &std::path::Path,
         attach: &[String],
-        tool: &str,
     ) -> Result<Vec<crate::consult::ConsultAttachment>, McpError> {
-        self.resolver
-            .resolve_sweep_attachments(root, attach, tool)
-            .await
+        self.resolver.resolve_sweep_attachments(root, attach).await
     }
 
     /// Shim over [`Resolver::gate_consult_image_attachments`] — the resolution glue
@@ -1848,7 +1762,7 @@ impl KaiboHandler {
     /// explore → offline synth, so the synth must run on the batch or direct lane
     /// (an interactive synth belongs to `consult`). The other half — a *missing
     /// explorer* — is caught when the explorer arm is resolved (`arm` errors, naming
-    /// the gap), the same way `explore` leans on it; here we only need the synth-lane
+    /// the gap); here we only need the synth-lane
     /// half. A synth-only batch cast (`anthropic-batch`) passes this but fails at the
     /// explorer resolve, which is the honest error (no dossier phase to staff).
     fn require_deliberate_cast(&self, cast: &Cast) -> Result<(), McpError> {
@@ -2015,8 +1929,8 @@ impl KaiboHandler {
             debugging, architecture, \"what does this change break\" — and get a grounded \
             answer with `file:line` citations. A synthesis agent (DeepSeek, Gemini, \
             Anthropic, OpenRouter, or local — pick with `cast`) drives a READ-ONLY shell over \
-            the project: it reads the real, current source, delegates broad sweeps to an \
-            explorer when its cast runs a team, and answers with evidence, never modifying anything. Describe your \
+            the project: it reads the real, current source and answers with evidence, never \
+            modifying anything. Describe your \
             intent in prose; kaibo locates the code itself, so you don't paste files or \
             diffs. `attach` puts specific files in front of it; `session_id` threads a \
             multi-turn consultation. For a toolless opinion use `oneshot`; to run in the \
@@ -2035,29 +1949,15 @@ impl KaiboHandler {
         self.require_interactive_cast(&cast, "consult")?;
         self.apply_model_override(
             &mut cast,
-            ModelRole::Explorer,
-            input.explorer_model.as_deref(),
-            input.explorer_backend.as_deref(),
-            "explorer_model",
-            "explorer_backend",
-        )?;
-        self.apply_model_override(
-            &mut cast,
             ModelRole::Synth,
             input.synth_model.as_deref(),
             input.synth_backend.as_deref(),
             "synth_model",
             "synth_backend",
         )?;
-        // A solo cast (`consult = "solo"`, or no explorer slot) runs single-stage.
-        let explorer = self.resolver.consult_explorer_arm(
-            &cast,
-            input.explorer_model.as_deref(),
-            "explorer_model",
-        )?;
         let synth = self.arm(&cast, ModelRole::Synth)?;
-        // Progress rides the whole investigation: sweeps and direct reads emit beats
-        // onto the wire when the client supplied a token, else a no-op sink.
+        // Progress rides the whole investigation: the synth's reads emit beats onto the
+        // wire when the client supplied a token, else a no-op sink.
         let progress = progress_sink(peer, &meta);
         let defaults = &self.config.defaults;
         // Resolve attachments (inline within budget, demote past it, classify images),
@@ -2078,23 +1978,15 @@ impl KaiboHandler {
             &cast.name,
         )?;
         let cfg = ConsultConfig {
-            explore: ExploreConfig {
-                phase: PhaseContext {
-                    progress: progress.clone(),
-                    house_rules: self.house_rules(&root)?,
-                    prompts: self.resolved_prompts(&cast),
-                    orientation: self.orientation(&root).await?,
-                    call_deadline: defaults.call_deadline,
-                },
-                explorer_max_turns: defaults.explorer_max_turns,
-                sandbox: self.config.sandbox.clone(),
-                max_attachments: defaults.max_attachments,
-                web: self.web_if_asked(
-                    input.web,
-                    "consult",
-                    Arm::all_native(explorer.iter().chain([&synth])),
-                )?,
+            phase: PhaseContext {
+                progress: progress.clone(),
+                house_rules: self.house_rules(&root)?,
+                prompts: self.resolved_prompts(&cast),
+                orientation: self.orientation(&root).await?,
+                call_deadline: defaults.call_deadline,
             },
+            sandbox: self.config.sandbox.clone(),
+            web: self.web_if_asked(input.web, "consult", synth.has_native_web())?,
             synth_max_turns: defaults.synth_max_turns,
             attachments,
             artifacts: self.artifact_sink(
@@ -2112,14 +2004,11 @@ impl KaiboHandler {
         // only ever touched there, never held across the consult await.
         let session = input.session_id.as_deref().map(|id| (&self.sessions, id));
 
-        // The root span for this tool call's trace: it parents both phases'
-        // `run_phase` spans (and through them rig's GenAI tree), so the explore and
-        // synth model loops land in ONE trace instead of two orphan roots. Inert
-        // unless an exporter is attached.
+        // The root span for this tool call's trace: it parents the synth's `run_phase`
+        // span (and through it rig's GenAI tree). Inert unless an exporter is attached.
         let span = tracing::info_span!(
             "consult",
             cast = %cast.name,
-            explorer_model = explorer.as_ref().map_or("none", |a| a.model.as_str()),
             synth_model = %synth.model,
             session = session.is_some(),
         );
@@ -2128,7 +2017,6 @@ impl KaiboHandler {
             &input.question,
             input.context.as_deref(),
             root,
-            explorer.as_ref(),
             &synth,
             &cfg,
             session,
@@ -2152,9 +2040,9 @@ impl KaiboHandler {
         };
         progress.emit(PhaseEvent::PhaseFinished { phase: "consult" });
 
-        // Provenance: name the cast and the models that answered, so a caller (a
-        // cross-model study especially) sees which model produced this without
-        // digging into `kaibo://config`. consult runs two arms — both are named.
+        // Provenance: a header naming who prepared the answer, and a footer naming the
+        // cast and the model that answered, so a caller (a cross-model study especially)
+        // sees which model produced this without digging into `kaibo://config`.
         // Fold any non-fatal warnings (a failed session record) back into the answer
         // text before the footer — the MCP client has no structured warnings channel, so
         // it sees them inline exactly as #76 shipped (the CLI keeps them off `--json`).
@@ -2163,11 +2051,11 @@ impl KaiboHandler {
             &out.warnings,
             cfg.artifacts.as_deref(),
             &cast.name,
-            &consult_models(explorer.as_ref().map(|a| a.model.as_str()), &synth.model),
+            &synth.model,
             &out.usage,
-            cfg.explore.web.as_deref(),
+            cfg.web.as_deref(),
         );
-        Ok(consult_result(answer, out.report, input.include_report))
+        Ok(CallToolResult::success(vec![ContentBlock::text(answer)]))
     }
 
     #[tool(
@@ -2190,24 +2078,11 @@ impl KaiboHandler {
         self.require_interactive_cast(&cast, "consult_submit")?;
         self.apply_model_override(
             &mut cast,
-            ModelRole::Explorer,
-            input.explorer_model.as_deref(),
-            input.explorer_backend.as_deref(),
-            "explorer_model",
-            "explorer_backend",
-        )?;
-        self.apply_model_override(
-            &mut cast,
             ModelRole::Synth,
             input.synth_model.as_deref(),
             input.synth_backend.as_deref(),
             "synth_model",
             "synth_backend",
-        )?;
-        let explorer = self.resolver.consult_explorer_arm(
-            &cast,
-            input.explorer_model.as_deref(),
-            "explorer_model",
         )?;
         let synth = self.arm(&cast, ModelRole::Synth)?;
         let defaults = &self.config.defaults;
@@ -2235,24 +2110,16 @@ impl KaiboHandler {
         // clone of this exact handle, so what it reads is what the running phase emitted.
         let progress_log = self.job_progress_log();
         let cfg = ConsultConfig {
-            explore: ExploreConfig {
-                phase: PhaseContext {
-                    progress: progress_log.clone(),
-                    house_rules: self.house_rules(&root)?,
-                    prompts: self.resolved_prompts(&cast),
-                    orientation: self.orientation(&root).await?,
-                    call_deadline: defaults.call_deadline,
-                },
-                explorer_max_turns: defaults.explorer_max_turns,
-                sandbox: self.config.sandbox.clone(),
-                max_attachments: defaults.max_attachments,
-                // Refused here, before a job exists, like `save_artifacts` below.
-                web: self.web_if_asked(
-                    input.web,
-                    "consult_submit",
-                    Arm::all_native(explorer.iter().chain([&synth])),
-                )?,
+            phase: PhaseContext {
+                progress: progress_log.clone(),
+                house_rules: self.house_rules(&root)?,
+                prompts: self.resolved_prompts(&cast),
+                orientation: self.orientation(&root).await?,
+                call_deadline: defaults.call_deadline,
             },
+            sandbox: self.config.sandbox.clone(),
+            // Refused here, before a job exists, like `save_artifacts` below.
+            web: self.web_if_asked(input.web, "consult_submit", synth.has_native_web())?,
             synth_max_turns: defaults.synth_max_turns,
             attachments,
             // Same two-key gate as the sync lane, and refused here for the same reason —
@@ -2275,42 +2142,24 @@ impl KaiboHandler {
         let context = input.context.clone();
         let sessions = self.sessions.clone();
         let session_id = input.session_id.clone();
-        let include_report = input.include_report;
         let cast_name = cast.name.clone();
-        let explorer_model = explorer.as_ref().map(|a| a.model.clone());
         let synth_model = synth.model.clone();
-        let label = match &explorer_model {
-            Some(e) => format!("cast `{cast_name}` (explorer `{e}`, synth `{synth_model}`)"),
-            None => format!("cast `{cast_name}` (synth `{synth_model}`, single-stage)"),
-        };
+        let label = format!("cast `{cast_name}` (synth `{synth_model}`)");
 
         let job_id = self.jobs.submit(label, progress_log, async move {
             let session = session_id.as_ref().map(|id| (&sessions, id.as_str()));
-            match consult(
-                &question,
-                context.as_deref(),
-                root,
-                explorer.as_ref(),
-                &synth,
-                &cfg,
-                session,
-            )
-            .await
-            {
+            match consult(&question, context.as_deref(), root, &synth, &cfg, session).await {
                 Ok(out) => {
                     let answer = consult_answer_text(
                         out.answer,
                         &out.warnings,
                         cfg.artifacts.as_deref(),
                         &cast_name,
-                        &consult_models(explorer_model.as_deref(), &synth_model),
+                        &synth_model,
                         &out.usage,
-                        cfg.explore.web.as_deref(),
+                        cfg.web.as_deref(),
                     );
-                    Ok(JobResult {
-                        answer,
-                        report: include_report.then_some(out.report),
-                    })
+                    Ok(JobResult { answer })
                 }
                 // Render the failure to its final text here (classification + guidance),
                 // so `job_get` wraps a ready string without re-deriving anything — with
@@ -2332,88 +2181,6 @@ impl KaiboHandler {
             cast.name
         );
         Ok(CallToolResult::success(vec![ContentBlock::text(msg)]))
-    }
-
-    #[tool(
-        description = "Survey a codebase and get back a structured, cited report of \
-            evidence — not an answer. A fast model sweeps the project READ-ONLY (grep and \
-            targeted reads) and returns a summary, the relevant locations with \
-            `file:line`, how they connect, what remains open, and the trail it followed. `attach` names text files it must \
-            read whole during the sweep. The evidence-gathering half of `consult`, \
-            exposed directly: map unfamiliar code, or assemble a cited survey to reason \
-            over yourself. For a synthesized answer instead, use `consult`."
-    )]
-    async fn explore(
-        &self,
-        Parameters(input): Parameters<ExploreInput>,
-        peer: Peer<RoleServer>,
-        meta: RequestMetaObject,
-    ) -> Result<CallToolResult, McpError> {
-        let root = self.resolve_root(input.path)?;
-        // Resolve the cast, then layer a per-call explorer override onto the clone.
-        // Deliberately NO `require_interactive_cast`: explore runs the *explorer* arm
-        // interactively, so a deliberate/direct cast's explorer is perfectly valid —
-        // explore only needs an explorer slot, resolved next (a synth-only batch cast
-        // has none and `arm` errors clearly).
-        let mut cast = self.resolve_cast(input.cast)?;
-        self.apply_model_override(
-            &mut cast,
-            ModelRole::Explorer,
-            input.explorer_model.as_deref(),
-            input.explorer_backend.as_deref(),
-            "explorer_model",
-            "explorer_backend",
-        )?;
-        let explorer = self.arm(&cast, ModelRole::Explorer)?;
-        let progress = progress_sink(peer, &meta);
-        let defaults = &self.config.defaults;
-        let attachments = self
-            .resolve_sweep_attachments(&root, &input.attach, "explore")
-            .await?;
-        let cfg = ExploreConfig {
-            phase: PhaseContext {
-                progress: progress.clone(),
-                house_rules: self.house_rules(&root)?,
-                prompts: self.resolved_prompts(&cast),
-                orientation: self.orientation(&root).await?,
-                call_deadline: defaults.call_deadline,
-            },
-            explorer_max_turns: defaults.explorer_max_turns,
-            sandbox: self.config.sandbox.clone(),
-            max_attachments: defaults.max_attachments,
-            web: None,
-        };
-
-        let span =
-            tracing::info_span!("explore", cast = %cast.name, explorer_model = %explorer.model);
-        progress.emit(PhaseEvent::PhaseStarted { phase: "explore" });
-        // The top-level `explore` tool doesn't inject `attach` (v1 scope) — its
-        // report goes straight back to the calling agent's own context, which is
-        // exactly the channel `attach` exists to bypass; no consumer to route to.
-        let (report, usage) = match explore_with(
-            &input.question,
-            root,
-            &explorer,
-            &cfg,
-            &attachments,
-            None,
-            // The report is the tool result — it lands in the calling agent's own
-            // context, with no synth of ours between the explorer and its reader.
-            ReportReader::CallingAgent,
-        )
-        .instrument(span)
-        .await
-        {
-            Ok(out) => out,
-            // A provider/model-loop failure is a clean tool-result error, same as `consult`.
-            Err(e) => return Ok(consultation_failed("explore", &cast.name, e)),
-        };
-        progress.emit(PhaseEvent::PhaseFinished { phase: "explore" });
-
-        // The report IS the text (no structured_content). Provenance names the one arm
-        // that produced it, so a cross-model study sees which explorer surveyed.
-        let report = with_provenance(report, &cast.name, &[("explorer", &explorer.model)], &usage);
-        Ok(CallToolResult::success(vec![ContentBlock::text(report)]))
     }
 
     #[tool(
@@ -2439,9 +2206,9 @@ impl KaiboHandler {
         meta: RequestMetaObject,
     ) -> Result<CallToolResult, McpError> {
         let cast = self.resolve_cast(input.cast)?;
-        // The explorer slot runs research when the cast has one, as it runs `explore`; a
-        // cast without one runs it on its synth, which must then answer interactively.
-        let (role, label) = if self.config.cast_can_explore(&cast.name) {
+        // The explorer slot runs research when the cast has one; a cast without one runs
+        // it on its synth, which must then answer interactively.
+        let (role, label) = if self.config.cast_has_explorer(&cast.name) {
             (ModelRole::Explorer, "explorer")
         } else {
             self.require_interactive_cast(&cast, "research")?;
@@ -2450,7 +2217,7 @@ impl KaiboHandler {
         let arm = self.arm(&cast, role)?;
         let web = self.web_session(
             "research",
-            "Use `consult` or `explore` to answer from the project instead.",
+            "Use `consult` to answer from the project instead.",
             arm.has_native_web(),
         )?;
         let progress = progress_sink(peer, &meta);
@@ -2470,18 +2237,14 @@ impl KaiboHandler {
         };
         let span = tracing::info_span!("research", cast = %cast.name, model = %arm.model);
         progress.emit(PhaseEvent::PhaseStarted { phase: "research" });
-        let (report, usage) = match research_with(
-            &input.question,
-            input.context.as_deref(),
-            &arm,
-            &cfg,
-        )
-        .instrument(span)
-        .await
-        {
-            Ok(out) => out,
-            Err(e) => return Ok(consultation_failed("research", &cast.name, e)),
-        };
+        let (report, usage) =
+            match research_with(&input.question, input.context.as_deref(), &arm, &cfg)
+                .instrument(span)
+                .await
+            {
+                Ok(out) => out,
+                Err(e) => return Ok(consultation_failed("research", &cast.name, e)),
+            };
         progress.emit(PhaseEvent::PhaseFinished { phase: "research" });
         let report = with_web_usage(
             with_provenance(
@@ -2586,14 +2349,13 @@ impl KaiboHandler {
             let explorer_model = explorer.model.clone();
 
             // The dossier is built synchronously, on the live progress sink: the caller
-            // waits through this bounded (minutes) explorer sweep, exactly as `explore`
-            // does, so a thin/failed dossier is a clean error *before* any offline tokens
+            // waits through this bounded (minutes) explorer sweep, so a thin/failed dossier is a clean error *before* any offline tokens
             // are spent. Only the deliberation (Stage 2) is handed off async. Attachments
             // reach the dossier-builder as read-WHOLE directives (the sweep semantics), so
             // their content flows to the offline synth through the dossier it writes.
             let defaults = &self.config.defaults;
             let attachments = self
-                .resolve_sweep_attachments(&root, &input.attach, "deliberate")
+                .resolve_sweep_attachments(&root, &input.attach)
                 .await?;
             let cfg = ExploreConfig {
                 phase: PhaseContext {
@@ -2615,22 +2377,16 @@ impl KaiboHandler {
             // cap instead of assuming blind.
             let (synth_slot, _synth_backend, synth_caps) = self.batch_synth(&cast)?;
             let consumer = SweepConsumer {
-                kind: SweepConsumerKind::OfflineSynth,
                 label: Arc::from(format!(
                     "the offline synth (`{}`) on cast `{}`",
                     synth_slot.id, cast.name
                 )),
                 vision: synth_caps.vision,
             };
-            // Deliberate's dossier sweep does NOT dedupe against the caller's own attach
-            // list (an empty seed): a caller-attached file reaches the offline synth ONLY
-            // through what the explorer writes (it's a read-WHOLE directive here, never
-            // inlined), so deduping would silently strand it — see SweepAttachSink's doc.
             let sink = (defaults.max_attachments > 0).then(|| {
                 Arc::new(SweepAttachSink::new(
                     defaults.max_attachments,
-                    consumer.clone(),
-                    std::collections::HashSet::new(),
+                    consumer,
                 ))
             });
 
@@ -2645,8 +2401,6 @@ impl KaiboHandler {
                 &cfg,
                 &attachments,
                 sink.as_ref(),
-                // The dossier is written for the offline synth that reasons over it.
-                ReportReader::SynthesisAgent,
             )
             .instrument(span)
             .await
@@ -2671,7 +2425,6 @@ impl KaiboHandler {
             // dossier text. Keeping is never fatal — see `server::dossier`.
             let (images, kept) = stitch_and_keep(
                 &mut dossier,
-                &consumer,
                 sink.as_ref(),
                 self.media_cas.as_ref(),
                 &input.question,
@@ -2907,7 +2660,6 @@ impl KaiboHandler {
                             &roles,
                             &(dossier_usage + synth_usage),
                         ),
-                        report: None,
                     })
                 }
                 Err(e) => Err(consultation_failure_text("deliberate", &cast_name, e)),
@@ -3076,9 +2828,13 @@ impl KaiboHandler {
             None => wire.url(backend.base_url.as_deref()),
         };
         // Validate before resolving the key: the key may come from an operator command.
-        let mut request =
-            crate::decide::DecisionRequest::new_for(wire, slot.id.clone(), input.state, input.questions)
-                .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
+        let mut request = crate::decide::DecisionRequest::new_for(
+            wire,
+            slot.id.clone(),
+            input.state,
+            input.questions,
+        )
+        .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
         // The backend's `data_collection` pin rides this request too, as it does every
         // OpenRouter completion.
         if backend.data_collection == crate::config::DataCollection::Deny {
@@ -3806,7 +3562,6 @@ impl KaiboHandler {
                                         &[(media, &slot_ref)],
                                         &Usage::new(),
                                     ),
-                                    report: None,
                                 });
                             }
                             Ok(crate::media::MediaPollOutcome::Pending) => {
@@ -4762,8 +4517,8 @@ different access: the reference's Host agents section covers Codex. Ask me befor
 opening access or changing the host's tool approval settings.
 7. Staff every tool my keys allow, not only `consult`. Model-backed tools need cast slots, and \
 `runtime.unstaffable_tools` in the resolved config names each gap. Any text-provider key \
-(DeepSeek, Anthropic, Gemini, OpenRouter, or a local endpoint) staffs `consult`, `explore`, \
-and `oneshot` through a built-in cast. Anthropic, Gemini, OpenRouter, or a hosted OpenAI \
+(DeepSeek, Anthropic, Gemini, OpenRouter, or a local endpoint) staffs `consult` and \
+`oneshot` through a built-in cast. Anthropic, Gemini, OpenRouter, or a hosted OpenAI \
 Platform key also staffs `batch_submit` (`lane = \"batch\"`; `anthropic-batch` and \
 `gemini-batch` are built in), and any text backend staffs `deliberate` when a cast pairs an \
 interactive `explorer` with an offline `synth` (`lane = \"batch\"` on those four, or \
@@ -4822,7 +4577,7 @@ fn kaibo_prompts() -> Vec<Prompt> {
             .with_title("Setup goal")
             .with_description(
                 "What you want from the setup, e.g. \"a local-only privacy cast\" or \
-                 \"a cheap DeepSeek explorer with a Claude synth\". Optional — omit for a \
+                 \"a DeepSeek explorer with a Claude synth\". Optional — omit for a \
                  general walk-through.",
             )
             .with_required(false)]),
@@ -4940,18 +4695,16 @@ pass back through *your* context. That's the whole point: keep your context lean
 kaibo carry the files. One semantic everywhere — **the answering model sees the bytes** —
 delivered per tool:
 
-- **`consult` / `consult_submit` — inlined, and pushed to the sweeps.** Text attachments
-  splice into the investigation prompt whole, lines numbered like `cat -n`, so the model
-  cites them by exact `file:line` (files past the inline budget — `[defaults]
-  inline_attach_budget`, default 256 KiB — are instead ordered read WHOLE through the
-  model's shell, never silently dropped). Every delegated explorer sweep is also directed
-  to read them whole, so a sub-agent is never blind to the files you flagged. Hand it the
-  files a question centers on: `attach: [\"src/server.rs\", \"docs/architecture.png\"]`.
+- **`consult` / `consult_submit` — inlined.** Text attachments splice into the
+  investigation prompt whole, lines numbered like `cat -n`, so the model cites them by
+  exact `file:line` (files past the inline budget — `[defaults] inline_attach_budget`,
+  default 256 KiB — are instead ordered read WHOLE through the model's shell, never
+  silently dropped). Hand it the files a question centers on: `attach: [\"src/server.rs\", \"docs/architecture.png\"]`.
   An attached image opens via `view_image` and needs a vision-capable cast — kaibo
   refuses an image to a blind synth up front rather than name a file it could never open.
-- **`explore` — read-whole directives.** Its explorer reads through the shell, so
-  attached text files become orders to read each one whole during the sweep. Text only;
-  attach images to `consult` with a vision cast.
+- **`deliberate` — read-whole directives.** Its explorer reads through the shell, so
+  attached text files become orders to read each one whole while it builds the dossier.
+  Text only; attach images to `consult` with a vision cast.
 - **`oneshot` / `batch_submit` — inlined.** These models are tool-less — they can't go
   read the repo — so kaibo splices the file bytes straight into the prompt (numbered the
   same way). Give them the *whole* file(s): `[\"README.md\", \"src/server.rs\"]`, not a
@@ -4961,11 +4714,10 @@ delivered per tool:
   (png/jpeg/gif/webp) ride as native image parts and want a vision-capable model
   (`kaibo://config` shows each slot's `vision`).
 
-The explorer can attach too, mid-sweep: a `consult`/`deliberate` investigator that finds a
-file where the whole thing IS the evidence can route its real bytes straight to whoever
-reads its report — the `consult` answer, or a `deliberate` dossier — without transcribing
-a span into its own report first. You never call this yourself; it's the explorer's own
-tool (`[defaults] max_attachments`, default 32 files per sweep, `0` turns it off).
+`deliberate`'s explorer can attach too, while it builds the dossier: when the whole of a
+file IS the evidence, it routes the real bytes into the dossier instead of transcribing a
+span into its report. You never call this yourself; it's the explorer's own tool
+(`[defaults] max_attachments`, default 32 files per survey, `0` turns it off).
 
 Prefer whole files to excerpts, and a prose summary of *intent* to a raw paste — your
 intent is the part kaibo can't recover from the source itself. **Reviewing a change?**
@@ -4988,33 +4740,16 @@ you're running is the whole value: a fresh set of eyes on your work.
 
 For a one-off without editing config, override the model on the call itself:
 
-- `consult` / `consult_submit`: `explorer_model` (+ `explorer_backend`) and/or
-  `synth_model` (+ `synth_backend`).
+- `consult` / `consult_submit`: `synth_model` (+ `synth_backend`).
+- `deliberate`: `explorer_model` (+ `explorer_backend`) and/or `synth_model` (+
+  `synth_backend`).
 - `oneshot` / `batch_submit`: `model` (+ `backend`).
 
 A model id is sent **verbatim** — an id with a `/` in it (HuggingFace-style
 `org/model-name`) is still one id, not a path. The `*_model` override keeps the slot's
 configured backend; pair it with the matching `*_backend` (`synth_backend`, `backend`, …)
 to retarget the slot to a different connection wholesale — which also lets you fill a role
-the cast doesn't otherwise carry. A cast set to solo `consult` refuses an explorer
-override on `consult`, since it runs no explorer there.
-
-## Survey the code, or get an answer: `explore` vs `consult`
-
-`consult` hands back an *answer* — a synthesis agent investigates and concludes. `explore`
-hands back the *evidence*: it's the fast, cheap explorer half of `consult`, run on its
-own, so you get the structured cited report — a summary, the relevant `file:line`
-locations, how they connect, what remains open, and the trail the explorer followed —
-with no synthesis on top.
-Reach for `explore` to map unfamiliar code, or to assemble a grounded survey you'll reason
-over yourself (or hand to another model). It reads the repo itself, like `consult`, so the
-same `path` / `cast` / `explorer_model` / `explorer_backend` arguments apply, plus `attach`
-(text files the explorer is ordered to read whole during the sweep); no `context` or
-`session_id` — those belong to the tools that carry a synthesis agent. Since it runs
-*only* the explorer, its `cast` accepts any cast with an explorer — including `deliberate`/
-`direct` casts: point it at one to run that team's (often smarter, slower) explorer
-standalone, when you want a stronger sweep than your own fast one, or to size the explorer up.
-When you want the conclusion rather than the map, use `consult`.
+the cast doesn't otherwise carry.
 
 ## The web: `research`, and `web: true`
 
@@ -5034,9 +4769,8 @@ refuses any other (`url_not_in_prior_context`), so an advisory or model page the
 names by URL is read, and one the model would have to guess may not be.
 
 `web: true` on `consult`, `consult_submit`, or `deliberate` adds the web to a code
-question. It is off by default. On a team cast each delegated survey gets `web_search`
-and `web_fetch`, and the driver gets `web_fetch` alone, to read one page whose address it
-has. On a solo cast the driver gets both. `deliberate` puts the sources and the `web:`
+question. It is off by default. The `consult` synth gets `web_search` and `web_fetch`;
+`deliberate`'s explorer gets both while it builds the dossier. `deliberate` puts the sources and the `web:`
 line in the dossier and in its acknowledgment. A `web: true` call always carries the
 `web:` line, `0 searches, 0 fetches` included, so an unused web reads differently from an
 absent one.
@@ -5057,8 +4791,8 @@ when false, `why_not`.
 
 ## Deepest reasoning, offline: `deliberate`
 
-`deliberate` is `explore → offline synth`: a fast model builds a cited dossier (you wait
-for this — the same live explorer sweep `explore` runs, minutes), then a heavyweight synth
+`deliberate` is `explorer → offline synth`: the cast's explorer builds a cited dossier
+(you wait for this, minutes), then a heavyweight synth
 reasons over that evidence *offline*, so you don't hold a session open for the slow part.
 Reach for it on a hard question worth the wait — a design review, a gnarly bug, \"is this
 abstraction right\".
@@ -5296,27 +5030,19 @@ fn render_prompts_resource(config: &Config, cast: Option<&Cast>) -> String {
              `kaibo://prompts/<cast>`. The `[orientation]` map and `[context]` house rules \
              append per call for the project-reading phases (path-dependent).\n\n\
              A phase is a role, not one tool — several tools share a preamble. The \
-             **explorer** framing drives standalone `explore`, the delegated sweep inside \
-             `consult`, and `deliberate`'s dossier-building pass; it is listed twice \
-             because the sweep and the dossier are written for a synthesis agent that \
-             answers from them, while `explore` hands its report straight back to you. \
-             The **offline-synth** framing serves both `batch_submit` and `deliberate`'s \
+             **explorer** framing drives `deliberate`'s dossier-building pass. The \
+             **offline-synth** framing serves both `batch_submit` and `deliberate`'s \
              synth. So tuning one phase moves every tool that wears it.\n",
         ),
     }
 
     for phase in Phase::ALL {
-        // A cast with an interactive synth runs exactly one of the two `consult` drivers
-        // — with `explore′` on a team cast, single-stage on a solo cast (`Cast::consult_solo`) —
-        // so its own view shows that one. A cast with no interactive synth runs neither.
-        // The base doc shows both.
+        // A cast with no interactive synth runs no `consult` driver, so its own view
+        // leaves that phase out. The base doc shows it.
         if let Some(c) = cast {
             let interactive = c.slot(ModelRole::Synth).is_some() && c.synth_lane().is_none();
-            let solo = c.consult_solo();
-            match phase {
-                Phase::Consult if !interactive || solo => continue,
-                Phase::ConsultSolo if !interactive || !solo => continue,
-                _ => {}
+            if phase == Phase::Consult && !interactive {
+                continue;
             }
         }
         // Attribute the framing by precedence: a cast slot's `preamble` wins over a global
@@ -5827,7 +5553,7 @@ mod tests {
     /// `request_timeout` (+ margin), NOT the interactive `call_deadline`. This is the
     /// decision that keeps a slow local `deliberate` from forcing the interactive
     /// ceiling high: give that model 3h of `request_timeout` and the direct job inherits
-    /// it, while `consult`/`explore`/`oneshot` stay bounded at the tight `call_deadline`.
+    /// it, while `consult`/`oneshot` stay bounded at the tight `call_deadline`.
     #[test]
     fn deliberate_direct_deadline_tracks_request_timeout_not_call_deadline() {
         let cfg = crate::config::Config::builtin();
@@ -5871,15 +5597,10 @@ mod tests {
         // The sink and consumer exactly as the `deliberate` handler builds them:
         // offline synth, vision on (the synth's cap is what admits the image).
         let consumer = SweepConsumer {
-            kind: SweepConsumerKind::OfflineSynth,
             label: std::sync::Arc::from("the offline synth (`scripted-synth`)"),
             vision: true,
         };
-        let sink = std::sync::Arc::new(SweepAttachSink::new(
-            8,
-            consumer.clone(),
-            std::collections::HashSet::new(),
-        ));
+        let sink = std::sync::Arc::new(SweepAttachSink::new(8, consumer));
 
         // Route both files through the real tool — the same resolve/read/classify/
         // commit path a live explorer's `attach` call runs.
@@ -5913,7 +5634,6 @@ mod tests {
         let mut dossier = String::from("src/x.rs:1 DOSSIER");
         let (images, kept) = stitch_and_keep(
             &mut dossier,
-            &consumer,
             Some(&sink),
             Some(&store),
             "does the diagram confirm it?",
@@ -6037,20 +5757,20 @@ mod tests {
         );
     }
 
-    /// `explore` refuses an image attachment on every cast, and says why: its survey
+    /// `deliberate` refuses an image attachment on every cast, and says why: its survey
     /// reads through the shell, which has no image tool. The reason must not blame the
     /// cast's models — the built-in `deepseek` explorer is itself sighted — and the
     /// refusal names the tools that do take an image.
     #[tokio::test]
-    async fn explore_refuses_an_image_for_its_toolset_not_its_models() {
+    async fn deliberate_refuses_an_image_for_its_toolset_not_its_models() {
         let root = tempfile::tempdir().unwrap();
         let root_canon = std::fs::canonicalize(root.path()).unwrap();
         let png_sig = [0x89u8, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
         std::fs::write(root_canon.join("shot.png"), png_sig).unwrap();
         let err = handler()
-            .resolve_sweep_attachments(&root_canon, &["shot.png".to_string()], "explore")
+            .resolve_sweep_attachments(&root_canon, &["shot.png".to_string()])
             .await
-            .expect_err("an image attachment to explore is refused");
+            .expect_err("an image attachment to deliberate is refused");
         let msg = err.message.to_string();
         assert!(msg.contains("shot.png"), "names the file: {msg}");
         assert!(
@@ -6281,7 +6001,10 @@ mod tests {
     fn web_true_is_refused_with_the_reason_and_a_next_step() {
         let off = hermetic_handler_from_toml("[web]\nenabled = false\n");
         let err = off.web_if_asked(true, "consult", false).unwrap_err();
-        assert!(err.message.contains("`consult` was asked to use the web"), "{err:?}");
+        assert!(
+            err.message.contains("`consult` was asked to use the web"),
+            "{err:?}"
+        );
         assert!(err.message.contains("`[web] enabled = false`"), "{err:?}");
         assert!(err.message.contains("Re-run without `web`"), "{err:?}");
         assert!(off.web_if_asked(false, "consult", false).unwrap().is_none());
@@ -6289,12 +6012,17 @@ mod tests {
         let keyless = hermetic_handler_from_toml(
             "[backends.deepseek]\napi_key_file = \"/nonexistent-kaibo-test/deepseek\"\n",
         );
-        let err = keyless.web_session("research", "Use `consult` instead.", false).unwrap_err();
+        let err = keyless
+            .web_session("research", "Use `consult` instead.", false)
+            .unwrap_err();
         assert!(err.message.contains("has no usable API key"), "{err:?}");
         assert!(err.message.ends_with("Use `consult` instead."), "{err:?}");
 
         let ok = hermetic_handler_from_toml("[backends.deepseek]\nkey_optional = true\n");
-        let web = ok.web_if_asked(true, "consult", false).unwrap().expect("a session");
+        let web = ok
+            .web_if_asked(true, "consult", false)
+            .unwrap()
+            .expect("a session");
         assert_eq!(web.provider(), "deepseek");
 
         // A call whose every web phase is native needs no `[web]` key: the session opens
@@ -6340,12 +6068,9 @@ mod tests {
             context: None,
             path: None,
             cast: None,
-            explorer_model: None,
-            explorer_backend: None,
             synth_model: None,
             synth_backend: None,
             session_id: Some("sess-1".into()),
-            include_report: false,
             attach: Vec::new(),
             save_artifacts,
             web: false,
@@ -6635,7 +6360,11 @@ mod tests {
                 if let Some(end) = text.find("\r\n\r\n") {
                     let len = text
                         .lines()
-                        .find_map(|l| l.to_ascii_lowercase().strip_prefix("content-length:").map(|v| v.trim().parse::<usize>().unwrap_or(0)))
+                        .find_map(|l| {
+                            l.to_ascii_lowercase()
+                                .strip_prefix("content-length:")
+                                .map(|v| v.trim().parse::<usize>().unwrap_or(0))
+                        })
                         .unwrap_or(0);
                     if req.len() >= end + 4 + len || n == 0 {
                         break;
@@ -6696,7 +6425,10 @@ mod tests {
         let lower = req.to_ascii_lowercase();
         assert!(lower.contains("x-goog-api-key: gem-secret"), "{req}");
         assert!(!lower.contains("authorization:"), "{req}");
-        assert!(req.contains("\"input\":\"git push --force origin main\""), "{req}");
+        assert!(
+            req.contains("\"input\":\"git push --force origin main\""),
+            "{req}"
+        );
         assert!(!req.contains("\"state\""), "{req}");
     }
 
@@ -6843,7 +6575,10 @@ mod tests {
         let text = result_text(out);
         assert!(text.contains("HTTP 400"), "{text}");
         assert!(text.contains("does not exist"), "{text}");
-        assert!(text.contains("change the request, not the timing"), "{text}");
+        assert!(
+            text.contains("change the request, not the timing"),
+            "{text}"
+        );
         assert!(text.contains("cast `judge`"), "{text}");
     }
 
@@ -8520,7 +8255,7 @@ enabled = false
     #[test]
     fn a_surface_of_only_the_media_store_is_not_substantive() {
         let h = hermetic_handler_from_toml(
-            "[server.tools]\nconsult = false\nexplore = false\ndeliberate = false\n\
+            "[server.tools]\nconsult = false\ndeliberate = false\n\
              oneshot = false\nrun_kaish = false\nbatch = false\nlist_models = false\n\
              generate = false\n",
         );
@@ -8538,7 +8273,7 @@ enabled = false
         // And the same handler with one castless tool back on IS substantive — the rule
         // is about followers, not about being small.
         let with_shell = hermetic_handler_from_toml(
-            "[server.tools]\nconsult = false\nexplore = false\ndeliberate = false\n\
+            "[server.tools]\nconsult = false\ndeliberate = false\n\
              oneshot = false\nbatch = false\nlist_models = false\ngenerate = false\n",
         );
         assert!(
@@ -8782,23 +8517,6 @@ enabled = false
                 );
             }
         }
-        // `explore` runs only the explorer, so it advertises *every* cast with one —
-        // interactive AND offline-synth casts (`mydeliberate`) — but not the synth-only
-        // casts (`mybatch`, `mydirect`), which have no explorer to run.
-        let explore = enum_of("explore");
-        for with_explorer in ["myinteractive", "mydeliberate"] {
-            assert!(
-                explore.iter().any(|c| c == with_explorer),
-                "explore enum should list the explorer-bearing cast {with_explorer}, got {explore:?}"
-            );
-        }
-        for no_explorer in ["mybatch", "mydirect"] {
-            assert!(
-                !explore.iter().any(|c| c == no_explorer),
-                "explore enum must not list the synth-only cast {no_explorer} (no explorer), \
-                 got {explore:?}"
-            );
-        }
         let batch = enum_of("batch_submit");
         // Both batch synths (explorer or not) can be batch_submit'd — it's synth-only.
         assert!(
@@ -8902,9 +8620,6 @@ enabled = false
                 "consult" | "consult_submit" | "oneshot" => {
                     h.require_interactive_cast(cast, tool).is_ok()
                 }
-                // `explore` has no lane gate — it runs whichever cast's explorer, so any cast
-                // is accepted (a missing explorer faults later at the arm resolve, not the gate).
-                "explore" => true,
                 "batch_submit" => h.require_batch_cast(cast).is_ok(),
                 "deliberate" => h.require_deliberate_cast(cast).is_ok(),
                 // `generate`'s call-time gate is a media slot's presence — the same
@@ -8917,7 +8632,7 @@ enabled = false
                 "decide" => cast.slot(crate::config::ModelRole::Decision).is_some(),
                 // `research` runs the explorer, else an interactive synth.
                 "research" => {
-                    h.config.cast_can_explore(&cast.name)
+                    h.config.cast_has_explorer(&cast.name)
                         || h.require_interactive_cast(cast, tool).is_ok()
                 }
                 other => panic!("unmapped cast-taking tool `{other}` — add its gate here"),
@@ -8949,13 +8664,10 @@ enabled = false
         assert!(checked > 0, "the guard checked nothing");
     }
 
-    /// A synth-only interactive cast runs `consult` single-stage: one model doing its own
-    /// reads, with no `explore′` to delegate to. So `consult`, `consult_submit`, and
-    /// `oneshot` all offer it, and its gate accepts it. `explore` still needs an explorer
-    /// slot, so the synth-only cast stays off that tool. This inverts the old refusal,
-    /// which sent a synth-only cast to `oneshot` and lost the shell.
+    /// A synth-only interactive cast runs `consult`: one model doing its own reads. So
+    /// `consult`, `consult_submit`, and `oneshot` all offer it, and its gate accepts it.
     #[test]
-    fn a_synth_only_cast_is_offered_to_consult_single_stage() {
+    fn a_synth_only_cast_is_offered_to_consult() {
         let h = handler_from_toml(
             r#"
             [backends.gem]
@@ -8993,11 +8705,6 @@ enabled = false
                 "`{tool}` must offer both casts, got {offered:?}"
             );
         }
-        let offered = enum_of("explore");
-        assert!(
-            !offered.iter().any(|c| c == "solo"),
-            "`explore` needs an explorer slot, got {offered:?}"
-        );
 
         let solo = h.config.resolve_cast("solo").unwrap();
         assert!(h.require_interactive_cast(solo, "consult").is_ok());
@@ -9034,107 +8741,6 @@ enabled = false
             )
             .expect("a backend adds the slot");
         assert!(cast.slot(ModelRole::Explorer).is_some());
-    }
-
-    /// `consult = "solo"` on a cast WITH an explorer: `consult` resolves no explorer arm
-    /// (so no explorer model can be called), `explore` still staffs the cast, and a
-    /// `team` cast on the same backend still resolves its explorer. An `explorer_model`
-    /// override on the solo cast is refused, naming the key and the way out.
-    #[test]
-    fn a_solo_cast_with_an_explorer_resolves_no_explorer_for_consult() {
-        let h = handler_from_toml(
-            r#"
-            [backends.gem]
-            kind = "gemini"
-            key_optional = true
-
-            [casts.solo]
-            explorer = "gem/lite"
-            synth    = "gem/flash"
-            consult  = "solo"
-
-            [casts.team]
-            explorer = "gem/lite"
-            synth    = "gem/flash"
-            "#,
-        );
-        let solo = h.config.resolve_cast("solo").unwrap();
-        let none = h
-            .resolver
-            .consult_explorer_arm(solo, None, "explorer_model")
-            .expect("resolves");
-        assert!(none.is_none(), "solo consult must not resolve the explorer");
-        assert!(
-            h.config.cast_can_explore("solo"),
-            "`explore` still staffs it"
-        );
-        assert!(h.resolver.arm(solo, ModelRole::Explorer).is_ok());
-
-        let team = h.config.resolve_cast("team").unwrap();
-        let some = h
-            .resolver
-            .consult_explorer_arm(team, None, "explorer_model")
-            .expect("resolves");
-        assert!(some.is_some(), "team consult resolves its explorer");
-
-        let err = h
-            .resolver
-            .consult_explorer_arm(solo, Some("other"), "explorer_model")
-            .expect_err("override cannot take effect");
-        let msg = err.message.to_string();
-        for needle in [
-            "explorer_model",
-            "consult = \"solo\"",
-            "`explore`",
-            "kaibo://config",
-        ] {
-            assert!(msg.contains(needle), "refusal must name {needle}: {msg}");
-        }
-    }
-
-    /// The per-cast prompts view and `kaibo://config` both show the mode a cast runs.
-    #[test]
-    fn a_solo_cast_with_an_explorer_shows_the_solo_driver_and_mode() {
-        use crate::consult::Phase;
-        let config = Config::from_toml_str(
-            r#"
-            [casts.solo]
-            explorer = "anthropic/claude-haiku-4-5"
-            synth    = "anthropic/claude-opus-4-8"
-            consult  = "solo"
-            "#,
-        )
-        .expect("config parses");
-        let heading = |p: Phase| format!("## {}\n", p.label());
-        let text = render_prompts_resource(&config, Some(config.resolve_cast("solo").unwrap()));
-        assert!(text.contains(&heading(Phase::ConsultSolo)), "{text}");
-        assert!(!text.contains(&heading(Phase::Consult)), "{text}");
-
-        let body = render_config_resource(
-            &config,
-            &[],
-            None,
-            false,
-            vec![],
-            false,
-            crate::config::CasMode::Memory,
-            None,
-        );
-        let doc: toml::Value = toml::from_str(&body).expect("valid TOML");
-        let mode = |c: &str| {
-            doc["casts"][c]
-                .get("consult")
-                .and_then(|v| v.as_str())
-                .map(str::to_string)
-        };
-        assert_eq!(mode("solo").as_deref(), Some("solo"));
-        assert_eq!(mode("anthropic").as_deref(), Some("solo"));
-        assert_eq!(mode("deepseek").as_deref(), Some("team"));
-        assert_eq!(
-            mode("anthropic-batch"),
-            None,
-            "no interactive synth, no consult"
-        );
     }
 
     /// A cast with no synth slot has no model to answer a text tool: `consult`,
@@ -9197,7 +8803,6 @@ enabled = false
             }
         }
         assert!(enum_of("generate").iter().any(|c| c == "artist"));
-        assert!(enum_of("explore").iter().any(|c| c == "scout"));
 
         let artist = h.config.resolve_cast("artist").unwrap();
         let err = h
@@ -9223,7 +8828,7 @@ enabled = false
             "no `synth` slot",
             "`consult`",
             "`explorer`",
-            "`explore`",
+            "`research`",
         ] {
             assert!(msg.contains(needle), "refusal must name {needle}: {msg}");
         }
@@ -9239,7 +8844,7 @@ enabled = false
     /// keeps real key files, so a naive fixture passes on her box and fails in CI). The
     /// keyless `openai-local` needs the extra `key_optional = false`: without a required
     /// credential it resolves to a *placeholder* and stays `LocalUnverified`, which counts
-    /// as usable — and that is what kept `explore` looking ungated even under an empty
+    /// as usable — and that is what kept explorer-only tools looking ungated even under an empty
     /// environment, since the built-in local casts all carry explorer slots.
     const NO_BUILTIN_CASTS: &str = r#"
         [backends.anthropic]
@@ -9255,7 +8860,7 @@ enabled = false
         api_key_file = "/nonexistent-kaibo-test/openai"
     "#;
 
-    /// A cast fixture with an interactive team and nothing else — so `explore` has an
+    /// A cast fixture with an interactive team and nothing else — so `research` has an
     /// explorer, `consult`/`oneshot` have an interactive synth, and NOTHING can staff
     /// `batch_submit` or `deliberate` (both need an offline synth lane).
     /// `NO_BUILTIN_CASTS` followed by `rest`. A plain concatenation rather than
@@ -9408,9 +9013,8 @@ enabled = false
         );
     }
 
-    /// And `explore`: a synth-only fixture has no explorer slot anywhere, so the sweep
-    /// tool cannot run. `consult` runs single-stage on the synth alone, and `oneshot`
-    /// needs only the synth, so both stay.
+    /// A synth-only fixture has no explorer slot anywhere. `consult` runs on the synth
+    /// alone, and `oneshot` needs only the synth, so both stay.
     #[test]
     fn explore_is_not_advertised_without_an_explorer_slot() {
         let h = hermetic_handler_from_toml(&with_no_builtin_casts(
@@ -9427,14 +9031,10 @@ enabled = false
         "#,
         ));
         let tools = h.advertised_tools();
-        assert!(
-            !tools.iter().any(|t| t == "explore"),
-            "explore must be dropped when no cast carries an explorer slot. Advertised: {tools:?}"
-        );
         for kept in ["consult", "consult_submit", "oneshot"] {
             assert!(
                 tools.iter().any(|t| t == kept),
-                "{kept} needs only the interactive synth (`consult` runs single-stage), so \
+                "{kept} needs only the interactive synth, so \
                  it must survive. Advertised: {tools:?}"
             );
         }
@@ -9525,7 +9125,7 @@ enabled = false
             "every refusal names what the caller can reach instead: {msg}"
         );
 
-        // Unstaffable: `explore` needs an explorer slot, and this cast has none. The
+        // Unstaffable: `deliberate` needs an explorer slot, and this cast has none. The
         // operator changed nothing, so naming a flag here would send them to the wrong
         // knob entirely.
         let h = hermetic_handler_from_toml(&with_no_builtin_casts(
@@ -9542,7 +9142,7 @@ enabled = false
         "#,
         ));
         let msg = h
-            .gated_tool_refusal("explore")
+            .gated_tool_refusal("deliberate")
             .expect("an unstaffable tool earns a refusal too")
             .to_string();
         assert!(
@@ -9550,7 +9150,7 @@ enabled = false
             "an unstaffable tool must name the cast shape it wants: {msg}"
         );
         assert!(
-            !msg.contains("--no-explore"),
+            !msg.contains("--no-deliberate"),
             "nobody turned this off — naming a flag would send the reader to the wrong \
              knob: {msg}"
         );
@@ -9737,7 +9337,6 @@ enabled = false
                 consult: false,
                 batch: false,
                 deliberate,
-                explore: true,
                 oneshot: true,
                 run_kaish: true,
                 list_models: true,
@@ -10481,7 +10080,6 @@ enabled = false
             .submit("test", Arc::new(ProgressLog::silent()), async {
                 Ok(JobResult {
                     answer: "answer".into(),
-                    report: None,
                 })
             });
         let other = h
@@ -10489,7 +10087,6 @@ enabled = false
             .submit("test", Arc::new(ProgressLog::silent()), async {
                 Ok(JobResult {
                     answer: "answer".into(),
-                    report: None,
                 })
             });
         // Both must reach a terminal state before `job_get` will evict (Running has no ping).
@@ -10549,8 +10146,8 @@ enabled = false
     #[test]
     fn progress_param_carries_seq_and_message() {
         let token = ProgressToken(NumberOrString::String("abc".into()));
-        let event = PhaseEvent::SweepStarted {
-            question: "where is X?".into(),
+        let event = PhaseEvent::KaishRun {
+            script: "grep -rn X src".into(),
         };
         let p = progress_param(token.clone(), 3, &event);
         assert_eq!(p.progress_token, token);
@@ -10559,7 +10156,7 @@ enabled = false
             p.total.is_none(),
             "a consult's step count isn't known up front"
         );
-        assert_eq!(p.message.as_deref(), Some("exploring: where is X?"));
+        assert_eq!(p.message.as_deref(), Some("running kaish: grep -rn X src"));
     }
 
     /// The server advertises the `logging` capability — the half of MCP logging the
@@ -11165,10 +10762,7 @@ enabled = false
         let text = read_text(PROMPTS_URI, &[]);
         // Each phase's built-in preamble appears verbatim (single-sourced — no drift).
         for body in [
-            // Both explorer readers: the doc lists them separately because they render
-            // different text, and a doc that showed one would misreport the other tool.
-            report_preamble(ReportReader::SynthesisAgent),
-            report_preamble(ReportReader::CallingAgent),
+            report_preamble(),
             consult_preamble(),
             oneshot_preamble(),
             batch_preamble(),
@@ -11285,9 +10879,9 @@ enabled = false
         );
     }
 
-    /// A cast runs one of the two `consult` drivers, so its prompts view shows that one:
-    /// the delegating driver for a cast with an explorer, the single-stage driver for a
-    /// synth-only cast. The base doc shows both, because it describes every cast.
+    /// A cast with an interactive synth runs the `consult` driver, so its prompts view
+    /// shows it, explorer slot or not; a cast whose synth is offline runs no `consult`
+    /// and its view leaves the driver out. The base doc shows it.
     #[test]
     fn per_cast_prompts_resource_shows_the_consult_driver_the_cast_runs() {
         use crate::consult::Phase;
@@ -11311,18 +10905,12 @@ enabled = false
         let offline =
             render_prompts_resource(&config, Some(config.resolve_cast("offline").unwrap()));
         assert!(!offline.contains(&heading(Phase::Consult)), "{offline}");
-        assert!(!offline.contains(&heading(Phase::ConsultSolo)), "{offline}");
         let team = render_prompts_resource(&config, Some(config.resolve_cast("team").unwrap()));
         assert!(team.contains(&heading(Phase::Consult)), "{team}");
-        assert!(!team.contains(&heading(Phase::ConsultSolo)), "{team}");
         let solo = render_prompts_resource(&config, Some(config.resolve_cast("solo").unwrap()));
-        assert!(solo.contains(&heading(Phase::ConsultSolo)), "{solo}");
-        assert!(!solo.contains(&heading(Phase::Consult)), "{solo}");
+        assert!(solo.contains(&heading(Phase::Consult)), "{solo}");
         let base = render_prompts_resource(&config, None);
-        assert!(
-            base.contains(&heading(Phase::Consult)) && base.contains(&heading(Phase::ConsultSolo)),
-            "{base}"
-        );
+        assert!(base.contains(&heading(Phase::Consult)), "{base}");
     }
 
     /// The per-cast template is advertised, and an unknown cast is a not-found whose
@@ -11498,7 +11086,7 @@ enabled = false
             "the template must point at the guide it defers its detail to"
         );
         // Each cast-gated tool is named where an operator would look up why it vanished.
-        for tool in ["consult", "explore", "batch_submit", "deliberate"] {
+        for tool in ["consult", "batch_submit", "deliberate"] {
             assert!(
                 guide.contains(tool),
                 "the gating section must account for `{tool}`"
@@ -11667,7 +11255,9 @@ enabled = false
             None,
             false,
             crate::config::CastUsability::Ready,
-            &[], true);
+            &[],
+            true,
+        );
         // The scope section must name each allowed path.
         assert!(
             text.contains("/projects/myapp"),
@@ -11697,7 +11287,9 @@ enabled = false
             Some(&root),
             false,
             crate::config::CastUsability::Ready,
-            &[], true);
+            &[],
+            true,
+        );
         assert!(
             text.contains("/projects/myapp"),
             "scope section must name the configured root:\n{text}"
@@ -11721,7 +11313,9 @@ enabled = false
             Some(&root),
             true,
             crate::config::CastUsability::Ready,
-            &[], true);
+            &[],
+            true,
+        );
         assert!(
             text.contains("/work/space"),
             "scope section must name the inferred root:\n{text}"
@@ -11743,7 +11337,9 @@ enabled = false
             None,
             false,
             crate::config::CastUsability::Ready,
-            &[], true);
+            &[],
+            true,
+        );
         // Must explain that every call must pass a path.
         assert!(
             text.to_lowercase().contains("every call") || text.contains("no default"),

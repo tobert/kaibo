@@ -2,8 +2,8 @@
 //! call, sharing one [`WebSession`] per kaibo call.
 //!
 //! The session is the call's budget and record. Every search and fetch any phase of one
-//! call makes (the research loop, each delegated survey, a consult driver) draws on the
-//! same counters, so a driver that delegates five surveys cannot spend five budgets. A
+//! call makes (the research loop, a dossier survey, a consult driver) draws on the
+//! same counters, so no phase can spend a budget of its own. A
 //! call over budget is refused with a tool error the model reads, never a silent
 //! no-op. The session also records each page fetched, which is what kaibo reports back as
 //! the call's sources: the pages the team actually read, taken from kaibo's own record and
@@ -313,7 +313,12 @@ impl WebSession {
         if sources.is_empty() {
             return None;
         }
-        let of = |kind| sources.iter().filter(|s| s.kind == kind).collect::<Vec<_>>();
+        let of = |kind| {
+            sources
+                .iter()
+                .filter(|s| s.kind == kind)
+                .collect::<Vec<_>>()
+        };
         let mut out = String::new();
         let mut listed = 0;
         // Each section reports its own overflow, so an entry left out is never counted
@@ -807,7 +812,10 @@ mod tests {
         let (read_part, cited_part) = block.split_at(cited);
         assert!(read_part.contains("1. Later — https://later"), "{block}");
         assert!(read_part.contains("2. Read — https://read"), "{block}");
-        assert!(cited_part.contains("3. Snippet — https://snippet"), "{block}");
+        assert!(
+            cited_part.contains("3. Snippet — https://snippet"),
+            "{block}"
+        );
         assert!(!cited_part.contains("https://later"), "{block}");
 
         // A full Pages read section still names the citations it had no room for.
@@ -816,7 +824,10 @@ mod tests {
         }
         let block = s.sources_block().unwrap();
         assert!(block.contains("+10 more pages read not listed"), "{block}");
-        assert!(block.ends_with("+1 more search results cited not listed"), "{block}");
+        assert!(
+            block.ends_with("+1 more search results cited not listed"),
+            "{block}"
+        );
 
         // A page the provider cited without saying how lists under its own heading, and
         // a fetch of it later moves it to the pages read.

@@ -34,13 +34,11 @@ use tokio::task::AbortHandle;
 
 use crate::progress::ProgressLog;
 
-/// A completed consultation, ready to render back to the calling agent. `answer`
-/// already carries its provenance footer; `report` is the explorer's aggregated
-/// report when the submit asked for it (`include_report`), else `None`.
+/// A completed job, ready to render back to the calling agent. `answer` already
+/// carries its provenance footer.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct JobResult {
     pub answer: String,
-    pub report: Option<String>,
 }
 
 /// Where a job is in its lifecycle, as one `job_get` sees it.
@@ -314,7 +312,6 @@ mod tests {
     fn done(answer: &str) -> JobResult {
         JobResult {
             answer: answer.to_string(),
-            report: None,
         }
     }
 
@@ -499,12 +496,12 @@ mod tests {
         assert_eq!(store.get(&id).unwrap().last_progress, None);
 
         // A beat fires → the snapshot surfaces it (message + count) while still Running.
-        progress.emit(PhaseEvent::SweepStarted {
-            question: "where is the sandbox?".into(),
+        progress.emit(PhaseEvent::KaishRun {
+            script: "grep -rn sandbox src".into(),
         });
         assert_eq!(
             store.get(&id).unwrap().last_progress,
-            Some(("exploring: where is the sandbox?".to_string(), 1))
+            Some(("running kaish: grep -rn sandbox src".to_string(), 1))
         );
 
         // Once it finishes, the beat is moot — a Done snapshot carries the answer, not a

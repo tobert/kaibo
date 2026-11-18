@@ -40,7 +40,6 @@ record. Each later release appends a new section at the top.
 - A native web tool error logs the provider's `error_code` at warn, since the model's own account of a refusal is often wrong.
 - `--json` output marks each web source with `fetched`: `true`, `false`, or `null` where the provider does not say.
 - `[web]` sets the search backend and per-call caps (`max_searches`, `max_fetches`, 10 each); `--no-research` drops the tool; `kaibo://config` reports `[web]` with `live`.
-- A cast's `consult = "solo" | "team"` key runs `consult` with the synth alone, keeping the explorer slot for `explore` and `deliberate`; `kaibo://config` shows each cast's mode.
 - `batch_submit` and `deliberate` run on `openrouter` backends via `/api/v1/batches`, stripping any `:batch` suffix from `list_models` ids.
 - OpenRouter slots on `google/gemini-*` and `~google/gemini-*` classify as vision-capable without an explicit `vision = true` pin.
 - `kaibo configure` and `docs/config.example.toml` cover Gemini Argon (`max_tokens` sizing from `list_models`), `batch_submit`, and `deliberate`.
@@ -48,11 +47,14 @@ record. Each later release appends a new section at the top.
 - `prompt_cache = "short" | "long" | "off"` on an `anthropic` or `openrouter` backend sets the cache retention; `short` is the default.
 
 ### Changed
+- `consult` no longer delegates to an explorer: on every cast the synth reads the project itself, starting from the project file map.
+- A `consult` answer opens with `The following report was prepared by kaibo/<cast>.`, and its footer names the synth alone.
+- The `consult` synth's preamble opens by naming who asked: another agent, which acts on the answer.
+- `kaibo consult --json` reports `models` as `{ "synth": … }`; the `explorer` key is gone.
 - The explorer's report is evidence for another model or agent to reason from, not a verdict: it adds `Connections` and `OpenQuestions` sections, and `SummaryOfFindings` becomes `Summary`.
 - Explorer and `consult` preambles read what each claim needs (a whole file or a span) instead of whole files first, and the `[orientation]` file map no longer says to read unmarked files whole; attached files are still read whole.
 - Moves to kaish 0.19.0: `ls -l`, `stat`, and `date` in the model's shell print GNU's formats, `ls -A` lists hidden files, and `%` is a word character (`printf %s`).
 - The `configure` prompt recommends a workspace root such as `~/src` and asks for the user's clear yes before scoping to `~`, `$HOME`, or `/`.
-- The built-in `anthropic` cast sets `consult = "solo"`: the Sonnet reads the code itself, and the Haiku explorer serves `explore` only.
 - The built-in `gemini` cast's synth is `gemini/gemini-pro-latest` (explorer stays `gemini/gemini-flash-latest`).
 - Moves to turso 0.8.3; an existing `state.db` from 0.7.2 opens unchanged.
 - Moves to rig 0.46, with the TLS tree still free of aws-lc, OpenSSL, and the bundled `webpki-root-certs` roots.
@@ -60,6 +62,11 @@ record. Each later release appends a new section at the top.
 - A malformed-generation retry now spends one of the run's model-call turns, where it used to spend none.
 - The footer's `in` token count includes cached tokens for Anthropic, as it already did for OpenAI-shaped providers.
 - OpenRouter prompt caching is sent as a request-level `cache_control` marker.
+
+### Removed
+- The `explore` tool and `kaibo explore`; `consult` reads the code itself, and `deliberate` keeps its explorer for the dossier.
+- `explorer_model`, `explorer_backend`, and `include_report` on `consult` and `consult_submit` (and their CLI flags); sending one is an invalid-params error naming it.
+- `--no-explore`, `KAIBO_NO_EXPLORE`, and `[server.tools] explore`.
 
 ### Fixed
 - Release pages say the container package page's install box offers a `sha256-*` signature tag; pull a version tag instead.

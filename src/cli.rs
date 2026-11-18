@@ -42,17 +42,17 @@ use crate::config::{Config, Lane, ModelRole, ToolDisables};
 use crate::consult::{
     batch_system_prompt, consult, deliberation_prompt, explore_with, oneshot as run_oneshot_engine,
     research_with, ConsultConfig, ConsultOutput, ExploreConfig, ModelCaps, PhaseContext,
-    ReportReader, ResearchConfig,
+    ResearchConfig,
 };
 use crate::progress::TerminalSink;
 use crate::sandbox::KaishWorker;
 use crate::server::{
-    batch_within_window, configure_prompt_text_cli, consult_models, consultation_failure_text,
+    batch_within_window, configure_prompt_text_cli, consult_header, consultation_failure_text,
     now_epoch_secs, render_config_resource, with_provenance, with_web_sources, with_web_usage,
     Resolver, BATCH_RECENCY_WINDOW_SECS, CONFIG_EXAMPLE_TOML,
 };
 use crate::session::{SessionStore as MemSessionStore, Sessions};
-use crate::sweep_attach::{SweepAttachSink, SweepConsumer, SweepConsumerKind};
+use crate::sweep_attach::{SweepAttachSink, SweepConsumer};
 use crate::web::WebSession;
 
 /// Exit codes, distinct so an agent caller branches without parsing prose.
@@ -131,8 +131,6 @@ pub enum Command {
     /// Get a toolless second opinion: no codebase access, the model answers from your
     /// prompt (plus piped stdin and `--attach` files) and its own knowledge.
     Oneshot(OneshotArgs),
-    /// Survey the codebase and print a cited report (the evidence half of consult).
-    Explore(ExploreArgs),
     /// Research a question on the web and print a URL-cited report. Reads no project.
     Research(ResearchArgs),
     /// Investigate the codebase, then send that evidence to an offline synth model. A
@@ -179,8 +177,8 @@ pub fn run_config_guide() -> i32 {
 /// `configure` MCP prompt, framed for a caller with no MCP resource access.
 #[derive(Args, Debug)]
 pub struct ConfigureArgs {
-    /// What you want from the setup, e.g. "a local-only privacy cast" or "a cheap
-    /// DeepSeek explorer with a Claude synth". Optional — omit for a general walkthrough.
+    /// What you want from the setup, e.g. "a local-only privacy cast" or "a DeepSeek
+    /// explorer with a Claude synth". Optional — omit for a general walkthrough.
     pub goal: Option<String>,
 }
 
@@ -287,9 +285,6 @@ pub struct ServeGates {
     /// verbs that only `consult` produces.
     #[arg(long)]
     pub no_consult: bool,
-    /// Don't advertise the `explore` tool.
-    #[arg(long)]
-    pub no_explore: bool,
     /// Don't advertise the `deliberate` tool.
     #[arg(long)]
     pub no_deliberate: bool,
@@ -329,7 +324,6 @@ impl ServeGates {
     pub fn tool_disables(&self) -> ToolDisables {
         ToolDisables {
             consult: self.no_consult,
-            explore: self.no_explore,
             deliberate: self.no_deliberate,
             oneshot: self.no_oneshot,
             run_kaish: self.no_run_kaish,
@@ -374,26 +368,12 @@ pub struct ConsultArgs {
     #[arg(long)]
     pub context: Option<String>,
 
-    /// Override the explorer (investigation) model id (verbatim; pair with
-    /// --explorer-backend to also retarget).
-    #[arg(long, value_name = "ID")]
-    pub explorer_model: Option<String>,
-    /// Run the explorer override on this backend (name or alias). Requires --explorer-model.
-    #[arg(long, value_name = "BACKEND")]
-    pub explorer_backend: Option<String>,
     /// Override the synth (final-answer) model id (pair with --synth-backend to retarget).
     #[arg(long, value_name = "ID")]
     pub synth_model: Option<String>,
     /// Run the synth override on this backend (name or alias). Requires --synth-model.
     #[arg(long, value_name = "BACKEND")]
     pub synth_backend: Option<String>,
-
-    /// Also print the explorer's aggregated report. Under --json it is the `report`
-    /// field on stdout; otherwise it goes to stderr under a `--- explorer report ---`
-    /// header, so a pipe still captures only the answer. Empty when no sweep ran: the
-    /// synth read everything itself, or the cast has no explorer.
-    #[arg(long)]
-    pub include_report: bool,
 
     /// Let the investigation search and read the web for what the project cannot
     /// answer, such as a dependency's changelog or an advisory. Off by default. Uses the
@@ -436,37 +416,6 @@ pub struct OneshotArgs {
     pub backend: Option<String>,
 
     /// Emit a JSON envelope on stdout (answer + provenance + usage) instead of prose.
-    #[arg(long)]
-    pub json: bool,
-}
-
-/// `kaibo explore` — a cited survey report (the evidence-gathering half of consult): a
-/// model sweeps the project READ-ONLY and returns a summary, `file:line` locations, how
-/// they connect, what remains open, and the trail it followed, not a synthesized answer.
-#[derive(Args, Debug)]
-pub struct ExploreArgs {
-    /// What to survey or map. Say in prose what you want mapped — kaibo's explorer
-    /// locates and reads the real, current code and reports back with citations.
-    pub question: String,
-
-    /// Project to explore. Optional when a default root exists (see `kaibo config`); must resolve
-    /// to at-or-under an allowed tree.
-    #[arg(long, value_name = "DIR")]
-    pub path: Option<String>,
-
-    /// Workspace file central to the survey: the explorer is directed to read it
-    /// WHOLE. Text only (it reads through the shell). Repeatable.
-    #[arg(long, value_name = "FILE", action = clap::ArgAction::Append)]
-    pub attach: Vec<String>,
-
-    /// Override the explorer model id (verbatim; pair with --explorer-backend).
-    #[arg(long, value_name = "ID")]
-    pub explorer_model: Option<String>,
-    /// Run the explorer override on this backend (name or alias). Requires --explorer-model.
-    #[arg(long, value_name = "BACKEND")]
-    pub explorer_backend: Option<String>,
-
-    /// Emit a JSON envelope on stdout (report + provenance + usage) instead of prose.
     #[arg(long)]
     pub json: bool,
 }
@@ -943,7 +892,6 @@ pub async fn run_consult(common: CommonArgs, args: ConsultArgs) -> i32 {
     let session_capacity = config.defaults.session_capacity;
     let inline_budget = config.defaults.inline_attach_budget;
     let call_deadline = config.defaults.call_deadline;
-    let default_explorer_turns = config.defaults.explorer_max_turns;
     let default_synth_turns = config.defaults.synth_max_turns;
     let sandbox = config.sandbox.clone();
     let resolver = match Resolver::from_config(Arc::new(config)) {
@@ -962,7 +910,6 @@ pub async fn run_consult(common: CommonArgs, args: ConsultArgs) -> i32 {
         &resolver,
         inline_budget,
         call_deadline,
-        default_explorer_turns,
         default_synth_turns,
         &sandbox,
         &persistence,
@@ -1025,7 +972,6 @@ async fn resolve_and_run(
     resolver: &Resolver,
     inline_budget: usize,
     call_deadline: std::time::Duration,
-    default_explorer_turns: usize,
     default_synth_turns: usize,
     sandbox: &crate::sandbox::SandboxConfig,
     persistence: &crate::config::PersistenceConfig,
@@ -1046,26 +992,12 @@ async fn resolve_and_run(
     resolver
         .apply_model_override(
             &mut cast,
-            ModelRole::Explorer,
-            args.explorer_model.as_deref(),
-            args.explorer_backend.as_deref(),
-            "explorer_model",
-            "explorer_backend",
-        )
-        .map_err(SetupError::usage)?;
-    resolver
-        .apply_model_override(
-            &mut cast,
             ModelRole::Synth,
             args.synth_model.as_deref(),
             args.synth_backend.as_deref(),
             "synth_model",
             "synth_backend",
         )
-        .map_err(SetupError::usage)?;
-    // A solo cast (`consult = "solo"`, or no explorer slot) runs single-stage.
-    let explorer = resolver
-        .consult_explorer_arm(&cast, args.explorer_model.as_deref(), "--explorer-model")
         .map_err(SetupError::usage)?;
     let synth = resolver
         .arm(&cast, ModelRole::Synth)
@@ -1096,28 +1028,20 @@ async fn resolve_and_run(
     };
 
     let cfg = ConsultConfig {
-        explore: ExploreConfig {
-            phase: PhaseContext {
-                progress: Arc::new(TerminalSink),
-                house_rules: resolver.house_rules(&root).map_err(SetupError::setup)?,
-                prompts: resolver.resolved_prompts(&cast),
-                orientation: resolver
-                    .orientation(&root)
-                    .await
-                    .map_err(SetupError::setup)?,
-                call_deadline,
-            },
-            explorer_max_turns: default_explorer_turns,
-            sandbox: sandbox.clone(),
-            max_attachments: resolver.config.defaults.max_attachments,
-            web: resolver
-                .web_if_asked(
-                    args.web,
-                    "consult",
-                    crate::consult::Arm::all_native(explorer.iter().chain([&synth])),
-                )
+        phase: PhaseContext {
+            progress: Arc::new(TerminalSink),
+            house_rules: resolver.house_rules(&root).map_err(SetupError::setup)?,
+            prompts: resolver.resolved_prompts(&cast),
+            orientation: resolver
+                .orientation(&root)
+                .await
                 .map_err(SetupError::setup)?,
+            call_deadline,
         },
+        sandbox: sandbox.clone(),
+        web: resolver
+            .web_if_asked(args.web, "consult", synth.has_native_web())
+            .map_err(SetupError::setup)?,
         synth_max_turns: default_synth_turns,
         attachments,
         // No client key on this front door (see `load_config`), so no sink and no
@@ -1129,7 +1053,6 @@ async fn resolve_and_run(
         &args.question,
         args.context.as_deref(),
         root,
-        explorer.as_ref(),
         &synth,
         &cfg,
         session,
@@ -1137,14 +1060,12 @@ async fn resolve_and_run(
     .await
     {
         Ok(out) => {
-            let explorer_model = explorer.as_ref().map(|a| a.model.as_str());
             emit_answer(
                 args,
                 &out,
                 &cast.name,
-                explorer_model,
                 &synth.model,
-                cfg.explore.web.as_deref(),
+                cfg.web.as_deref(),
             );
             Ok(EXIT_OK)
         }
@@ -1199,12 +1120,11 @@ fn emit_answer(
     args: &ConsultArgs,
     out: &ConsultOutput,
     cast: &str,
-    explorer_model: Option<&str>,
     synth_model: &str,
     web: Option<&WebSession>,
 ) {
     if args.json {
-        let mut env = consult_envelope(out, cast, explorer_model, synth_model, args.include_report);
+        let mut env = consult_envelope(out, cast, synth_model);
         if let Some(web) = web {
             env["web"] = web_json(web);
         }
@@ -1215,22 +1135,17 @@ fn emit_answer(
         with_provenance(
             with_web_sources(out.answer.clone(), web),
             cast,
-            &consult_models(explorer_model, synth_model),
+            &[("synth", synth_model)],
             &out.usage,
         ),
         web,
     );
-    println!("{answer}");
+    println!("{}{answer}", consult_header(cast));
     // Non-fatal warnings (a failed session record) go to STDERR, never stdout — stdout
     // stays the model's answer, clean for a pipe. (`--json` carries them structured
     // instead; see `consult_envelope`.)
     for w in &out.warnings {
         eprintln!("kaibo: {w}");
-    }
-    // The report is opt-in extra; keep it off stdout's answer line — send it to stderr
-    // so a pipe still captures just the answer.
-    if args.include_report && !out.report.is_empty() {
-        eprintln!("\n--- explorer report ---\n{}", out.report);
     }
 }
 
@@ -1248,30 +1163,19 @@ fn usage_json(usage: &Usage) -> serde_json::Value {
 
 /// The `--json` success envelope: the raw answer (no footer), provenance, and usage —
 /// a stable shape for a script. Pure, so it's unit-testable without a model.
-fn consult_envelope(
-    out: &ConsultOutput,
-    cast: &str,
-    explorer_model: Option<&str>,
-    synth_model: &str,
-    include_report: bool,
-) -> serde_json::Value {
-    let mut env = serde_json::json!({
+fn consult_envelope(out: &ConsultOutput, cast: &str, synth_model: &str) -> serde_json::Value {
+    serde_json::json!({
         // The raw model answer — no footer, no injected notices. A machine consumer
         // (`jq -r .answer`) gets the model's words uncorrupted; kaibo's own non-fatal
         // notices ride the separate `warnings` array below.
         "answer": out.answer,
         "cast": cast,
-        // `explorer` is null when the cast ran single-stage, so the key is always there.
-        "models": { "explorer": explorer_model, "synth": synth_model },
+        "models": { "synth": synth_model },
         "usage": usage_json(&out.usage),
         // Non-fatal notices about this turn (e.g. a failed session record). Always
         // present (empty when the turn was clean) so a consumer can rely on the key.
         "warnings": out.warnings,
-    });
-    if include_report {
-        env["report"] = serde_json::Value::String(out.report.clone());
-    }
-    env
+    })
 }
 
 /// A web session as a stable JSON object: the provider, the request counts, and each
@@ -1522,122 +1426,7 @@ async fn oneshot_inner(
     }
 }
 
-// ---------------------------------------------------------------------------
-// explore
-// ---------------------------------------------------------------------------
-
-/// Run `kaibo explore` — a cited survey report. Same conventions as consult; the
-/// payload is the report (`report` field under `--json`).
-pub async fn run_explore(common: CommonArgs, args: ExploreArgs) -> i32 {
-    init_cli_logging();
-    let config = match load_config(&common) {
-        Ok(c) => c,
-        Err(e) => {
-            return fail_preflight(
-                args.json,
-                "config",
-                format!("config error: {e:#}"),
-                EXIT_USAGE,
-            )
-        }
-    };
-    let resolver = match Resolver::from_config(Arc::new(config)) {
-        Ok(r) => r,
-        Err(e) => return fail_preflight(args.json, "setup", format!("{e:#}"), EXIT_SETUP),
-    };
-    match explore_inner(&common, &args, &resolver).await {
-        Ok(code) => code,
-        Err(SetupError {
-            kind,
-            message,
-            code,
-        }) => fail_preflight(args.json, kind, message, code),
-    }
-}
-
-async fn explore_inner(
-    common: &CommonArgs,
-    args: &ExploreArgs,
-    resolver: &Resolver,
-) -> Result<i32, SetupError> {
-    let root = resolver
-        .resolve_root(args.path.clone())
-        .map_err(SetupError::setup)?;
-    // NO require_interactive_cast: explore runs the *explorer* arm, so a deliberate/direct
-    // cast's explorer is valid; it needs only an explorer slot (resolved next).
-    let mut cast = resolver
-        .resolve_cast(common.cast.clone())
-        .map_err(SetupError::usage)?;
-    resolver
-        .apply_model_override(
-            &mut cast,
-            ModelRole::Explorer,
-            args.explorer_model.as_deref(),
-            args.explorer_backend.as_deref(),
-            "explorer_model",
-            "explorer_backend",
-        )
-        .map_err(SetupError::usage)?;
-    let explorer = resolver
-        .arm(&cast, ModelRole::Explorer)
-        .map_err(SetupError::setup)?;
-    let attachments = resolver
-        .resolve_sweep_attachments(&root, &args.attach, "explore")
-        .await
-        .map_err(SetupError::setup)?;
-    let cfg = ExploreConfig {
-        phase: PhaseContext {
-            progress: Arc::new(TerminalSink),
-            house_rules: resolver.house_rules(&root).map_err(SetupError::setup)?,
-            prompts: resolver.resolved_prompts(&cast),
-            orientation: resolver
-                .orientation(&root)
-                .await
-                .map_err(SetupError::setup)?,
-            call_deadline: resolver.config.defaults.call_deadline,
-        },
-        explorer_max_turns: resolver.config.defaults.explorer_max_turns,
-        sandbox: resolver.config.sandbox.clone(),
-        max_attachments: resolver.config.defaults.max_attachments,
-        web: None,
-    };
-    // `kaibo explore` prints the report to stdout — the person or script reading it is
-    // the only reader there is.
-    match explore_with(
-        &args.question,
-        root,
-        &explorer,
-        &cfg,
-        &attachments,
-        None,
-        ReportReader::CallingAgent,
-    )
-    .await
-    {
-        Ok((report, usage)) => {
-            if args.json {
-                println!(
-                    "{}",
-                    serde_json::json!({
-                        "report": report,
-                        "cast": cast.name,
-                        "model": explorer.model,
-                        "usage": usage_json(&usage),
-                    })
-                );
-            } else {
-                println!(
-                    "{}",
-                    with_provenance(report, &cast.name, &[("explorer", &explorer.model)], &usage)
-                );
-            }
-            Ok(EXIT_OK)
-        }
-        Err(e) => Ok(fail_consultation(args.json, "explore", &cast.name, e)),
-    }
-}
-
-/// Run `kaibo research` — a URL-cited web report. Same conventions as explore; the
+/// Run `kaibo research` — a URL-cited web report. Same conventions as consult; the
 /// payload is the report (`report` field under `--json`, with `web` beside it).
 pub async fn run_research(common: CommonArgs, args: ResearchArgs) -> i32 {
     init_cli_logging();
@@ -1676,7 +1465,7 @@ async fn research_inner(
         .map_err(SetupError::usage)?;
     // The same slot choice as the MCP tool: the explorer when the cast has one, else an
     // interactive synth.
-    let (role, label) = if resolver.config.cast_can_explore(&cast.name) {
+    let (role, label) = if resolver.config.cast_has_explorer(&cast.name) {
         (ModelRole::Explorer, "explorer")
     } else {
         resolver
@@ -1688,7 +1477,7 @@ async fn research_inner(
     let web = resolver
         .web_session(
             "research",
-            "Use `kaibo consult` or `kaibo explore` to answer from the project instead.",
+            "Use `kaibo consult` to answer from the project instead.",
             arm.has_native_web(),
         )
         .map_err(SetupError::setup)?;
@@ -1888,7 +1677,7 @@ async fn deliberate_inner(
             .map_err(SetupError::setup)?;
         let explorer_model = explorer.model.clone();
         let attachments = resolver
-            .resolve_sweep_attachments(&root, &args.attach, "deliberate")
+            .resolve_sweep_attachments(&root, &args.attach)
             .await
             .map_err(SetupError::setup)?;
         let cfg = ExploreConfig {
@@ -1928,7 +1717,6 @@ async fn deliberate_inner(
             })?;
         let synth_caps = ModelCaps::resolve(synth_backend.kind, &synth_slot.id, synth_slot.vision);
         let consumer = SweepConsumer {
-            kind: SweepConsumerKind::OfflineSynth,
             label: Arc::from(format!(
                 "the offline synth (`{}`) on cast `{}`",
                 synth_slot.id, cast.name
@@ -1938,8 +1726,7 @@ async fn deliberate_inner(
         let sink = (resolver.config.defaults.max_attachments > 0).then(|| {
             Arc::new(SweepAttachSink::new(
                 resolver.config.defaults.max_attachments,
-                consumer.clone(),
-                std::collections::HashSet::new(),
+                consumer,
             ))
         });
         let (mut dossier, usage) = match explore_with(
@@ -1949,8 +1736,6 @@ async fn deliberate_inner(
             &cfg,
             &attachments,
             sink.as_ref(),
-            // The dossier is written for the offline synth that reasons over it.
-            ReportReader::SynthesisAgent,
         )
         .await
         {
@@ -1966,7 +1751,6 @@ async fn deliberate_inner(
         }
         let (images, kept) = crate::server::stitch_and_keep(
             &mut dossier,
-            &consumer,
             sink.as_ref(),
             media.as_ref(),
             &args.question,
@@ -3839,7 +3623,6 @@ mod tests {
     fn out_with(answer: &str, warnings: Vec<String>) -> ConsultOutput {
         ConsultOutput {
             answer: answer.to_string(),
-            report: "the report".to_string(),
             usage: rig_core::completion::Usage::new()
                 .input_tokens(10)
                 .output_tokens(20),
@@ -3850,26 +3633,19 @@ mod tests {
     #[test]
     fn consult_envelope_carries_answer_provenance_usage_and_warnings() {
         let out = out_with("the answer", vec![]);
-        let env = consult_envelope(&out, "deepseek", Some("explorer-m"), "synth-m", false);
+        let env = consult_envelope(&out, "deepseek", "synth-m");
         assert_eq!(env["answer"], "the answer");
         assert_eq!(env["cast"], "deepseek");
-        assert_eq!(env["models"]["explorer"], "explorer-m");
-        assert_eq!(env["models"]["synth"], "synth-m");
+        assert_eq!(env["models"], serde_json::json!({ "synth": "synth-m" }));
         assert_eq!(env["usage"]["input_tokens"], 10);
         assert_eq!(env["usage"]["output_tokens"], 20);
         // `warnings` is always present (empty when the turn was clean) so a consumer
         // can rely on the key.
         assert_eq!(env["warnings"], serde_json::json!([]));
-        // The report is omitted unless requested.
-        assert!(env.get("report").is_none(), "report is opt-in");
-
-        let with_report = consult_envelope(&out, "deepseek", Some("e"), "s", true);
-        assert_eq!(with_report["report"], "the report");
-
-        // Single-stage: the explorer key stays, as null, so a consumer can rely on it.
-        let solo = consult_envelope(&out, "deepseek", None, "s", false);
-        assert_eq!(solo["models"]["explorer"], serde_json::Value::Null);
-        assert_eq!(solo["models"]["synth"], "s");
+        assert!(
+            env.get("report").is_none(),
+            "consult has no report to carry"
+        );
     }
 
     /// A record-failure warning rides the `warnings` array — NOT the `answer` field, which
@@ -3880,7 +3656,7 @@ mod tests {
             "clean model words",
             vec!["⚠️ Session turn NOT recorded (persistence error: disk full).".to_string()],
         );
-        let env = consult_envelope(&out, "deepseek", Some("e"), "s", false);
+        let env = consult_envelope(&out, "deepseek", "s");
         assert_eq!(
             env["answer"], "clean model words",
             "the answer field must be the model's raw words, no injected notices"
@@ -3941,7 +3717,6 @@ mod tests {
         config.root = Some(dir.path().to_path_buf());
         let inline_budget = config.defaults.inline_attach_budget;
         let call_deadline = config.defaults.call_deadline;
-        let et = config.defaults.explorer_max_turns;
         let st = config.defaults.synth_max_turns;
         let sandbox = config.sandbox.clone();
         let persistence = config.persistence.clone();
@@ -3970,7 +3745,6 @@ mod tests {
             &resolver,
             inline_budget,
             call_deadline,
-            et,
             st,
             &sandbox,
             &persistence,
@@ -3987,68 +3761,10 @@ mod tests {
         assert_eq!(error_envelope(err.kind, &err.message)["kind"], "usage");
     }
 
-    /// `--explorer-model` on a cast with `consult = "solo"` (the built-in `anthropic`)
-    /// is a usage error (exit 2) naming the refusal, raised before any key is resolved.
-    /// This ties the CLI call site to `Resolver::consult_explorer_arm`: reverting it to
-    /// `optional_arm` resolves the explorer and fails this test. The server's `consult`
-    /// and `consult_submit` sites have no arm-injection seam (they build arms with
-    /// `Arm::from_slot` on the real client), so only `consult_explorer_arm` itself is
-    /// tested there.
-    #[tokio::test]
-    async fn explorer_model_on_a_solo_cast_is_a_usage_error_exit_2() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut config = Config::builtin();
-        config.root = Some(dir.path().to_path_buf());
-        let inline_budget = config.defaults.inline_attach_budget;
-        let call_deadline = config.defaults.call_deadline;
-        let et = config.defaults.explorer_max_turns;
-        let st = config.defaults.synth_max_turns;
-        let sandbox = config.sandbox.clone();
-        let persistence = config.persistence.clone();
-        let cap = config.defaults.session_capacity;
-        let resolver = Resolver::from_config(Arc::new(config)).unwrap();
-
-        let cli = Cli::parse_from([
-            "kaibo",
-            "consult",
-            "q",
-            "--cast",
-            "anthropic",
-            "--explorer-model",
-            "x",
-            "--json",
-        ]);
-        let common = cli.common.clone();
-        let args = match cli.command {
-            Some(Command::Consult(c)) => c,
-            _ => unreachable!("parsed a consult subcommand"),
-        };
-
-        let err = resolve_and_run(
-            &common,
-            &args,
-            &resolver,
-            inline_budget,
-            call_deadline,
-            et,
-            st,
-            &sandbox,
-            &persistence,
-            cap,
-        )
-        .await
-        .expect_err("an explorer override on a solo cast must be refused");
-        assert_eq!(err.code, EXIT_USAGE);
-        assert_eq!(err.kind, "usage");
-        for needle in ["--explorer-model", "consult = \"solo\"", "`explore`"] {
-            assert!(err.message.contains(needle), "{needle}: {}", err.message);
-        }
-    }
-
     // --- stage 2 subcommands -------------------------------------------------
 
     #[test]
-    fn oneshot_explore_kaish_batch_subcommands_route() {
+    fn oneshot_research_kaish_batch_subcommands_route() {
         // A global (--cast) before the subcommand still lands on cli.common.
         let cli = Cli::parse_from(["kaibo", "--cast", "gemini", "oneshot", "second opinion?"]);
         assert_eq!(cli.common.cast.as_deref(), Some("gemini"));
@@ -4058,15 +3774,6 @@ mod tests {
                 assert!(!o.json);
             }
             other => panic!("expected oneshot, got {other:?}"),
-        }
-
-        let cli = Cli::parse_from(["kaibo", "explore", "map the sandbox", "--json"]);
-        match cli.command {
-            Some(Command::Explore(e)) => {
-                assert_eq!(e.question, "map the sandbox");
-                assert!(e.json);
-            }
-            other => panic!("expected explore, got {other:?}"),
         }
 
         let cli = Cli::parse_from([

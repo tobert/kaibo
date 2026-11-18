@@ -11,32 +11,8 @@
 use rig_core::completion::Usage;
 use rmcp::model::{CallToolResult, ContentBlock, LoggingLevel};
 use rmcp::ErrorData as McpError;
-use serde_json::json;
 
 use crate::jobs::{JobSnapshot, JobState, JobStore};
-
-/// Assemble the `consult` tool result. The answer is always the text content
-/// (unchanged from a bare consult). The explorer's aggregated report — the
-/// `explore′` sweeps the driver delegated — rides along as `structured_content`
-/// only when the caller set `include_report`, keeping a normal call lean. When
-/// requested it is surfaced even if empty: an empty report is the honest signal
-/// that the consult read every span itself and delegated no sweep, which is
-/// distinct from the caller not asking at all. Pure and offline-testable.
-///
-/// Text-only on purpose: a sweep-routed image (`attach` in `src/sweep_attach.rs`)
-/// is consumed by the *driver* inside its tool loop — it never reaches the final
-/// MCP result, which stays a cited text answer.
-pub(super) fn consult_result(
-    answer: String,
-    report: String,
-    include_report: bool,
-) -> CallToolResult {
-    let mut result = CallToolResult::success(vec![ContentBlock::text(answer)]);
-    if include_report {
-        result.structured_content = Some(json!({ "report": report }));
-    }
-    result
-}
 
 /// How a runtime consultation failure should be framed to the calling agent — derived
 /// from the error chain by [`classify_failure`].
@@ -215,24 +191,37 @@ pub(crate) fn consultation_failure_text_with_artifacts(
 /// The final answer text for a completed consult, composed once for both lanes.
 ///
 /// Order is the contract, and it is why this is a function rather than two call sites:
-/// the model's answer, then any non-fatal warnings (a failed session record — kept out of
-/// the answer body so a machine consumer gets the model's words uncorrupted), then this
-/// call's artifact footer, then the provenance line naming the cast and models. The sync
-/// `consult` and the deferred `consult_submit` must produce the same shape, and a lane
-/// that quietly dropped the footer would strand durably-written artifacts.
+/// the attribution header ([`consult_header`]), the model's answer, then any non-fatal
+/// warnings (a failed session record — kept out of the answer body so a machine consumer
+/// gets the model's words uncorrupted), then this call's artifact footer, then the
+/// provenance line naming the cast and model. The sync `consult` and the deferred
+/// `consult_submit` must produce the same shape, and a lane that quietly dropped the
+/// footer would strand durably-written artifacts.
 pub(crate) fn consult_answer_text(
     answer: String,
     warnings: &[String],
     sink: Option<&crate::artifact::ArtifactSink>,
     cast: &str,
-    models: &[(&str, &str)],
+    synth_model: &str,
     usage: &rig_core::completion::Usage,
     web: Option<&crate::web::WebSession>,
 ) -> String {
     let with_sources = with_web_sources(answer, web);
     let with_warnings = append_warnings(with_sources, warnings);
     let with_footer = crate::artifact::with_artifacts(with_warnings, sink);
-    with_web_usage(with_provenance(with_footer, cast, models, usage), web)
+    let with_provenance = with_provenance(with_footer, cast, &[("synth", synth_model)], usage);
+    format!(
+        "{}{}",
+        consult_header(cast),
+        with_web_usage(with_provenance, web)
+    )
+}
+
+/// The line kaibo puts above every `consult` answer, naming who prepared it. The calling
+/// agent may quote or forward part of the answer; the header travels at the top, where
+/// the provenance footer at the bottom is the first thing a cut drops.
+pub(crate) fn consult_header(cast: &str) -> String {
+    format!("The following report was prepared by kaibo/{cast}.\n\n")
 }
 
 /// Append the call's sources (the pages kaibo's record says the team fetched) right
@@ -364,14 +353,7 @@ pub(super) fn render_job(id: &str, snap: JobSnapshot) -> CallToolResult {
             snap.age.as_secs(),
             running_beat(&snap.last_progress, &snap.chat),
         ))]),
-        JobState::Done(result) => {
-            let include_report = result.report.is_some();
-            consult_result(
-                result.answer,
-                result.report.unwrap_or_default(),
-                include_report,
-            )
-        }
+        JobState::Done(result) => CallToolResult::success(vec![ContentBlock::text(result.answer)]),
         JobState::Failed(text) => CallToolResult::error(vec![ContentBlock::text(text)]),
         JobState::Canceled => CallToolResult::success(vec![ContentBlock::text(format!(
             "Job `{id}` was canceled."
@@ -572,22 +554,8 @@ pub(crate) fn append_warnings(mut answer: String, warnings: &[String]) -> String
     answer
 }
 
-/// The provenance roles for a `consult`: explorer then synth, or the synth alone when
-/// the cast ran single-stage with no explorer. Shared by both MCP lanes and the CLI so
-/// the footer names exactly the models that ran.
-pub(crate) fn consult_models<'a>(
-    explorer: Option<&'a str>,
-    synth: &'a str,
-) -> Vec<(&'static str, &'a str)> {
-    explorer
-        .map(|e| ("explorer", e))
-        .into_iter()
-        .chain([("synth", synth)])
-        .collect()
-}
-
 /// Append a provenance footer naming the cast and model(s) that produced `answer`.
-/// `roles` labels each model: one for `oneshot`, [`consult_models`] for `consult`.
+/// `roles` labels each model.
 pub(crate) fn with_provenance(
     answer: String,
     cast: &str,
@@ -1017,7 +985,8 @@ mod tests {
     /// **Both consult lanes compose the same answer.** The sync tool and the deferred job
     /// used to build their final text separately, which is exactly how one of them ends up
     /// dropping the artifact footer and stranding durably-written content. One function,
-    /// one order: answer, then warnings, then artifacts, then provenance.
+    /// one order: the attribution header, the answer, then warnings, then artifacts,
+    /// then provenance.
     #[test]
     fn the_shared_answer_render_orders_answer_warnings_artifacts_then_provenance() {
         let sink = populated_sink();
@@ -1027,9 +996,13 @@ mod tests {
             &["a warning".to_string()],
             Some(&sink),
             "deepseek",
-            &[("synth", "deepseek-flash")],
+            "deepseek-flash",
             &rig_core::completion::Usage::new(),
             None,
+        );
+        assert!(
+            text.starts_with("The following report was prepared by kaibo/deepseek.\n\n"),
+            "the attribution header leads, naming the cast: {text}"
         );
         let at = |needle: &str| {
             text.find(needle)
@@ -1043,6 +1016,10 @@ mod tests {
         assert!(
             at(&format!("kaibo://cas/{digest}")) < at("deepseek-flash"),
             "and the provenance line last: {text}"
+        );
+        assert!(
+            text.contains("synth `deepseek-flash`") && !text.contains("explorer"),
+            "the footer names the synth alone: {text}"
         );
     }
 
@@ -1306,20 +1283,6 @@ mod tests {
         );
     }
 
-    /// A solo consult resolves no explorer, so its footer names the synth alone: the
-    /// explorer model never answered and is not listed.
-    #[test]
-    fn a_solo_consult_footer_names_only_the_synth() {
-        let out = with_provenance(
-            "a".into(),
-            "anthropic",
-            &consult_models(None, "claude-sonnet-5-5"),
-            &Usage::new(),
-        );
-        assert!(out.contains("synth `claude-sonnet-5-5`"), "{out}");
-        assert!(!out.contains("explorer"), "{out}");
-    }
-
     /// Provenance footer: the answer keeps its text, and the cast plus every labelled
     /// model is appended so a caller (a cross-model study most of all) sees which model
     /// produced the answer without cross-referencing `kaibo://config`.
@@ -1401,48 +1364,5 @@ mod tests {
             out.contains("tokens · 48170 in · 3102 out"),
             "footer carries the tokens line: {out}"
         );
-    }
-
-    /// Default path: no report requested ⇒ the answer is the whole result and no
-    /// structured content rides along (a lean call, byte-for-byte its pre-flag shape).
-    #[test]
-    fn consult_result_omits_report_unless_requested() {
-        let result = consult_result("the answer".into(), "FILE:1 evidence".into(), false);
-        assert_eq!(answer_text(&result), "the answer");
-        assert!(
-            result.structured_content.is_none(),
-            "report must not leak into a default call: {:?}",
-            result.structured_content
-        );
-    }
-
-    /// Opt-in: the report is surfaced as structured_content under `report`, while the
-    /// answer stays the text channel — the report rides *separately*, not duplicated
-    /// into the answer the model reads.
-    #[test]
-    fn consult_result_attaches_report_when_requested() {
-        let result = consult_result("ans".into(), "src/x.rs:1 the snippet".into(), true);
-        assert_eq!(answer_text(&result), "ans", "answer stays the text channel");
-        assert!(
-            !answer_text(&result).contains("the snippet"),
-            "report must not be folded into the answer text"
-        );
-        let sc = result.structured_content.expect("report was requested");
-        assert_eq!(
-            sc["report"], "src/x.rs:1 the snippet",
-            "report rides under `report`"
-        );
-    }
-
-    /// Opt-in with an empty report (the consult delegated no sweep): still surfaced.
-    /// Emptiness is the signal — present-but-empty means "asked, no sweep happened",
-    /// which a caller must be able to tell apart from "never asked" (None).
-    #[test]
-    fn consult_result_surfaces_empty_report_when_requested() {
-        let result = consult_result("ans".into(), String::new(), true);
-        let sc = result
-            .structured_content
-            .expect("requested even when empty");
-        assert_eq!(sc["report"], "", "an empty report is surfaced honestly");
     }
 }

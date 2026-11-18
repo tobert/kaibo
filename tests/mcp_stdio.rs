@@ -48,7 +48,7 @@ const CALL_TIMEOUT: Duration = Duration::from_secs(60);
 ///
 /// This is a *stock* install with no credentials at all: the built-in `openai-local`
 /// backend needs no key, so the casts it staffs keep `consult` / `consult_submit` /
-/// `explore` / `oneshot` (and the job verbs that collect `consult_submit`'s handles)
+/// `oneshot` (and the job verbs that collect `consult_submit`'s handles)
 /// advertised — kaibo does not check that a local server is actually listening, only
 /// that a cast can be staffed. `run_kaish`, `list_models`, and `read_cas` need no cast
 /// at all — and neither do the media store's two halves, `read_cas` and `write_cas`:
@@ -60,7 +60,6 @@ const CALL_TIMEOUT: Duration = Duration::from_secs(60);
 const KEYLESS_TOOLS: &[&str] = &[
     "consult",
     "consult_submit",
-    "explore",
     "job_cancel",
     "job_get",
     "job_list",
@@ -484,7 +483,10 @@ async fn every_tool_declares_additive_changes_and_none_claims_read_only() {
             read_only.push(t.name.to_string());
         }
     }
-    assert!(missing.is_empty(), "no destructiveHint:false on {missing:?}");
+    assert!(
+        missing.is_empty(),
+        "no destructiveHint:false on {missing:?}"
+    );
     assert!(read_only.is_empty(), "readOnlyHint:true on {read_only:?}");
 
     server.shutdown().await;

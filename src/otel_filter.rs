@@ -138,8 +138,7 @@ pub const SAFE_ATTRIBUTES: &[&str] = &[
     "media",
     // The configured backend a `job_list` sweep is reading, by name.
     "backend",
-    // Loop shape: how many turns, how many delegations. The numbers that answer
-    // "did the driver actually delegate", with no payload.
+    // Loop shape: how many turns, with no payload.
     "turns",
     "turn",
     "max_turns",

@@ -25,19 +25,19 @@ see the read-only invariant.
 (`consult.rs`): a model + preamble + an *injected toolset*, run as a bounded tool
 loop. Each consultation tool is that loop wearing different clothes:
 
-- **`consult`** — the synthesis agent with `{run_kaish, explore′}` + optional caller
-  `context`: it reads precise spans directly and delegates broad sweeps to a cheap
-  explorer sub-agent, then answers. No rigid explorer→synth hand-off; the model
-  chooses. Supplied context is trusted starting evidence — it investigates for
-  *more*, not to re-verify. The `explore′` sweep (`report_preamble`) lives *inside*
-  this loop now; it is not a standalone tool.
+- **`consult`** — the synthesis agent with `{run_kaish}` + optional caller `context`:
+  one model reads the project itself (the `[orientation]` file map in its preamble
+  gives it the layout up front), then answers. Supplied context is trusted starting
+  evidence — it investigates for *more*, not to re-verify. The explorer phase
+  (`report_preamble`) survives only for `deliberate`'s dossier and `research`.
 - **`oneshot`** — the synthesis agent with **no tools**: the caller owns the context, so
   it's one upstream request, prompt in / answer out, no codebase access. The thin
   counterpart to `consult` — and the door to a model outside the caller's family.
 - **`run_kaish`** — drive the read-only kaish shell directly, no model in the loop.
 
-Both model-driven tools name their cast + answering model(s) in a provenance footer
-(`with_provenance` in `server.rs`), so a cross-model study sees which model answered.
+Both model-driven tools name their cast + answering model in a provenance footer
+(`with_provenance` in `server/render.rs`), so a cross-model study sees which model
+answered; `consult` also puts a header line above the answer naming `kaibo/<cast>`.
 
 A `--no-<tool>` capability flag per tool gates the surface (all on by default; `consult` also
 gates `consult_submit`, `batch` gates `batch_submit`, `generate` additionally needs the
@@ -53,7 +53,7 @@ endpoint). A **`[backends.<name>]`**
 so two `openai` backends (hosted GPT and a local Gemma/llama.cpp server, say) can be
 live at once. A **`[casts.<name>]`** is a model team mapping each reasoning role
 (`explorer` / `synth`, with a `vision` pin where a slot reads images) to a
-`"backend/model-id"`, freely cross-backend, so one cast can pair a cheap local explorer
+`"backend/model-id"`, freely cross-backend, so one cast can pair a local explorer
 with a hosted synth; a call picks its team with the `cast` arg. Backends and casts come from a built-in registry merged under an XDG
 `config.toml`, `KAIBO_*` env, then CLI flags (precedence: per-call > CLI > env > file >
 built-in); a missing config file is a non-error. See `docs/config.md`, and
@@ -176,7 +176,7 @@ surface rule in the invariants).
   gives the battery nothing new to find.
 - **Model loops are tested offline.** A scripted `ModelSource` in
   `src/test_support.rs` (`#[cfg(test)]`) — rig's `MockScript` wire over our own `Transport` — drives the *real* consult loop with no
-  network — delegation→report aggregation, session replay, turn-cap recovery. It's
+  network — the synth's reads, session replay, turn-cap recovery. It's
   **content-driven, not consumption-ordered**: a responder branches on the inbound
   `CompletionRequest` (preamble, transcript, `tool_choice`) keyed by model id, the way
   a real model reads the whole request each call. That's deliberate — rig can run a
@@ -408,9 +408,11 @@ collision appears in real prose, not in advance.
 | arm | noun | A resolved slot: a built client plus the request shape for that model. The one live construction point is `Arm::from_slot`. |
 | lane | noun | How a synth is driven: `interactive`, `batch` (a provider's offline queue), or `direct` (a big local model kaibo runs itself). |
 | phase | noun | One model, one preamble, one injected toolset, run as a bounded tool loop. `run_phase` is the primitive. |
-| survey | noun | One explorer investigation pass, ending in a cited report. `explore` runs one; `consult` delegates one; `deliberate` builds a dossier from one. **The published name.** |
+| survey | noun | One explorer investigation pass, ending in a cited report. `deliberate` builds its dossier from one. **The published name.** |
 | sweep | noun | The same thing in code — module names, identifiers, comments. Not published. Retiring from published prose, not yet finished; `docs/` is converted, the preambles, tool descriptions, and CLI help are not. As a plain verb ("omit `backend` to sweep every configured backend") it is ordinary English and stays. |
 | dossier | noun | The cited evidence an offline synth reasons over in `deliberate`, gathered by an explorer beforehand. |
+| client agent | noun | The agent that called kaibo (Codex, Claude, a local agent) and acts on what kaibo returns. Preambles name it on first mention, then say "that agent" where nothing else could be meant. Not "the caller" in a preamble. |
+| explorer agent | noun | The model in a cast's `explorer` slot, in a preamble's own voice: it builds `deliberate`'s dossier and runs `research`. Code and config say `explorer`. |
 | family | noun | A model lineage from one vendor, as in "a model outside your own family". About forty uses, one sense. Use it; do not paraphrase it. |
 | allowed set | noun | The canonicalized trees a call's path must resolve into — `--root`, each `--allow-path`, and any followed worktree. The read boundary. |
 | published | adjective | Text kaibo sends to a model: a tool `description`, a schema param doc, a clap arg doc, a help topic, an error string. Everything else is internal. |
@@ -463,8 +465,8 @@ How kaibo talks to LLMs — project defaults, made local so any agent here inher
 - **Trust grounded evidence; steer toward acquisition, not verification.** When a
   phase is handed context (an explorer report, a prior turn, pasted source), frame
   a grounded `file:line` as *trusted* — the explorer read the real span and is
-  rewarded for accurate cites, so a capable synth re-deriving it just burns the
-  turn budget the cheap-explorer → capable-synth split exists to save. The behavior
+  rewarded for accurate cites, so a synth re-deriving it just burns turns it
+  could spend reasoning. The behavior
   to install is *get more when the context isn't enough* (an unquoted span, a whole
   file or large chunk for the full picture, a detail left open, anything the
   question reaches past) — not *re-confirm what's likely right*. This is also the

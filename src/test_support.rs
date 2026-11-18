@@ -5,9 +5,8 @@
 //! is a plain function over it. The live tests exercise that loop against a real
 //! provider; this harness lets us drive the *same* loop deterministically, with no
 //! network — so we can pin behavior the live tests can only observe flakily: that a
-//! `consult` tool call actually drives the nested `explore′` agent and aggregates into
-//! the report, that the turn-cap finalize path produces an answer, that a session's
-//! prior turns reach the next prompt.
+//! `consult` reads through `run_kaish` and answers, that the turn-cap finalize path
+//! produces an answer, that a session's prior turns reach the next prompt.
 //!
 //! ## How it plugs in (rig 0.46)
 //!
@@ -26,7 +25,7 @@
 //! (preamble, chat history, `tool_choice`, …) rather than on "which call number is
 //! this". That matters because rig can execute a turn's tool calls concurrently: a
 //! queue-pop mock ("the Nth call returns the Nth step") would be correct today and
-//! race the day a driver turn emits two `explore` calls or someone bumps tool
+//! race the day a driver turn emits two `run_kaish` calls or someone bumps tool
 //! concurrency. Branching on content is immune to that — and it also handles the
 //! finalize replay for free (`tool_choice == None` ⇒ "answer now"), since the mock
 //! reads the same signal the real model would.
@@ -75,14 +74,14 @@ pub struct RecordedRequest {
     pub model: String,
     /// The agent preamble (role framing) as rig forwarded it.
     pub preamble: Option<String>,
-    /// Names of the tools declared on this request, e.g. `["run_kaish", "explore"]`.
+    /// Names of the tools declared on this request, e.g. `["run_kaish", "view_image"]`.
     pub tool_names: Vec<String>,
     /// Concatenated text of every `User` message in the history (oldest→newest),
     /// joined by newlines — enough to assert a prior turn's Q&A reached the prompt.
     pub user_text: String,
     /// Like `user_text` but *also* including tool-result text — what the model was
     /// actually shown. Use this to assert a prior tool call's output (a `run_kaish`
-    /// result, an `explore′` report) survived into a later turn, e.g. that the forced
+    /// result) survived into a later turn, e.g. that the forced
     /// finalize turn carries the partial work rather than a blank history.
     pub transcript: String,
     /// Provider-specific params (e.g. the thinking toggle) forwarded by `run_phase`.
@@ -91,7 +90,7 @@ pub struct RecordedRequest {
     /// `Some(ToolChoice::None)` marks the forced finalize turn after a turn-cap hit.
     pub tool_choice: Option<ToolChoice>,
     /// The raw chat history rig forwarded, images and all. `transcript`/`user_text`
-    /// only extract `Text` content, so an image (a `view_image`/`explore` tool
+    /// only extract `Text` content, so an image (a `view_image` tool
     /// result, or a user `Image` turn from the break-rewrite path) is invisible to
     /// them — a test that must see whether an image actually reached a request
     /// needs this instead (with the `any_tool_result_image`/`user_image_messages`
@@ -123,8 +122,8 @@ impl RecordedRequest {
 }
 
 /// A scripted provider client. Cheap to clone — clones share one responder table and
-/// one request log, so the model rig hands to the nested `explore′` agent (a clone)
-/// records into the same log and routes through the same responders.
+/// one request log, so every arm built from a clone records into the same log and
+/// routes through the same responders.
 #[derive(Clone)]
 pub struct ScriptedClient {
     responders: Arc<HashMap<String, Responder>>,
@@ -262,10 +261,12 @@ impl Transport<MockScript> for ScriptedRuntime {
             });
             let response = responder(&request)?;
             let document = response.raw.clone();
-            Ok(Opened::new(futures::stream::iter([Ok(MockFrame::Response(
-                Box::new(response),
-            ))]))
-            .with_document(document))
+            Ok(
+                Opened::new(futures::stream::iter([Ok(MockFrame::Response(Box::new(
+                    response,
+                )))]))
+                .with_document(document),
+            )
         })
     }
 }
@@ -512,7 +513,7 @@ pub fn preamble(req: &CompletionRequest) -> Option<String> {
 
 /// Everything the model was shown in user turns — `User` text *and* tool-result
 /// text — oldest→newest, joined by newlines. Use this to detect that a prior tool
-/// call's output (an `explore′` report, a `run_kaish` result) has come back into the
+/// call's output (a `run_kaish` result) has come back into the
 /// loop, since tool results arrive as `UserContent::ToolResult`, not plain text.
 pub fn transcript_text(req: &CompletionRequest) -> String {
     req.chat_history
@@ -556,7 +557,7 @@ pub fn is_finalize_turn(req: &CompletionRequest) -> bool {
 }
 
 /// A [`ProgressSink`](crate::progress::ProgressSink) that records every event, so a
-/// loop test can prove the deep loop (a delegated sweep, a direct `run_kaish` read)
+/// loop test can prove the deep loop (a direct `run_kaish` read)
 /// actually emitted progress. The production sink renders these onto the MCP wire;
 /// here we just capture them and assert.
 #[derive(Debug, Default)]

@@ -1,6 +1,5 @@
 //! The consult tool-loop engine and orchestration.
 
-use std::collections::HashSet;
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -13,19 +12,18 @@ use rig_agent::agent::hook::{
     InvalidToolCallContext, ModelTurnAction, ModelTurnFinished, OutcomeAction, OutcomeEvent,
 };
 use rig_agent::agent::AgentBuilder;
-use rig_agent::run::RequestPatch;
 use rig_agent::completion::PromptError;
-use rig_agent::tool::{DynamicTool, Tool, ToolExecutionError, ToolOutput};
+use rig_agent::run::RequestPatch;
+use rig_agent::tool::{DynamicTool, ToolOutput};
 use rig_core::completion::message::{
-    AssistantContent, DocumentSourceKind, Image, ImageMediaType, MimeType, ToolChoice, ToolResult,
-    ToolResultContent, UserContent,
+    AssistantContent, Image, ImageMediaType, MimeType, ToolChoice, ToolResult, ToolResultContent,
+    UserContent,
 };
 use rig_core::completion::{CacheRetention, CompletionRequest, FinishReason, Message, Usage};
 use rig_core::effect::Answered;
 use rig_core::operation::Completion;
 use rig_core::providers::{anthropic, gemini, openai};
 use rig_core::DynModel;
-use serde::Deserialize;
 use serde_json::{json, Value};
 
 use crate::artifact::SaveArtifact;
@@ -38,7 +36,7 @@ use crate::explorer::RunKaish;
 use crate::progress::{EffortLowered, PhaseEvent, ProgressSink};
 use crate::sandbox::{KaishWorker, SandboxConfig};
 use crate::session::{QaTurn, Sessions};
-use crate::sweep_attach::{SweepAttach, SweepAttachSink, SweepConsumer, SweepConsumerKind};
+use crate::sweep_attach::{SweepAttach, SweepAttachSink};
 use crate::tool_span::traced;
 use crate::view_image::ViewImage;
 
@@ -46,13 +44,12 @@ use super::config::{ConsultConfig, ExploreConfig, PhaseContext, ResearchConfig};
 #[cfg(test)]
 use super::prompts::PromptOverrides;
 use super::prompts::{
-    closing_obligation, consult_user_prompt, consult_web_note, deliberation_prompt, explorer_attach_directive,
-    research_user_prompt, resolve_phase_preamble, sweep_evidence_block, web_directive, Phase,
-    ReportReader,
+    closing_obligation, consult_user_prompt, deliberation_prompt, explorer_attach_directive,
+    research_user_prompt, resolve_phase_preamble, web_directive, Phase,
 };
+use super::shaping::{ModelCaps, ModelShape};
 use crate::web::native::NativeWeb;
 use crate::web::{WebFetch, WebSearch, WebSession};
-use super::shaping::{ModelCaps, ModelShape};
 
 // --- The Arm seam ------------------------------------------------------------
 
@@ -150,7 +147,10 @@ impl rig_core::http_client::HttpMiddleware for AppIdentity {
         headers: &'a mut http::HeaderMap,
     ) -> rig_core::wasm_compat::WasmBoxedFuture<'a, rig_core::http_client::Result<()>> {
         Box::pin(async move {
-            for (name, value) in [("x-openrouter-title", self.title), ("http-referer", self.referer)] {
+            for (name, value) in [
+                ("x-openrouter-title", self.title),
+                ("http-referer", self.referer),
+            ] {
                 headers.insert(
                     http::header::HeaderName::from_static(name),
                     http::HeaderValue::from_static(value),
@@ -235,7 +235,7 @@ pub trait ModelSource {
 }
 
 /// One resolved phase arm: its own model + request params + caps. The unit
-/// `consult`/`oneshot` (and the nested `explore′`) receive — they never learn about
+/// `consult`/`oneshot` (and `deliberate`'s explorer) receive — they never learn about
 /// backends or casts. The server resolves a cast's slots into arms
 /// ([`Arm::from_slot`]); tests inject any [`ModelSource`] (the scripted offline one
 /// included) via [`Arm::new`], which is what keeps the mock harness driving the *real*
@@ -295,7 +295,13 @@ impl Arm {
         caps: ModelCaps,
     ) -> Self {
         let model = model.into();
-        Self::from_model(client.completion_model(&model), model, max_tokens, params, caps)
+        Self::from_model(
+            client.completion_model(&model),
+            model,
+            max_tokens,
+            params,
+            caps,
+        )
     }
 
     /// Wrap a pre-built model as an arm — the seam a provider-specific model
@@ -367,7 +373,12 @@ impl Arm {
         let t = slot.tunables(role, defaults);
         let shape = ModelShape::resolve(backend.kind, &slot.id, t.thinking_style);
         shape.check_effort(&t.effort).map_err(|e| {
-            anyhow!("model {:?} (backend {:?}, {} slot): {e}", slot.id, backend.name, role.key())
+            anyhow!(
+                "model {:?} (backend {:?}, {} slot): {e}",
+                slot.id,
+                backend.name,
+                role.key()
+            )
         })?;
         // Re-assert the budget rule at the single live construction point: config
         // load validates every *configured* slot, but per-call overrides build
@@ -477,14 +488,26 @@ impl Arm {
                     &slot.id,
                     backend.prompt_cache,
                 );
-                Ok(Self::from_model(model, &slot.id, t.max_tokens, params, caps))
+                Ok(Self::from_model(
+                    model,
+                    &slot.id,
+                    t.max_tokens,
+                    params,
+                    caps,
+                ))
             }
             WireKind::DeepSeek => {
                 let key = backend.resolve_key()?;
                 let model = openai::OpenAIConfig::with_key(&deepseek_dialect(), key)
                     .connect(http)
                     .chat(&slot.id);
-                Ok(Self::from_model(Llm::new(model), &slot.id, t.max_tokens, params, caps))
+                Ok(Self::from_model(
+                    Llm::new(model),
+                    &slot.id,
+                    t.max_tokens,
+                    params,
+                    caps,
+                ))
             }
             WireKind::Gemini => {
                 // base_url is optional here (unlike the openai kind): unset dials
@@ -499,7 +522,13 @@ impl Arm {
                     config = config.with_base_url(base_url);
                 }
                 let model = config.connect(http).completion(&slot.id);
-                Ok(Self::from_model(Llm::new(model), &slot.id, t.max_tokens, params, caps))
+                Ok(Self::from_model(
+                    Llm::new(model),
+                    &slot.id,
+                    t.max_tokens,
+                    params,
+                    caps,
+                ))
             }
             WireKind::OpenRouter => {
                 // A keyed gateway with a *fixed* endpoint (rig pins the base URL), so —
@@ -521,7 +550,13 @@ impl Arm {
                         Self::openrouter_completion_model(http, key, &slot.id, backend.prompt_cache)
                     }
                 };
-                Ok(Self::from_model(model, &slot.id, t.max_tokens, params, caps))
+                Ok(Self::from_model(
+                    model,
+                    &slot.id,
+                    t.max_tokens,
+                    params,
+                    caps,
+                ))
             }
             WireKind::Openai => {
                 // Any OpenAI-compatible endpoint, addressed by the backend's base
@@ -659,12 +694,6 @@ impl Arm {
         self.native_web.is_some()
     }
 
-    /// Whether every arm in `arms` has native web tools: the condition for a call to
-    /// need no `[web]` backend key.
-    pub(crate) fn all_native<'a>(arms: impl IntoIterator<Item = &'a Arm>) -> bool {
-        arms.into_iter().all(Arm::has_native_web)
-    }
-
     /// [`run`](Self::run) with a phase's native web tools.
     #[allow(clippy::too_many_arguments)] // `run`'s inputs plus the hook
     pub(crate) async fn run_native(
@@ -749,10 +778,8 @@ impl Arm {
     }
 }
 
-/// The result of a consult: the final answer, the explorer's report (kept so
-/// callers can inspect/debug the hand-off, and for future session storage), the
-/// token [`Usage`] the whole consult reported — the synth loop plus every delegated
-/// `explore′` sweep, summed. Zero-valued when no provider reported usage (the
+/// The result of a consult: the final answer and the token [`Usage`] the synth loop
+/// reported. Zero-valued when no provider reported usage (the
 /// existing "unknown" sentinel), so a footer can tell "cost this much" from "the
 /// backend told us nothing".
 ///
@@ -767,7 +794,6 @@ impl Arm {
 #[derive(Debug, Clone)]
 pub struct ConsultOutput {
     pub answer: String,
-    pub report: String,
     pub usage: Usage,
     pub warnings: Vec<String>,
 }
@@ -1601,12 +1627,11 @@ impl AgentHook for ToolImageBreakHook {
 }
 
 /// Does this tool output carry an image part? Keys the break hook on the RESULT, not
-/// the tool's name — fully general, so the next image-bearing tool (`view_image`
-/// today, and a sweep's `explore` result carrying a routed image) needs no new `if`.
+/// the tool's name — fully general, so the next image-bearing tool after
+/// `view_image` needs no new `if`.
 /// Typed, not sniffed: rig 0.41 hands the hook the model-visible [`ToolOutput`]
 /// whole, so the check reads the declared content parts — the same declared-image
-/// contract [`crate::view_image::ViewImage`] and [`crate::consult::RunExplore`] emit
-/// on.
+/// contract [`crate::view_image::ViewImage`] emits on.
 fn tool_output_carries_image(output: &ToolOutput) -> bool {
     output
         .as_content()
@@ -1615,8 +1640,8 @@ fn tool_output_carries_image(output: &ToolOutput) -> bool {
 }
 
 /// Rewrite a transcript so every image-bearing tool result rides the **user-turn**
-/// channel instead of the tool-result channel — `view_image`, or a delegated
-/// `explore` sweep that routed an image via `attach`. For each such result that
+/// channel instead of the tool-result channel — `view_image`, or any other tool
+/// whose result carries an image. For each such result that
 /// still carries an image: keep its text as a short ack (so the `tool_use → tool_result`
 /// pairing stays valid) and emit a separate, tool-result-free `Message::User { [Image] }`
 /// right after that user message — the bytes the model now sees on a channel OpenAI
@@ -1651,9 +1676,8 @@ fn rewrite_tool_image_history(history: Vec<Message>) -> Vec<Message> {
         for part in content {
             match part {
                 // Key on the RESULT still carrying an image — not the tool's name or
-                // id. Fully general: the next image-bearing tool (today: `view_image`
-                // and a sweep's `explore` result carrying a routed image) needs no
-                // edit here. A result already acked to text (an earlier break, or an
+                // id. Fully general: the next image-bearing tool (today only
+                // `view_image`) needs no edit here. A result already acked to text (an earlier break, or an
                 // already-inserted image turn) holds no `ToolResultContent::Image`, so
                 // it falls through untouched — the idempotency that makes re-running
                 // this safe.
@@ -1745,8 +1769,8 @@ fn split_for_resume(mut history: Vec<Message>) -> (Vec<Message>, Message) {
 ///
 /// The toolset is injected via a *factory* (not a prebuilt `Vec`, and not hardcoded
 /// to `run_kaish`) so the same loop is the primitive behind every tool on the
-/// surface — `oneshot` ({} — no tools), the recomposed `consult`
-/// ({run_kaish, explore′}), and its nested `explore′` ({run_kaish}). The factory matters because of the
+/// surface — `oneshot` ({} — no tools), `consult` ({run_kaish, view_image…}), and
+/// `deliberate`'s explorer ({run_kaish, attach}). The factory matters because of the
 /// turn-cap recovery below: a fresh toolset is built for the forced final turn, and
 /// A `DynamicTool` toolset is consumed by the builder, so we rebuild rather than share. Each call
 /// spawns its own `KaishWorker`(s); the caller owns their lifetime.
@@ -1761,8 +1785,7 @@ fn split_for_resume(mut history: Vec<Message>) -> (Vec<Message>, Message) {
 /// **A tool-result image on the user-turn channel.** When `break_on_tool_images` is
 /// set (a vision model whose transport can't carry an image in a tool result — an
 /// OpenAI VLM), a [`ToolImageBreakHook`] terminates the loop at the turn boundary
-/// after any tool result carries an image — `view_image`, or a delegated `explore`
-/// sweep that routed one via `attach`. rig hands back the full transcript via
+/// after any tool result carries an image (`view_image` today). rig hands back the full transcript via
 /// `PromptCancelled`; we rewrite each image-bearing result onto a separate user
 /// `Image` turn ([`rewrite_tool_image_history`]) and re-enter the loop with the
 /// remaining turn budget. The model now sees the image in user content, the one
@@ -1930,7 +1953,8 @@ where
     // comes back, so the log holds one record per turn. Transient transport failures are
     // retried underneath, in the HTTP client (`crate::completion_retry::RetryingHttp`),
     // so the loop never sees them.
-    let watch = Watch::new(log.clone(), identity, model_name).with_beat(progress.clone(), role.key());
+    let watch =
+        Watch::new(log.clone(), identity, model_name).with_beat(progress.clone(), role.key());
     let result = run_phase_loop(
         model,
         &watch,
@@ -1959,9 +1983,8 @@ where
     // `len` is every completion this phase made, and each turn already recorded how
     // many tool calls it emitted — so this is a read, not new bookkeeping.
     //
-    // Sub-agent exclusion falls out of the structure: a delegated `explore′` sweep is
-    // its own `run_phase` with its own explorer identity, so its turns are counted
-    // against it, and the driver sees only the one tool call it made to reach it.
+    // Sub-agent exclusion falls out of the structure: each phase is its own
+    // `run_phase` with its own identity, so its turns are counted against it alone.
     if let Some(identity) = identity {
         crate::metrics::record_agent_invocation(
             identity.agent,
@@ -2073,8 +2096,8 @@ where
             .add_hook(MalformedGenerationHook::new(model_name))
             .add_hook(ToolImageBreakHook::new(break_on_tool_images))
             // Every tool-driven phase runs through this loop, so installing the hook here
-            // is what gives the consult driver, each delegated `explore′` sweep, and the
-            // `deliberate` dossier sweep the same recovery. The toolless lanes
+            // is what gives the consult driver and the `deliberate` dossier sweep the
+            // same recovery. The toolless lanes
             // (`oneshot`, `deliberate`'s direct synth) bypass the agent entirely via
             // `Arm::complete` and can raise no tool call at all.
             .add_hook(UnknownToolFeedbackHook::new(model_name))
@@ -2091,7 +2114,7 @@ where
             // finish and hands back `output: ""` (its own
             // `prompt_request_stops_cleanly_on_empty_terminal_turn` pins that as intended),
             // so the check has to live here — the one seam every phase runs through, which
-            // is what makes `consult`/`oneshot`/`explore`/`deliberate` inherit it at once.
+            // is what makes `consult`/`oneshot`/`deliberate` inherit it at once.
             // The shape that produced it in the wild: a reasoning model whose last choice
             // carried only a `Reasoning` block, which rig's text extraction filters out.
             Ok(resp) => {
@@ -2423,7 +2446,7 @@ pub(crate) async fn run_completion(
     // the provider malformed — so the count comes off the log's attempts rather than a
     // literal, and a lane whose single call failed still reports the call it made. No
     // tools: a single-shot lane declares none, and a zero here is the honest reading
-    // that makes `oneshot` distinguishable from a consult that never delegated.
+    // that makes `oneshot` distinguishable from a consult that made no tool call.
     if let Some(identity) = identity {
         crate::metrics::record_agent_invocation(
             identity.agent,
@@ -2440,13 +2463,11 @@ pub(crate) async fn run_completion(
 /// Run the explorer phase once and return its cited report. The explorer [`Arm`]
 /// drives a fresh `{run_kaish}` toolset over a spawned kernel, bounded by
 /// `max_turns`, and hands back the curated report the [`report_preamble`] shape
-/// asks for. This is the one seam both callers of the explorer share: the nested
-/// `explore′` sub-agent inside [`consult_with`] (via [`RunExplore::call`]) and the
-/// top-level `explore` tool (via [`explore_with`]).
+/// asks for. Its caller is `deliberate`'s dossier stage, via [`explore_with`].
 ///
 /// `preamble` is already resolved (the report shape + `[orientation]` + house
-/// rules) — this fn is just the inner `arm.run`, so preamble composition and the
-/// progress bracket stay with each caller. A fresh kernel per tool build ([`run_phase`]
+/// rules) — this fn is just the inner `arm.run`, so preamble composition stays with
+/// the caller. A fresh kernel per tool build ([`run_phase`]
 /// may build a second for the turn-cap recovery turn); the shared `progress` sink is
 /// handed to `run_kaish` so the sweep's own reads surface too. `!Send` care (an
 /// invariant): the kernel stays on its `KaishWorker` thread and never crosses the
@@ -2456,8 +2477,8 @@ pub(crate) async fn run_completion(
 /// alongside `run_kaish` (sharing the same kernel `view_image` shares with
 /// `run_kaish` in `consult_tools`) and appends [`explorer_attach_directive`] to the
 /// preamble in the same place, so preamble and toolset can never drift apart.
-/// `None` (the top-level `explore` tool, v1) is byte-for-byte the old behavior —
-/// same preamble, same two-line toolset.
+/// `None` (`max_attachments = 0`) leaves the preamble and the `{run_kaish}` toolset
+/// as they are.
 #[allow(clippy::too_many_arguments)] // each arg is a distinct, named loop input
 /// `web_search` and `web_fetch` over the call's one [`WebSession`], traced like every
 /// other tool in a phase's toolset.
@@ -2494,7 +2515,9 @@ async fn run_with_web(
     base: ToolFactory<'_>,
 ) -> Result<(String, Usage)> {
     let Some(web) = web else {
-        return arm.run(preamble, prompt, max_turns, progress, role, base).await;
+        return arm
+            .run(preamble, prompt, max_turns, progress, role, base)
+            .await;
     };
     if let Some(native) = web.native_for(arm.native_web) {
         // The hook declares the tools per request and records each turn's use as it
@@ -2516,8 +2539,15 @@ async fn run_with_web(
         }
         Ok(tools)
     };
-    arm.run(preamble, prompt, max_turns, progress.clone(), role, &with_web)
-        .await
+    arm.run(
+        preamble,
+        prompt,
+        max_turns,
+        progress.clone(),
+        role,
+        &with_web,
+    )
+    .await
 }
 
 /// Run `research`: the explorer arm on the web, with `web_search` and `web_fetch` and
@@ -2580,7 +2610,7 @@ pub(crate) async fn run_explore_phase(
         // A directive spliced after the composed preamble moves the deliverable into the
         // middle; restate it last, as `phase_preamble` does for its own splices.
         preamble.push_str("\n\n");
-        preamble.push_str(closing_obligation(Phase::Explorer(ReportReader::SynthesisAgent)));
+        preamble.push_str(closing_obligation(Phase::Explorer));
     }
     let preamble = preamble.as_str();
     run_with_web(
@@ -2610,257 +2640,6 @@ pub(crate) async fn run_explore_phase(
         },
     )
     .await
-}
-
-/// `explore′` — the explorer unit wrapped as a rig [`Tool`] the consult loop can
-/// call. Its `call` runs a *nested* agent: the explorer [`Arm`] (a cheap model,
-/// possibly on a different backend than the driver) driving `{run_kaish}` over a
-/// fresh kernel, returning a curated report. This is what lets the capable
-/// `consult` model delegate a broad repo sweep instead of reading every span
-/// itself.
-///
-/// `!Send` care (an invariant): the nested kernel stays on its `KaishWorker`
-/// thread and never crosses the `.await` here — only the `Send` worker handle
-/// does — so `call`'s future is `Send`, as rig requires. `tests/explore_send.rs`
-/// pins this at compile time.
-pub struct RunExplore {
-    /// The explorer's resolved arm: its own client, model, params, `max_tokens`.
-    arm: Arm,
-    max_turns: usize,
-    root: PathBuf,
-    /// Sandbox limits for the fresh kernel each delegated sweep spawns.
-    sandbox: SandboxConfig,
-    /// Every delegated report is appended here, so the caller can surface what the
-    /// sweeps found (the recomposed `consult`'s `report`) and a test can observe
-    /// that a delegation actually happened.
-    reports: Arc<Mutex<Vec<String>>>,
-    /// Every sweep's token usage sums in here. The explorer runs *inside* the synth's
-    /// tool loop, so its tokens never reach the synth's own `PromptResponse.usage` —
-    /// this shared cell is how `consult_with` recovers them to fold into the consult
-    /// total. Parallel to `reports`: one sink, many sweeps.
-    usage_sink: Arc<Mutex<Usage>>,
-    /// Liveness for the sweep: brackets each delegation with start/finish, and is
-    /// handed to the nested kernel's `run_kaish` so the sub-agent's own reads show
-    /// through too (a delegated sweep is where a long consult spends its silence).
-    progress: Arc<dyn ProgressSink>,
-    /// The sweep's fully-resolved system prompt, computed once by `consult_tools`:
-    /// the explorer override-or-default with house rules already appended. So the
-    /// nested explorer carries the explorer's `[prompts]`/`[context]` framing,
-    /// built once instead of per sweep.
-    preamble: Arc<str>,
-    /// Who reads this sweep's report — decides the vision gate and the demotion
-    /// wording a fresh [`SweepAttachSink`] is built with per sweep.
-    consumer: SweepConsumer,
-    /// This sweep's attach budget. `0` means "don't inject the tool at all" — no
-    /// sink is built, `run_explore_phase` gets `None`, byte-for-byte the pre-attach
-    /// behavior.
-    max_attachments: usize,
-    /// Canonical paths whose bytes already reach the consumer another way (the
-    /// caller's own `consult` attachments) — seeded into every sweep's sink so
-    /// `attach` doesn't re-route what's already in front of the driver. Empty for
-    /// `deliberate` (see `SweepAttachSink`'s doc).
-    already_delivered: Arc<HashSet<PathBuf>>,
-    /// The call's web session when the caller asked for the web; every sweep shares it,
-    /// so the call has one budget however many sweeps the driver delegates.
-    web: Option<Arc<WebSession>>,
-}
-
-impl RunExplore {
-    #[allow(clippy::too_many_arguments)]
-    pub fn new(
-        arm: Arm,
-        max_turns: usize,
-        root: impl Into<PathBuf>,
-        sandbox: SandboxConfig,
-        reports: Arc<Mutex<Vec<String>>>,
-        usage_sink: Arc<Mutex<Usage>>,
-        progress: Arc<dyn ProgressSink>,
-        preamble: Arc<str>,
-        consumer: SweepConsumer,
-        max_attachments: usize,
-        already_delivered: Arc<HashSet<PathBuf>>,
-        web: Option<Arc<WebSession>>,
-    ) -> Self {
-        Self {
-            arm,
-            max_turns,
-            root: root.into(),
-            sandbox,
-            reports,
-            usage_sink,
-            progress,
-            preamble,
-            consumer,
-            max_attachments,
-            already_delivered,
-            web,
-        }
-    }
-}
-
-#[derive(Debug, Deserialize)]
-pub struct RunExploreArgs {
-    /// The question or sub-question to investigate across the repo.
-    pub question: String,
-}
-
-/// The nested explore loop failed (the sub-agent errored or its worker died).
-#[derive(Debug)]
-pub struct RunExploreError(String);
-
-impl std::fmt::Display for RunExploreError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "explore failed: {}", self.0)
-    }
-}
-
-impl std::error::Error for RunExploreError {}
-
-impl Tool for RunExplore {
-    const NAME: &'static str = "explore";
-    type Error = RunExploreError;
-    type Args = RunExploreArgs;
-    /// [`ToolOutput`], not `String`: no attachment → `ToolOutput::text(report)`,
-    /// exactly the plain report the driver always read. With a routed image → the
-    /// text plus one *declared* `Image` block per routed image, the same typed
-    /// contract [`crate::view_image::ViewImage::view`] emits — rig 0.41 only routes
-    /// images a tool declares, never ones it might discover inside text output.
-    type Output = ToolOutput;
-
-    /// Keep the failure text model-visible: rig's default would redact it to a
-    /// kind-level "the tool failed", and a dead sweep is something the driver must
-    /// *see* to recover from — it answers from its own direct reads instead of retrying
-    /// blind, and can only choose that if the failure reaches it. `with_source` keeps
-    /// the concrete error for operator diagnostics and downcasting.
-    fn map_error(&self, error: Self::Error) -> ToolExecutionError {
-        ToolExecutionError::other(error.to_string()).with_source(error)
-    }
-
-    fn description(&self) -> String {
-        "Delegate a broad sweep to the explorer on your team. It \
-         searches the repository on a read-only kaish shell and reports back \
-         with concrete `file:line` citations. Give it a focused question. Use \
-         `explore` when a question needs breadth, and use `run_kaish` to read \
-         specific code yourself."
-            .to_string()
-    }
-
-    fn parameters(&self) -> Value {
-        json!({
-            "type": "object",
-            "properties": {
-                "question": {
-                    "type": "string",
-                    "description": "the question or sub-question to investigate"
-                }
-            },
-            "required": ["question"]
-        })
-    }
-
-    async fn call(
-        &self,
-        _ctx: &mut rig_agent::tool::ToolContext,
-        args: Self::Args,
-    ) -> Result<Self::Output, Self::Error> {
-        // Bracket the delegation: the start carries the sub-question, the finish fires
-        // on both success and failure (the `?` below short-circuits, so emit it before
-        // unwrapping the result).
-        self.progress.emit(PhaseEvent::SweepStarted {
-            question: args.question.clone(),
-        });
-        // A fresh sink per sweep — `attach`'s budget/dedupe is scoped to ONE sweep,
-        // not the whole consult (a driver that delegates 5 sweeps pays for 5 budgets;
-        // see the residual-risk note in the design doc). `0` means the operator
-        // turned the tool off: no sink, `run_explore_phase` gets `None`, byte-for-byte
-        // the pre-attach behavior.
-        let sink = (self.max_attachments > 0).then(|| {
-            Arc::new(SweepAttachSink::new(
-                self.max_attachments,
-                self.consumer.clone(),
-                (*self.already_delivered).clone(),
-            ))
-        });
-        // Reuse the one seam — explore′ is just the shared explorer phase, run on the
-        // sub-agent's arm with its resolved preamble. The sweep bracket
-        // (started/finished) and the reports-sink push stay here (consult-loop
-        // specific); `run_explore_phase` is only the inner `arm.run`.
-        let result = run_explore_phase(
-            &self.arm,
-            &self.preamble,
-            &args.question,
-            self.root.clone(),
-            &self.sandbox,
-            self.max_turns,
-            &self.progress,
-            sink.as_ref(),
-            self.web.as_ref(),
-        )
-        .await;
-        self.progress.emit(PhaseEvent::SweepFinished);
-        let (report, usage) = result.map_err(|e| RunExploreError(format!("{e:#}")))?;
-        // Fold this sweep's tokens into the shared consult total before returning the
-        // report to the driver — the synth's own `PromptResponse` will never see them.
-        // Lock poisoning means another delegation panicked — surface it, don't mask.
-        *self.usage_sink.lock().expect("explore usage sink poisoned") += usage;
-        // A sweep that reported nothing is a *failed* sweep, not an empty one. Handing the
-        // driver a blank tool result is the same silent-empty class one level down, and
-        // worse in one way: the driver cannot tell a blank sweep from a sweep that found
-        // nothing, so it would answer as though the breadth had been covered. As an error
-        // it becomes visible — rig folds it back as this tool's result and the driver
-        // recovers (re-delegate, or read the spans itself). Checked AFTER the usage fold,
-        // because those tokens were spent either way and the footer must say so.
-        // `run_phase`'s own guard makes this near-unreachable today; it stays as this
-        // seam's invariant, not a duplicate of that one.
-        if report.trim().is_empty() {
-            return Err(RunExploreError(
-                "the explorer returned an empty report — no findings reached the driver"
-                    .to_string(),
-            ));
-        }
-        // The `reports` sink feeds `ConsultOutput.report` (the readable artifact a
-        // caller sees via `include_report`) — the explorer's own prose only, never
-        // the routed bytes (those already reached the driver on the tool result; a
-        // caller-facing summary duplicating full attached files would just bloat it).
-        self.reports
-            .lock()
-            .expect("explore report sink poisoned")
-            .push(report.clone());
-        // What the DRIVER sees on the tool result: the report plus whatever this
-        // sweep routed via `attach` — text bodies inline, an image manifest, notes,
-        // and demotions. `None` (no sink, or a sink that never attached anything)
-        // leaves this byte-for-byte the bare report, and `images` stays empty.
-        let (text, images) = match &sink {
-            Some(sink) => {
-                let delivery = sink.drain();
-                let images = delivery.images();
-                let text = match sweep_evidence_block(&self.consumer, &delivery) {
-                    Some(block) => format!("{report}{block}"),
-                    None => report,
-                };
-                (text, images)
-            }
-            None => (report, Vec::new()),
-        };
-        // No image → plain text, exactly the pre-attach tool result (see the `Output`
-        // doc). With one or more → the text followed by a declared `Image` block per
-        // routed image, the same typed blocks `view_image` emits for one.
-        if images.is_empty() {
-            Ok(ToolOutput::text(text))
-        } else {
-            let mut parts: Vec<ToolResultContent> = vec![ToolResultContent::text(text)];
-            parts.extend(images.iter().filter_map(|a| match a {
-                Attachment::Image { mime, data_b64, .. } => Some(ToolResultContent::Image(Image {
-                    data: DocumentSourceKind::Base64(data_b64.clone()),
-                    media_type: ImageMediaType::from_mime_type(mime),
-                    detail: None,
-                    native: None,
-                })),
-                Attachment::Text { .. } => None,
-            }));
-            Ok(ToolOutput::content(parts).expect("the text part is always present"))
-        }
-    }
 }
 
 /// Assemble a single user turn from `text` plus any image attachments — shared by
@@ -2937,114 +2716,40 @@ pub async fn oneshot(
     .await
 }
 
-/// Build the recomposed `consult` toolset: `{run_kaish, explore′}`, or `{run_kaish}`
-/// alone when the cast runs solo (single-stage: the synth does all its own reads).
-/// Factored out so the wiring (explore′ present exactly when an explorer arm is, pointed
-/// at that arm) is unit-testable without a live model. `reports` collects each `explore′`
-/// sweep.
-#[allow(clippy::too_many_arguments)] // the sinks and flags are each a distinct wiring input
-fn consult_tools(
-    explorer: Option<&Arm>,
-    root: &Path,
-    cfg: &ConsultConfig,
-    reports: Arc<Mutex<Vec<String>>>,
-    explore_usage: Arc<Mutex<Usage>>,
-    synth: &Arm,
-) -> Result<Vec<DynamicTool>> {
-    // run_kaish for precise reads by the consult model itself — carries the sink so
-    // the driver's own reads show up as progress alongside the delegated sweeps'.
-    let worker = KaishWorker::spawn_with(root, cfg.explore.sandbox.clone())?;
+/// Build the `consult` toolset: `run_kaish` for the synth's own reads, plus
+/// `view_image` on a vision-capable synth and `save_artifact` when the server built a
+/// sink. Factored out so the wiring is unit-testable without a live model.
+fn consult_tools(root: &Path, cfg: &ConsultConfig, synth: &Arm) -> Result<Vec<DynamicTool>> {
+    // run_kaish for the consult model's own reads — carries the sink so its reads show
+    // up as progress.
+    let worker = KaishWorker::spawn_with(root, cfg.sandbox.clone())?;
     let mut tools: Vec<DynamicTool> = vec![traced(RunKaish::with_progress(
         worker.clone(),
-        cfg.explore.phase.progress.clone(),
+        cfg.phase.progress.clone(),
     ))];
-    if let Some(explorer) = explorer {
-        // explore′ for delegated breadth: the same explore unit, wrapped as a tool,
-        // pointed at the explorer arm — its own client, model, and request shape,
-        // which may live on a different backend than the driver's. Bounded by
-        // explorer_max_turns per sweep; no cap on how many times consult may delegate
-        // (Amy's call — watch real behavior). Its system prompt is the explorer
-        // override-or-default + house rules, built once here rather than per sweep —
-        // plus the caller's attachment directive: a sweep is a fresh agent that saw
-        // neither the driver prompt nor the inlined bytes, so without this a driver
-        // that delegates early sends a sweep blind to the very files the caller
-        // flagged as central. The directive orders whole `cat -n` reads (the explorer
-        // chooses when, not whether), keeping citation-exact line numbers for free.
-        let mut explorer_preamble_owned = resolve_phase_preamble(
-            // The nested sweep always reports to the consult driver — this loop IS the
-            // synthesis agent, so the reader is fixed here rather than plumbed in.
-            Phase::Explorer(ReportReader::SynthesisAgent),
-            &cfg.explore.phase.prompts,
-            cfg.explore.phase.orientation.as_deref(),
-            cfg.explore.phase.house_rules.as_deref(),
-        );
-        if let Some(directive) = super::prompts::explorer_attachment_directive(&cfg.attachments) {
-            explorer_preamble_owned.push_str(&directive);
-        }
-        let explorer_preamble: Arc<str> = Arc::from(explorer_preamble_owned);
-        // Who a delegated sweep's `attach` calls route to: the DRIVER (this loop runs on
-        // the synth arm), named so the explorer knows who reads its report, gated on the
-        // synth's own vision cap (the same cap `view_image` below rides).
-        let consumer = SweepConsumer {
-            kind: SweepConsumerKind::ConsultDriver,
-            label: Arc::from(format!("the synthesis agent (`{}`)", synth.model)),
-            vision: synth.caps.vision,
-        };
-        // The caller's own `consult` attachments already reach the driver another way
-        // (inlined, or a read-WHOLE directive) — seed the sink so a sweep's `attach`
-        // doesn't re-route what's already in front of the driver.
-        // Resolved exactly as `attach_one` resolves an explorer's path — canonicalized, not
-        // merely joined. A plain join misses the dedupe for any caller path carrying a `./`,
-        // a `..`, or a symlink, and the reader then receives the same bytes twice.
-        let already_delivered: HashSet<PathBuf> = crate::sweep_attach::delivered_seed(
-            root,
-            cfg.attachments.iter().map(|a| Path::new(a.path())),
-        );
-        let explore = RunExplore::new(
-            explorer.clone(),
-            cfg.explore.explorer_max_turns,
-            root,
-            cfg.explore.sandbox.clone(),
-            reports,
-            explore_usage,
-            cfg.explore.phase.progress.clone(),
-            explorer_preamble,
-            consumer,
-            cfg.explore.max_attachments,
-            Arc::new(already_delivered),
-            cfg.explore.web.clone(),
-        );
-        tools.push(traced(explore));
-    }
-    // The driver's own web tools (fetch-only on a team, both when solo) are added by
-    // `run_with_web` in `consult_with`, which also picks native or kaibo-run.
-    // The driver loop runs on the *synth* arm, so view_image rides the synth's
-    // vision cap (the delegated explore′ sub-agent gets its own view_image keyed to
-    // the explorer arm's caps, inside `explore`). Shares the driver's kernel.
+    // The driver's own web tools are added by `run_with_web` in `consult_with`, which
+    // also picks native or kaibo-run. The driver loop runs on the *synth* arm, so
+    // view_image rides the synth's vision cap. Shares the driver's kernel.
     if synth.caps.vision {
         tools.push(traced(ViewImage::new(worker, root.to_path_buf())));
     }
     // save_artifact, when the server built a sink for this call (all three keys held:
-    // operator config, the caller's `save_artifacts`, a live media CAS). The DRIVER only
-    // — a delegated sweep builds its toolset in `run_explore_phase` from the explore
-    // rung, which carries no sink, so this cannot reach one. Every rebuild of this
-    // toolset (the main loop, the forced final turn) shares the one sink, so the
-    // per-call caps count the call rather than the turn.
+    // operator config, the caller's `save_artifacts`, a live media CAS). Every rebuild
+    // of this toolset (the main loop, the forced final turn) shares the one sink, so
+    // the per-call caps count the call rather than the turn.
     if let Some(sink) = &cfg.artifacts {
         tools.push(traced(SaveArtifact::new(Arc::clone(sink))));
     }
     Ok(tools)
 }
 
-/// Run the `explore` tool: the evidence-gathering half of `consult`, surfaced on
-/// its own. One explorer arm sweeps `root` read-only over `{run_kaish}` and returns
-/// its cited report *verbatim* — no synth, no session. `attached` files (the tool's
-/// `attach` arg; deliberate's dossier stage passes none) land as a preamble
-/// directive to read each WHOLE with `cat -n` — the explorer reads through its
-/// shell, so nothing is inlined here. The report shape is [`report_preamble`],
-/// resolved through the same [`phase_preamble`] layering `consult_tools` gives the
-/// nested `explore′`, so a `[prompts].explorer` override, `[orientation]`, and
-/// house rules all reach it.
+/// Run `deliberate`'s dossier survey. One explorer arm surveys `root` read-only over
+/// `{run_kaish}` and returns its cited report *verbatim* — no synth, no session.
+/// `attached` files (deliberate's `attach` arg) land as a preamble directive to read
+/// each WHOLE with `cat -n` — the explorer reads through its shell, so nothing is
+/// inlined here. The report shape is [`report_preamble`], resolved through the
+/// [`phase_preamble`] layering, so a `[prompts].explorer` override, `[orientation]`,
+/// and house rules all reach it.
 pub(crate) async fn explore_with(
     question: &str,
     root: PathBuf,
@@ -3052,10 +2757,9 @@ pub(crate) async fn explore_with(
     cfg: &ExploreConfig,
     attached: &[super::prompts::ConsultAttachment],
     attach: Option<&Arc<SweepAttachSink>>,
-    reader: ReportReader,
 ) -> Result<(String, Usage)> {
     let mut preamble = resolve_phase_preamble(
-        Phase::Explorer(reader),
+        Phase::Explorer,
         &cfg.phase.prompts,
         cfg.phase.orientation.as_deref(),
         cfg.phase.house_rules.as_deref(),
@@ -3065,7 +2769,7 @@ pub(crate) async fn explore_with(
     }
     with_call_deadline(
         cfg.phase.call_deadline,
-        "explore",
+        "the deliberate dossier survey",
         run_explore_phase(
             explorer,
             &preamble,
@@ -3088,8 +2792,8 @@ pub(crate) async fn explore_with(
 /// when it doesn't fire — a wedged local server holding a pooled keep-alive, rig's
 /// split send-then-body read. On elapse the call aborts loudly instead of hanging the
 /// caller's session indefinitely (the 2026-07-02 ~17h park a stopped local backend
-/// caused). The interactive loop tools pass `call_deadline` here (`consult`/`explore`/
-/// `oneshot` and the async `consult_submit`); `deliberate`'s direct lane passes a
+/// caused). The interactive loop tools pass `call_deadline` here (`consult`, `oneshot`,
+/// `deliberate`'s dossier survey, and the async `consult_submit`); `deliberate`'s direct lane passes a
 /// deadline sized to its synth backend's `request_timeout` instead (one completion, so
 /// `request_timeout` is its natural bound). The batch lane calls this not at all — kaibo
 /// holds no wait there, the deliberation runs on the provider's queue.
@@ -3127,7 +2831,7 @@ async fn with_call_deadline<T>(
 /// interactive ceiling high. The **batch** lane, by contrast, holds no in-process wait
 /// at all — its deliberation runs on the *provider's* queue.
 ///
-/// `attachments` carries any images a delegated dossier sweep routed via `attach`
+/// `attachments` carries any images the dossier sweep routed via `attach`
 /// (text attachments never reach here — they're already stitched into `dossier`'s
 /// text by `sweep_evidence_block`) — the single turn's own images, via the same
 /// [`user_turn_with_attachments`] helper [`oneshot`] uses. `&[]` is byte-for-byte the
@@ -3145,77 +2849,39 @@ pub async fn deliberate_direct(
     with_call_deadline(deadline, "deliberate", synth.complete(system, prompt)).await
 }
 
-/// Run a `consult` over its resolved arms.
+/// Run a `consult` on its resolved synth arm.
 ///
-/// One loop, two tools — no rigid explorer→synth hand-off. The synthesis agent
-/// decides when to delegate a sweep to the cheap `explore′` vs. read a span
-/// directly with `run_kaish`. Each arm carries its own client and request shape,
-/// so a mixed cast routes each phase to its own backend through the same loop.
-/// `ConsultOutput.report` aggregates whatever the `explore′` sweeps returned
-/// (empty if the model read everything itself).
-///
-/// `explorer: None` is single-stage: a solo cast's synth reads everything itself
-/// over `run_kaish`, under the [`Phase::ConsultSolo`] preamble, which never mentions a
-/// teammate it cannot reach.
+/// One model, one loop: the synthesis agent reads the project itself over
+/// `run_kaish` (plus the web tools when the call asked for the web) and writes the
+/// answer. The `[orientation]` map in its preamble gives it the project layout up
+/// front.
 pub(crate) async fn consult_with(
     user_prompt: &str,
     root: &Path,
-    explorer: Option<&Arm>,
     synth: &Arm,
     cfg: &ConsultConfig,
 ) -> Result<ConsultOutput> {
-    let reports = Arc::new(Mutex::new(Vec::<String>::new()));
-    // The delegated sweeps' tokens land here (they run inside the synth loop, so the
-    // synth's own `PromptResponse.usage` never counts them); summed with the synth's
-    // usage below into the consult total.
-    let explore_usage = Arc::new(Mutex::new(Usage::new()));
-
-    let (answer, synth_usage) = with_call_deadline(
-        cfg.explore.phase.call_deadline,
+    let (answer, usage) = with_call_deadline(
+        cfg.phase.call_deadline,
         "consult",
         run_with_web(
             synth,
-            cfg.explore.web.as_ref(),
-            // The team driver reads one known page itself rather than paying for a
-            // survey; searching, and the breadth of page text it brings, stays with the
-            // sweep. A solo driver has no sweep, so it searches itself.
-            if explorer.is_some() {
-                WebTools::FetchOnly
-            } else {
-                WebTools::Both
-            },
-            &consult_driver_preamble(explorer.is_some(), cfg),
+            cfg.web.as_ref(),
+            WebTools::Both,
+            &consult_driver_preamble(cfg),
             Message::user(user_prompt.to_string()),
             cfg.synth_max_turns,
-            cfg.explore.phase.progress.clone(),
+            cfg.phase.progress.clone(),
             ModelRole::Synth,
-            // Rebuilt per call (main loop, and again if run_phase forces a final
-            // turn); every build shares the one `reports` + `explore_usage` sink so
-            // all explore′ sweeps aggregate.
-            &|| {
-                consult_tools(
-                    explorer,
-                    root,
-                    cfg,
-                    reports.clone(),
-                    explore_usage.clone(),
-                    synth,
-                )
-            },
+            // Rebuilt per call (main loop, and again if run_phase forces a final turn).
+            &|| consult_tools(root, cfg, synth),
         ),
     )
     .await
     .context("consult loop")?;
 
-    let report = reports
-        .lock()
-        .expect("explore report sink poisoned")
-        .join("\n\n---\n\n");
-    // Consult total: the synth's own loop plus every delegated sweep.
-    let usage = synth_usage + *explore_usage.lock().expect("explore usage sink poisoned");
     Ok(ConsultOutput {
         answer,
-        report,
         usage,
         // Populated downstream (`consult_session_turn` on a record failure); the raw
         // consult loop has no non-fatal notices of its own.
@@ -3223,26 +2889,17 @@ pub(crate) async fn consult_with(
     })
 }
 
-/// The consult driver's system prompt. With the web on, a solo driver gets the web
-/// directive (it searches itself) and a team driver gets a note that its explorer can
-/// search (it delegates the web like any other breadth).
-fn consult_driver_preamble(has_explorer: bool, cfg: &ConsultConfig) -> String {
+/// The consult driver's system prompt. With the web on, the driver gets the web
+/// directive (it searches itself).
+fn consult_driver_preamble(cfg: &ConsultConfig) -> String {
     let mut preamble = resolve_phase_preamble(
-        if has_explorer {
-            Phase::Consult
-        } else {
-            Phase::ConsultSolo
-        },
-        &cfg.explore.phase.prompts,
-        cfg.explore.phase.orientation.as_deref(),
-        cfg.explore.phase.house_rules.as_deref(),
+        Phase::Consult,
+        &cfg.phase.prompts,
+        cfg.phase.orientation.as_deref(),
+        cfg.phase.house_rules.as_deref(),
     );
-    if cfg.explore.web.is_some() {
-        preamble.push_str(&if has_explorer {
-            consult_web_note()
-        } else {
-            web_directive("answer")
-        });
+    if cfg.web.is_some() {
+        preamble.push_str(&web_directive("answer"));
         preamble.push_str("\n\n");
         preamble.push_str(closing_obligation(Phase::Consult));
     }
@@ -3269,7 +2926,6 @@ pub(crate) async fn consult_session_turn(
     question: &str,
     context: Option<&str>,
     root: &Path,
-    explorer: Option<&Arm>,
     synth: &Arm,
     cfg: &ConsultConfig,
 ) -> Result<ConsultOutput> {
@@ -3281,7 +2937,7 @@ pub(crate) async fn consult_session_turn(
     };
     let user_prompt = consult_user_prompt(question, context, &history, &cfg.attachments);
 
-    let mut out = consult_with(&user_prompt, root, explorer, synth, cfg).await?;
+    let mut out = consult_with(&user_prompt, root, synth, cfg).await?;
 
     // Record failure is NON-fatal: by here the model has answered (a paid-for result), so
     // losing that answer over a bookkeeping write would be the wrong trade — and it mirrors
@@ -3317,8 +2973,7 @@ pub(crate) async fn consult_session_turn(
     Ok(out)
 }
 
-/// Run a consult against `root` over the resolved `explorer` and `synth` arms. A
-/// solo cast passes `explorer: None` and runs single-stage.
+/// Run a consult against `root` on the resolved `synth` arm.
 ///
 /// The server resolves a cast's slots into the arms ([`Arm::from_slot`] — keys,
 /// endpoints, request shapes); `cfg` carries the per-call loop bounds. `session`
@@ -3329,19 +2984,22 @@ pub async fn consult(
     question: &str,
     context: Option<&str>,
     root: impl Into<PathBuf>,
-    explorer: Option<&Arm>,
     synth: &Arm,
     cfg: &ConsultConfig,
     session: Option<Session<'_>>,
 ) -> Result<ConsultOutput> {
     let root = root.into();
-    consult_session_turn(session, question, context, &root, explorer, synth, cfg).await
+    consult_session_turn(session, question, context, &root, synth, cfg).await
 }
 
 #[cfg(test)]
 mod tests {
+    use super::super::prompts::sweep_evidence_block;
     use super::super::shaping::{thinking_params, ModelShape, ThinkingStyleOverride};
     use super::*;
+    use crate::sweep_attach::SweepConsumer;
+    use rig_agent::tool::Tool;
+    use rig_core::message::DocumentSourceKind;
     use std::time::Duration;
 
     use crate::credentials::ProviderKind;
@@ -3456,7 +3114,6 @@ mod tests {
     #[tokio::test]
     async fn house_rules_splice_into_the_phase_preamble_only_when_configured() {
         const SYNTH: &str = "capable-synth";
-        const EXPLORER: &str = "cheap-explorer";
         const MARKER: &str = "HOUSE_RULE_MARKER: prefer tabs over spaces";
 
         let dir = tempdir().unwrap();
@@ -3467,24 +3124,15 @@ mod tests {
             .on_model(SYNTH, |_req| Ok(text_response("done")))
             .build();
         let cfg = ConsultConfig {
-            explore: ExploreConfig {
-                phase: PhaseContext {
-                    house_rules: Some(Arc::from(MARKER)),
-                    ..PhaseContext::default()
-                },
-                ..ExploreConfig::default()
+            phase: PhaseContext {
+                house_rules: Some(Arc::from(MARKER)),
+                ..PhaseContext::default()
             },
             ..ConsultConfig::default()
         };
-        consult_with(
-            "q",
-            dir.path(),
-            Some(&arm(&client, EXPLORER)),
-            &arm(&client, SYNTH),
-            &cfg,
-        )
-        .await
-        .unwrap();
+        consult_with("q", dir.path(), &arm(&client, SYNTH), &cfg)
+            .await
+            .unwrap();
         let reqs = client.requests_for(SYNTH);
         let pre = reqs[0].preamble.as_deref().unwrap_or("");
         assert!(
@@ -3506,91 +3154,15 @@ mod tests {
             .on_model(SYNTH, |_req| Ok(text_response("done")))
             .build();
         let cfg2 = ConsultConfig::default(); // house_rules: None
-        consult_with(
-            "q",
-            dir.path(),
-            Some(&arm(&bare, EXPLORER)),
-            &arm(&bare, SYNTH),
-            &cfg2,
-        )
-        .await
-        .unwrap();
+        consult_with("q", dir.path(), &arm(&bare, SYNTH), &cfg2)
+            .await
+            .unwrap();
         let reqs2 = bare.requests_for(SYNTH);
         let pre2 = reqs2[0].preamble.as_deref().unwrap_or("");
         assert!(!pre2.contains(MARKER), "no [context] → no marker: {pre2}");
         assert!(
             pre2.contains("You are the synthesis agent"),
             "base preamble intact: {pre2}"
-        );
-    }
-
-    /// House rules reach the *nested* `explore′` sweep too, not just the driver —
-    /// the consistency that lets the cheap explorer orient on `AGENTS.md` while it
-    /// searches. Drives the real consult loop: the driver delegates one sweep, the
-    /// explorer reports, the driver answers. We then assert BOTH models saw the
-    /// marker in their preamble — the explorer via the `RunExplore`-threaded block.
-    #[tokio::test]
-    async fn house_rules_reach_the_nested_explorer_sweep() {
-        const SYNTH: &str = "capable-synth";
-        const EXPLORER: &str = "cheap-explorer";
-        const MARKER: &str = "HOUSE_RULE_MARKER: the cast lives in config.rs";
-
-        let client = ScriptedClient::builder()
-            .on_model(SYNTH, |req| {
-                let seen = transcript_text(req);
-                if !seen.contains("SWEEP_DONE") {
-                    Ok(tool_call_response(
-                        "t-explore",
-                        "explore",
-                        json!({ "question": "where does the cast live?" }),
-                    ))
-                } else {
-                    Ok(text_response("ANSWER: config.rs"))
-                }
-            })
-            // The explorer answers its sweep immediately (no kaish needed for this
-            // test — we only care what preamble it was handed).
-            .on_model(EXPLORER, |_req| Ok(text_response("SWEEP_DONE")))
-            .build();
-
-        let dir = tempdir().unwrap();
-        let cfg = ConsultConfig {
-            explore: ExploreConfig {
-                phase: PhaseContext {
-                    house_rules: Some(Arc::from(MARKER)),
-                    ..PhaseContext::default()
-                },
-                ..ExploreConfig::default()
-            },
-            ..ConsultConfig::default()
-        };
-        consult_with(
-            "where does the cast live?",
-            dir.path(),
-            Some(&arm(&client, EXPLORER)),
-            &arm(&client, SYNTH),
-            &cfg,
-        )
-        .await
-        .unwrap();
-
-        // The driver saw it (as the standalone test also proves)...
-        let synth_pre = client.requests_for(SYNTH)[0]
-            .preamble
-            .clone()
-            .unwrap_or_default();
-        assert!(synth_pre.contains(MARKER), "driver preamble: {synth_pre}");
-        // ...and so did the nested explorer — the teeth for this change.
-        let explorer_reqs = client.requests_for(EXPLORER);
-        assert!(!explorer_reqs.is_empty(), "the sweep must have run");
-        let explorer_pre = explorer_reqs[0].preamble.clone().unwrap_or_default();
-        assert!(
-            explorer_pre.contains(MARKER),
-            "the nested explore′ sweep must carry the house rules too: {explorer_pre}"
-        );
-        assert!(
-            explorer_pre.contains("You are the explorer"),
-            "still the explorer's own role framing: {explorer_pre}"
         );
     }
 
@@ -3603,7 +3175,6 @@ mod tests {
     #[tokio::test]
     async fn a_prompt_override_fully_replaces_the_preamble_and_house_rules_still_append() {
         const SYNTH: &str = "capable-synth";
-        const EXPLORER: &str = "cheap-explorer";
         const CUSTOM: &str = "You are a SECURITY AUDITOR. Hunt injection sinks.";
         const HOUSE: &str = "HOUSE_RULE_MARKER: prefer tabs";
 
@@ -3612,28 +3183,19 @@ mod tests {
             .build();
         let dir = tempdir().unwrap();
         let cfg = ConsultConfig {
-            explore: ExploreConfig {
-                phase: PhaseContext {
-                    prompts: PromptOverrides {
-                        consult: Some(CUSTOM.to_string()),
-                        ..PromptOverrides::default()
-                    },
-                    house_rules: Some(Arc::from(HOUSE)),
-                    ..PhaseContext::default()
+            phase: PhaseContext {
+                prompts: PromptOverrides {
+                    consult: Some(CUSTOM.to_string()),
+                    ..PromptOverrides::default()
                 },
-                ..ExploreConfig::default()
+                house_rules: Some(Arc::from(HOUSE)),
+                ..PhaseContext::default()
             },
             ..ConsultConfig::default()
         };
-        consult_with(
-            "q",
-            dir.path(),
-            Some(&arm(&client, EXPLORER)),
-            &arm(&client, SYNTH),
-            &cfg,
-        )
-        .await
-        .unwrap();
+        consult_with("q", dir.path(), &arm(&client, SYNTH), &cfg)
+            .await
+            .unwrap();
 
         let reqs = client.requests_for(SYNTH);
         let pre = reqs[0].preamble.as_deref().unwrap_or("");
@@ -3685,7 +3247,7 @@ mod tests {
     }
 
     /// `oneshot` is the *thin* path: it must hand the model NO tools — no `run_kaish`,
-    /// no `explore`, no `view_image`. The caller owns the context; there is no
+    /// no `view_image`. The caller owns the context; there is no
     /// codebase access. Pin the empty toolset so a regression that wires a shell back
     /// in (re-collapsing oneshot into consult) fails here.
     #[tokio::test]
@@ -4459,141 +4021,16 @@ mod tests {
         );
     }
 
-    /// The load-bearing e2e: a scripted consult that delegates a sweep to `explore′`,
-    /// reads a span itself, and answers — driving the *real* loop end to end with no
-    /// network. This proves what the offline wiring test below cannot: the driver's
-    /// `explore` tool call actually runs the nested explorer agent (which itself runs
-    /// real kaish), and its report aggregates into `ConsultOutput.report`. If
-    /// delegation silently broke, `report` would come back empty and this fails.
+    /// The consult loop end to end, offline: the synth reads a real file through
+    /// `run_kaish`, the read comes back into its transcript, and its next turn is the
+    /// cited answer.
     #[tokio::test]
-    async fn consult_delegates_to_explore_and_aggregates_the_report() {
-        const SYNTH: &str = "capable-synth";
-        const EXPLORER: &str = "cheap-explorer";
-        const REPORT: &str = "EXPLORER_REPORT: src/foo.rs:1 fn target_marker";
-
-        let client = ScriptedClient::builder()
-            // The consult driver: delegate first, then read a span itself, then answer.
-            // Content-driven, so it's robust to the loop's turn structure: it decides
-            // from what it has already been shown, not from a call counter.
-            .on_model(SYNTH, |req| {
-                assert!(has_tool(req, "run_kaish"), "driver must have run_kaish");
-                assert!(has_tool(req, "explore"), "driver must have explore′");
-                let seen = transcript_text(req);
-                if !seen.contains("EXPLORER_REPORT") {
-                    // Haven't delegated yet → delegate a broad sweep.
-                    Ok(tool_call_response(
-                        "t-explore",
-                        "explore",
-                        json!({ "question": "where is target_marker defined?" }),
-                    ))
-                } else if !seen.contains("target_marker() {}") {
-                    // Report in hand, but confirm the span directly via run_kaish.
-                    Ok(tool_call_response(
-                        "t-read",
-                        "run_kaish",
-                        json!({ "script": "cat -n src/foo.rs" }),
-                    ))
-                } else {
-                    // Have the report and the confirmed span → answer.
-                    Ok(text_response(
-                        "ANSWER: target_marker is defined at src/foo.rs:1.",
-                    ))
-                }
-            })
-            // The explorer sub-agent: run real kaish once, then write its report.
-            .on_model(EXPLORER, |req| {
-                // Only run_kaish — the explorer has no nested explore′.
-                assert!(has_tool(req, "run_kaish"), "explorer must have run_kaish");
-                assert!(!has_tool(req, "explore"), "explorer must NOT nest explore′");
-                let seen = transcript_text(req);
-                if !seen.contains("target_marker") {
-                    Ok(tool_call_response(
-                        "t-grep",
-                        "run_kaish",
-                        json!({ "script": "grep -rn target_marker src" }),
-                    ))
-                } else {
-                    Ok(text_response(REPORT))
-                }
-            })
-            .build();
-
-        let dir = project_with_marker();
-        let cfg = ConsultConfig::default();
-
-        let out = consult_with(
-            "Where is target_marker defined?",
-            dir.path(),
-            Some(&arm(&client, EXPLORER)),
-            &arm(&client, SYNTH),
-            &cfg,
-        )
-        .await
-        .expect("scripted consult should succeed");
-
-        // The driver concluded with its final answer.
-        assert!(
-            out.answer
-                .contains("target_marker is defined at src/foo.rs:1"),
-            "answer should be the driver's final text, got: {:?}",
-            out.answer
-        );
-        // The teeth: the explorer's report aggregated into ConsultOutput.report. A
-        // non-empty report here means the `explore` tool call genuinely drove the
-        // nested explorer agent and the reports sink collected it.
-        assert!(
-            out.report.contains("EXPLORER_REPORT"),
-            "explorer's report must aggregate into ConsultOutput.report, got: {:?}",
-            out.report
-        );
-
-        // And the routing held: the cheap model saw the *report* preamble (explorer
-        // role), the synth model saw the *consult* preamble (driver role).
-        let explorer_reqs = client.requests_for(EXPLORER);
-        assert!(
-            !explorer_reqs.is_empty(),
-            "explorer model was actually invoked"
-        );
-        assert!(
-            explorer_reqs[0]
-                .preamble
-                .as_deref()
-                .unwrap_or("")
-                .contains("You are the explorer"),
-            "explorer got the report preamble: {:?}",
-            explorer_reqs[0].preamble
-        );
-        let synth_reqs = client.requests_for(SYNTH);
-        assert!(
-            synth_reqs[0]
-                .preamble
-                .as_deref()
-                .unwrap_or("")
-                .contains("You also have `explore`"),
-            "driver got the consult preamble: {:?}",
-            synth_reqs[0].preamble
-        );
-    }
-
-    /// Single-stage: a cast with no explorer runs `consult` as one model doing its own
-    /// reads. The driver is offered `run_kaish` and never `explore`, its preamble says
-    /// nothing about a team or a sweep, and the loop still reaches a real kaish read and
-    /// an answer. If the explore′ tool leaked back in, or the preamble still promised a
-    /// teammate the model cannot reach, this fails.
-    #[tokio::test]
-    async fn a_consult_without_an_explorer_reads_for_itself() {
-        const SYNTH: &str = "solo-synth";
+    async fn consult_reads_through_run_kaish_and_answers_with_a_citation() {
+        const SYNTH: &str = "synth-model";
 
         let client = ScriptedClient::builder()
             .on_model(SYNTH, |req| {
-                assert!(
-                    has_tool(req, "run_kaish"),
-                    "solo driver must have run_kaish"
-                );
-                assert!(
-                    !has_tool(req, "explore"),
-                    "solo driver must not be offered explore′"
-                );
+                assert!(has_tool(req, "run_kaish"), "the synth reads with run_kaish");
                 if !transcript_text(req).contains("target_marker() {}") {
                     Ok(tool_call_response(
                         "t-read",
@@ -4611,458 +4048,29 @@ mod tests {
         let out = consult_with(
             "Where is target_marker defined?",
             dir.path(),
-            None,
             &arm(&client, SYNTH),
             &cfg,
         )
         .await
-        .expect("a solo consult should succeed");
+        .expect("the consult should succeed");
 
         assert!(out.answer.contains("src/foo.rs:1"), "got {:?}", out.answer);
-        assert!(out.report.is_empty(), "no sweep ran, got {:?}", out.report);
-        let reqs = client.requests_for(SYNTH);
-        let preamble = reqs[0].preamble.as_deref().unwrap_or("");
-        for absent in ["`explore`", "two-model team", "explorer"] {
-            assert!(
-                !preamble.contains(absent),
-                "the solo preamble must not mention {absent}: {preamble}"
-            );
-        }
-        assert!(
-            preamble.contains("You are the synthesis agent"),
-            "the solo driver keeps its role: {preamble}"
-        );
+        assert_eq!(client.requests_for(SYNTH).len(), 2, "one read, then the answer");
     }
 
-    /// A consult's reported `usage` must be the synth loop's tokens **plus** every
-    /// delegated `explore′` sweep's — the nested explorer runs inside the synth's tool
-    /// loop, so its tokens never reach the synth's own `PromptResponse.usage` and a
-    /// naive implementation would drop them. Each scripted completion "reports" a fixed
-    /// per-call usage; rig sums `usage += resp.usage` across a run, so the expected
-    /// total is (synth completions × synth-usage) + (explorer completions × explorer-usage),
-    /// computed from the request log so it can't drift with the loop's turn count. The
-    /// teeth: forget to fold the explorer sink in and the total comes back short by the
-    /// explorer's share, and this fails.
-    #[tokio::test]
-    async fn consult_usage_sums_synth_and_delegated_explorer_tokens() {
-        const SYNTH: &str = "capable-synth";
-        const EXPLORER: &str = "cheap-explorer";
-        const REPORT: &str = "EXPLORER_REPORT: src/foo.rs:1";
-        // Distinct per-call footprints so a missing addend is obvious in the total.
-        let synth_each = usage(100, 10);
-        let explorer_each = usage(50, 5);
+    // --- The explorer phase behind `deliberate`'s dossier --------------------------
 
-        let client = ScriptedClient::builder()
-            .on_model(SYNTH, move |req| {
-                let resp = if transcript_text(req).contains("EXPLORER_REPORT") {
-                    text_response("ANSWER: done.")
-                } else {
-                    tool_call_response("t-explore", "explore", json!({ "question": "sweep" }))
-                };
-                Ok(with_usage(resp, synth_each))
-            })
-            .on_model(EXPLORER, move |_req| {
-                Ok(with_usage(text_response(REPORT), explorer_each))
-            })
-            .build();
-
-        let dir = project_with_marker();
-        let cfg = ConsultConfig::default();
-
-        let out = consult_with(
-            "Where is target_marker defined?",
-            dir.path(),
-            Some(&arm(&client, EXPLORER)),
-            &arm(&client, SYNTH),
-            &cfg,
-        )
-        .await
-        .expect("scripted consult should succeed");
-
-        // Expected = per-call usage × how many completions each model actually made.
-        let ns = client.requests_for(SYNTH).len() as u64;
-        let ne = client.requests_for(EXPLORER).len() as u64;
-        assert!(
-            ns >= 2,
-            "driver should delegate then answer (≥2 turns), got {ns}"
-        );
-        assert!(
-            ne >= 1,
-            "explorer should have been delegated at least one sweep"
-        );
-
-        assert_eq!(
-            out.usage.input_tokens,
-            Some(ns * 100 + ne * 50),
-            "input tokens must sum synth + explorer completions"
-        );
-        assert_eq!(
-            out.usage.output_tokens,
-            Some(ns * 10 + ne * 5),
-            "output tokens must sum synth + explorer completions"
-        );
-        // And the explorer's share is genuinely included — the total strictly exceeds
-        // the synth's own tokens, so dropping the nested sink would fail here.
-        assert!(
-            out.usage.input_tokens > Some(ns * 100),
-            "the delegated explorer's tokens must be folded into the consult total"
-        );
-    }
-
-    /// Attachments reach the delegated sweep: a consult carrying attachments must
-    /// hand every `explore′` sub-agent the read-them-WHOLE directive in its
-    /// preamble — the sweep is a fresh agent that never saw the driver prompt, so
-    /// without this it's blind to the very files the caller flagged as central.
-    /// Inlined and oversize text attachments alike are listed; the directive is
-    /// command voice with the paging idiom.
-    #[tokio::test]
-    async fn consult_attachments_reach_the_delegated_sweep_preamble() {
-        const SYNTH: &str = "capable-synth";
-        const EXPLORER: &str = "cheap-explorer";
-
-        let client = ScriptedClient::builder()
-            .on_model(SYNTH, |req| {
-                if !transcript_text(req).contains("EXPLORER_REPORT") {
-                    Ok(tool_call_response(
-                        "t-explore",
-                        "explore",
-                        json!({ "question": "survey the change" }),
-                    ))
-                } else {
-                    Ok(text_response("ANSWER: done."))
-                }
-            })
-            .on_model(EXPLORER, |_req| {
-                Ok(text_response("EXPLORER_REPORT: src/foo.rs:1"))
-            })
-            .build();
-
-        let dir = project_with_marker();
-        let cfg = ConsultConfig {
-            attachments: vec![
-                super::super::prompts::ConsultAttachment::Text {
-                    path: "changes.diff".into(),
-                    body: "-a\n+b".into(),
-                },
-                super::super::prompts::ConsultAttachment::TextOversize {
-                    path: "src/big.rs".into(),
-                    size: 900_000,
-                },
-            ],
-            ..ConsultConfig::default()
-        };
-
-        consult_with(
-            "Does the change hold up?",
-            dir.path(),
-            Some(&arm(&client, EXPLORER)),
-            &arm(&client, SYNTH),
-            &cfg,
-        )
-        .await
-        .expect("scripted consult should succeed");
-
-        let explorer_reqs = client.requests_for(EXPLORER);
-        assert!(!explorer_reqs.is_empty(), "the sweep actually ran");
-        let preamble = explorer_reqs[0].preamble.as_deref().unwrap_or("");
-        assert!(
-            preamble.contains("Read each one WHOLE"),
-            "the sweep preamble carries the command-voice directive: {preamble:?}"
-        );
-        assert!(
-            preamble.contains("- changes.diff") && preamble.contains("- src/big.rs"),
-            "inlined and oversize attachments are both listed for the sweep: {preamble:?}"
-        );
-        assert!(
-            !preamble.contains("-a\n+b"),
-            "the sweep gets paths to read, never inlined bytes: {preamble:?}"
-        );
-    }
-
-    // --- The explorer `attach` tool, wired into the recomposed consult loop ------
-
-    /// A delegated sweep's OWN toolset (not the driver's) is exactly
-    /// `{run_kaish, attach}` — never a nested `explore` (a sweep doesn't delegate
-    /// further). Pinned by asserting inside the EXPLORER's own responder, since the
-    /// inner toolset only exists once the driver actually delegates.
-    #[tokio::test]
-    async fn the_delegated_sweep_toolset_is_run_kaish_and_attach() {
-        const SYNTH: &str = "capable-synth";
-        const EXPLORER: &str = "cheap-explorer";
-
-        let client = ScriptedClient::builder()
-            .on_model(SYNTH, |req| {
-                if !transcript_text(req).contains("REPORT") {
-                    Ok(tool_call_response(
-                        "t-explore",
-                        "explore",
-                        json!({ "question": "q" }),
-                    ))
-                } else {
-                    Ok(text_response("ANSWER"))
-                }
-            })
-            .on_model(EXPLORER, |req| {
-                assert!(has_tool(req, "run_kaish"), "{:?}", req.tools);
-                assert!(has_tool(req, "attach"), "{:?}", req.tools);
-                assert!(
-                    !has_tool(req, "explore"),
-                    "a sweep does not delegate further: {:?}",
-                    req.tools
-                );
-                Ok(text_response("REPORT"))
-            })
-            .build();
-
-        let dir = project_with_marker();
-        let cfg = ConsultConfig::default();
-
-        consult_with(
-            "q",
-            dir.path(),
-            Some(&arm(&client, EXPLORER)),
-            &arm(&client, SYNTH),
-            &cfg,
-        )
-        .await
-        .expect("scripted consult should succeed");
-    }
-
-    /// The load-bearing wiring test: a sweep that calls `attach` must land its
-    /// routed file — full body, numbered — on the DRIVER's tool result, not just
-    /// in the sweep's own transcript.
-    #[tokio::test]
-    async fn a_sweep_attachment_rides_the_tool_result_to_the_driver() {
-        const SYNTH: &str = "capable-synth";
-        const EXPLORER: &str = "cheap-explorer";
-
-        let client = ScriptedClient::builder()
-            .on_model(SYNTH, |req| {
-                if !transcript_text(req).contains("<file path=\"src/foo.rs\">") {
-                    Ok(tool_call_response(
-                        "t-explore",
-                        "explore",
-                        json!({ "question": "attach the marker file" }),
-                    ))
-                } else {
-                    Ok(text_response("ANSWER: done"))
-                }
-            })
-            .on_model(EXPLORER, |req| {
-                if !transcript_text(req).contains("attached: src/foo.rs") {
-                    Ok(tool_call_response(
-                        "t-attach",
-                        "attach",
-                        json!({ "paths": ["src/foo.rs"] }),
-                    ))
-                } else {
-                    Ok(text_response("REPORT: routed the config file"))
-                }
-            })
-            .build();
-
-        let dir = project_with_marker();
-        let cfg = ConsultConfig::default();
-
-        consult_with(
-            "attach the marker file",
-            dir.path(),
-            Some(&arm(&client, EXPLORER)),
-            &arm(&client, SYNTH),
-            &cfg,
-        )
-        .await
-        .expect("scripted consult should succeed");
-
-        let synth_reqs = client.requests_for(SYNTH);
-        assert!(
-            synth_reqs
-                .iter()
-                .any(|r| r.transcript.contains("<file path=\"src/foo.rs\">")
-                    && r.transcript.contains("fn target_marker")),
-            "the driver's transcript must carry the attached file's numbered body: {:?}",
-            synth_reqs.iter().map(|r| &r.transcript).collect::<Vec<_>>()
-        );
-    }
-
-    /// The explorer's OWN context (its later requests, after the attach call) must
-    /// never carry the routed bytes — the whole premise of the feature is that the
-    /// bytes bypass the sweep's own context.
-    #[tokio::test]
-    async fn the_explorer_never_sees_the_attached_bytes() {
-        const SYNTH: &str = "capable-synth";
-        const EXPLORER: &str = "cheap-explorer";
-
-        let client = ScriptedClient::builder()
-            .on_model(SYNTH, |req| {
-                if !transcript_text(req).contains("REPORT: routed") {
-                    Ok(tool_call_response(
-                        "t-explore",
-                        "explore",
-                        json!({ "question": "attach the marker file" }),
-                    ))
-                } else {
-                    Ok(text_response("ANSWER: done"))
-                }
-            })
-            .on_model(EXPLORER, |req| {
-                if !transcript_text(req).contains("attached: src/foo.rs") {
-                    Ok(tool_call_response(
-                        "t-attach",
-                        "attach",
-                        json!({ "paths": ["src/foo.rs"] }),
-                    ))
-                } else {
-                    Ok(text_response("REPORT: routed the config file"))
-                }
-            })
-            .build();
-
-        let dir = project_with_marker();
-        let cfg = ConsultConfig::default();
-
-        consult_with(
-            "attach the marker file",
-            dir.path(),
-            Some(&arm(&client, EXPLORER)),
-            &arm(&client, SYNTH),
-            &cfg,
-        )
-        .await
-        .expect("scripted consult should succeed");
-
-        for r in client.requests_for(EXPLORER) {
-            assert!(
-                !r.transcript.contains("fn target_marker"),
-                "the explorer's own transcript must never carry the routed bytes: {:?}",
-                r.transcript
-            );
-        }
-    }
-
-    /// A sweep that never calls `attach` hands the driver exactly the bare report —
-    /// no evidence block appended, byte-for-byte the pre-attach behavior.
-    #[tokio::test]
-    async fn a_sweep_with_no_attachment_hands_the_driver_the_bare_report() {
-        const SYNTH: &str = "capable-synth";
-        const EXPLORER: &str = "cheap-explorer";
-
-        let client = ScriptedClient::builder()
-            .on_model(SYNTH, |req| {
-                if !transcript_text(req).contains("PLAIN REPORT") {
-                    Ok(tool_call_response(
-                        "t-explore",
-                        "explore",
-                        json!({ "question": "find it" }),
-                    ))
-                } else {
-                    Ok(text_response("ANSWER"))
-                }
-            })
-            .on_model(EXPLORER, |_req| {
-                Ok(text_response("PLAIN REPORT: src/foo.rs:1"))
-            })
-            .build();
-
-        let dir = project_with_marker();
-        let cfg = ConsultConfig::default();
-
-        consult_with(
-            "q",
-            dir.path(),
-            Some(&arm(&client, EXPLORER)),
-            &arm(&client, SYNTH),
-            &cfg,
-        )
-        .await
-        .expect("scripted consult should succeed");
-
-        let synth_reqs = client.requests_for(SYNTH);
-        assert!(
-            synth_reqs
-                .iter()
-                .any(|r| r.transcript.contains("PLAIN REPORT: src/foo.rs:1")
-                    && !r.transcript.contains("Files the explorer routed")),
-            "no attach call -> no evidence block, just the bare report: {:?}",
-            synth_reqs.iter().map(|r| &r.transcript).collect::<Vec<_>>()
-        );
-    }
-
-    /// Past `max_attachments`, the extra file's demotion reaches the DRIVER as a
-    /// loud, consumer-shaped line — the driver learns it can still `run_kaish` the
-    /// file itself.
-    #[tokio::test]
-    async fn an_over_cap_sweep_attach_reaches_the_driver_as_a_loud_demotion() {
-        const SYNTH: &str = "capable-synth";
-        const EXPLORER: &str = "cheap-explorer";
-
-        let client = ScriptedClient::builder()
-            .on_model(SYNTH, |req| {
-                if !transcript_text(req).contains("could not route") {
-                    Ok(tool_call_response(
-                        "t-explore",
-                        "explore",
-                        json!({ "question": "attach two files" }),
-                    ))
-                } else {
-                    Ok(text_response("ANSWER"))
-                }
-            })
-            .on_model(EXPLORER, |req| {
-                if !transcript_text(req).contains("1 of 1 attachments") {
-                    Ok(tool_call_response(
-                        "t-attach",
-                        "attach",
-                        json!({ "paths": ["src/foo.rs", "src/bar.rs"] }),
-                    ))
-                } else {
-                    Ok(text_response("REPORT: tried to route both"))
-                }
-            })
-            .build();
-
-        let dir = project_with_marker();
-        fs::write(dir.path().join("src/bar.rs"), "fn other() {}\n").unwrap();
-        let cfg = ConsultConfig {
-            explore: ExploreConfig {
-                max_attachments: 1,
-                ..ExploreConfig::default()
-            },
-            ..ConsultConfig::default()
-        };
-
-        consult_with(
-            "attach two files",
-            dir.path(),
-            Some(&arm(&client, EXPLORER)),
-            &arm(&client, SYNTH),
-            &cfg,
-        )
-        .await
-        .expect("scripted consult should succeed");
-
-        let synth_reqs = client.requests_for(SYNTH);
-        assert!(
-            synth_reqs
-                .iter()
-                .any(|r| r.transcript.contains("could not route")
-                    && r.transcript.contains("budget of 1 was full")),
-            "the over-cap demotion must reach the driver: {:?}",
-            synth_reqs.iter().map(|r| &r.transcript).collect::<Vec<_>>()
-        );
-    }
-
-    /// `explore` (v1) never offers `attach` — the top-level tool passes `None`
-    /// straight through to `run_explore_phase`, so the toolset stays exactly
-    /// `{run_kaish}`.
+    /// With no attach sink (`max_attachments = 0`) the explorer is never offered
+    /// `attach`: `None` passes straight through to `run_explore_phase`, so the toolset
+    /// stays exactly `{run_kaish}`.
     #[tokio::test]
     async fn the_top_level_explore_sweep_offers_no_attach_tool() {
-        const EXPLORER: &str = "cheap-explorer";
+        const EXPLORER: &str = "explorer-model";
         let client = ScriptedClient::builder()
             .on_model(EXPLORER, |req| {
                 assert!(
                     !has_tool(req, "attach"),
-                    "the top-level explore tool must not offer attach"
+                    "no attach sink means no attach tool"
                 );
                 Ok(text_response("REPORT"))
             })
@@ -5077,412 +4085,26 @@ mod tests {
             &cfg,
             &[],
             None,
-            ReportReader::CallingAgent,
         )
         .await
         .expect("scripted explore should succeed");
     }
 
-    /// `max_attachments: 0` omits the `attach` tool from a delegated sweep's
-    /// toolset entirely — the config-driven off switch, distinct from the v1
-    /// top-level-`explore` exclusion above (this one is `consult`'s nested sweep).
-    #[tokio::test]
-    async fn max_attachments_zero_omits_the_attach_tool() {
-        const SYNTH: &str = "capable-synth";
-        const EXPLORER: &str = "cheap-explorer";
-
-        let client = ScriptedClient::builder()
-            .on_model(SYNTH, |req| {
-                if !transcript_text(req).contains("REPORT") {
-                    Ok(tool_call_response(
-                        "t-explore",
-                        "explore",
-                        json!({ "question": "q" }),
-                    ))
-                } else {
-                    Ok(text_response("ANSWER"))
-                }
-            })
-            .on_model(EXPLORER, |req| {
-                assert!(
-                    !has_tool(req, "attach"),
-                    "max_attachments = 0 must omit the attach tool"
-                );
-                Ok(text_response("REPORT"))
-            })
-            .build();
-
-        let dir = project_with_marker();
-        let cfg = ConsultConfig {
-            explore: ExploreConfig {
-                max_attachments: 0,
-                ..ExploreConfig::default()
-            },
-            ..ConsultConfig::default()
-        };
-
-        consult_with(
-            "q",
-            dir.path(),
-            Some(&arm(&client, EXPLORER)),
-            &arm(&client, SYNTH),
-            &cfg,
-        )
-        .await
-        .expect("scripted consult should succeed");
-    }
-
-    /// A sweep's `attach` call surfaces as `PhaseEvent::Attached` on the shared
-    /// progress sink — the one beat that lets an operator observe the pattern the
-    /// generous default budget exists to watch for.
-    #[tokio::test]
-    async fn sweep_attachments_surface_as_progress() {
-        const SYNTH: &str = "capable-synth";
-        const EXPLORER: &str = "cheap-explorer";
-
-        let client = ScriptedClient::builder()
-            .on_model(SYNTH, |req| {
-                if !transcript_text(req).contains("REPORT: routed") {
-                    Ok(tool_call_response(
-                        "t-explore",
-                        "explore",
-                        json!({ "question": "attach the marker file" }),
-                    ))
-                } else {
-                    Ok(text_response("ANSWER: done"))
-                }
-            })
-            .on_model(EXPLORER, |req| {
-                if !transcript_text(req).contains("attached: src/foo.rs") {
-                    Ok(tool_call_response(
-                        "t-attach",
-                        "attach",
-                        json!({ "paths": ["src/foo.rs"] }),
-                    ))
-                } else {
-                    Ok(text_response("REPORT: routed the config file"))
-                }
-            })
-            .build();
-
-        let dir = project_with_marker();
-        let sink = Arc::new(RecordingSink::default());
-        let cfg = ConsultConfig {
-            explore: ExploreConfig {
-                phase: PhaseContext {
-                    progress: sink.clone(),
-                    ..PhaseContext::default()
-                },
-                ..ExploreConfig::default()
-            },
-            ..ConsultConfig::default()
-        };
-
-        consult_with(
-            "attach the marker file",
-            dir.path(),
-            Some(&arm(&client, EXPLORER)),
-            &arm(&client, SYNTH),
-            &cfg,
-        )
-        .await
-        .expect("scripted consult should succeed");
-
-        let events = sink.events();
-        assert!(
-            events.contains(&PhaseEvent::Attached {
-                path: "src/foo.rs".into()
-            }),
-            "an attach call must surface as progress: {events:?}"
-        );
-    }
-
-    /// A minimal PNG signature plus filler — enough to sniff as an image without
-    /// decoding it (mirrors the `view_image`/`attach.rs`/`sweep_attach.rs` test helpers).
-    fn fake_png_bytes() -> Vec<u8> {
-        let mut v = vec![0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
-        v.extend(std::iter::repeat_n(0xAB, 16));
-        v
-    }
-
-    /// A vision-capable driver (Anthropic/Gemini-shaped: `tool_result_images = true`)
-    /// receives a sweep's routed image right on the `explore` tool result — no break,
-    /// no user-turn rewrite, since this transport carries an image in a tool result.
-    #[tokio::test]
-    async fn a_vision_driver_receives_the_sweep_image_in_the_tool_result() {
-        const SYNTH: &str = "vision-synth";
-        const EXPLORER: &str = "cheap-explorer";
-
-        let client = ScriptedClient::builder()
-            .on_model(SYNTH, |req| {
-                let history: Vec<Message> = req.chat_history.iter().map(|m| (**m).clone()).collect();
-                if any_tool_result_image(&history) {
-                    Ok(text_response("ANSWER: saw the diagram"))
-                } else {
-                    Ok(tool_call_response(
-                        "t-explore",
-                        "explore",
-                        json!({ "question": "attach the diagram" }),
-                    ))
-                }
-            })
-            .on_model(EXPLORER, |req| {
-                if !transcript_text(req).contains("attached: docs/arch.png") {
-                    Ok(tool_call_response(
-                        "t-attach",
-                        "attach",
-                        json!({ "paths": ["docs/arch.png"] }),
-                    ))
-                } else {
-                    Ok(text_response("REPORT: the diagram shows the pipeline"))
-                }
-            })
-            .build();
-
-        let dir = project_with_marker();
-        fs::create_dir(dir.path().join("docs")).unwrap();
-        fs::write(dir.path().join("docs/arch.png"), fake_png_bytes()).unwrap();
-
-        let cfg = ConsultConfig::default();
-        // vision + tool_result_images: the Anthropic/Gemini shape.
-        let synth = vision_arm(&client, SYNTH);
-
-        consult_with(
-            "attach the diagram",
-            dir.path(),
-            Some(&arm(&client, EXPLORER)),
-            &synth,
-            &cfg,
-        )
-        .await
-        .expect("scripted consult should succeed");
-
-        assert!(
-            client
-                .requests_for(SYNTH)
-                .iter()
-                .any(|r| any_tool_result_image(&r.chat_history)),
-            "the vision driver must receive the image on the explore tool result"
-        );
-    }
-
-    /// A vision-capable driver whose TRANSPORT can't carry an image in a tool result
-    /// (an OpenAI VLM shape: `tool_result_images = false`) still receives the sweep's
-    /// image — on a separate user `Image` turn, via the same break-rewrite-resume
-    /// path `view_image` uses, now generalized to any image-bearing tool result.
-    #[tokio::test]
-    async fn an_openai_vlm_driver_receives_the_sweep_image_on_a_user_turn() {
-        const SYNTH: &str = "openai-vlm-synth";
-        const EXPLORER: &str = "cheap-explorer";
-
-        let client = ScriptedClient::builder()
-            .on_model(SYNTH, |req| {
-                let history: Vec<Message> = req.chat_history.iter().map(|m| (**m).clone()).collect();
-                if user_image_messages(&history) > 0 {
-                    Ok(text_response("ANSWER: saw the diagram"))
-                } else {
-                    Ok(tool_call_response(
-                        "t-explore",
-                        "explore",
-                        json!({ "question": "attach the diagram" }),
-                    ))
-                }
-            })
-            .on_model(EXPLORER, |req| {
-                if !transcript_text(req).contains("attached: docs/arch.png") {
-                    Ok(tool_call_response(
-                        "t-attach",
-                        "attach",
-                        json!({ "paths": ["docs/arch.png"] }),
-                    ))
-                } else {
-                    Ok(text_response("REPORT: the diagram shows the pipeline"))
-                }
-            })
-            .build();
-
-        let dir = project_with_marker();
-        fs::create_dir(dir.path().join("docs")).unwrap();
-        fs::write(dir.path().join("docs/arch.png"), fake_png_bytes()).unwrap();
-
-        let cfg = ConsultConfig::default();
-        // vision but NOT tool_result_images: the OpenAI VLM shape that must break,
-        // rewrite, and resume.
-        let synth = Arm::new(
-            client.clone(),
-            SYNTH,
-            16384,
-            None,
-            ModelCaps {
-                vision: true,
-                tool_result_images: false,
-            },
-        );
-
-        consult_with(
-            "attach the diagram",
-            dir.path(),
-            Some(&arm(&client, EXPLORER)),
-            &synth,
-            &cfg,
-        )
-        .await
-        .expect("scripted consult should succeed");
-
-        let synth_reqs = client.requests_for(SYNTH);
-        assert!(
-            synth_reqs
-                .iter()
-                .any(|r| user_image_messages(&r.chat_history) > 0),
-            "the OpenAI-shaped driver must receive the image on its own user turn: {:?}",
-            synth_reqs
-                .iter()
-                .map(|r| r.chat_history.len())
-                .collect::<Vec<_>>()
-        );
-        assert!(
-            synth_reqs
-                .iter()
-                .all(|r| !any_tool_result_image(&r.chat_history)),
-            "an image must never ride this transport's tool-result channel"
-        );
-    }
-
-    /// A blind consumer (the default `arm()` — not vision-capable) never receives an
-    /// image: `attach` refuses it in the receipt, and the EXPLORER sees that refusal
-    /// on its very next turn (immediately, within the same sweep) rather than only
-    /// finding out once the whole sweep concludes.
-    #[tokio::test]
-    async fn a_blind_driver_refuses_the_image_and_the_explorer_learns_immediately() {
-        const SYNTH: &str = "blind-synth";
-        const EXPLORER: &str = "cheap-explorer";
-
-        let client = ScriptedClient::builder()
-            .on_model(SYNTH, |req| {
-                if !transcript_text(req).contains("REPORT") {
-                    Ok(tool_call_response(
-                        "t-explore",
-                        "explore",
-                        json!({ "question": "attach the diagram" }),
-                    ))
-                } else {
-                    Ok(text_response("ANSWER: no diagram available"))
-                }
-            })
-            .on_model(EXPLORER, |req| {
-                if !transcript_text(req).contains("not attached: docs/arch.png") {
-                    Ok(tool_call_response(
-                        "t-attach",
-                        "attach",
-                        json!({ "paths": ["docs/arch.png"] }),
-                    ))
-                } else {
-                    // The explorer learns of the refusal on its OWN very next turn —
-                    // it doesn't have to wait for anything downstream.
-                    assert!(
-                        transcript_text(req).contains("reads text only"),
-                        "the explorer must see the refusal reason immediately: {}",
-                        transcript_text(req)
-                    );
-                    Ok(text_response("REPORT: could not attach the diagram"))
-                }
-            })
-            .build();
-
-        let dir = project_with_marker();
-        fs::create_dir(dir.path().join("docs")).unwrap();
-        fs::write(dir.path().join("docs/arch.png"), fake_png_bytes()).unwrap();
-
-        let cfg = ConsultConfig::default();
-
-        consult_with(
-            "attach the diagram",
-            dir.path(),
-            Some(&arm(&client, EXPLORER)),
-            &arm(&client, SYNTH), // the default arm is blind
-            &cfg,
-        )
-        .await
-        .expect("scripted consult should succeed");
-
-        for r in client.requests_for(SYNTH) {
-            assert!(
-                !any_tool_result_image(&r.chat_history),
-                "a blind driver must never receive an image on any channel"
-            );
-        }
-    }
-
-    /// The reader reaches the wire. `explore_with` is shared by standalone `explore`
-    /// (whose report goes straight to the calling agent) and `deliberate`'s dossier
-    /// pass (whose report goes to an offline synth), so the parameter has to survive
-    /// the trip into rig's preamble — a hardcoded phase inside the function would
-    /// compile fine and quietly send every sweep the wrong framing.
-    #[tokio::test]
-    async fn the_reader_reaches_the_preamble_rig_forwards() {
-        const EXPLORER: &str = "cheap-explorer";
-
-        let run = |reader| async move {
-            let client = ScriptedClient::builder()
-                .on_model(EXPLORER, |_req| Ok(text_response("REPORT: src/foo.rs:1")))
-                .build();
-            let dir = project_with_marker();
-            explore_with(
-                "what is here?",
-                dir.path().to_path_buf(),
-                &arm(&client, EXPLORER),
-                &ExploreConfig::default(),
-                &[],
-                None,
-                reader,
-            )
-            .await
-            .expect("scripted explore should succeed");
-            client
-                .requests_for(EXPLORER)
-                .first()
-                .and_then(|r| r.preamble.clone())
-                .expect("the explorer request carries a preamble")
-        };
-
-        let caller = run(ReportReader::CallingAgent).await;
-        assert!(
-            !caller.contains("synthesis agent"),
-            "a CallingAgent sweep must not be told a synth reads it: {caller}"
-        );
-        assert!(
-            caller.contains("the agent that asked"),
-            "a CallingAgent sweep still names its reader: {caller}"
-        );
-
-        let synth = run(ReportReader::SynthesisAgent).await;
-        assert!(
-            synth.contains("The synthesis agent writes the final answer"),
-            "a SynthesisAgent sweep keeps the hand-off framing: {synth}"
-        );
-    }
-
-    /// The `explore` tool's phase, surfaced directly: `explore_with` runs ONE
+    /// `deliberate`'s dossier phase, surfaced directly: `explore_with` runs ONE
     /// explorer arm over `{run_kaish}` against the real repo and returns the
-    /// explorer's cited report *verbatim* — no synth, no second phase. Mirrors the
-    /// consult e2e above but for the exposed evidence-gathering half. If the phase
+    /// explorer's cited report *verbatim* — no synth, no second phase. If the phase
     /// ever synthesized an answer instead of surfacing the report, the marker
     /// wouldn't survive; and the explorer must run on the report (explorer-role)
     /// preamble, not a driver preamble.
     #[tokio::test]
     async fn explore_with_runs_the_single_explorer_phase_and_returns_the_report() {
-        const EXPLORER: &str = "cheap-explorer";
+        const EXPLORER: &str = "explorer-model";
         const REPORT: &str = "EXPLORER_REPORT: src/foo.rs:1 fn target_marker";
 
         let client = ScriptedClient::builder()
             // A single-phase sweep: grep once against real kaish, then write the report.
             .on_model(EXPLORER, |req| {
-                // Explorer-only — `run_kaish`, and no nested `explore′` (explore is one phase).
                 assert!(has_tool(req, "run_kaish"), "explorer must have run_kaish");
-                assert!(
-                    !has_tool(req, "explore"),
-                    "explore is single-phase — no nested explore′"
-                );
                 let seen = transcript_text(req);
                 if !seen.contains("target_marker() {}") {
                     Ok(tool_call_response(
@@ -5506,7 +4128,6 @@ mod tests {
             &cfg,
             &[],
             None,
-            ReportReader::CallingAgent,
         )
         .await
         .expect("scripted explore should succeed");
@@ -5532,11 +4153,11 @@ mod tests {
         );
     }
 
-    /// The top-level `explore` tool's attachments land the same way: a read-WHOLE
-    /// directive appended to the explorer preamble — never inlined bytes.
+    /// `deliberate`'s caller-attached files reach the explorer as a read-WHOLE
+    /// directive appended to its preamble — never inlined bytes.
     #[tokio::test]
     async fn explore_with_appends_the_attachment_directive() {
-        const EXPLORER: &str = "cheap-explorer";
+        const EXPLORER: &str = "explorer-model";
         let client = ScriptedClient::builder()
             .on_model(EXPLORER, |_req| {
                 Ok(text_response("EXPLORER_REPORT: src/foo.rs:1"))
@@ -5555,7 +4176,6 @@ mod tests {
                 size: 900_000,
             }],
             None,
-            ReportReader::CallingAgent,
         )
         .await
         .expect("scripted explore should succeed");
@@ -5570,17 +4190,12 @@ mod tests {
         );
     }
 
-    /// The `explore` phase is a *single* sweep, not a nested delegation — so its
-    /// progress shape is the explorer's own reads reaching the sink directly, with
-    /// **no** `SweepStarted`/`SweepFinished` bracket (that bracket is `RunExplore`'s,
-    /// emitted only when the consult driver delegates a sub-agent). This is the teeth
-    /// for the seam split: if the bracket ever migrated from `RunExplore::call` into
-    /// the shared `run_explore_phase`, a `SweepStarted` would appear here and this
-    /// test fails; and if the sink weren't threaded through, the explorer's `run_kaish`
-    /// read would be missing.
+    /// The explorer phase's progress shape is its own reads reaching the sink
+    /// directly. If the sink weren't threaded through, the explorer's `run_kaish` read
+    /// would be missing.
     #[tokio::test]
-    async fn explore_progress_surfaces_the_read_with_no_sweep_bracket() {
-        const EXPLORER: &str = "cheap-explorer";
+    async fn explore_progress_surfaces_the_explorers_read() {
+        const EXPLORER: &str = "explorer-model";
 
         let client = ScriptedClient::builder()
             .on_model(EXPLORER, |req| {
@@ -5613,7 +4228,6 @@ mod tests {
             &cfg,
             &[],
             None,
-            ReportReader::CallingAgent,
         )
         .await
         .expect("scripted explore should succeed");
@@ -5626,24 +4240,11 @@ mod tests {
             }),
             "the explorer's read must surface through the single phase: {events:?}"
         );
-        // No sweep bracket: explore is not a sub-agent delegation. A migrated bracket
-        // would light these up.
-        assert!(
-            !events
-                .iter()
-                .any(|e| matches!(e, PhaseEvent::SweepStarted { .. })),
-            "explore is single-phase — no SweepStarted bracket belongs here: {events:?}"
-        );
-        assert!(
-            !events.contains(&PhaseEvent::SweepFinished),
-            "explore is single-phase — no SweepFinished bracket belongs here: {events:?}"
-        );
     }
 
     /// The `direct` lane: `deliberate_direct` runs the offline synth as ONE toolless
     /// turn over the dossier and returns its deliberation. Teeth: the synth must be
-    /// toolless (no `run_kaish`/`explore` — it reasons over the handed dossier, it
-    /// does not investigate), the dossier must reach it, and the result is the synth's
+    /// toolless (it reasons over the handed dossier, it does not investigate), the dossier must reach it, and the result is the synth's
     /// answer. This is the local-lane execution the `direct` cast finally routes to.
     #[tokio::test]
     async fn deliberate_direct_runs_one_toolless_turn_over_the_dossier() {
@@ -5652,7 +4253,7 @@ mod tests {
         let client = ScriptedClient::builder()
             .on_model(SYNTH, |req| {
                 assert!(
-                    !has_tool(req, "run_kaish") && !has_tool(req, "explore"),
+                    req.tools.is_empty(),
                     "the direct synth deliberates toolless over the dossier"
                 );
                 let seen = transcript_text(req);
@@ -5697,7 +4298,7 @@ mod tests {
     /// works end to end at the engine layer, without the MCP server.
     #[tokio::test]
     async fn a_deliberate_dossier_sweep_routes_bytes_into_the_dossier() {
-        const EXPLORER: &str = "cheap-explorer";
+        const EXPLORER: &str = "explorer-model";
 
         let client = ScriptedClient::builder()
             .on_model(EXPLORER, |req| {
@@ -5718,15 +4319,10 @@ mod tests {
         let dir = project_with_marker();
         let cfg = ExploreConfig::default();
         let consumer = SweepConsumer {
-            kind: SweepConsumerKind::OfflineSynth,
             label: Arc::from("the offline synth (`test-model`)"),
             vision: false,
         };
-        let sink = Arc::new(SweepAttachSink::new(
-            cfg.max_attachments,
-            consumer.clone(),
-            HashSet::new(),
-        ));
+        let sink = Arc::new(SweepAttachSink::new(cfg.max_attachments, consumer));
 
         let (mut dossier, _usage) = explore_with(
             "what's the relevant module?",
@@ -5735,7 +4331,6 @@ mod tests {
             &cfg,
             &[],
             Some(&sink),
-            ReportReader::SynthesisAgent,
         )
         .await
         .expect("scripted explore should succeed");
@@ -5747,7 +4342,7 @@ mod tests {
         );
 
         let delivery = sink.drain();
-        if let Some(block) = sweep_evidence_block(&consumer, &delivery) {
+        if let Some(block) = sweep_evidence_block(&delivery) {
             dossier.push_str(&block);
         }
 
@@ -5770,7 +4365,8 @@ mod tests {
 
         let client = ScriptedClient::builder()
             .on_model(SYNTH, |req| {
-                let history: Vec<Message> = req.chat_history.iter().map(|m| (**m).clone()).collect();
+                let history: Vec<Message> =
+                    req.chat_history.iter().map(|m| (**m).clone()).collect();
                 assert!(
                     user_image_messages(&history) > 0,
                     "the single turn must carry the routed image"
@@ -5808,23 +4404,16 @@ mod tests {
     #[tokio::test]
     async fn consult_aborts_when_a_backend_wedges() {
         const SYNTH: &str = "wedged-synth";
-        const EXPLORER: &str = "cheap-explorer";
         let dir = tempdir().unwrap();
 
         // The synth's very first completion never returns; the explorer is never reached.
         let client = ScriptedClient::builder().hang_model(SYNTH).build();
         let mut cfg = ConsultConfig::default();
-        cfg.explore.phase.call_deadline = Duration::from_millis(50);
+        cfg.phase.call_deadline = Duration::from_millis(50);
 
         let outcome = tokio::time::timeout(
             Duration::from_secs(5),
-            consult_with(
-                "q",
-                dir.path(),
-                Some(&arm(&client, EXPLORER)),
-                &arm(&client, SYNTH),
-                &cfg,
-            ),
+            consult_with("q", dir.path(), &arm(&client, SYNTH), &cfg),
         )
         .await
         .expect("consult_with did not honor call_deadline — it hung past 5s (no backstop)");
@@ -5847,8 +4436,8 @@ mod tests {
         );
     }
 
-    /// The same wall-clock backstop guards `explore`, not just `consult`: a wedged
-    /// explorer must abort by `call_deadline`. Guards against a refactor dropping the
+    /// The same wall-clock backstop guards the dossier survey, not just `consult`: a
+    /// wedged explorer must abort by `call_deadline`. Guards against a refactor dropping the
     /// wrap from `explore_with` specifically (it shares `with_call_deadline`, but the
     /// call site is its own). Same outer-guard teeth as the consult version.
     #[tokio::test]
@@ -5868,7 +4457,6 @@ mod tests {
                 &cfg,
                 &[],
                 None,
-                ReportReader::CallingAgent,
             ),
         )
         .await
@@ -5912,129 +4500,6 @@ mod tests {
         );
     }
 
-    /// Progress reaches the *deep* loop. The same delegate-then-read flow as the e2e
-    /// above, but driven through a [`RecordingSink`] on `ConsultConfig`: the sink must
-    /// see the sweep bracket (start/finish), the nested explorer's own `run_kaish`
-    /// read, and the driver's direct `run_kaish` read. This is the teeth for the whole
-    /// threading job — were the sink dropped anywhere between `ConsultConfig` and the
-    /// tools (or not forwarded into the nested explorer), one of these would be missing.
-    #[tokio::test]
-    async fn progress_events_reach_the_sweep_and_both_kaish_reads() {
-        const SYNTH: &str = "capable-synth";
-        const EXPLORER: &str = "cheap-explorer";
-
-        let client = ScriptedClient::builder()
-            .on_model(SYNTH, |req| {
-                let seen = transcript_text(req);
-                if !seen.contains("EXPLORER_REPORT") {
-                    Ok(tool_call_response(
-                        "t-explore",
-                        "explore",
-                        json!({ "question": "where is target_marker defined?" }),
-                    ))
-                } else if !seen.contains("target_marker() {}") {
-                    Ok(tool_call_response(
-                        "t-read",
-                        "run_kaish",
-                        json!({ "script": "cat -n src/foo.rs" }),
-                    ))
-                } else {
-                    Ok(text_response("ANSWER: src/foo.rs:1"))
-                }
-            })
-            .on_model(EXPLORER, |req| {
-                // Branch on tool *output* (run_kaish prefixes "exit:"), not on the
-                // question text — the sub-question itself contains "target_marker", so
-                // a content check on that would skip the read we're here to observe.
-                if !transcript_text(req).contains("exit:") {
-                    Ok(tool_call_response(
-                        "t-grep",
-                        "run_kaish",
-                        json!({ "script": "grep -rn target_marker src" }),
-                    ))
-                } else {
-                    Ok(text_response("EXPLORER_REPORT: src/foo.rs:1"))
-                }
-            })
-            .build();
-
-        let dir = project_with_marker();
-        let sink = Arc::new(RecordingSink::default());
-        let cfg = ConsultConfig {
-            explore: ExploreConfig {
-                phase: PhaseContext {
-                    progress: sink.clone(),
-                    ..PhaseContext::default()
-                },
-                ..ExploreConfig::default()
-            },
-            ..ConsultConfig::default()
-        };
-
-        consult_with(
-            "Where is target_marker?",
-            dir.path(),
-            Some(&arm(&client, EXPLORER)),
-            &arm(&client, SYNTH),
-            &cfg,
-        )
-        .await
-        .expect("scripted consult should succeed");
-
-        let events = sink.events();
-        assert!(
-            events.contains(&PhaseEvent::SweepStarted {
-                question: "where is target_marker defined?".into()
-            }),
-            "the delegation must announce its start: {events:?}"
-        );
-        assert!(
-            events.contains(&PhaseEvent::SweepFinished),
-            "the delegation must announce its finish: {events:?}"
-        );
-        assert!(
-            events.contains(&PhaseEvent::KaishRun { script: "grep -rn target_marker src".into() }),
-            "the nested explorer's read must surface (sink threaded into the sub-agent): {events:?}"
-        );
-        assert!(
-            events.contains(&PhaseEvent::KaishRun {
-                script: "cat -n src/foo.rs".into()
-            }),
-            "the driver's own direct read must surface: {events:?}"
-        );
-        // Ordering sanity: the sweep starts before its nested read, which precedes the
-        // sweep finishing — the bracket actually brackets.
-        let pos = |want: &PhaseEvent| events.iter().position(|e| e == want).unwrap();
-        let start = pos(&PhaseEvent::SweepStarted {
-            question: "where is target_marker defined?".into(),
-        });
-        let nested = pos(&PhaseEvent::KaishRun {
-            script: "grep -rn target_marker src".into(),
-        });
-        let finish = pos(&PhaseEvent::SweepFinished);
-        assert!(
-            start < nested && nested < finish,
-            "sweep must bracket its nested read: {events:?}"
-        );
-        // Every model call beats, labeled with the role that made it: the driver's
-        // calls as `synth`, the delegated sweep's as `explorer`. This is what `job_get`
-        // reads to tell a slow synth from a busy explorer.
-        let beats = |agent: &str| {
-            events
-                .iter()
-                .filter(|e| matches!(e, PhaseEvent::ChatCompleted { agent: a, .. } if *a == agent))
-                .count()
-        };
-        assert!(
-            beats("synth") >= 2,
-            "the driver made at least a tool turn and an answer turn: {events:?}"
-        );
-        assert!(
-            beats("explorer") >= 2,
-            "the delegated sweep made at least a tool turn and a report turn: {events:?}"
-        );
-    }
-
     /// A stateless consult (default `ConsultConfig`) emits to the `NullSink` — no
     /// panic, no observable effect. The opt-out path stays a true no-op.
     #[tokio::test]
@@ -6044,153 +4509,9 @@ mod tests {
         let dir = tempdir().unwrap();
         let cfg = ConsultConfig::default();
         // No token, no recording sink — just prove the default path runs clean.
-        consult_with(
-            "q",
-            dir.path(),
-            Some(&arm(&client, "explorer")),
-            &arm(&client, SYNTH),
-            &cfg,
-        )
-        .await
-        .unwrap();
-    }
-
-    /// Multi-sweep: a driver that delegates to `explore′` more than once must
-    /// aggregate every report into `ConsultOutput.report`, joined by the `---`
-    /// separator. The single-delegation e2e can't see this — one report makes any
-    /// join string look right.
-    #[tokio::test]
-    async fn multiple_sweeps_aggregate_into_one_report_joined_by_separator() {
-        const SYNTH: &str = "capable-synth";
-        const EXPLORER: &str = "cheap-explorer";
-
-        let client = ScriptedClient::builder()
-            .on_model(SYNTH, |req| {
-                // Delegate twice (distinguishable sub-questions), then answer. Count
-                // the reports already gathered to decide which step we're on.
-                let sweeps = transcript_text(req).matches("REPORT-").count();
-                match sweeps {
-                    0 => Ok(tool_call_response(
-                        "s1",
-                        "explore",
-                        json!({ "question": "find the sandbox" }),
-                    )),
-                    1 => Ok(tool_call_response(
-                        "s2",
-                        "explore",
-                        json!({ "question": "find the kaish syntax" }),
-                    )),
-                    _ => Ok(text_response("ANSWER from both sweeps")),
-                }
-            })
-            .on_model(EXPLORER, |req| {
-                // Each sweep answers immediately with a distinguishable report, keyed
-                // off its sub-question (which is the explorer's whole prompt).
-                if transcript_text(req).contains("sandbox") {
-                    Ok(text_response("REPORT-SANDBOX: src/sandbox.rs:1"))
-                } else {
-                    Ok(text_response("REPORT-KAISH: src/kaish_syntax.rs:1"))
-                }
-            })
-            .build();
-
-        let dir = project_with_marker();
-        let cfg = ConsultConfig::default();
-
-        let out = consult_with(
-            "two-part question",
-            dir.path(),
-            Some(&arm(&client, EXPLORER)),
-            &arm(&client, SYNTH),
-            &cfg,
-        )
-        .await
-        .unwrap();
-
-        assert!(
-            out.report.contains("REPORT-SANDBOX"),
-            "first sweep present: {:?}",
-            out.report
-        );
-        assert!(
-            out.report.contains("REPORT-KAISH"),
-            "second sweep present: {:?}",
-            out.report
-        );
-        assert_eq!(
-            out.report.matches("---").count(),
-            1,
-            "exactly one `---` between two reports, got: {:?}",
-            out.report
-        );
-        assert_eq!(
-            client.requests_for(EXPLORER).len(),
-            2,
-            "the driver must have delegated two distinct sweeps"
-        );
-    }
-
-    /// A dying `explore′` sweep must not sink the whole consult: the driver sees the
-    /// failure in its transcript and answers from what it has, the report sink stays
-    /// empty, and — the teeth for the harness's record-before-respond promise — the
-    /// failed explorer request is still logged.
-    #[tokio::test]
-    async fn a_failed_sweep_surfaces_and_the_driver_recovers() {
-        const SYNTH: &str = "capable-synth";
-        const EXPLORER: &str = "cheap-explorer";
-
-        let client = ScriptedClient::builder()
-            .on_model(SYNTH, |req| {
-                // Delegate once; once the failure has come back, answer from direct work.
-                if transcript_text(req).contains("simulated provider outage") {
-                    Ok(text_response(
-                        "ANSWER: explore failed, answered from direct reads",
-                    ))
-                } else {
-                    Ok(tool_call_response(
-                        "s1",
-                        "explore",
-                        json!({ "question": "find it" }),
-                    ))
-                }
-            })
-            .on_model(EXPLORER, |_req| {
-                Err(provider_error("simulated provider outage"))
-            })
-            .build();
-
-        let dir = project_with_marker();
-        let cfg = ConsultConfig::default();
-
-        let out = consult_with(
-            "a question",
-            dir.path(),
-            Some(&arm(&client, EXPLORER)),
-            &arm(&client, SYNTH),
-            &cfg,
-        )
-        .await
-        .expect("a failed sweep must not fail the whole consult");
-
-        // The driver only reaches this answer by *seeing* the error in its transcript
-        // (its branch requires it) — so the answer text proves the failure surfaced.
-        assert!(
-            out.answer.contains("answered from direct reads"),
-            "driver should recover after the sweep failed, got: {:?}",
-            out.answer
-        );
-        // The sweep errored before `RunExplore` pushed to the sink, so the report is
-        // empty — distinct from a sweep that ran and found nothing.
-        assert!(
-            out.report.is_empty(),
-            "a failed sweep contributes no report: {:?}",
-            out.report
-        );
-        // Record-before-respond: the failing explorer call was still captured.
-        assert!(
-            !client.requests_for(EXPLORER).is_empty(),
-            "the failed explorer request must still be logged"
-        );
+        consult_with("q", dir.path(), &arm(&client, SYNTH), &cfg)
+            .await
+            .unwrap();
     }
 
     /// Turn-cap recovery, offline: a model that never stops calling tools must still
@@ -6227,7 +4548,6 @@ mod tests {
         let out = consult_with(
             "A question the model never finishes answering",
             dir.path(),
-            Some(&arm(&client, "explorer-unused")),
             &arm(&client, SYNTH),
             &cfg,
         )
@@ -6297,27 +4617,25 @@ mod tests {
             .on_model(SYNTH, |req| {
                 if is_finalize_turn(req) {
                     Ok(with_usage(text_response(RECOVERED), usage(36_104, 3_971)))
-                } else if transcript_text(req).contains("SWEEP_DONE") {
+                } else if transcript_text(req).contains("target_marker() {}") {
                     Ok(with_usage(
                         reasoning_response("I have finished reviewing. Now to write it up..."),
                         usage(1_164_958, 16_801),
                     ))
                 } else {
                     Ok(tool_call_response(
-                        "t-explore",
-                        "explore",
-                        json!({ "question": "review the diff" }),
+                        "t-read",
+                        "run_kaish",
+                        json!({ "script": "cat -n src/foo.rs" }),
                     ))
                 }
             })
-            .on_model("cheap-explorer", |_req| Ok(text_response("SWEEP_DONE")))
             .build();
 
         let dir = project_with_marker();
         let out = consult_with(
             "review this branch",
             dir.path(),
-            Some(&arm(&client, "cheap-explorer")),
             &arm(&client, SYNTH),
             &ConsultConfig::default(),
         )
@@ -6345,7 +4663,7 @@ mod tests {
         // It must carry the accumulated evidence — a forced turn over a blank history
         // would just invite the ungrounded answer the gate exists to refuse.
         assert!(
-            finalizes[0].transcript.contains("SWEEP_DONE"),
+            finalizes[0].transcript.contains("target_marker() {}"),
             "the forced turn must replay the gathered evidence, got: {:?}",
             finalizes[0].transcript
         );
@@ -6366,7 +4684,9 @@ mod tests {
 
         // The retry's usage is ADDED to what was already spent, never substituted —
         // the caller paid for both, so the footer must say so. (16,801 + 3,971.)
-        assert_eq!(out.usage.output_tokens, Some(20_772),
+        assert_eq!(
+            out.usage.output_tokens,
+            Some(20_772),
             "the pre-retry spend must survive into the returned usage"
         );
         assert_eq!(out.usage.input_tokens, Some(1_201_062));
@@ -6403,7 +4723,6 @@ mod tests {
         let err = consult_with(
             "review this branch",
             dir.path(),
-            Some(&arm(&client, "explorer-unused")),
             &arm(&client, SYNTH),
             &ConsultConfig::default(),
         )
@@ -6442,27 +4761,25 @@ mod tests {
         let client = ScriptedClient::builder()
             // Reasoning-only forever, including when forced to conclude.
             .on_model(SYNTH, |req| {
-                if transcript_text(req).contains("SWEEP_DONE") {
+                if transcript_text(req).contains("target_marker() {}") {
                     Ok(with_usage(
                         reasoning_response("...still thinking..."),
                         usage(1_000, 500),
                     ))
                 } else {
                     Ok(tool_call_response(
-                        "t-explore",
-                        "explore",
-                        json!({ "question": "review the diff" }),
+                        "t-read",
+                        "run_kaish",
+                        json!({ "script": "cat -n src/foo.rs" }),
                     ))
                 }
             })
-            .on_model("cheap-explorer", |_req| Ok(text_response("SWEEP_DONE")))
             .build();
 
         let dir = project_with_marker();
         let err = consult_with(
             "review this branch",
             dir.path(),
-            Some(&arm(&client, "cheap-explorer")),
             &arm(&client, SYNTH),
             &ConsultConfig::default(),
         )
@@ -6547,7 +4864,6 @@ mod tests {
         let out = consult_with(
             "review src/foo.rs",
             dir.path(),
-            Some(&arm(&client, "explorer-unused")),
             &arm(&client, SYNTH),
             &ConsultConfig::default(),
         )
@@ -6603,12 +4919,9 @@ mod tests {
                 .to_params(8192, None, None, "max");
         let sink = Arc::new(RecordingSink::default());
         let cfg = ConsultConfig {
-            explore: ExploreConfig {
-                phase: PhaseContext {
-                    progress: sink.clone(),
-                    ..PhaseContext::default()
-                },
-                ..ExploreConfig::default()
+            phase: PhaseContext {
+                progress: sink.clone(),
+                ..PhaseContext::default()
             },
             ..ConsultConfig::default()
         };
@@ -6616,7 +4929,6 @@ mod tests {
         consult_with(
             "review src/foo.rs",
             dir.path(),
-            Some(&arm(client, "cheap-explorer")),
             &arm_with(client, synth, params),
             &cfg,
         )
@@ -6722,7 +5034,6 @@ mod tests {
         let err = consult_with(
             "review src/foo.rs",
             dir.path(),
-            Some(&arm(&client, "cheap-explorer")),
             &arm_with(&client, SYNTH, params),
             &ConsultConfig::default(),
         )
@@ -6744,17 +5055,16 @@ mod tests {
             .on_model(SYNTH, |req| {
                 if is_finalize_turn(req) {
                     Ok(text_response("REVIEW: src/foo.rs:1 defines the marker."))
-                } else if transcript_text(req).contains("SWEEP_DONE") {
+                } else if transcript_text(req).contains("target_marker() {}") {
                     Ok(reasoning_response("I have finished reviewing."))
                 } else {
                     Ok(tool_call_response(
-                        "t-explore",
-                        "explore",
-                        json!({ "question": "review the diff" }),
+                        "t-read",
+                        "run_kaish",
+                        json!({ "script": "cat -n src/foo.rs" }),
                     ))
                 }
             })
-            .on_model("cheap-explorer", |_req| Ok(text_response("SWEEP_DONE")))
             .build();
 
         let sink = consult_at_max_effort(&client, SYNTH).await;
@@ -6798,7 +5108,6 @@ mod tests {
         let err = consult_with(
             "classify these cases",
             dir.path(),
-            Some(&arm(&client, "explorer-unused")),
             &arm(&client, SYNTH),
             &ConsultConfig::default(),
         )
@@ -6849,7 +5158,6 @@ mod tests {
         let err = consult_with(
             "q",
             dir.path(),
-            Some(&arm(&client, "explorer-unused")),
             &arm(&client, SYNTH),
             &ConsultConfig::default(),
         )
@@ -6898,7 +5206,6 @@ mod tests {
         let err = consult_with(
             "a question the model never finishes answering",
             dir.path(),
-            Some(&arm(&client, "explorer-unused")),
             &arm(&client, SYNTH),
             &cfg,
         )
@@ -6918,12 +5225,10 @@ mod tests {
         );
     }
 
-    /// The fourth door, which the report shape hides: the **explorer** phase. The
-    /// top-level `explore` tool returns its report verbatim, so a reasoning-only
-    /// explorer turn ships a report body that is just the footer — same silent shape,
-    /// different tool. (Inside `consult` this lands as an empty `explore′` tool result,
-    /// which is arguably worse: the driver reasons on a blank sweep and never learns
-    /// the sweep failed.)
+    /// The fourth door, which the report shape hides: the **explorer** phase. Its
+    /// report becomes `deliberate`'s dossier verbatim, so a reasoning-only explorer
+    /// turn would hand the offline synth a blank dossier — same silent shape, different
+    /// tool.
     #[tokio::test]
     async fn a_reasoning_only_explorer_report_fails_loudly_instead_of_reporting_empty() {
         const EXPLORER: &str = "deepseek-flash";
@@ -6944,7 +5249,6 @@ mod tests {
             &ExploreConfig::default(),
             &[],
             None,
-            ReportReader::CallingAgent,
         )
         .await
         .expect_err("an explorer that reported nothing must fail, not return an empty report");
@@ -7158,7 +5462,6 @@ mod tests {
             &ExploreConfig::default(),
             &[],
             None,
-            ReportReader::CallingAgent,
         )
         .await
         .expect_err("an explorer that reported nothing must fail");
@@ -7254,7 +5557,6 @@ mod tests {
         let err = consult_with(
             "q",
             dir.path(),
-            None,
             &arm(&client, MODEL),
             &ConsultConfig::default(),
         )
@@ -7317,71 +5619,6 @@ mod tests {
                 && !span.fields.contains_key("error.type"),
             "a successful single shot must leave the status unset: {span:?}"
         );
-    }
-
-    /// Thinking params must reach *every* model call — the consult driver and each
-    /// nested `explore′`. All other tests pass `None` for thinking, so a regression
-    /// that dropped `additional_params` in `run_phase`, or stopped `RunExplore`
-    /// forwarding its arm's params to the nested loop, would slip through. These
-    /// shapes are provider-specific and have already drifted once.
-    #[tokio::test]
-    async fn thinking_params_reach_both_the_driver_and_every_sweep() {
-        const SYNTH: &str = "capable-synth";
-        const EXPLORER: &str = "cheap-explorer";
-        // Anthropic budget tier: both arms resolve to the same top-level `thinking`
-        // block (the ids classify legacy/budget). The mock doesn't interpret it — we
-        // only assert it survives the plumbing into *every* request, unchanged.
-        let expected = json!({ "thinking": { "type": "enabled", "budget_tokens": 4096 } });
-
-        let client = ScriptedClient::builder()
-            .on_model(SYNTH, |req| {
-                if transcript_text(req).contains("REPORT") {
-                    Ok(text_response("ANSWER"))
-                } else {
-                    Ok(tool_call_response(
-                        "s1",
-                        "explore",
-                        json!({ "question": "find it" }),
-                    ))
-                }
-            })
-            .on_model(EXPLORER, |_req| Ok(text_response("REPORT: src/foo.rs:1")))
-            .build();
-
-        let dir = project_with_marker();
-        let cfg = ConsultConfig::default();
-
-        consult_with(
-            "q",
-            dir.path(),
-            Some(&arm_with(
-                &client,
-                EXPLORER,
-                thinking_params(ProviderKind::Anthropic, EXPLORER, 4096),
-            )),
-            &arm_with(
-                &client,
-                SYNTH,
-                thinking_params(ProviderKind::Anthropic, SYNTH, 4096),
-            ),
-            &cfg,
-        )
-        .await
-        .unwrap();
-
-        // Both roles were actually exercised (so the loop below isn't vacuous)...
-        assert!(!client.requests_for(SYNTH).is_empty(), "driver ran");
-        assert!(!client.requests_for(EXPLORER).is_empty(), "a sweep ran");
-        // ...and every request carried the thinking shape, unchanged.
-        for r in client.requests() {
-            assert_eq!(
-                r.additional_params.as_ref(),
-                Some(&expected),
-                "model {:?} must carry the thinking params, got: {:?}",
-                r.model,
-                r.additional_params
-            );
-        }
     }
 
     /// The `run_phase` span surfaces the exact reasoning params it ships, so a trace can
@@ -7455,29 +5692,25 @@ mod tests {
             }
         }
 
-        // A driver that delegates one sweep then answers; the sweep returns a report.
-        // Same shape as the request-shaping tests — the mock ignores the blob's content,
-        // we only assert what the span recorded.
+        // A driver that reads once then answers. Same shape as the request-shaping tests
+        // — the mock ignores the blob's content, we only assert what the span recorded.
         fn client() -> ScriptedClient {
             const SYNTH: &str = "gemini-3.5-flash";
-            const EXPLORER: &str = "gemini-flash-lite-latest";
             ScriptedClient::builder()
                 .on_model(SYNTH, |req| {
-                    if transcript_text(req).contains("REPORT") {
+                    if transcript_text(req).contains("target_marker") {
                         Ok(text_response("ANSWER"))
                     } else {
                         Ok(tool_call_response(
                             "s1",
-                            "explore",
-                            json!({ "question": "q" }),
+                            "run_kaish",
+                            json!({ "script": "cat -n src/foo.rs" }),
                         ))
                     }
                 })
-                .on_model(EXPLORER, |_req| Ok(text_response("REPORT: src/foo.rs:1")))
                 .build()
         }
         const SYNTH: &str = "gemini-3.5-flash";
-        const EXPLORER: &str = "gemini-flash-lite-latest";
 
         // On-theme: the Gemini 3-line thinkingLevel blob — the very shape PR 80 routes.
         let expected =
@@ -7488,7 +5721,7 @@ mod tests {
             "fixture must be the level blob, got {expected_str}"
         );
 
-        // Positive: both arms carry the blob → every run_phase span records it.
+        // Positive: the arm carries the blob → its run_phase span records it.
         let cap = PhaseCapture::default();
         serialized_capture(async {
             let sub = tracing_subscriber::registry().with(cap.clone());
@@ -7498,7 +5731,6 @@ mod tests {
             consult_with(
                 "q",
                 dir.path(),
-                Some(&arm_with(&cl, EXPLORER, Some(expected.clone()))),
                 &arm_with(&cl, SYNTH, Some(expected.clone())),
                 &ConsultConfig::default(),
             )
@@ -7507,8 +5739,8 @@ mod tests {
         });
         let seen = cap.0.lock().unwrap().clone();
         assert!(
-            seen.len() >= 2,
-            "both the driver and its sweep must emit a run_phase span, got {seen:?}"
+            !seen.is_empty(),
+            "the driver must emit a run_phase span, got {seen:?}"
         );
         assert!(
             seen.iter()
@@ -7523,15 +5755,9 @@ mod tests {
             let _g = tracing::subscriber::set_default(sub);
             let cl = client();
             let dir = project_with_marker();
-            consult_with(
-                "q",
-                dir.path(),
-                Some(&arm(&cl, EXPLORER)),
-                &arm(&cl, SYNTH),
-                &ConsultConfig::default(),
-            )
-            .await
-            .unwrap();
+            consult_with("q", dir.path(), &arm(&cl, SYNTH), &ConsultConfig::default())
+                .await
+                .unwrap();
         });
         let seen = cap.0.lock().unwrap().clone();
         assert!(!seen.is_empty(), "run_phase spans must still have fired");
@@ -7539,174 +5765,6 @@ mod tests {
             seen.iter().all(|v| v.is_none()),
             "a toggle-less phase must record no thinking blob, got {seen:?}"
         );
-    }
-
-    /// The per-phase payoff: when a cast's synth and explorer straddle a thinking-shape
-    /// boundary, each request must carry the shape fit to *its own* model — never one
-    /// resolved once and shared. Here an Anthropic-adaptive driver (top-level
-    /// `thinking:{type:adaptive}` + `output_config.effort`) runs beside a Gemini-level
-    /// explorer (nested `generationConfig.thinkingConfig.thinkingLevel`): structurally
-    /// disjoint blobs, so a regression that shared one arm's params would land the wrong
-    /// keys on the other's request and this test would catch it. (A cross-*provider*
-    /// straddle now that Gemini is single-tier — the whole 3-line takes a level.)
-    #[tokio::test]
-    async fn each_phase_gets_thinking_fit_to_its_own_model() {
-        const SYNTH: &str = "claude-sonnet-4-6"; // Anthropic adaptive → output_config.effort
-        const EXPLORER: &str = "gemini-flash-lite-latest"; // Gemini → thinkingLevel
-
-        let client = ScriptedClient::builder()
-            .on_model(SYNTH, |req| {
-                if transcript_text(req).contains("REPORT") {
-                    Ok(text_response("ANSWER"))
-                } else {
-                    Ok(tool_call_response(
-                        "s1",
-                        "explore",
-                        json!({ "question": "find it" }),
-                    ))
-                }
-            })
-            .on_model(EXPLORER, |_req| Ok(text_response("REPORT: src/foo.rs:1")))
-            .build();
-
-        let dir = project_with_marker();
-        let cfg = ConsultConfig::default();
-
-        consult_with(
-            "q",
-            dir.path(),
-            Some(&arm_with(
-                &client,
-                EXPLORER,
-                thinking_params(ProviderKind::Gemini, EXPLORER, 4096),
-            )),
-            &arm_with(
-                &client,
-                SYNTH,
-                thinking_params(ProviderKind::Anthropic, SYNTH, 4096),
-            ),
-            &cfg,
-        )
-        .await
-        .unwrap();
-
-        let params = |r: &crate::test_support::RecordedRequest| {
-            r.additional_params.as_ref().unwrap().clone()
-        };
-        // The adaptive synth: top-level adaptive thinking + effort, no Gemini nesting.
-        for r in client.requests_for(SYNTH) {
-            let p = params(&r);
-            assert_eq!(
-                p["thinking"]["type"], "adaptive",
-                "adaptive driver wants adaptive thinking"
-            );
-            assert_eq!(
-                p["output_config"]["effort"], "high",
-                "adaptive depth rides output_config.effort"
-            );
-            assert!(
-                p.get("generationConfig").is_none(),
-                "the Gemini nesting must not leak onto the Anthropic arm"
-            );
-        }
-        // The Gemini explorer: nested thinkingLevel, none of the adaptive keys.
-        for r in client.requests_for(EXPLORER) {
-            let p = params(&r);
-            assert_eq!(
-                p["generationConfig"]["thinkingConfig"]["thinkingLevel"], "high",
-                "the Gemini sweep wants a level"
-            );
-            assert!(
-                p.get("thinking").is_none() && p.get("output_config").is_none(),
-                "the adaptive keys must not leak onto the Gemini arm"
-            );
-        }
-    }
-
-    /// The mixed-cast payoff: each phase runs on its OWN client. Two distinct
-    /// scripted clients — the synth's knows only the synth model, the explorer's
-    /// only the explorer model — so any cross-routing panics ("no responder").
-    /// Each arm also carries its own `max_tokens`, and every request must show
-    /// its own arm's value: the per-arm resolution the cast split exists for.
-    #[tokio::test]
-    async fn a_mixed_cast_routes_each_phase_to_its_own_client() {
-        const SYNTH: &str = "claude-synth";
-        const EXPLORER: &str = "deepseek-explorer";
-
-        let synth_client = ScriptedClient::builder()
-            .on_model(SYNTH, |req| {
-                if transcript_text(req).contains("REPORT") {
-                    Ok(text_response("ANSWER from the other wire"))
-                } else {
-                    Ok(tool_call_response(
-                        "s1",
-                        "explore",
-                        json!({ "question": "find it" }),
-                    ))
-                }
-            })
-            .build();
-        let explorer_client = ScriptedClient::builder()
-            .on_model(EXPLORER, |_req| Ok(text_response("REPORT: src/foo.rs:1")))
-            .build();
-
-        let dir = project_with_marker();
-        let cfg = ConsultConfig::default();
-        let explorer_arm = Arm::new(
-            explorer_client.clone(),
-            EXPLORER,
-            4096,
-            None,
-            ModelCaps {
-                vision: false,
-                tool_result_images: true,
-            },
-        );
-        let synth_arm = Arm::new(
-            synth_client.clone(),
-            SYNTH,
-            32768,
-            None,
-            ModelCaps {
-                vision: true,
-                tool_result_images: true,
-            },
-        );
-
-        let out = consult_with("q", dir.path(), Some(&explorer_arm), &synth_arm, &cfg)
-            .await
-            .expect("mixed-cast consult should succeed");
-
-        assert!(out.answer.contains("ANSWER from the other wire"));
-        assert!(out.report.contains("REPORT"), "the sweep crossed clients");
-        // Routing held: each client saw only its own phase…
-        assert!(!synth_client.requests_for(SYNTH).is_empty());
-        assert!(!explorer_client.requests_for(EXPLORER).is_empty());
-        assert!(
-            synth_client.requests_for(EXPLORER).is_empty(),
-            "the synth client must never serve the explorer model"
-        );
-        assert!(
-            explorer_client.requests_for(SYNTH).is_empty(),
-            "the explorer client must never serve the synth model"
-        );
-        // …and each request carried ITS arm's max_tokens, not a shared value.
-        for r in synth_client.requests() {
-            assert_eq!(
-                r.max_tokens,
-                Some(32768),
-                "synth arm budget on {:?}",
-                r.model
-            );
-        }
-        for r in explorer_client.requests() {
-            assert_eq!(
-                r.max_tokens,
-                Some(4096),
-                "explorer arm budget on {:?}",
-                r.model
-            );
-        }
     }
 
     /// `Arm::from_slot`, offline: the keyless openai kind builds with no network
@@ -8061,7 +6119,10 @@ mod tests {
         let err = Arm::from_slot(&backend, &slot, ModelRole::Synth, &defaults)
             .expect_err("none has no wire form on the adaptive tier");
         let msg = err.to_string();
-        assert!(msg.contains("claude-opus-5-5") && msg.contains("synth"), "{msg}");
+        assert!(
+            msg.contains("claude-opus-5-5") && msg.contains("synth"),
+            "{msg}"
+        );
         assert!(msg.contains("`low`"), "{msg}");
     }
 
@@ -8541,7 +6602,9 @@ mod tests {
         // OpenRouter dashboard.
         let headers = http.recorded_headers().expect("a request was sent");
         assert_eq!(
-            headers.get("x-openrouter-title").and_then(|v| v.to_str().ok()),
+            headers
+                .get("x-openrouter-title")
+                .and_then(|v| v.to_str().ok()),
             Some("kaibo")
         );
         assert_eq!(
@@ -8621,79 +6684,6 @@ mod tests {
         }
     }
 
-    /// `run_phase` builds the toolset twice — once for the main loop, again for the
-    /// forced finalize turn. The `reports` sink is created once in `consult_with` and
-    /// `clone()`d into each build, so a sweep that completed before the cap must
-    /// survive into the final `ConsultOutput.report`. Delegate once, then burn turns
-    /// on `run_kaish` until the cap forces a finalize (the second build) — the first
-    /// sweep's report must still be there.
-    #[tokio::test]
-    async fn a_sweeps_report_survives_the_finalize_toolset_rebuild() {
-        const SYNTH: &str = "capable-synth";
-        const EXPLORER: &str = "cheap-explorer";
-
-        let client = ScriptedClient::builder()
-            .on_model(SYNTH, |req| {
-                if is_finalize_turn(req) {
-                    Ok(text_response("FINAL"))
-                } else if !transcript_text(req).contains("REPORT-E") {
-                    // First turn: delegate one sweep (pushes to the shared sink).
-                    Ok(tool_call_response(
-                        "s1",
-                        "explore",
-                        json!({ "question": "find it" }),
-                    ))
-                } else {
-                    // Already swept; keep burning turns without re-delegating, so the
-                    // cap fires and forces the second toolset build.
-                    Ok(tool_call_response(
-                        "k",
-                        "run_kaish",
-                        json!({ "script": "cat src/foo.rs" }),
-                    ))
-                }
-            })
-            .on_model(EXPLORER, |_req| Ok(text_response("REPORT-E: src/foo.rs:1")))
-            .build();
-
-        let dir = project_with_marker();
-        let cfg = ConsultConfig {
-            synth_max_turns: 2,
-            ..ConsultConfig::default()
-        };
-
-        let out = consult_with(
-            "q",
-            dir.path(),
-            Some(&arm(&client, EXPLORER)),
-            &arm(&client, SYNTH),
-            &cfg,
-        )
-        .await
-        .unwrap();
-
-        // The teeth: were `reports` rebuilt per `make_tools` call instead of shared,
-        // the pre-cap sweep would be lost and this would be empty.
-        assert!(
-            out.report.contains("REPORT-E"),
-            "the pre-cap sweep's report must survive the finalize rebuild, got: {:?}",
-            out.report
-        );
-        assert_eq!(
-            client.requests_for(EXPLORER).len(),
-            1,
-            "exactly one sweep was delegated (the rest burned run_kaish)"
-        );
-        assert!(
-            client
-                .requests_for(SYNTH)
-                .iter()
-                .any(|r| r.tool_choice == Some(ToolChoice::None)),
-            "the cap must have forced a finalize turn (the second toolset build)"
-        );
-        assert!(out.answer.contains("FINAL"), "finalize produced the answer");
-    }
-
     /// Session glue, end to end and offline: a second turn must *see* the first
     /// turn's `(question, answer)` pair in its prompt, and both turns must accumulate
     /// in the store. This is the `server.consult` history→consult→record dance,
@@ -8714,7 +6704,6 @@ mod tests {
             "Q1 what is kaish",
             None,
             dir.path(),
-            Some(&arm(&client, "explorer")),
             &arm(&client, SYNTH),
             &cfg,
         )
@@ -8733,7 +6722,6 @@ mod tests {
             "Q2 who calls it",
             None,
             dir.path(),
-            Some(&arm(&client, "explorer")),
             &arm(&client, SYNTH),
             &cfg,
         )
@@ -8780,7 +6768,6 @@ mod tests {
                 q,
                 None,
                 dir.path(),
-                Some(&arm(&client, "explorer")),
                 &arm(&client, SYNTH),
                 &cfg,
             )
@@ -8826,7 +6813,6 @@ mod tests {
             "Q that fails",
             None,
             dir.path(),
-            Some(&arm(&client, "explorer")),
             &arm(&client, SYNTH),
             &cfg,
         )
@@ -8860,7 +6846,6 @@ mod tests {
             "Q that answers",
             None,
             dir.path(),
-            Some(&arm(&client, "explorer")),
             &arm(&client, SYNTH),
             &cfg,
         )
@@ -8901,7 +6886,6 @@ mod tests {
             "lone question",
             None,
             dir.path(),
-            Some(&arm(&client, "explorer")),
             &arm(&client, SYNTH),
             &cfg,
         )
@@ -8916,132 +6900,34 @@ mod tests {
         );
     }
 
-    /// The recomposed consult must drive BOTH tools: a direct `run_kaish` and the
-    /// delegated `explore′`. Pin the wiring offline — no model, just the toolset.
-    /// A non-vision synth gets no `view_image` (it's gated on the synth's caps).
+    /// The consult toolset is `run_kaish` alone for a blind synth, and gains
+    /// `view_image` exactly when the *synth* arm is vision-capable. Pins the wiring
+    /// offline — no model, just the toolset — both ways, so the driver's perception cap
+    /// doesn't drift.
     #[test]
-    fn consult_toolset_has_both_run_kaish_and_explore() {
+    fn consult_tools_are_run_kaish_plus_view_image_on_a_vision_synth() {
         let dir = tempdir().unwrap();
         // The scripted client satisfies the same trait bounds with no network and no
-        // key-format requirement — so this stays a pure toolset-wiring test, not a
-        // hostage to rig's anthropic constructor.
+        // key-format requirement — so this stays a pure toolset-wiring test.
         let client = ScriptedClient::builder().build();
         let cfg = ConsultConfig::default();
-        let reports = Arc::new(Mutex::new(Vec::new()));
-
-        let synth = arm(&client, "synth-model"); // not vision-capable
-        let tools = consult_tools(
-            Some(&arm(&client, "explorer-model")),
-            dir.path(),
-            &cfg,
-            reports,
-            Arc::new(Mutex::new(Usage::new())),
-            &synth,
-        )
-        .expect("building the consult toolset should succeed");
-
-        let names: Vec<String> = tools.iter().map(|t| t.name().to_string()).collect();
-        assert!(
-            names.iter().any(|n| n == "run_kaish"),
-            "missing run_kaish, got {names:?}"
+        let names = |synth: &Arm| -> Vec<String> {
+            consult_tools(dir.path(), &cfg, synth)
+                .expect("building the consult toolset should succeed")
+                .iter()
+                .map(|t| t.name().to_string())
+                .collect()
+        };
+        assert_eq!(
+            names(&arm(&client, "synth-model")),
+            ["run_kaish"],
+            "a blind synth's toolset is run_kaish alone"
         );
-        assert!(
-            names.iter().any(|n| n == "explore"),
-            "missing explore′, got {names:?}"
-        );
-        assert!(
-            !names.iter().any(|n| n == "view_image"),
-            "a blind synth must not get view_image, got {names:?}"
-        );
-
-        // No explorer arm → the same toolset minus explore′.
-        let tools = consult_tools(
-            None,
-            dir.path(),
-            &cfg,
-            Arc::new(Mutex::new(Vec::new())),
-            Arc::new(Mutex::new(Usage::new())),
-            &synth,
-        )
-        .expect("building the solo consult toolset should succeed");
-        let names: Vec<String> = tools.iter().map(|t| t.name().to_string()).collect();
-        assert_eq!(names, ["run_kaish"], "solo toolset is run_kaish alone");
-    }
-
-    /// When the synth arm is vision-capable, the consult driver's toolset gains
-    /// `view_image` — the consumption of the resolved caps. The explorer arm's caps
-    /// are irrelevant here (the driver runs on the synth); the bool models that.
-    #[test]
-    fn a_vision_synth_gets_view_image_in_the_consult_toolset() {
-        let dir = tempdir().unwrap();
-        let client = ScriptedClient::builder().build();
-        let cfg = ConsultConfig::default();
-        let reports = Arc::new(Mutex::new(Vec::new()));
-
-        let synth = vision_arm(&client, "synth-model"); // synth IS vision-capable
-        let tools = consult_tools(
-            Some(&arm(&client, "explorer-model")),
-            dir.path(),
-            &cfg,
-            reports,
-            Arc::new(Mutex::new(Usage::new())),
-            &synth,
-        )
-        .expect("building the consult toolset should succeed");
-
-        let names: Vec<String> = tools.iter().map(|t| t.name().to_string()).collect();
-        assert!(
-            names.iter().any(|n| n == "view_image"),
-            "a vision synth must get view_image, got {names:?}"
-        );
-    }
-
-    /// The `consult` driver's toolset: `run_kaish` and the nested `explore′` always,
-    /// `view_image` exactly when the *synth* arm is vision-capable. Pins the gate both
-    /// ways so the driver's perception cap doesn't drift.
-    #[test]
-    fn consult_tools_gate_view_image_on_the_synth_vision_cap() {
-        let dir = tempdir().unwrap();
-        let cfg = ConsultConfig::default();
-        let client = ScriptedClient::builder()
-            .on_model("m", |_r| Ok(text_response("x")))
-            .build();
-        let explorer = arm(&client, "m");
-        let reports = Arc::new(Mutex::new(Vec::<String>::new()));
-
-        let usage_sink = Arc::new(Mutex::new(Usage::new()));
-        let blind_synth = arm(&client, "synth-model");
-        let blind = consult_tools(
-            Some(&explorer),
-            dir.path(),
-            &cfg,
-            reports.clone(),
-            usage_sink.clone(),
-            &blind_synth,
-        )
-        .expect("blind toolset builds");
-        let blind_names: Vec<String> = blind.iter().map(|t| t.name().to_string()).collect();
-        assert!(blind_names.iter().any(|n| n == "run_kaish"));
-        assert!(blind_names.iter().any(|n| n == "explore"));
-        assert!(
-            !blind_names.iter().any(|n| n == "view_image"),
-            "no view_image without vision, got {blind_names:?}"
-        );
-
-        let seeing_synth = vision_arm(&client, "synth-model");
-        let seeing = consult_tools(
-            Some(&explorer),
-            dir.path(),
-            &cfg,
-            reports,
-            usage_sink,
-            &seeing_synth,
-        )
-        .expect("vision toolset builds");
-        let seeing_names: Vec<String> = seeing.iter().map(|t| t.name().to_string()).collect();
-        assert!(
-            seeing_names.iter().any(|n| n == "view_image"),
-            "view_image present with vision, got {seeing_names:?}"
+        let seeing = names(&vision_arm(&client, "synth-model"));
+        assert_eq!(
+            seeing,
+            ["run_kaish", "view_image"],
+            "a vision synth gets view_image too"
         );
     }
 
@@ -9075,21 +6961,13 @@ mod tests {
     fn save_artifact_is_in_the_driver_toolset_only_with_a_sink() {
         let dir = tempdir().unwrap();
         let client = ScriptedClient::builder().build();
-        let explorer = arm(&client, "explorer-model");
         let synth = arm(&client, "synth-model");
         let names = |cfg: &ConsultConfig| -> Vec<String> {
-            consult_tools(
-                Some(&explorer),
-                dir.path(),
-                cfg,
-                Arc::new(Mutex::new(Vec::new())),
-                Arc::new(Mutex::new(Usage::new())),
-                &synth,
-            )
-            .expect("toolset builds")
-            .iter()
-            .map(|t| t.name().to_string())
-            .collect()
+            consult_tools(dir.path(), cfg, &synth)
+                .expect("toolset builds")
+                .iter()
+                .map(|t| t.name().to_string())
+                .collect()
         };
 
         let without = names(&ConsultConfig::default());
@@ -9115,8 +6993,7 @@ mod tests {
     /// reason, and the boundary moves with it.
     ///
     /// `save_artifact` is the interesting contrast: it IS an inner tool, but only on the
-    /// driver loop and only with a sink, which is why the sweep assertions below name
-    /// both and the driver assertions name only `read_cas`.
+    /// driver loop and only with a sink.
     const CLIENT_ONLY_VERBS: [&str; 6] = [
         "read_cas",
         // The deposit half crosses the same line from the other side: a store spanning
@@ -9137,20 +7014,12 @@ mod tests {
     fn the_driver_toolset_never_carries_a_client_surface_verb() {
         let dir = tempdir().unwrap();
         let client = ScriptedClient::builder().build();
-        let explorer = arm(&client, "explorer-model");
         let names = |cfg: &ConsultConfig, synth: &Arm| -> Vec<String> {
-            consult_tools(
-                Some(&explorer),
-                dir.path(),
-                cfg,
-                Arc::new(Mutex::new(Vec::new())),
-                Arc::new(Mutex::new(Usage::new())),
-                synth,
-            )
-            .expect("toolset builds")
-            .iter()
-            .map(|t| t.name().to_string())
-            .collect()
+            consult_tools(dir.path(), cfg, synth)
+                .expect("toolset builds")
+                .iter()
+                .map(|t| t.name().to_string())
+                .collect()
         };
         let (with_sink, _sink) = cfg_with_artifact_sink();
         for (what, cfg, synth) in [
@@ -9170,62 +7039,6 @@ mod tests {
                 );
             }
         }
-    }
-
-    /// **A delegated sweep never gets `save_artifact`.** v1 is driver-loop only, and the
-    /// placement enforces it: a sweep's toolset is built from the explore rung, which has
-    /// no sink to read. Driven end to end on a real nested sweep so this pins the
-    /// *running* toolset rather than a construction detail.
-    #[tokio::test]
-    async fn a_delegated_sweep_never_carries_save_artifact() {
-        const SYNTH: &str = "capable-synth";
-        const EXPLORER: &str = "cheap-explorer";
-        let client = ScriptedClient::builder()
-            .on_model(SYNTH, |req| {
-                assert!(
-                    has_tool(req, "save_artifact"),
-                    "the driver has the tool in this run, so the sweep's absence is a \
-                     real contrast: {:?}",
-                    req.tools
-                );
-                if !transcript_text(req).contains("SWEPT") {
-                    Ok(tool_call_response(
-                        "t1",
-                        "explore",
-                        json!({ "question": "what is here?" }),
-                    ))
-                } else {
-                    Ok(text_response("ANSWER"))
-                }
-            })
-            .on_model(EXPLORER, |req| {
-                for verb in CLIENT_ONLY_VERBS {
-                    assert!(
-                        !has_tool(req, verb),
-                        "a delegated sweep must never be handed {verb}: {:?}",
-                        req.tools
-                    );
-                }
-                Ok(text_response("SWEPT: src/foo.rs:1"))
-            })
-            .build();
-
-        let dir = project_with_marker();
-        let (cfg, sink) = cfg_with_artifact_sink();
-        let out = consult_with(
-            "q",
-            dir.path(),
-            Some(&arm(&client, EXPLORER)),
-            &arm(&client, SYNTH),
-            &cfg,
-        )
-        .await
-        .expect("scripted consult should succeed");
-        assert_eq!(out.answer, "ANSWER");
-        assert!(
-            sink.saved().is_empty(),
-            "nothing was saved in this run, so nothing is in the ledger"
-        );
     }
 
     /// **A consult that saves and then fails keeps the artifact.** The sink lives on the
@@ -9251,20 +7064,13 @@ mod tests {
                     Err(provider_error("overloaded_error"))
                 }
             })
-            .on_model("cheap-explorer", |_r| Ok(text_response("unused")))
             .build();
 
         let dir = project_with_marker();
         let (cfg, sink) = cfg_with_artifact_sink();
-        let err = consult_with(
-            "make a corpus",
-            dir.path(),
-            Some(&arm(&client, "cheap-explorer")),
-            &arm(&client, SYNTH),
-            &cfg,
-        )
-        .await
-        .expect_err("the scripted provider fails after the save");
+        let err = consult_with("make a corpus", dir.path(), &arm(&client, SYNTH), &cfg)
+            .await
+            .expect_err("the scripted provider fails after the save");
         assert!(
             format!("{err:#}").contains("overloaded"),
             "the failure is the provider's, got: {err:#}"
@@ -9303,7 +7109,6 @@ mod tests {
                     Ok(text_response("ANSWER: see the artifact."))
                 }
             })
-            .on_model("cheap-explorer", |_r| Ok(text_response("unused")))
             .build();
 
         let dir = project_with_marker();
@@ -9314,7 +7119,6 @@ mod tests {
             "make an inventory",
             None,
             dir.path(),
-            Some(&arm(&client, "cheap-explorer")),
             &arm(&client, SYNTH),
             &cfg,
         )
@@ -9356,7 +7160,6 @@ mod tests {
                     Ok(text_response("ANSWER: the corpus is in the artifact."))
                 }
             })
-            .on_model("cheap-explorer", |_req| Ok(text_response("unused")))
             .build();
 
         let dir = project_with_marker();
@@ -9364,7 +7167,6 @@ mod tests {
         let out = consult_with(
             "generate a fuzz corpus",
             dir.path(),
-            Some(&arm(&client, "cheap-explorer")),
             &arm(&client, SYNTH),
             &cfg,
         )
@@ -9459,7 +7261,11 @@ mod tests {
 
     /// A tool call block, naming its tool as rig 0.46 requires (a non-empty `ToolName`).
     fn tc(id: &str, name: &str, args: Value) -> AssistantContent {
-        AssistantContent::tool_call(id, ToolName::new(name).expect("a non-empty tool name"), args)
+        AssistantContent::tool_call(
+            id,
+            ToolName::new(name).expect("a non-empty tool name"),
+            args,
+        )
     }
 
     /// An assistant turn holding `content`.
@@ -9662,22 +7468,21 @@ mod tests {
         );
     }
 
-    /// The generalization's whole point: an `explore` sweep's result carrying a
-    /// routed image (the hybrid envelope `RunExplore::call` emits once it attached
-    /// an image) gets EXACTLY the same user-turn-channel treatment as `view_image` —
-    /// no per-tool `if` was added for it, because the rewrite keys on the result,
-    /// not the tool's name.
+    /// The generalization's whole point: any tool's result carrying an image (here a
+    /// tool named `other_tool`, standing in for any non-`view_image` tool) gets EXACTLY
+    /// the same user-turn-channel treatment as `view_image` — no per-tool `if`,
+    /// because the rewrite keys on the result, not the tool's name.
     #[test]
-    fn rewrite_moves_an_explore_result_image_onto_a_separate_user_image_turn() {
+    fn rewrite_moves_another_tools_result_image_onto_a_separate_user_image_turn() {
         let assistant = assistant_calling(vec![tc(
-            "explore-1",
-            "explore",
+            "other-1",
+            "other_tool",
             json!({ "question": "what does the diagram show?" }),
         )]);
         let result = Message::User {
             content: vec![UserContent::ToolResult(tool_result(
-                "explore-1",
-                "explore",
+                "other-1",
+                "other_tool",
                 vec![
                     ToolResultContent::text("attached: docs/arch.png (image/png, 4.0 KiB)"),
                     ToolResultContent::Image(Image {
@@ -9691,7 +7496,7 @@ mod tests {
 
         assert!(
             !any_tool_result_image(&out),
-            "the explore result's image must leave the tool-result channel: {out:?}"
+            "the other tool's image must leave the tool-result channel: {out:?}"
         );
         assert_eq!(
             user_image_messages(&out),
@@ -9701,28 +7506,28 @@ mod tests {
         assert!(
             out.iter().any(|m| matches!(m, Message::User { content }
                 if content.iter().any(|c| matches!(c, UserContent::ToolResult(tr)
-                    if &*tr.call.wire() == "explore-1"
+                    if &*tr.call.wire() == "other-1"
                     && tr.content.iter().all(|rc| matches!(rc, ToolResultContent::Text(_))))))),
-            "the explore tool_use stays answered by a text-only result: {out:?}"
+            "the other tool's tool_use stays answered by a text-only result: {out:?}"
         );
     }
 
-    /// Two image-bearing results in ONE assistant turn (`view_image` + an `explore`
-    /// sweep that routed a picture): the rewrite must move BOTH out — per-part
+    /// Two image-bearing results in ONE assistant turn (`view_image` + a second
+    /// image-bearing tool): the rewrite must move BOTH out — per-part
     /// filtering that stopped at the first image-bearing result would strand the
     /// second on a channel the transport rejects. (DeepSeek review gap, 2026-07-26.)
     #[test]
     fn rewrite_moves_both_images_when_two_tools_carry_them() {
         let assistant = assistant_calling(vec![
             tc("vi", ViewImage::NAME, json!({ "path": "shot.png" })),
-            tc("ex", "explore", json!({ "question": "diagram?" })),
+            tc("ot", "other_tool", json!({ "question": "diagram?" })),
         ]);
         let results = Message::User {
             content: vec![
                 vi_result("vi"),
                 UserContent::ToolResult(tool_result(
-                    "ex",
-                    "explore",
+                    "ot",
+                    "other_tool",
                     vec![
                         ToolResultContent::text("attached: docs/arch.png (image/png, 4.0 KiB)"),
                         ToolResultContent::Image(Image {
@@ -9744,7 +7549,7 @@ mod tests {
             2,
             "each image gets its own user Image turn: {out:?}"
         );
-        for id in ["vi", "ex"] {
+        for id in ["vi", "ot"] {
             assert!(
                 out.iter().any(|m| matches!(m, Message::User { content }
                     if content.iter().any(|c| matches!(c, UserContent::ToolResult(tr)
@@ -9773,8 +7578,7 @@ src/view_image.rs:177: json!({"response": note, "parts": [{"type":"image", "data
         let envelope = json!({"response": "r", "parts": [{"type": "image", "data": "ZmFrZQ=="}]});
         assert!(!tool_output_carries_image(&ToolOutput::json(envelope)));
 
-        // A genuinely declared image part — the block `view_image` and a routed
-        // `explore` result emit — does carry.
+        // A genuinely declared image part — the block `view_image` emits — does carry.
         let with_image = ToolOutput::content(vec![
             ToolResultContent::text("note"),
             ToolResultContent::Image(Image {

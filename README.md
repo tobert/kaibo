@@ -44,22 +44,19 @@ workspace and write nowhere.
 ## How `consult` works
 
 You ask your agent for something. It calls `consult` with a question and a cast — the
-two-model team you picked, from whatever family you like.
+model team you picked, from whatever family you like.
 
-From there kaibo runs its own agents. The **synth** is the synthesis agent: it owns
-the investigation, and it decides how to work. It reads spans through the read-only shell
-itself, and it can hand a broad survey to the **explorer** — a cheaper, faster model that
-searches the repo and reports back what it found. Delegating is a tool call, and it's the
-synth's call whether to make one. Then the synth checks what matters, fills the gaps, and
-writes the answer. A cast with no explorer, or one that sets `consult = "solo"` (the built-in `anthropic`
-cast does), runs single-stage: the synth does every read itself.
+From there kaibo runs its own agent. The **synth** is the synthesis agent: it owns the
+investigation. It starts with a map of the project's files, searches and reads through
+the read-only shell itself, and writes the answer with `file:line` citations. kaibo puts
+a line above the answer naming who prepared it (`The following report was prepared by
+kaibo/<cast>.`) and a footer below naming the model and its token use.
 
-So the chain runs: you → your agent → kaibo's synth → kaibo's explorer. If your agent
-spawned a subagent to do the work, that's one more link, and the inside is the same. Every
-link is a model plus the harness it acts through, working for the link above it, and every
-link hands back a summary instead of everything it saw. That's the whole idea: your agent
-gets one cited answer instead of an investigation, and the cheap model does most of the
-reading.
+So the chain runs: you → your agent → kaibo's synth. If your agent spawned a subagent to
+do the work, that's one more link, and the inside is the same. Every link is a model plus
+the harness it acts through, working for the link above it, and every link hands back a
+summary instead of everything it saw. That's the whole idea: your agent gets one cited
+answer instead of an investigation.
 
 ## What it looks like
 
@@ -264,7 +261,6 @@ human at a terminal can drive kaibo directly:
 |---|---|
 | `consult` | `kaibo consult "question" [--cast … --attach … --session … --web --json]` |
 | `oneshot` | `kaibo oneshot "prompt" [--attach … --json]` (context also via stdin: `oneshot "review this" < diff.txt`) |
-| `explore` | `kaibo explore "question" [--cast … --json]` |
 | `research` | `kaibo research "question" [--context … --cast … --json]` |
 | `deliberate` | `kaibo deliberate "question" [--cast … --attach … --dossier … --web --json]` |
 | `run_kaish` | `kaibo kaish -c 'script'` |
@@ -441,22 +437,18 @@ every tool off is refused at startup.
 ### `consult` — the full investigation
 
 Ask a model *outside your own family* about a codebase; get a grounded, cited answer —
-the synth-and-explorer investigation described [above](#how-consult-works), returning the
-report rather than the transcript. Describe what you did or want to know in prose — kaibo
+the investigation described [above](#how-consult-works), returning the answer rather than
+the transcript. Describe what you did or want to know in prose — kaibo
 reads the real, current source itself, so you don't need to paste a diff; optionally
 seed it with `context` (a change summary or pasted source), which it trusts as starting
 evidence while investigating for more. The answer carries a provenance footer naming the
-cast and models that produced it.
-
-When an answer surprises you, pass `include_report: true` to get the explorer's raw
-findings back alongside it — the audit trail for how the consultation reached its
-conclusion. (For deeper tracing, kaibo emits per-tool OpenTelemetry spans; see
-[`docs/config.md`](docs/config.md).)
+cast and model that produced it. For tracing how it got there, kaibo emits per-tool
+OpenTelemetry spans; see [`docs/config.md`](docs/config.md).
 
 *Args:* `question` (required), `context` (optional seed), `path` (project dir; optional
-with a default `--root`), `cast`, `session_id`, `include_report`, `web` (see
-[`research`](#research--the-web-not-the-repo)), and per-call `explorer_model` /
-`synth_model` (+ `_backend`) overrides.
+with a default `--root`), `cast`, `session_id`, `attach`, `web` (see
+[`research`](#research--the-web-not-the-repo)), and a per-call `synth_model` (+
+`synth_backend`) override.
 
 ### `oneshot` — a thin second opinion
 
@@ -466,12 +458,6 @@ model outside your family a direct question (you've pasted what's needed, or it'
 general). Pick the model with `cast`; the answer carries the same provenance footer.
 
 *Args:* `prompt` (required), `cast`, and a per-call `model` (+ `backend`) override.
-
-### `explore` — the survey, not the verdict
-
-The same read-only investigation as `consult`, returning a structured, cited survey
-report — what's where, how it fits together — instead of an answer. Reach for it
-when you want the map.
 
 ### `research` — the web, not the repo
 
@@ -483,9 +469,9 @@ project. Reach for it when a codebase cannot answer: a dependency's changelog or
 bugs, a security advisory, an API that moved after your model's training cutoff.
 
 `web: true` on `consult`, `consult_submit`, or `deliberate` brings the same tools into a
-code question. It is off by default, so a code review stays on the code. With it, each
-explorer survey can search, and the team `consult` driver reads only the survey's cited
-report. A solo cast's driver searches itself.
+code question. It is off by default, so a code review stays on the code. With it, the
+`consult` synth searches and reads pages itself, and `deliberate`'s explorer does so
+while it builds the dossier.
 
 The provider fetches each page on its own servers, so kaibo never opens a URL a model
 chose. Any cast can use it: native search bills the cast's provider, and every other cast
@@ -545,8 +531,9 @@ data path the model can't steer. See "Media CAS" in [`docs/config.md`](docs/conf
 
 ## Backends, Roles, and Casts
 
-Short version: a **cast** is just a named team — a cheap explorer that surveys plus a
-strong synth that answers — and a call picks its team with the `cast` argument.
+Short version: a **cast** is just a named team — a synth that answers, plus an explorer
+that builds `deliberate`'s dossier and runs `research` — and a call picks its team with
+the `cast` argument.
 Everything below is how you wire your own.
 
 Model diversity *is* the product, so configuration is first-class. kaibo works out of
@@ -583,10 +570,10 @@ base_url = "http://localhost:8080/v1"
 key_optional = true
 
 # A cast that mixes model families — a different lineage per role, named as one team.
-# (kaibo calls this a "chimera": local Qwen does the surveying, hosted GPT writes
-# the answer. Two families, not two flavors of one.)
+# (kaibo calls this a "chimera": local Qwen builds deliberate's dossier, hosted GPT
+# writes the answers. Two families, not two flavors of one.)
 [casts.mixed]
-explorer = "llama/qwen2.5-coder-7b"       # cheap, local surveys — Qwen family
+explorer = "llama/qwen2.5-coder-7b"       # local dossier surveys — Qwen family
 synth    = { backend = "gpt", id = "<current sol id>", vision = true, effort = "high" }
 ```
 
@@ -627,23 +614,21 @@ always readable at the `kaibo://config` MCP resource.
 your agent ──stdio MCP──▶ kaibo
                             │  consult(question or request)
                             ▼
-                    ┌───────────────────────────┐   ┌───────────────────────────┐
-                    │ synth (synthesis agent)   │   │ explorer (fast model)     │
-                    │   • reads files via kaish │   │   • reads files via kaish │
-                    │   • delegates to explorer │-> │                           │
-                    │   • writes a summary      │ <-│   • summarizes results    │
-                    └───────────────────────────┘   └───────────────────────────┘
-                            │  synthesized answer (not the transcript)
+                    ┌───────────────────────────┐
+                    │ synth (synthesis agent)   │
+                    │   • reads files via kaish │
+                    │   • writes the answer     │
+                    └───────────────────────────┘
+                            │  cited answer (not the transcript)
                             ▼
                        back to your agent
 ```
 
 kaibo is an agent for your agent. Its models work the filesystem — and transform what
 they read — through kaish: it mounts your repository so they can read it, and has no
-write path, so nothing can change. Putting the bulk of that tool calling on a smaller,
-faster explorer is what keeps a consult quick and cheap — the big model spends its
-budget on the answer instead of the search. (oneshot() skips all of that — a single
-direct call when you already have the context.)
+write path, so nothing can change. (oneshot() skips all of that — a single direct call
+when you already have the context. deliberate() adds an explorer that builds a cited
+dossier first, so a slow offline synth can reason over it.)
 
 It is written in Rust on top of [`rmcp`](https://crates.io/crates/rmcp) and
 [`rig-core`](https://crates.io/crates/rig-core). [kaish](https://crates.io/crates/kaish-kernel)
@@ -730,9 +715,9 @@ so the cast is what decides. A DeepSeek-class team is inexpensive enough to reac
 without thinking about it; a frontier Anthropic or OpenAI cast adds up a good deal
 faster, especially with thinking on. Check your provider's current rates — they move,
 and kaibo won't guess at them for you. What kaibo does do is spend as little as the
-work allows: a family-mixing cast (cheap local explorer + hosted synth) keeps the
-broad, token-heavy surveying off the expensive model and pays it only for the answer,
-and the agent conversations are set up to cache well on most providers. For the
+work allows: the agent conversations are set up to cache well on most providers, and
+`deliberate` can put its token-heavy dossier survey on a local explorer and pay the
+hosted synth only for the reasoning. For the
 strongest models, `batch_submit` rides the provider's discounted batch lane.
 
 ---

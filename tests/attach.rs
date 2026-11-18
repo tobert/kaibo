@@ -237,7 +237,6 @@ async fn image_attachment_to_blind_synth_is_refused() {
         "blindcast".to_string(),
         Cast {
             name: "blindcast".to_string(),
-            consult: None,
             slots,
         },
     );

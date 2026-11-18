@@ -29,10 +29,9 @@
 //!
 //! `inference_calls` and `tool_calls` fall out of [`crate::completion_watch`] for
 //! free, which is why they cost one addition each rather than a counter threaded
-//! through the loop. `tool_calls` is the one Amy asked for by name: it answers "did
-//! the consult driver actually delegate a sweep, or did it read all 203 turns
-//! itself" — the question a $4 OpenRouter consult raised, and which until now needed
-//! OTLP span archaeology to answer.
+//! through the loop. `tool_calls` is the one Amy asked for by name: it answers how
+//! many tool calls a phase made — the question a $4 OpenRouter consult raised, and
+//! which until then needed OTLP span archaeology to answer.
 //!
 //! ## Counting rules that are easy to get wrong
 //!
@@ -42,11 +41,9 @@
 //!   **include failed calls**. A phase that died at turn 90 still reports 90 — which
 //!   is why `inference_calls` reads `CompletionLog::attempts` and not its length: a
 //!   failed call produces no `TurnRecord`, so the length would report 89.
-//! - Both **exclude calls made by sub-agents**. kaibo's delegated `explore′` sweep is
-//!   a sub-agent invocation: it records its own `inference_calls` against its own
-//!   name, and the driver counts the delegation as **one tool call**. That is what
-//!   makes each call counted exactly once across the tree, and it is why the driver's
-//!   `tool_calls` is the delegation answer rather than a mixed total.
+//! - Both **exclude calls made by sub-agents**. Each kaibo phase (the consult driver,
+//!   `deliberate`'s dossier explorer) records its own invocation under its own agent
+//!   name, so each call is counted exactly once.
 //! - `tool_calls` counts **client-side** tool calls only — tools kaibo executes.
 //!   A provider-side built-in (web search, code execution) is not ours to count.
 //!
@@ -95,7 +92,7 @@ mod buckets {
     /// range, so a phase pinned at its cap is visible as pile-up in one bucket.
     pub const CALL_COUNT: &[f64] = &[1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0, 128.0];
     /// One tool execution, in seconds. Same ladder as a client call: a `run_kaish`
-    /// grep and a delegated sweep differ by orders of magnitude, and both fit.
+    /// grep and a long `view_image` read differ by orders of magnitude, and both fit.
     pub const TOOL_DURATION: &[f64] = &[
         0.01, 0.02, 0.04, 0.08, 0.16, 0.32, 0.64, 1.28, 2.56, 5.12, 10.24, 20.48, 40.96, 81.92,
     ];
@@ -223,10 +220,9 @@ pub struct PhaseIdentity {
     /// This phase's agent name: the cast role it fills, `"synth"` or `"explorer"`.
     ///
     /// That is the distinction the agent metrics exist to draw. A consult driver is
-    /// the synth; a delegated `explore′` sweep is an explorer running its own
-    /// invocation. Reading `gen_ai.invoke_agent.tool_calls` split by this name is how
-    /// "did the driver delegate, or did it read everything itself" gets answered
-    /// without opening a single trace.
+    /// the synth; `deliberate`'s dossier survey is an explorer running its own
+    /// invocation. Reading `gen_ai.invoke_agent.tool_calls` split by this name keeps
+    /// the two roles apart without opening a single trace.
     pub agent: &'static str,
 }
 
@@ -305,9 +301,8 @@ fn record_completion_on(
 /// `inference_calls` and `tool_calls` follow the conventions' counting rules quoted in
 /// the module docs: this invocation's own calls, failed ones included, sub-agent calls
 /// excluded. kaibo satisfies the sub-agent rule by construction rather than by
-/// filtering — a delegated `explore′` sweep runs its own [`record_agent_invocation`]
-/// under its own agent name, and the driver sees the delegation only as the one tool
-/// call it made.
+/// filtering — each phase runs its own [`record_agent_invocation`] under its own agent
+/// name.
 pub fn record_agent_invocation(
     agent: &str,
     model: &str,
@@ -356,12 +351,7 @@ fn record_agent_invocation_on(
     inst.tool_calls.record(tool_calls, &count_attrs);
 }
 
-/// Record one tool execution — a `run_kaish` shell call, a delegated `explore′` sweep,
-/// a `view_image` read.
-///
-/// The delegated sweep shows up here *and* as its own agent invocation, which is not
-/// double counting: they measure different things. This says how long the driver
-/// waited; the sweep's own invocation says what it did while the driver waited.
+/// Record one tool execution — a `run_kaish` shell call, a `view_image` read.
 pub fn record_tool_execution(tool: &str, duration: Duration, error: Option<&str>) {
     record_tool_execution_on(instruments(), tool, duration, error);
 }
@@ -619,10 +609,8 @@ mod tests {
 
     #[test]
     fn the_driver_and_the_sweep_are_separate_series() {
-        // The reason this whole signal was prioritized. A consult driver that delegated
-        // twice and an explorer sweep that ran twenty turns must be readable apart —
-        // `tool_calls` on the synth answers "did it delegate", and it only answers that
-        // if the sweep's own turns are counted against the explorer instead.
+        // A synth phase and an explorer phase must be readable apart: each phase's
+        // `tool_calls` is counted against its own agent name, never mixed.
         let (provider, exporter, inst) = reader();
         record_agent_invocation_on(
             &inst,
@@ -653,7 +641,7 @@ mod tests {
             .iter()
             .find(|r| attr(r, "gen_ai.agent.name").as_deref() == Some("explorer"))
             .expect("an explorer series");
-        assert_eq!(synth.2, 2, "the driver's own tool calls — its delegations");
+        assert_eq!(synth.2, 2, "the driver's own tool calls");
         assert_eq!(explorer.2, 19, "the sweep's own reads, on its own series");
 
         let inference = find(&rows, "gen_ai.invoke_agent.inference_calls");

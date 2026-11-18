@@ -12,7 +12,7 @@
 //! `.git`/`target`.)
 //!
 //! Size-gated, with a graceful descent — orientation is an *enhancement* (the model
-//! always has `glob`/`grep`/`explore′` regardless), so its absence must never be
+//! always has `glob`/`grep` regardless), so its absence must never be
 //! fatal. At or under `full_list_max_files` the whole file list is injected. Above
 //! it the flat list would be too big, so we fall back to a **directory map**: the
 //! same files folded into a depth-limited tree of dir → file-count lines, which

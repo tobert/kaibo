@@ -31,7 +31,7 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use rmcp::ErrorData as McpError;
 
-use crate::config::{Cast, Config, ConsultMode, Lane, ModelRole, ModelSlot};
+use crate::config::{Cast, Config, Lane, ModelRole, ModelSlot};
 use crate::consult::{Arm, PromptOverrides};
 use crate::web::{WebApi, WebClient, WebSession};
 
@@ -531,8 +531,6 @@ impl Resolver {
     /// `org/model`) is still one id, never parsed for a backend. Retargeting is the
     /// explicit `backend` arg's job: when set, it resolves (aliases included) and the
     /// slot is replaced wholesale, which also works on a role the cast doesn't carry.
-    /// (`consult` refuses an explorer override on a `consult = "solo"` cast; see
-    /// [`consult_explorer_arm`](Self::consult_explorer_arm).)
     /// Either way the configured slot's pins/tunables are dropped — they described the
     /// *configured* model; the new id classifies fresh.
     pub(crate) fn override_model(
@@ -700,50 +698,6 @@ impl Resolver {
             .transpose()
     }
 
-    /// [`arm`](Self::arm) for a slot the cast may leave out: `None` when `cast` has no
-    /// `role` slot, so the caller runs without that phase. `consult` resolves its explorer
-    /// this way, and a synth-only cast runs single-stage.
-    pub(crate) fn optional_arm(
-        &self,
-        cast: &Cast,
-        role: ModelRole,
-    ) -> Result<Option<Arm>, McpError> {
-        match cast.slot(role) {
-            Some(_) => self.arm(cast, role).map(Some),
-            None => Ok(None),
-        }
-    }
-
-    /// The explorer arm a `consult` runs with: `None` when the cast runs `consult` solo
-    /// (`Cast::consult_solo`), so no explorer model is resolved or called. A cast with
-    /// an explicit `consult = "solo"` refuses an `explorer_model` override, which could
-    /// not take effect; a cast that is solo only because it has no explorer slot keeps
-    /// the override as the way to add one.
-    pub(crate) fn consult_explorer_arm(
-        &self,
-        cast: &Cast,
-        explorer_model: Option<&str>,
-        model_arg: &str,
-    ) -> Result<Option<Arm>, McpError> {
-        if cast.consult == Some(ConsultMode::Solo) {
-            if explorer_model.is_some() {
-                return Err(McpError::invalid_params(
-                    format!(
-                        "{model_arg} was sent, but cast `{name}` has consult = \"solo\": its \
-                         synth reads the code itself and no explorer runs for `consult`. \
-                         Drop {model_arg}, use `explore` for an explorer survey, or pick a \
-                         cast with consult = \"team\" (`kaibo://config` lists each cast's \
-                         mode)",
-                        name = cast.name
-                    ),
-                    None,
-                ));
-            }
-            return Ok(None);
-        }
-        self.optional_arm(cast, ModelRole::Explorer)
-    }
-
     /// Assemble the operator's house rules for this call against the resolved `root`:
     /// the `[context]` files read here, in trusted server-side Rust, and folded into
     /// the phase preamble. A missing *declared* user file is a loud `internal_error`,
@@ -776,7 +730,7 @@ impl Resolver {
         cast.resolved_prompts(&self.config.prompts)
     }
 
-    /// Resolve caller-named `consult`/`explore` attachments: attach means *the model
+    /// Resolve caller-named `consult` attachments: attach means *the model
     /// sees the bytes*. A text file within `budget` (cumulative, caller order) is read
     /// server-side and inlined into the driver prompt; a text file past it is demoted
     /// to a named path the prompt directs the model to read WHOLE through its shell.
@@ -929,8 +883,7 @@ impl Resolver {
         Ok(out)
     }
 
-    /// Resolve attachments for a sweep-only tool (`explore`, `deliberate`'s dossier
-    /// stage): read-WHOLE directives, never inlined bytes — budget 0, so no file is read
+    /// Resolve attachments for `deliberate`'s dossier survey: read-WHOLE directives, never inlined bytes — budget 0, so no file is read
     /// here at all. Images are refused up front: the sweep toolset carries no `view_image`,
     /// so naming one would send the explorer down a dead end (`cat` refuses binary).
     /// Uses the resolver's own sandbox config for the read-only VFS.
@@ -938,15 +891,14 @@ impl Resolver {
         &self,
         root: &Path,
         attach: &[String],
-        tool: &str,
     ) -> Result<Vec<crate::consult::ConsultAttachment>, McpError> {
         let attachments =
             Self::resolve_consult_attachments(root, attach, 0, &self.config.sandbox).await?;
         if let Some(img) = attachments.iter().find(|a| a.is_image()) {
             return Err(McpError::invalid_params(
                 format!(
-                    "attached file {} is an image, and {tool} refuses image attachments: \
-                     its survey reads files through the shell, which has no image tool, \
+                    "attached file {} is an image, and `deliberate` refuses image \
+                     attachments: its survey reads files through the shell, which has no image tool, \
                      whatever the cast's models can see. Attach the image to `consult` or \
                      `oneshot` with a cast whose synth reads images (`kaibo://config` shows \
                      `vision = true` on the slot)",
@@ -1030,7 +982,7 @@ fn synthless_cast_refusal(cast: &Cast, tool: &str) -> String {
     };
     // The tools a synth-less cast can still staff, by the slot each one runs.
     let mut fits: Vec<&str> = [
-        (ModelRole::Explorer, "`explore`"),
+        (ModelRole::Explorer, "`research`"),
         (ModelRole::Image, "`generate`"),
         (ModelRole::Audio, "`generate`"),
         (ModelRole::Decision, "`decide`"),

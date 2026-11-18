@@ -854,7 +854,6 @@ async fn a_consult_tool_loop_runs_on_the_plan_route() {
         "Where is target_marker defined?",
         None,
         dir.path(),
-        None,
         &plan_arm("plan-loop", &base),
         &kaibo::consult::ConsultConfig::default(),
         None,

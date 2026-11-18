@@ -161,7 +161,7 @@ async fn run_traced<T: Tool>(
 }
 
 /// A short, span-friendly summary of a tool call's JSON args: the most informative
-/// field — the `run_kaish` `script`, a `path`, an `explore` `question` — else the
+/// field — the `run_kaish` `script`, a `path`, a `question` or `prompt` — else the
 /// raw JSON, truncated. Read-only project args carry no secrets; the cap just keeps
 /// a long script from bloating the span. This is the field that turns "16 run_kaish
 /// calls" into "1 was `glob`, 15 were `cat -n`/`grep`".

@@ -15,7 +15,7 @@
 use clap::Parser;
 use kaibo::cli::Cli;
 use kaibo::config::Config;
-use kaibo::server::{ConsultInput, DeliberateInput, ExploreInput};
+use kaibo::server::{ConsultInput, DeliberateInput};
 use serde_json::json;
 
 /// Every tool that runs a model loop refuses a per-call turn limit by name.
@@ -36,15 +36,6 @@ fn the_mcp_tools_refuse_a_per_call_turn_limit() {
             "synth_max_turns",
             serde_json::from_value::<ConsultInput>(
                 json!({ "question": "q", "synth_max_turns": 500 }),
-            )
-            .err()
-            .map(|e| e.to_string()),
-        ),
-        (
-            "explore",
-            "explorer_max_turns",
-            serde_json::from_value::<ExploreInput>(
-                json!({ "question": "q", "explorer_max_turns": 5 }),
             )
             .err()
             .map(|e| e.to_string()),
@@ -89,7 +80,6 @@ fn the_cli_has_no_turn_limit_flags() {
     for argv in [
         vec!["kaibo", "consult", "why?", "--explorer-max-turns", "5"],
         vec!["kaibo", "consult", "why?", "--synth-max-turns", "500"],
-        vec!["kaibo", "explore", "map it", "--explorer-max-turns", "5"],
         vec![
             "kaibo",
             "deliberate",

@@ -4,11 +4,8 @@
 //! a bounded tool loop. Every tool on the surface is that loop wearing different
 //! clothes:
 //!
-//! - [`consult`] — the synthesis agent · `{run_kaish, explore′}` (or `{run_kaish}` alone
-//!   on a solo cast — single-stage) · optional context → a
-//!   cited answer. No rigid explorer→synth hand-off: the synthesis agent decides when
-//!   to delegate a broad sweep to the cheap [`RunExplore`] sub-agent vs. read a span
-//!   directly. The `explore′` sweep ([`report_preamble`]) is internal to this loop.
+//! - [`consult`] — the synthesis agent · `{run_kaish}` · optional context → a cited
+//!   answer. One model reads the project itself.
 //! - [`oneshot`] — the synthesis agent · no tools · the caller's context → a direct
 //!   answer. The thin counterpart: one upstream request, no codebase access.
 //!
@@ -17,8 +14,7 @@
 //! server resolves a cast's slots into arms ([`Arm::from_slot`]); a cast whose
 //! explorer and synth live on different backends — different wire protocols,
 //! even — runs each phase on its own client through the same loop primitive.
-//! Each tool gets its own fresh [`KaishWorker`] (a kernel rooted at the
-//! project), and so does every `explore′` delegation.
+//! Each tool gets its own fresh [`KaishWorker`] (a kernel rooted at the project).
 
 mod config;
 mod engine;
@@ -28,11 +24,10 @@ mod shaping;
 mod web_tests;
 
 pub use config::{ConsultConfig, ExploreConfig, PhaseContext, ResearchConfig};
-pub(crate) use engine::{explore_with, research_with};
 pub use engine::{
-    consult, deliberate_direct, oneshot, Arm, ConsultOutput, Llm, ModelSource, RunExplore,
-    RunExploreArgs, RunExploreError, Session,
+    consult, deliberate_direct, oneshot, Arm, ConsultOutput, Llm, ModelSource, Session,
 };
+pub(crate) use engine::{explore_with, research_with};
 // `run_phase` is the offline-testable loop primitive; re-exported at crate scope so
 // `crate::consult::run_phase` (referenced in module docs) resolves. `run_phase_logged`
 // is that same loop with the per-turn completion record kept — the seam to reach for
@@ -43,11 +38,11 @@ pub(crate) use engine::{failure_class, run_phase, run_phase_logged};
 pub use prompts::{
     batch_preamble, batch_system_prompt, consult_preamble, consult_user_prompt,
     deliberation_prompt, oneshot_preamble, report_preamble, resolve_phase_preamble,
-    sweep_evidence_block, ConsultAttachment, Phase, PromptOverrides, ReportReader,
+    sweep_evidence_block, ConsultAttachment, Phase, PromptOverrides,
 };
 pub use shaping::{
-    effort_rank, effort_sinks, hosted_openai_accepts_reasoning,
-    hosted_openai_accepts_sampling, hosted_openai_responses_params, inject_provider_prefs,
-    is_effort_off, known_efforts, request_params, thinking_params, ModelCaps, ModelShape, ThinkingStyleOverride, DEFAULT_EFFORT, EFFORT_LADDER, EFFORT_OFF,
-    THINKING_BUDGET,
+    effort_rank, effort_sinks, hosted_openai_accepts_reasoning, hosted_openai_accepts_sampling,
+    hosted_openai_responses_params, inject_provider_prefs, is_effort_off, known_efforts,
+    request_params, thinking_params, ModelCaps, ModelShape, ThinkingStyleOverride, DEFAULT_EFFORT,
+    EFFORT_LADDER, EFFORT_OFF, THINKING_BUDGET,
 };
