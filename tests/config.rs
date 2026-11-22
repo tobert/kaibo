@@ -3552,3 +3552,74 @@ fn a_signed_in_backend_cannot_staff_a_batch_synth() {
     let msg = format!("{err:#}");
     assert!(msg.contains("batch") && msg.contains("API key"), "{msg}");
 }
+
+// --- [server.http] ------------------------------------------------------------
+
+/// HTTP is off by default, and the socket path is left to the server's default.
+#[test]
+fn http_is_off_by_default() {
+    let c = Config::builtin();
+    assert!(!c.http.enabled);
+    assert_eq!(c.http.socket, None);
+}
+
+/// `KAIBO_HTTP` turns it on and `KAIBO_HTTP_SOCKET` moves the socket.
+#[test]
+fn http_env_overrides() {
+    let c = load_env(&[
+        ("KAIBO_HTTP", "1"),
+        ("KAIBO_HTTP_SOCKET", "/run/user/7/k.sock"),
+    ]);
+    assert!(c.http.enabled);
+    assert_eq!(
+        c.http.socket.as_deref(),
+        Some(std::path::Path::new("/run/user/7/k.sock"))
+    );
+}
+
+/// `KAIBO_HTTP=0` and `--no-http` close a socket a lower layer opened.
+#[test]
+fn http_can_be_turned_off_from_a_higher_layer() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("config.toml");
+    std::fs::write(&file, "[server.http]\nenabled = true\n").unwrap();
+    let from_file = |env: &'static [(&'static str, &'static str)]| {
+        Config::load_with(Some(file.clone()), None, move |k| {
+            env.iter()
+                .find(|(n, _)| *n == k)
+                .map(|(_, v)| v.to_string())
+        })
+        .unwrap()
+    };
+    assert!(from_file(&[]).http.enabled);
+    assert!(!from_file(&[("KAIBO_HTTP", "0")]).http.enabled);
+    assert!(!from_file(&[("KAIBO_HTTP", "false")]).http.enabled);
+
+    let mut c = from_file(&[]);
+    c.apply_http_cli(false, true, None).unwrap();
+    assert!(!c.http.enabled, "--no-http wins over the file");
+}
+
+/// A relative socket path is a load error naming the key, wherever it came from.
+#[test]
+fn a_relative_http_socket_is_refused_naming_the_key() {
+    let err = Config::from_toml_str("[server.http]\nsocket = \"mcp.sock\"\n")
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("[server.http] socket"), "{err}");
+    assert!(err.contains("not an absolute path"), "{err}");
+
+    let mut c = Config::builtin();
+    let err = c
+        .apply_http_cli(true, false, Some("rel/mcp.sock"))
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("--socket"), "{err}");
+}
+
+/// The old TCP keys are gone: `listen` is an unknown key, not a silent no-op.
+#[test]
+fn the_tcp_listen_key_is_gone() {
+    let err = Config::from_toml_str("[server.http]\nlisten = \"127.0.0.1:52426\"\n").unwrap_err();
+    assert!(format!("{err:#}").contains("listen"), "{err:#}");
+}

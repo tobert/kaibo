@@ -27,6 +27,11 @@ decide = true                       # requires decision slot
 research = true                     # requires live [web] access
 # job_* tools follow enabled producers; read_cas/write_cas follow cas.enabled.
 
+# Preview: serve over HTTP on an owner-only Unix socket. Setup: kaibo://config/http.
+# [server.http]
+# enabled = false                   # KAIBO_HTTP; kaibo serve --http
+# socket = "/run/user/1000/kaibo/mcp.sock"  # absolute; default $XDG_RUNTIME_DIR/kaibo/mcp.sock
+
 [defaults]
 explorer_max_turns = 100            # per survey; final answer turn follows the cap
 synth_max_turns = 200               # per consult driver

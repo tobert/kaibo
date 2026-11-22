@@ -24,7 +24,10 @@ path = "src/main.rs"
 kaish-kernel = { version = "0.19.0", default-features = false, features = ["localfs"] }
 # `time` is used by the deferred `generate` job's poll cadence (sleep + Instant) —
 # named here rather than inherited from a transitive enabler.
-tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "sync", "time", "net", "io-util"] }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "sync", "time", "net", "io-util", "signal"] }
+# Cancellation for the socket server's shutdown (`src/server/http.rs`); already in the tree
+# through rmcp, named here so the dep is ours, not implicit.
+tokio-util = "0.7"
 async-trait = "0.1"
 anyhow = "1"
 
@@ -133,8 +136,15 @@ toml = "1"
 # tree transitively via kaish-kernel, named here so the dep is ours, not implicit.
 regex = "1"
 
-# MCP server (stdio only — never bind a socket; the FS is the boundary).
-rmcp = { version = "3.9.0", features = ["server", "transport-io", "macros"] }
+# MCP server: stdio by default. The opt-in streamable-HTTP transport is served on a Unix
+# socket only, never a network socket (AGENTS.md, "stdio by default; two bound sockets, neither on a network address").
+rmcp = { version = "3.11.0", features = ["server", "transport-io", "macros", "transport-streamable-http-server"] }
+# The socket transport (`src/server/http.rs`): hyper serves rmcp's streamable-HTTP service
+# over accepted Unix streams. hyper, hyper-util, and http-body-util are already in the tree
+# through reqwest; these add only their server halves (pure Rust, no TLS).
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http-body-util = "0.1"
 clap = { version = "4", features = ["derive"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
@@ -273,11 +283,12 @@ tokio = { version = "1", features = ["test-util"] }
 # `client` adds the client service loop; `transport-child-process` spawns the server
 # and wires its stdio (it pulls `tokio/process` + `process-wrap`, both pure Rust).
 # Dev-only under resolver v2, so the shipped binary's dependency graph is unchanged;
-# `cargo tree -i aws-lc-rs` and `-i mimalloc` stay empty either way (both features are
+# `cargo tree -i aws-lc-rs` and `-i mimalloc` stay empty either way (all three features are
 # crypto-free — no reqwest, no TLS).
-rmcp = { version = "3.9.0", default-features = false, features = [
+rmcp = { version = "3.11.0", default-features = false, features = [
     "client",
     "transport-child-process",
+    "transport-streamable-http-client-unix-socket",
 ] }
 # The scripted completion transport (`rig_core::test_utils::MockScript`) the offline consult-loop
 # tests drive. Dev-only; `cargo tree -e normal` stays free of it.

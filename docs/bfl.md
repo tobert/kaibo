@@ -101,7 +101,7 @@ template.
 - The `flux-tools/*` image family (erase, deblur, outpainting, vto) — a table
   extension once the kind exists.
 - Finetune routes, webhooks (`webhook_url`/`webhook_secret`) — kaibo polls;
-  it does not bind sockets or receive callbacks (stdio-only invariant).
+  it receives no callbacks and binds no network address (see the socket invariant in AGENTS.md).
 
 ## Testing
 

@@ -15,6 +15,15 @@ record. Each later release appends a new section at the top.
 
 ## [Unreleased]
 
+### Added
+- Preview: `kaibo serve --http` serves MCP as streamable HTTP on an owner-only Unix socket (default `$XDG_RUNTIME_DIR/kaibo/mcp.sock`; `--socket`, `[server.http] socket`); off by default, no TCP listener, no token. Setup: `kaibo://config/http`.
+- `kaibo://config` shows `[http]`: enabled and the socket path.
+- `kaibo://configure` serves the configure walkthrough as a resource, for hosts without MCP prompts such as Codex.
+- `kaibo://hosts/{name}` and `kaibo host-guide <name>`: setup guides for Claude Code, Codex, OpenCode, agy, and Claude Desktop.
+
+### Changed
+- The `configure` prompt points the agent at its own host's guide and at the socket guide.
+
 ## [0.7.0] — 2026-11-18
 
 ### Security

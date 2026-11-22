@@ -73,7 +73,7 @@
 //! # Webhooks are refused, not silently dropped
 //!
 //! `webhook_url`/`webhook_secret` ride `fields` like any other provider knob — except
-//! kaibo is stdio-only and never binds a socket or receives a callback (see AGENTS.md).
+//! kaibo never receives a callback: it binds no network address for one (see AGENTS.md).
 //! Passing them through unchanged would have the provider answer
 //! `AsyncWebhookResponse` (no `polling_url` at all) for money kaibo cannot collect, so
 //! [`refuse_webhook_fields`] refuses both names before any request is sent.
@@ -257,8 +257,9 @@ pub enum BflError {
     /// A `fields` entry named a webhook parameter — refused before any request is
     /// sent, so nothing is billed for a callback kaibo cannot receive.
     #[error(
-        "`fields.{field}` asks BFL to call back a webhook, and kaibo is stdio-only — it \
-         never binds a socket or receives a callback, so the notification would go \
+        "`fields.{field}` asks BFL to call back a webhook, and kaibo receives no \
+         callbacks (its only MCP socket is an owner-only Unix socket, and `kaibo login` \
+         listens once on loopback), so the notification would go \
          nowhere and the generation would still be paid for. Drop `fields.{field}`; \
          kaibo already polls the provider for you"
     )]
@@ -956,7 +957,7 @@ mod tests {
             }
         ));
         let msg = err.to_string();
-        assert!(msg.contains("stdio-only"), "names why: {msg}");
+        assert!(msg.contains("receives no callbacks"), "names why: {msg}");
         assert!(
             msg.contains("Drop `fields.webhook_url`"),
             "names the fix: {msg}"

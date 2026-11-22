@@ -1,0 +1,526 @@
+//! The transport-agnostic MCP suite, shared by `tests/mcp_stdio.rs` and
+//! `tests/mcp_socket.rs`. Each includes this file as a module and supplies
+//! `connect(&ChildEnv, args) -> Connected`, the one step that differs: how the binary
+//! is started and how the client reaches it. Every test below then runs, unchanged,
+//! over each transport, so the socket carries the same contract stdio does.
+
+use std::future::Future;
+use std::path::Path;
+use std::time::Duration;
+
+use rmcp::model::{
+    CallToolRequestParams, CallToolResult, ReadResourceRequestParams, ServerPeerInfo, Tool,
+};
+use rmcp::service::{RoleClient, RunningService, ServiceError};
+use tempfile::TempDir;
+
+/// Ceiling on any single MCP request, and on the handshake. Generous on purpose: this
+/// is a hang detector, not a performance assertion, so a slow machine never flakes.
+pub const CALL_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// The exact tool surface a keyless kaibo advertises, sorted.
+///
+/// This is a *stock* install with no credentials at all: the built-in `openai-local`
+/// backend needs no key, so the casts it staffs keep `consult` / `consult_submit` /
+/// `oneshot` (and the job verbs that collect `consult_submit`'s handles)
+/// advertised — kaibo does not check that a local server is actually listening, only
+/// that a cast can be staffed. `run_kaish`, `list_models`, and `read_cas` need no cast
+/// at all — and neither do the media store's two halves, `read_cas` and `write_cas`:
+/// holding bytes and handing them back needs no provider. What is *missing* is the
+/// other half of the story: `batch_submit`, `deliberate`, and `generate` all need a cast
+/// shape no built-in provides, so their routes are dropped rather than
+/// advertised-and-broken. Note the asymmetry that leaves: a keyless kaibo can accept an
+/// upload it cannot yet generate from.
+pub const KEYLESS_TOOLS: &[&str] = &[
+    "consult",
+    "consult_submit",
+    "job_cancel",
+    "job_get",
+    "job_list",
+    "job_wait",
+    "list_models",
+    "oneshot",
+    "read_cas",
+    "run_kaish",
+    "write_cas",
+];
+
+/// Marker line written into the temp project's `Cargo.toml`, so a successful read is
+/// unmistakably *this* file and not the repo's own.
+pub const PROJECT_MARKER: &str = "kai-the-crab-was-here";
+
+/// Bound a request so a wedged server fails one test loudly instead of hanging `cargo
+/// test` until someone notices.
+pub async fn bounded<T>(what: &str, fut: impl Future<Output = T>) -> T {
+    match tokio::time::timeout(CALL_TIMEOUT, fut).await {
+        Ok(v) => v,
+        Err(_) => panic!("{what} did not finish within {CALL_TIMEOUT:?} — the server is hung"),
+    }
+}
+
+/// A live kaibo server plus the temp dirs it was pointed at. Dropping it kills the
+/// child (rmcp's transport does that) and removes the dirs.
+pub struct Server {
+    /// `HOME` and the XDG roots. Held so the dirs outlive the child.
+    _xdg: TempDir,
+    /// The project kaibo is rooted at — the only tree it may read.
+    project: TempDir,
+    pub client: RunningService<RoleClient, ()>,
+    /// Whatever keeps the server process alive for the transport in use.
+    _guard: Box<dyn std::any::Any + Send>,
+}
+
+/// The blank environment one server runs in: temp `HOME`, the XDG roots kaibo reads,
+/// and the project it is rooted at.
+pub struct ChildEnv {
+    pub home: std::path::PathBuf,
+    pub config_home: std::path::PathBuf,
+    pub state_home: std::path::PathBuf,
+    pub data_home: std::path::PathBuf,
+    pub root: std::path::PathBuf,
+}
+
+/// A started server as the suite sees it: the MCP client, and a guard that keeps the
+/// child process alive until the test ends.
+pub struct Connected {
+    pub client: RunningService<RoleClient, ()>,
+    pub guard: Box<dyn std::any::Any + Send>,
+}
+
+impl Server {
+    /// Spawn kaibo on a fresh temp project and complete the MCP handshake.
+    pub async fn start() -> Self {
+        Self::start_with_args(&[]).await
+    }
+
+    /// [`start`](Self::start) with extra CLI flags — how a test asks for a different
+    /// server posture (a `--no-<tool>` gate, say).
+    ///
+    /// `--root` names the project, which also drops the invocation cwd from the allowed
+    /// set — so the kaibo checkout this test runs from is *not* readable by the server
+    /// under test, and a read that lands on the temp project can only have come from
+    /// the temp project.
+    pub async fn start_with_args(args: &[&str]) -> Self {
+        let xdg = TempDir::new().expect("tempdir for the child's HOME/XDG roots");
+        let project = TempDir::new().expect("tempdir for the served project");
+        std::fs::write(
+            project.path().join("Cargo.toml"),
+            format!("[package]\nname = \"{PROJECT_MARKER}\"\n"),
+        )
+        .expect("seed the temp project");
+
+        let config_home = xdg.path().join("config");
+        let state_home = xdg.path().join("state");
+        let data_home = xdg.path().join("data");
+        let home = xdg.path().join("home");
+        for dir in [&config_home, &state_home, &data_home, &home] {
+            std::fs::create_dir_all(dir).expect("create an XDG root");
+        }
+
+        let env = ChildEnv {
+            home,
+            config_home,
+            state_home,
+            data_home,
+            root: project.path().to_path_buf(),
+        };
+        // The one transport-specific step: how this binary is started and reached.
+        let Connected { client, guard } = super::connect(&env, args).await;
+
+        Self {
+            _xdg: xdg,
+            project,
+            client,
+            _guard: guard,
+        }
+    }
+
+    /// The transport's guard, as the concrete type its `connect` boxed. Panics on a
+    /// different type: a test only asks for the guard its own transport made.
+    #[allow(dead_code)]
+    pub fn guard_as<T: 'static>(&self) -> &T {
+        self._guard
+            .downcast_ref::<T>()
+            .expect("the guard has the type this transport's connect boxed")
+    }
+
+    /// The project root the server was launched against.
+    pub fn root(&self) -> &Path {
+        self.project.path()
+    }
+
+    /// What the server said about itself at `initialize`.
+    pub fn handshake(&self) -> ServerPeerInfo {
+        let info = self
+            .client
+            .peer_info()
+            .expect("peer info is set once `initialize` completes");
+        (*info).clone()
+    }
+
+    /// Every advertised tool as the wire carries it — schema, `_meta`, and all — sorted
+    /// by name.
+    pub async fn tools(&self) -> Vec<Tool> {
+        let mut tools = bounded("tools/list", self.client.list_all_tools())
+            .await
+            .expect("tools/list should succeed");
+        tools.sort_by(|a, b| a.name.cmp(&b.name));
+        tools
+    }
+
+    /// Every advertised tool name, sorted.
+    pub async fn tool_names(&self) -> Vec<String> {
+        self.tools()
+            .await
+            .into_iter()
+            .map(|t| t.name.to_string())
+            .collect()
+    }
+
+    /// Ask the server to run a kaish script against the served root, returning whatever
+    /// `tools/call` answered — including a protocol-level refusal.
+    pub async fn try_run_kaish(&self, script: &str) -> Result<CallToolResult, ServiceError> {
+        let args = serde_json::json!({
+            "script": script,
+            "path": self.root().to_string_lossy(),
+        });
+        let params = CallToolRequestParams::new("run_kaish").with_arguments(
+            args.as_object()
+                .expect("the argument literal is an object")
+                .clone(),
+        );
+        bounded("tools/call run_kaish", self.client.call_tool(params)).await
+    }
+
+    /// Run a kaish script against the served root through the `run_kaish` tool, and
+    /// flatten the result to text.
+    pub async fn run_kaish(&self, script: &str) -> String {
+        let result = self
+            .try_run_kaish(script)
+            .await
+            .expect("tools/call run_kaish should return a result, not a protocol error");
+        result
+            .content
+            .into_iter()
+            .filter_map(|c| c.as_text().map(|t| t.text.clone()))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// Read one resource and flatten its text contents.
+    pub async fn read_resource(&self, uri: &str) -> String {
+        let params = ReadResourceRequestParams::new(uri);
+        let result = bounded("resources/read", self.client.read_resource(params))
+            .await
+            .unwrap_or_else(|e| panic!("resources/read {uri} should succeed: {e}"));
+        result
+            .contents
+            .into_iter()
+            .filter_map(|c| match c {
+                rmcp::model::ResourceContents::TextResourceContents { text, .. } => Some(text),
+                // Blob (and any future variant) is not what kaibo's config resources
+                // serve; keeping the text arm alone is the assertion.
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// Close the session and let the child exit. Dropping would also kill it; doing it
+    /// explicitly keeps a test from racing the reaper on the way out.
+    pub async fn shutdown(self) {
+        let _ = bounded("session shutdown", self.client.cancel()).await;
+    }
+}
+
+/// `initialize` completes, kaibo names itself, and the instructions the calling agent
+/// reads carry the front-door vocabulary.
+///
+/// The instructions are the retrieval index in deferral hosts (see AGENTS.md,
+/// "Client-facing text"), so their opening words are load-bearing product, not prose.
+#[tokio::test]
+async fn handshake_names_kaibo_and_ships_read_only_instructions() {
+    let server = Server::start().await;
+    let info = server.handshake();
+
+    let implementation = info
+        .server_info
+        .expect("kaibo names its implementation at initialize");
+    assert_eq!(
+        implementation.name, "kaibo",
+        "the server must identify as kaibo, not as the rmcp crate"
+    );
+    assert_eq!(
+        implementation.version,
+        env!("CARGO_PKG_VERSION"),
+        "the advertised version must be the crate's"
+    );
+    assert!(
+        info.capabilities.tools.is_some(),
+        "kaibo advertises tools; capabilities said otherwise: {:?}",
+        info.capabilities
+    );
+    assert!(
+        info.capabilities.resources.is_some(),
+        "kaibo advertises resources; capabilities said otherwise: {:?}",
+        info.capabilities
+    );
+
+    let instructions = info
+        .instructions
+        .expect("kaibo sends instructions at initialize");
+    for word in ["read-only", "consult", "cast"] {
+        assert!(
+            instructions.contains(word),
+            "the instructions must carry the front-door word `{word}`; got: {instructions}"
+        );
+    }
+
+    server.shutdown().await;
+}
+
+/// A keyless server advertises exactly the tools it can actually staff.
+///
+/// Pinning the whole set (not "contains run_kaish") is what makes a gating regression
+/// visible: a tool that starts being advertised without a cast that can staff it, or
+/// one that silently drops off a stock install, fails here.
+#[tokio::test]
+async fn a_keyless_server_advertises_exactly_the_castless_surface() {
+    let server = Server::start().await;
+
+    assert_eq!(
+        server.tool_names().await,
+        KEYLESS_TOOLS,
+        "a keyless kaibo's advertised surface changed"
+    );
+
+    server.shutdown().await;
+}
+
+/// A real read through the shipped MCP surface: `cat -n` on a file in the served root
+/// comes back with its contents.
+#[tokio::test]
+async fn run_kaish_reads_a_file_under_the_served_root() {
+    let server = Server::start().await;
+
+    let out = server.run_kaish("cat -n Cargo.toml").await;
+
+    assert!(
+        out.contains("exit: 0"),
+        "the read should succeed; got: {out}"
+    );
+    assert!(
+        out.contains(PROJECT_MARKER),
+        "the read should return the temp project's file; got: {out}"
+    );
+
+    server.shutdown().await;
+}
+
+/// The read-only invariant, probed through MCP for the first time: every mutation is
+/// refused, and the project on disk is untouched afterwards.
+///
+/// Two assertions per case on purpose. The refusal text proves kaish said no at the VFS
+/// layer rather than failing for some unrelated reason; the filesystem check proves
+/// nothing landed even if the text ever changes.
+#[tokio::test]
+async fn run_kaish_refuses_every_write_and_the_project_is_untouched() {
+    let server = Server::start().await;
+
+    for (script, victim) in [
+        ("echo x > written.txt", "written.txt"),
+        ("mkdir made", "made"),
+        ("touch touched.txt", "touched.txt"),
+        ("rm Cargo.toml", "no-victim"),
+    ] {
+        let out = server.run_kaish(script).await;
+        assert!(
+            out.contains("read-only"),
+            "`{script}` must be refused as read-only; got: {out}"
+        );
+        assert!(
+            !out.contains("exit: 0"),
+            "`{script}` must not report success; got: {out}"
+        );
+        assert!(
+            !server.root().join(victim).exists(),
+            "`{script}` must leave nothing behind, but {victim} exists"
+        );
+    }
+
+    assert!(
+        server.root().join("Cargo.toml").exists(),
+        "the seeded file must survive `rm`"
+    );
+
+    server.shutdown().await;
+}
+
+/// The config resources round-trip: the resolved state and the shipped template both
+/// come back as text a model can read.
+#[tokio::test]
+async fn the_config_resources_round_trip() {
+    let server = Server::start().await;
+
+    let resolved = server.read_resource("kaibo://config").await;
+    assert!(
+        resolved.contains("advertised_tools"),
+        "kaibo://config reports the resolved surface; got: {resolved}"
+    );
+    assert!(
+        resolved.contains(&server.root().to_string_lossy().to_string()),
+        "kaibo://config names the served root; got: {resolved}"
+    );
+
+    let example = server.read_resource("kaibo://config/example").await;
+    assert!(
+        example.contains("[backends."),
+        "kaibo://config/example is the config.toml template; got: {example}"
+    );
+
+    server.shutdown().await;
+}
+
+/// A `--no-<tool>` flag is a capability gate on the wire, not a hint: the tool is
+/// neither advertised nor callable.
+///
+/// The second half is the one that matters and the one only an MCP-speaking test can
+/// reach. `KaiboHandler::run_kaish` is a plain method — an in-process test calls it
+/// whatever the gate says — so "did `tools/call` refuse it?" is a question about the
+/// router the handler was actually served with. This is the assertion that caught
+/// `#[tool_handler]`'s default router rebuilding an ungated one.
+#[tokio::test]
+async fn a_gated_tool_is_neither_advertised_nor_callable() {
+    let server = Server::start_with_args(&["--no-run-kaish"]).await;
+
+    let tools = server.tool_names().await;
+    assert!(
+        !tools.contains(&"run_kaish".to_string()),
+        "--no-run-kaish must drop the tool from tools/list; got {tools:?}"
+    );
+
+    let refusal = server
+        .try_run_kaish("cat Cargo.toml")
+        .await
+        .expect_err("a gated tool must refuse the call, not run it");
+    // The refusal is kaibo's own, and it has to survive the trip over the wire — this is
+    // the only place that proves the caller reads these words rather than rmcp's
+    // `tool not found`, which says the same thing about a typo and about a tool the
+    // operator switched off. Pin the three things a blocked model can act on: which tool,
+    // which knob, and what it could reach for instead.
+    let refusal = refusal.to_string();
+    assert!(
+        refusal.contains("run_kaish") && refusal.contains("--no-run-kaish"),
+        "the refusal must name the tool and the flag that dropped it; got: {refusal}"
+    );
+    assert!(
+        refusal.contains("Live here:") && refusal.contains("`consult`"),
+        "the refusal must name what is live instead; got: {refusal}"
+    );
+    assert!(
+        !refusal.contains("not found"),
+        "a real tool the operator disabled must not read as a missing name; got: {refusal}"
+    );
+
+    // The other half, and the reason the override checks `ALL_TOOL_NAMES` first: a name
+    // kaibo never had is a typo, and `tool not found` is the true answer there. Without
+    // this, an override that explained *every* miss would be indistinguishable from one
+    // that explained the right ones.
+    let params = CallToolRequestParams::new("run_kiash");
+    let typo = bounded("tools/call run_kiash", server.client.call_tool(params))
+        .await
+        .expect_err("a name kaibo never had must still be refused")
+        .to_string();
+    assert!(
+        typo.contains("not found"),
+        "a misspelled tool name keeps the generic answer; got: {typo}"
+    );
+    assert!(
+        !typo.contains("Live here:"),
+        "kaibo must not explain a name it has never had; got: {typo}"
+    );
+
+    server.shutdown().await;
+}
+
+/// Every advertised tool says over MCP that it makes only additive changes
+/// (`destructiveHint: false`), except `job_cancel`, which stops a provider job. No tool
+/// claims `readOnlyHint`: several spend model credits, and hosts such as Codex run a
+/// read-only tool without asking. A tool added without the hint fails here.
+#[tokio::test]
+async fn every_tool_declares_additive_changes_and_none_claims_read_only() {
+    let server = Server::start().await;
+    let tools = server.tools().await;
+    assert!(!tools.is_empty(), "a keyless server advertises tools");
+
+    let mut missing = Vec::new();
+    let mut read_only = Vec::new();
+    for t in &tools {
+        let a = t.annotations.as_ref();
+        if t.name == "job_cancel" {
+            assert_ne!(
+                a.and_then(|a| a.destructive_hint),
+                Some(false),
+                "`job_cancel` stops a provider job and must not call itself additive"
+            );
+        } else if a.and_then(|a| a.destructive_hint) != Some(false) {
+            missing.push(t.name.to_string());
+        }
+        if a.and_then(|a| a.read_only_hint) == Some(true) {
+            read_only.push(t.name.to_string());
+        }
+    }
+    assert!(
+        missing.is_empty(),
+        "no destructiveHint:false on {missing:?}"
+    );
+    assert!(read_only.is_empty(), "readOnlyHint:true on {read_only:?}");
+
+    server.shutdown().await;
+}
+
+/// The `alwaysLoad` pin reaches the wire on `consult`, and on nothing else.
+///
+/// Routing and meta injection are separate steps on the same router
+/// (`server.rs`, `new_with_env`): the routes survive a change that drops the `_meta`
+/// stamp, so every other assertion here would still pass while the front door quietly
+/// stopped being resident under a schema-deferring host. This is the assertion that
+/// notices. It also pins the pin's *narrowness* — the whole point is that an unused
+/// tool bills nothing until the caller reaches for it.
+#[tokio::test]
+async fn consult_carries_the_always_load_pin_and_no_other_tool_does() {
+    let server = Server::start().await;
+    let tools = server.tools().await;
+
+    let consult = tools
+        .iter()
+        .find(|t| t.name == "consult")
+        .expect("`consult` is advertised on a keyless server");
+    let meta = consult
+        .meta
+        .as_ref()
+        .expect("`consult` carries `_meta` as served over MCP");
+    assert_eq!(
+        meta.get("anthropic/alwaysLoad"),
+        Some(&serde_json::Value::Bool(true)),
+        "`consult` must stay resident under a schema-deferring host; its _meta was {meta:?}"
+    );
+
+    let also_pinned: Vec<&str> = tools
+        .iter()
+        .filter(|t| t.name != "consult")
+        .filter(|t| {
+            t.meta
+                .as_ref()
+                .is_some_and(|m| m.contains_key("anthropic/alwaysLoad"))
+        })
+        .map(|t| t.name.as_ref())
+        .collect();
+    assert!(
+        also_pinned.is_empty(),
+        "only `consult` is pinned resident, so an unused tool bills nothing until it is \
+         reached for; also pinned: {also_pinned:?}"
+    );
+
+    server.shutdown().await;
+}

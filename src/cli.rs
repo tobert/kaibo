@@ -165,6 +165,53 @@ pub enum Command {
     /// Print the configuration reference (the `kaibo://config/guide` document). Reads no
     /// config, so it works when the config is broken.
     ConfigGuide,
+    /// Print the Unix-socket transport guide (the `kaibo://config/http` document): setup,
+    /// scope, the socket path, and service units. Reads no config.
+    HttpGuide,
+    /// Print the setup guide for one agent host, or the list of hosts with no name (the
+    /// `kaibo://hosts` documents). Reads no config.
+    HostGuide(HostGuideArgs),
+}
+
+/// `kaibo host-guide [name]`.
+#[derive(clap::Args, Debug)]
+pub struct HostGuideArgs {
+    /// The host: `claude-code`, `codex`, `opencode`, `agy`, or `claude-desktop`. Omit it
+    /// to list them.
+    pub name: Option<String>,
+}
+
+/// Print one host's setup guide, or the list of hosts. Exit 2 for an unknown host.
+pub fn run_host_guide(args: &HostGuideArgs) -> i32 {
+    use crate::server::hosts;
+    let Some(name) = args.name.as_deref() else {
+        print!(
+            "{}",
+            hosts::host_index(|name| format!("`kaibo host-guide {name}`"))
+        );
+        return 0;
+    };
+    match hosts::host_guide(name) {
+        Some(body) => {
+            print!("{body}");
+            0
+        }
+        None => {
+            eprintln!(
+                "kaibo: no setup guide for host {name:?}. kaibo has guides for {}. For \
+                 another host, follow the closest guide: every host takes a stdio \
+                 command with arguments.",
+                hosts::host_names()
+            );
+            EXIT_USAGE
+        }
+    }
+}
+
+/// Print the embedded Unix-socket transport guide.
+pub fn run_http_guide() -> i32 {
+    print!("{}", crate::server::HTTP_GUIDE_MD);
+    0
 }
 
 /// Print the embedded configuration reference without reading config or contacting providers.
@@ -317,6 +364,23 @@ pub struct ServeGates {
     /// [artifacts] enabled.
     #[arg(long = "allow-save-artifact")]
     pub allow_save_artifact: bool,
+
+    /// Serve MCP over streamable HTTP on a Unix socket instead of stdio (preview). The
+    /// socket is owner-only, at `$XDG_RUNTIME_DIR/kaibo/mcp.sock` unless `--socket` says
+    /// otherwise, and there is no TCP listener. Needs `--root` or an allowed tree, because
+    /// a server started by a service manager has no meaningful launch directory. Also
+    /// KAIBO_HTTP / [server.http] enabled.
+    #[arg(long, conflicts_with = "no_http")]
+    pub http: bool,
+
+    /// Serve on stdio even when KAIBO_HTTP or [server.http] enabled turns HTTP on.
+    #[arg(long)]
+    pub no_http: bool,
+
+    /// The absolute path of the Unix socket `--http` binds (default
+    /// `$XDG_RUNTIME_DIR/kaibo/mcp.sock`). Also KAIBO_HTTP_SOCKET / [server.http] socket.
+    #[arg(long, value_name = "PATH")]
+    pub socket: Option<String>,
 }
 
 impl ServeGates {
