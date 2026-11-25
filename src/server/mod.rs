@@ -495,7 +495,7 @@ pub struct DeliberateInput {
 #[serde(deny_unknown_fields)]
 pub struct HandleInput {
     /// The handle of the async work to act on — a `backend/provider-id` batch (durable) or
-    /// a `job-N` consult (this session). kaibo routes by the handle, so pass back the one
+    /// a `job-N` consult. kaibo routes by the handle, so pass back the one
     /// you were given. See `kaibo://tools`.
     pub handle: String,
 }
@@ -1522,6 +1522,7 @@ impl KaiboHandler {
     /// unchanged. The same store backs both `consult` sessions and batch-handle
     /// recording/recovery (via [`Sessions::store`]).
     pub fn with_session_store(mut self, store: crate::store::SessionStore) -> Self {
+        self.jobs = self.jobs.with_ledger(store.clone());
         self.sessions = Sessions::Persistent(store);
         self
     }
@@ -2081,8 +2082,9 @@ impl KaiboHandler {
             same arguments, but returns a `job-N` handle immediately. Fan out a \
             cross-model study (one submit per cast, collect them all) or keep working \
             while a deep consult runs. `job_wait` parks for results, `job_get` fetches \
-            them, `job_cancel` stops one. Handles live for this server session only. \
-            For an answer in this turn, use `consult`."
+            them, `job_cancel` stops one. With persistence on, a finished answer stays \
+            readable for 7 days, even after a restart; a job still running when kaibo exits \
+            is lost. For an answer in this turn, use `consult`."
     )]
     async fn consult_submit(
         &self,
@@ -2164,7 +2166,8 @@ impl KaiboHandler {
         let synth_model = synth.model.clone();
         let label = format!("cast `{cast_name}` (synth `{synth_model}`)");
 
-        let job_id = self.jobs.submit(label, progress_log, async move {
+        let job_id = self.jobs.mint("consult", &label).await;
+        let job_id = self.jobs.submit_as(job_id, label, progress_log, async move {
             let session = session_id.as_ref().map(|id| (&sessions, id.as_str()));
             match consult(&question, context.as_deref(), root, &synth, &cfg, session).await {
                 Ok(out) => {
@@ -2477,7 +2480,8 @@ impl KaiboHandler {
                 &system,
                 dossier_usage,
                 kept.as_ref(),
-            ),
+            )
+            .await,
         };
         // The caller paid for the dossier's searches now, so it sees them now: the ack
         // carries the web record beside the dossier cost, on either lane.
@@ -2601,7 +2605,7 @@ impl KaiboHandler {
     /// loses it, matching the standing no-daemon decision). Mirrors `consult_submit`'s
     /// spawn, but the background work is `deliberate_direct`, not the consult loop.
     #[allow(clippy::too_many_arguments)] // each arg is a distinct, named stage-2 input
-    fn deliberate_direct_job(
+    async fn deliberate_direct_job(
         &self,
         cast: &Cast,
         // `None` when the dossier was reused rather than swept for — see the batch lane's
@@ -2653,7 +2657,8 @@ impl KaiboHandler {
         let kept_for_job = kept.cloned();
         let label = format!("cast `{cast_name}` deliberate (direct synth `{synth_model}`)");
 
-        let job_id = self.jobs.submit(label, progress_log, async move {
+        let job_id = self.jobs.mint("deliberate", &label).await;
+        let job_id = self.jobs.submit_as(job_id, label, progress_log, async move {
             match crate::consult::deliberate_direct(
                 &question, &dossier, &images, &synth, &system, deadline,
             )
@@ -2688,7 +2693,8 @@ impl KaiboHandler {
             "{}; the direct (local) synth is now deliberating offline as `{job_id}` — cast \
              `{}`. This is one long local completion (it can take a while): `job_wait \
              {job_id}` parks for it, `job_get {job_id}` collects, `job_cancel {job_id}` \
-             stops it. Session-scoped — the job lives for this server session only.{}",
+             stops it. A restart loses a job that is still running; with persistence on, a \
+             finished answer stays readable for 7 days.{}",
             if swept {
                 "Dossier built"
             } else {
@@ -3562,7 +3568,8 @@ impl KaiboHandler {
                 let slot_ref = ran.clone();
                 let deadline = self.config.defaults.call_deadline;
                 let poll_arm = arm.clone();
-                let id = self.jobs.submit(label, progress_log, async move {
+                let id = self.jobs.mint("generate", &label).await;
+                let id = self.jobs.submit_as(id, label, progress_log, async move {
                     let started = tokio::time::Instant::now();
                     loop {
                         match poll_arm.poll(&provider_job).await {
@@ -3663,7 +3670,7 @@ impl KaiboHandler {
             )]));
         }
         self.ensure_consult_enabled(&input.handle)?;
-        match self.jobs.get(&input.handle) {
+        match self.jobs.lookup(&input.handle).await {
             Some(snap) => {
                 // Collecting a terminal job retires its completion ping from the
                 // `job_wait` ring — otherwise that stale Warn lingers and the next
@@ -3678,10 +3685,15 @@ impl KaiboHandler {
             }
             None => Err(McpError::invalid_params(
                 format!(
-                    "no background job `{}` — it may have finished and been evicted by \
-                     newer submits, been canceled, or never existed. Job ids look \
-                     like `job-1` and live only for this server session.",
-                    input.handle
+                    "no background job `{}` — it never existed, or it was removed: \
+                     {}. Job ids look like `job-1`.",
+                    input.handle,
+                    if self.jobs.is_durable() {
+                        "finished jobs are kept for 7 days"
+                    } else {
+                        "with persistence off, jobs live only for this server process, \
+                         up to `[defaults] job_capacity`"
+                    }
                 ),
                 None,
             )),
@@ -3717,10 +3729,15 @@ impl KaiboHandler {
         self.ensure_consult_enabled(&input.handle)?;
         // Producer-neutral wording throughout: a `job-N` may be a consultation, a
         // deliberation, or a deferred generation — the handle doesn't say which.
-        let msg = match self.jobs.cancel(&input.handle) {
+        let msg = match self.jobs.cancel_any(&input.handle).await {
             CancelOutcome::Canceled => format!("Canceled job `{}`.", input.handle),
             CancelOutcome::AlreadyFinished => format!(
                 "Job `{}` had already finished — `job_get` it for the result.",
+                input.handle
+            ),
+            CancelOutcome::Requested => format!(
+                "Job `{}` runs in another kaibo process. Asked it to stop; the job \
+                 changes to canceled within about ten seconds, and `job_get` shows it.",
                 input.handle
             ),
             CancelOutcome::Unknown => {
@@ -3738,7 +3755,7 @@ impl KaiboHandler {
     }
 
     #[tool(
-        description = "List your async work: background jobs in flight this session, \
+        description = "List your async work: background jobs, from this and other kaibo processes, \
             and the batches the providers still know about (last 24h by default; \
             `all: true` for everything) — each with a ready handle for \
             `job_get`/`job_cancel`. This is the way back to a batch whose handle you \
@@ -3755,7 +3772,7 @@ impl KaiboHandler {
         // producer is live — the same predicate the `job-N` collect guard uses
         // (`job_producer_live`), so a server never accepts handles it won't list.
         if self.job_producer_live() {
-            sections.push(render_jobs_section(&self.jobs.list()));
+            sections.push(render_jobs_section(&self.jobs.list_all().await));
         }
 
         // Handles the live provider listing surfaced — so the recovered-handles section
@@ -4862,8 +4879,8 @@ The synth's **lane** (a per-slot property of the cast) picks the mechanism and t
   `deliberate` returns a durable `backend/provider-id` handle the moment the dossier is
   submitted; collect the deliberation with `job_get` any time, even after a restart.
 - **`direct`** — one long completion on a big *local* model (no batch API; it takes the
-  time it takes). Returns a session-scoped `job-N`; `job_wait`/`job_get` it. Session-scoped
-  means a server restart loses it — collect it in the same session.
+  time it takes). Returns a `job-N`; `job_wait`/`job_get` it. A restart loses a job that is still
+  running; with persistence on, a finished answer stays readable for 7 days.
 
 A deliberate cast pairs an interactive explorer with an offline synth (e.g. the example
 config's `fable`, `gemini-deliberate`, or `local-direct`); `kaibo://config` shows each
@@ -4888,8 +4905,9 @@ at once, or when a deep job would otherwise block you.
 
 **Handles tell you their kind by shape**, and you pass back whatever you were given:
 
-- A **consult** handle is `job-N` (e.g. `job-1`). It's in-memory — it lives for *this*
-  server session only, so collect it before you reconnect.
+- A **consult** handle is `job-N` (e.g. `job-1`). With persistence on, a finished answer
+  stays readable for 7 days from any kaibo process, even after a restart; a job still
+  running when kaibo exits is lost, and reads as interrupted.
 - A **batch** handle is `backend/provider-id` (e.g. `anthropic/msgbatch_…`). It's durable
   — it survives a server restart, so you can always come back for it.
 
@@ -4899,7 +4917,7 @@ One small surface drives both kinds:
   once it's done (batch: every item's answer, labelled by index, per-item failures
   surfaced).
 - **`job_cancel <handle>`** stops a running job. A job that already finished is left alone.
-- **`job_list`** shows everything: consult jobs in flight this session, and the batches
+- **`job_list`** shows everything: consult jobs (from every kaibo process on this state db), and the batches
   the providers still know about — the way back to a handle you've lost. By default the
   batches section shows the last 24h (anything older is done and still collectible by its
   handle); pass `all: true` for the full history.
@@ -9555,6 +9573,45 @@ enabled = false
             crate::consult::batch_system_prompt(None),
             "the batch system prompt is passed through"
         );
+    }
+
+    /// A durable session store brings the job ledger with it: a job one handler mints is
+    /// readable through a second handler on the same db, and `job_list` shows it. Without
+    /// `with_session_store` the jobs stay in memory.
+    #[tokio::test]
+    async fn a_session_store_attaches_the_job_ledger() {
+        let dir = tempfile::tempdir().unwrap();
+        let cap = std::num::NonZeroUsize::new(8).unwrap();
+        let store = crate::store::SessionStore::open(&dir.path().join("state.db"), cap, &[])
+            .await
+            .unwrap();
+        assert!(!handler_from_toml(BATCH_CASTS_TOML).jobs.is_durable());
+        let writer = handler_from_toml(BATCH_CASTS_TOML).with_session_store(store.clone());
+        let reader = handler_from_toml(BATCH_CASTS_TOML).with_session_store(store);
+        assert!(writer.jobs.is_durable());
+
+        let id = writer.jobs.mint("consult", "cast `x`").await;
+        writer.jobs.submit_as(
+            id.clone(),
+            "cast `x`",
+            Arc::new(crate::progress::ProgressLog::silent()),
+            async {
+                Ok(crate::jobs::JobResult {
+                    answer: "kept".to_string(),
+                })
+            },
+        );
+        let mut seen = None;
+        for _ in 0..2000 {
+            match reader.jobs.lookup(&id).await.map(|s| s.state) {
+                Some(JobState::Done(r)) => {
+                    seen = Some(r.answer);
+                    break;
+                }
+                _ => tokio::task::yield_now().await,
+            }
+        }
+        assert_eq!(seen.as_deref(), Some("kept"));
     }
 
     /// Batch-handle persistence + recovery across a simulated restart. With a durable store

@@ -77,7 +77,7 @@ surface rule in the invariants).
   a test that can fail. **The shell writes nothing and kaibo never touches the project**
   (no kaish write path; the four levers unconditional). Read-only is scoped to what the
   *model can steer* — kaish's VFS never sees kaibo's own state. kaibo keeps handler-side
-  state (sessions + batch handles, the latter recovered on demand via `job_list`) only
+  state (sessions, batch handles, and background jobs, the latter two recovered on demand via `job_list`) only
   through the persistence store (`src/store.rs`) at a **fixed XDG path no model controls**:
   refused if it resolves into any allowed tree (`tests/store.rs`), and written via turso
   plus a **blessed `create_dir_all`** that `tests/no_write_path.rs` carves out. That store

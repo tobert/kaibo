@@ -497,9 +497,9 @@ pub(crate) fn batch_within_window(
 /// informative ("none"), so the section always renders.
 pub(super) fn render_jobs_section(jobs: &[(String, JobSnapshot)]) -> String {
     if jobs.is_empty() {
-        return "Background jobs (this session): none.".to_string();
+        return "Background jobs: none.".to_string();
     }
-    let mut s = String::from("Background jobs (this session), newest first:");
+    let mut s = String::from("Background jobs, newest first:");
     for (id, snap) in jobs {
         let state = match &snap.state {
             JobState::Running => {

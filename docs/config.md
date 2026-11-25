@@ -964,14 +964,23 @@ CLI/env: `--no-persistence` / `KAIBO_NO_PERSISTENCE` disable it (in-memory, like
 
 | persists | never persists |
 |---|---|
-| the `(question, answer)` turns of each session, caller question included (capacity-evicted, no TTL, same as the in-memory store) | background consult/deliberate job handles (`job-N`), which are in-memory and session-only by design |
-| the `{backend, provider-id, label}` of each submitted batch, so `job_list` can re-surface a handle after a restart | exploration reports, which would be stale bloat |
+| the `(question, answer)` turns of each session, caller question included (capacity-evicted, no TTL, same as the in-memory store) | exploration reports, which would be stale bloat |
+| the `{backend, provider-id, label}` of each submitted batch, so `job_list` can re-surface a handle after a restart | the running task itself: a restart loses a `job-N` that was still working |
+| each background job (`job-N`): kind, label, status, and the finished answer or failure text, kept 7 days after it finishes | |
 | each `kaibo login` sign-in (access and refresh tokens, the issued client id) and this machine's sign-in host id | |
 
 Stored content is the caller's questions, the models' answers, and batch-handle metadata.
 Nothing the *inner model team* steers reaches disk: the store is handler-side, and kaish
 has no write path to it. Because those answers are what you paid for, kaibo treats the db
 as your data and never removes the file under any error; moving it aside is your decision.
+
+**Jobs.** Each `consult_submit`, direct-lane `deliberate`, and deferred `generate` job
+gets a row at submit. A kaibo process refreshes its running jobs every 10 seconds, so a
+row that is `running` with no refresh for 45 seconds reads as `interrupted`: its process
+ended and no answer exists. Finished rows are deleted 7 days after they finish, and an
+answer that points into the media CAS is stored as that pointer. Another kaibo process
+sees the same jobs, and `job_cancel` on a job another process runs takes effect at that
+process's next refresh. With persistence off, jobs stay in memory as before.
 
 **Read-only toward your project is unchanged.** The store is handler-side at the XDG
 path. kaish's read-only sandbox never sees it, kaibo writes nothing into any project, and

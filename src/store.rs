@@ -86,6 +86,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use turso::{Builder, Connection, Database, Value};
 
+pub mod jobs;
+
 /// Per-connection busy budget. A single turso `Connection` refuses *concurrent* use, so
 /// the store mints a fresh connection per operation; this bounds how long one waits when
 /// another connection holds a write lock before it gives up with `Busy`.
@@ -93,7 +95,7 @@ pub(crate) const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Current on-disk schema version. Bump + add a migration arm when the shape changes;
 /// migrations are forward-only and applied through [`SessionStore::migrate`].
-pub const SCHEMA_VERSION: i64 = 2;
+pub const SCHEMA_VERSION: i64 = 3;
 
 /// How long a batch handle is kept before it's pruned. Provider batches expire around 30
 /// days (Anthropic/Gemini both), so a handle older than that names a batch the provider has
@@ -389,6 +391,9 @@ impl SessionStore {
             let conn = store.conn().await?;
             prune_stale_batch_handles(&conn, now()).await?;
         }
+        // Jobs whose owner died while kaibo was down read as `interrupted`, and finished
+        // jobs past retention go, before the first `job_list`.
+        store.job_sweep_stale().await?;
         Ok(store)
     }
 
@@ -413,6 +418,7 @@ impl SessionStore {
             match version {
                 0 => Self::apply_v1(&conn).await?,
                 1 => Self::apply_v2(&conn).await?,
+                2 => Self::apply_v3(&conn).await?,
                 other => {
                     return Err(StoreError::Corrupt(format!(
                         "no migration from schema version {other} (this binary knows up to \
