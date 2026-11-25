@@ -21,6 +21,9 @@ record. Each later release appends a new section at the top.
 - `kaibo://configure` serves the configure walkthrough as a resource, for hosts without MCP prompts such as Codex.
 - `kaibo://hosts/{name}` and `kaibo host-guide <name>`: setup guides for Claude Code, Codex, OpenCode, agy, and Claude Desktop.
 
+### Security
+- `url` 2.5.9 fixes RUSTSEC-2026-0592, a stack overflow in `Url::origin()` on deeply nested `blob:` URLs.
+
 ### Changed
 - The `configure` prompt points the agent at its own host's guide and at the socket guide.
 
