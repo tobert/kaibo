@@ -31,6 +31,7 @@ research = true                     # requires live [web] access
 # [server.http]
 # enabled = false                   # KAIBO_HTTP; kaibo serve --http
 # socket = "/run/user/1000/kaibo/mcp.sock"  # absolute; default $XDG_RUNTIME_DIR/kaibo/mcp.sock
+# connect = "off"                   # off | auto | required: forward a stdio server to the daemon; KAIBO_CONNECT
 
 [defaults]
 explorer_max_turns = 100            # per survey; final answer turn follows the cap

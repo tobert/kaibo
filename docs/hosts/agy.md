@@ -32,9 +32,10 @@ That writes `~/.gemini/config/mcp_config.json`:
 ## Unix socket (preview)
 
 No config entry to copy yet. As of 2026-11-22 this guide has not confirmed that agy can
-connect to a Unix socket: its documented HTTP transport takes a URL. Use stdio above. When
+connect to a Unix socket: its documented HTTP transport takes a URL. Use stdio above, with `--connect` in the args to forward to a running
+daemon (`kaibo://config/http`, "Reach the daemon from a stdio host"). When
 an agy release can dial a socket path, point it at the path `kaibo://config` shows under
-`[http]`; `kaibo://config/http` (`kaibo http-guide`) explains the server.
+`[http]`.
 
 ## Permissions
 

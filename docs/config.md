@@ -1394,6 +1394,15 @@ listener. The server refuses to start with no allowed tree. Setup and service un
 `kaibo://config/http` or `kaibo http-guide`; `kaibo://config` shows the socket path under
 `[http]`.
 
+`[server.http] connect` (`off` by default; `--connect[=MODE]`, `--no-connect`,
+`KAIBO_CONNECT`) makes a stdio `kaibo serve` forward to that daemon instead of running a
+server: `auto` forwards when a daemon answers on the socket and serves in-process when none
+does, and `required` exits 3 when none does. The daemon's root, allowed trees, casts, and
+`--no-<tool>` gates are what the host sees; this process's own are ignored. A server
+that serves the socket (`--http`, `KAIBO_HTTP`, or `[server.http] enabled`) ignores
+`connect`. `connect = "auto"` falls back to this process's own root and allowed trees when
+no daemon answers; `"required"` does not.
+
 ## Host agents
 
 Each host agent launches and limits kaibo in its own way: where its config lives, the

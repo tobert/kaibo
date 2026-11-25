@@ -99,7 +99,39 @@ let transport = StreamableHttpClientTransport::with_client(
 
 (rmcp 3.11, feature `transport-streamable-http-client-unix-socket`.) From a shell,
 `curl --unix-socket "$XDG_RUNTIME_DIR/kaibo/mcp.sock" http://localhost/mcp` reaches the
-same endpoint. The agent hosts in `kaibo://hosts` use stdio until they can dial a socket.
+same endpoint. The agent hosts in `kaibo://hosts` use stdio until they can dial a socket;
+see the next section for reaching the daemon from them.
+
+## Reach the daemon from a stdio host
+
+A host that can only launch a stdio server can still use the daemon. Launch kaibo with
+`--connect`:
+
+```sh
+kaibo serve --connect            # forward when a daemon answers, else serve in-process
+kaibo serve --connect=required   # exit 3 when no daemon answers
+```
+
+In a host's config the command is `kaibo` and the args are `["serve", "--connect"]`. That
+process holds no handler, keys, or root. It opens the socket and copies MCP messages
+both ways, so the host gets the daemon's tools, config, and jobs (a `job-N` from one host
+shows in `kaibo jobs list` and in every other host). Set it once for every launch with
+`[server.http] connect = "auto"` or `KAIBO_CONNECT=auto`. It dials the socket that
+`--socket`, `[server.http] socket`, or the default names, the same one the daemon binds.
+
+- **Scope is the daemon's while forwarding.** Its `--root`, allowed trees, casts, and
+  `--no-<tool>` flags apply, and a `--root` or `--no-<tool>` on the forwarding process is
+  ignored. With `auto` and no daemon, the process serves in-process with its own root
+  instead, so the same host can read a different tree depending on whether the daemon
+  runs. Use `required` when that difference matters.
+- **`auto` checks that something of yours accepts a connection** on the socket (and that
+  the server runs as your user), not that it speaks MCP. A socket that accepts and then
+  fails ends the session, as below.
+- **`auto` says what it did** on stderr: forwarding, or why it serves in-process.
+- **A daemon that stops ends the session.** The forwarding process exits 1, the host
+  restarts it, and under `auto` the restart serves in-process until the daemon is back.
+- **The host's closing stdin** ends the forwarding process with status 0; the daemon stays.
+- MCP log notifications are not sent over the socket, so a forwarded host does not see them.
 
 ## Run it as a service
 

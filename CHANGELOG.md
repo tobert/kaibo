@@ -16,6 +16,7 @@ record. Each later release appends a new section at the top.
 ## [Unreleased]
 
 ### Added
+- `kaibo serve --connect[=auto|required]` (`--connect=off` and `--no-connect` turn it off) forwards a stdio host to a running daemon on the Unix socket, so hosts that cannot dial a socket share one kaibo; also `[server.http] connect`, `KAIBO_CONNECT`, `--no-connect`.
 - `kaibo jobs list|get|wait|cancel` reads background jobs (`job-N`) from the state db, with no server running; exits 4 for a failed, canceled, or interrupted job.
 - Preview: `kaibo serve --http` serves MCP as streamable HTTP on an owner-only Unix socket (default `$XDG_RUNTIME_DIR/kaibo/mcp.sock`; `--socket`, `[server.http] socket`); off by default, no TCP listener, no token. Setup: `kaibo://config/http`.
 - `kaibo://config` shows `[http]`: enabled and the socket path.

@@ -127,6 +127,82 @@ async fn serve_http(_handler: kaibo::server::KaiboHandler, _socket: Option<PathB
     )
 }
 
+/// Forward stdio to the daemon on the socket when one answers (`--connect`). `None` means
+/// serve in-process: no daemon answered and the mode is `auto`. With `required` and no
+/// daemon, the process exits 3 and says how to start one.
+#[cfg(unix)]
+async fn forward_to_daemon(config: &Config) -> Option<Result<()>> {
+    let required = config.http.connect == kaibo::config::ConnectMode::Required;
+    let path = match config.http.socket.clone() {
+        Some(p) => p,
+        None => match kaibo::http_socket::default_socket_path() {
+            Ok(p) => p,
+            Err(e) => {
+                // Starting a daemon would fail for the same reason, so name the real fix.
+                let why = format!("no socket path could be chosen ({e})");
+                let fix = "Give the path with `--socket PATH` or `[server.http] socket`, or set \
+                           XDG_RUNTIME_DIR or HOME.";
+                return give_up(required, &why, fix);
+            }
+        },
+    };
+    if let Err(e) = kaibo::bridge::probe(&path).await {
+        let why = format!("no kaibo daemon answers on {} ({e})", path.display());
+        let fix = "Start one with `kaibo serve --http` (`kaibo http-guide` has a systemd unit).";
+        return give_up(required, &why, fix);
+    }
+    eprintln!(
+        "kaibo: forwarding to the daemon on {}; the daemon's root, allowed trees, and tool \
+         gates apply, and this process's are ignored",
+        path.display()
+    );
+    Some(kaibo::bridge::run(&path).await.map_err(|e| {
+        anyhow::anyhow!(
+            "the daemon on {} ended the session ({e}). The host restarts this process; \
+             under `--connect=auto` the restart serves in-process while no daemon runs.",
+            path.display()
+        )
+    }))
+}
+
+/// `auto`: say what happened and serve in-process (with this process's own root). `required`:
+/// refuse, with the fix.
+#[cfg(unix)]
+fn give_up(required: bool, why: &str, fix: &str) -> Option<Result<()>> {
+    if required {
+        eprintln!(
+            "kaibo: --connect=required, but {why}. {fix} Or use `--connect=auto` to serve \
+             in-process when none runs."
+        );
+        std::process::exit(3);
+    }
+    eprintln!(
+        "kaibo: {why}; serving in-process with this process's own root and allowed trees. \
+         Set `[server.http] connect = \"off\"` to stop looking for a daemon."
+    );
+    None
+}
+
+#[cfg(not(unix))]
+async fn forward_to_daemon(config: &Config) -> Option<Result<()>> {
+    match config.http.connect {
+        kaibo::config::ConnectMode::Required => {
+            eprintln!(
+                "kaibo: --connect=required needs a Unix socket, which this platform does not \
+                 offer. Run kaibo in-process (omit --connect)."
+            );
+            std::process::exit(3);
+        }
+        _ => {
+            eprintln!(
+                "kaibo: --connect needs a Unix socket, which this platform does not offer; \
+                 serving in-process."
+            );
+            None
+        }
+    }
+}
+
 /// Run the MCP server on stdio. The body of a bare `kaibo` / `kaibo serve` — behavior
 /// is byte-for-byte what it was before the CLI restructure. `common` carries the shared
 /// flags; `gates` the serve-only `--no-<tool>` toggles.
@@ -181,6 +257,19 @@ async fn serve(common: CommonArgs, gates: ServeGates) -> Result<()> {
     if let Err(e) = config.apply_http_cli(gates.http, gates.no_http, gates.socket.as_deref()) {
         eprintln!("kaibo: config error: {e:#}");
         std::process::exit(2);
+    }
+    if let Err(e) = config.apply_connect_cli(gates.connect.as_deref(), gates.no_connect) {
+        eprintln!("kaibo: config error: {e:#}");
+        std::process::exit(2);
+    }
+
+    // A stdio server may forward to a daemon instead of running one. Decided before
+    // logging, telemetry, or the handler exist: a forwarding process needs none of them.
+    // A server that serves the socket never connects to one.
+    if !config.http.enabled && config.http.connect != kaibo::config::ConnectMode::Off {
+        if let Some(result) = forward_to_daemon(&config).await {
+            return result;
+        }
     }
 
     // Logs MUST go to stderr; stdout carries the MCP protocol. RUST_LOG wins, else

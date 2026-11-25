@@ -31,7 +31,8 @@ Open Settings, then Developer, then Edit Config, and add:
 ## Unix socket
 
 Not from Desktop. Custom connectors connect from Anthropic's cloud, so they cannot reach a
-Unix socket on your machine. Use stdio.
+Unix socket on your machine. Use stdio, and add `--connect` to the entry's args to forward
+to a running daemon (`kaibo://config/http`, "Reach the daemon from a stdio host").
 
 ## What Desktop supports
 

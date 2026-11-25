@@ -2558,6 +2558,17 @@ impl Config {
         Ok(())
     }
 
+    /// Apply `kaibo serve --connect[=MODE]` / `--no-connect` (highest precedence).
+    pub fn apply_connect_cli(&mut self, connect: Option<&str>, no_connect: bool) -> Result<()> {
+        if let Some(mode) = connect {
+            self.http.connect = ConnectMode::parse(mode, "--connect")?;
+        }
+        if no_connect {
+            self.http.connect = ConnectMode::Off;
+        }
+        Ok(())
+    }
+
     /// Apply CLI overrides (highest precedence). Called from `main` after load.
     /// CLI can only *disable* a tool (the `--no-<tool>` flags); enabling is the job
     /// of the file/env/built-in layers. A non-empty `allow_paths` replaces lower layers.
@@ -3159,6 +3170,9 @@ struct RawHttp {
     /// Absolute path of the Unix socket. Default `$XDG_RUNTIME_DIR/kaibo/mcp.sock`.
     /// Env: `KAIBO_HTTP_SOCKET`. CLI: `--socket`.
     socket: Option<String>,
+    /// `off` (default), `auto`, or `required`: whether a stdio `kaibo serve` forwards to
+    /// a daemon on the socket. Env: `KAIBO_CONNECT`. CLI: `--connect`, `--no-connect`.
+    connect: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -3826,6 +3840,9 @@ fn apply_raw_env(raw: &mut RawConfig, get: &impl Fn(&str) -> Option<String>) -> 
     if let Some(v) = get("KAIBO_HTTP_SOCKET") {
         server.http.get_or_insert_with(Default::default).socket = Some(v);
     }
+    if let Some(v) = get("KAIBO_CONNECT") {
+        server.http.get_or_insert_with(Default::default).connect = Some(v);
+    }
     if let Some(v) = get("KAIBO_LOG") {
         server.log = Some(v);
     }
@@ -4173,6 +4190,37 @@ pub struct HttpConfig {
     pub enabled: bool,
     /// The socket path. `None` means the default, resolved when the server starts.
     pub socket: Option<PathBuf>,
+    /// Whether a stdio `kaibo serve` forwards to a daemon on the socket. Ignored while
+    /// `enabled`, because a server that serves the socket does not connect to one.
+    pub connect: ConnectMode,
+}
+
+/// `[server.http] connect`: what a stdio `kaibo serve` does about a daemon on the socket.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ConnectMode {
+    /// Serve in-process and never look for a daemon. The default.
+    #[default]
+    Off,
+    /// Forward to the daemon when one answers; serve in-process when none does.
+    Auto,
+    /// Forward to the daemon, and refuse to start when none answers.
+    Required,
+}
+
+impl ConnectMode {
+    /// Parse `off`, `auto`, or `required`; `source` names where the value came from.
+    pub fn parse(raw: &str, source: &str) -> Result<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "off" | "false" | "0" => Ok(Self::Off),
+            "auto" | "true" | "1" => Ok(Self::Auto),
+            "required" => Ok(Self::Required),
+            other => bail!(
+                "{source} = {other:?} is not a connect mode. Use \"off\" (serve in-process), \
+                 \"auto\" (forward to a daemon when one runs), or \"required\" (refuse to \
+                 start without one)."
+            ),
+        }
+    }
 }
 
 /// Parse a socket path: absolute, so a service manager's working directory cannot move it.
@@ -4195,6 +4243,10 @@ fn merge_http(raw: RawHttp) -> Result<HttpConfig> {
             .socket
             .map(|s| parse_http_socket(&s, "[server.http] socket"))
             .transpose()?,
+        connect: match raw.connect {
+            Some(c) => ConnectMode::parse(&c, "[server.http] connect")?,
+            None => ConnectMode::Off,
+        },
     })
 }
 
