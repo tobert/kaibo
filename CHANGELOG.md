@@ -16,6 +16,7 @@ record. Each later release appends a new section at the top.
 ## [Unreleased]
 
 ### Added
+- `kaibo jobs list|get|wait|cancel` reads background jobs (`job-N`) from the state db, with no server running; exits 4 for a failed, canceled, or interrupted job.
 - Preview: `kaibo serve --http` serves MCP as streamable HTTP on an owner-only Unix socket (default `$XDG_RUNTIME_DIR/kaibo/mcp.sock`; `--socket`, `[server.http] socket`); off by default, no TCP listener, no token. Setup: `kaibo://config/http`.
 - `kaibo://config` shows `[http]`: enabled and the socket path.
 - `kaibo://configure` serves the configure walkthrough as a resource, for hosts without MCP prompts such as Codex.

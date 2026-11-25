@@ -268,6 +268,7 @@ human at a terminal can drive kaibo directly:
 | `read_cas` | `kaibo cas read <digest> [--offset … --length … --json]` |
 | `write_cas` | `kaibo cas write FILE [--label … --json]` |
 | `batch_submit`, `job_get`/`job_list`/`job_cancel` (batch handles) | `kaibo batch submit \| get \| list \| cancel` |
+| `job_get`/`job_list`/`job_wait`/`job_cancel` (`job-N` handles) | `kaibo jobs list \| get \| wait \| cancel` |
 | `kaibo://config` resource | `kaibo config` |
 | `kaibo://config/example` resource | `kaibo example-config` |
 | `kaibo://config/guide` resource | `kaibo config-guide` |
