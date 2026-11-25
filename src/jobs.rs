@@ -312,8 +312,12 @@ impl JobStore {
                         .await
                     {
                         Ok(true) => {}
-                        Ok(false) => tracing::warn!(target: "kaibo::jobs", job = %task_id, "job ledger row was already finished or canceled; the answer is in memory only"),
-                        Err(e) => tracing::warn!(target: "kaibo::jobs", job = %task_id, error = %e, "job ledger write failed; the answer is in memory only"),
+                        Ok(false) => {
+                            tracing::warn!(target: "kaibo::jobs", job = %task_id, "job ledger row was already finished or canceled; the answer is in memory only")
+                        }
+                        Err(e) => {
+                            tracing::warn!(target: "kaibo::jobs", job = %task_id, error = %e, "job ledger write failed; the answer is in memory only")
+                        }
                     }
                 }
                 // Completion signal at **Warn** — kaibo's "the calling model should
@@ -462,18 +466,11 @@ impl JobStore {
     }
 
     /// A job by id: this process first, then the ledger (a job from before a restart, or
-    /// one another process runs). `None` when neither knows it.
+    /// one another process runs). `None` when neither knows it, or when the ledger cannot
+    /// be read (logged); [`try_lookup`](Self::try_lookup) tells those apart.
     pub async fn lookup(&self, id: &str) -> Option<JobSnapshot> {
-        if let Some(snap) = self.get(id) {
-            return Some(snap);
-        }
-        let ledger = self.ledger.as_ref()?;
-        let n = job_number(id)?;
-        if let Err(e) = ledger.store.job_sweep_stale().await {
-            tracing::warn!(target: "kaibo::jobs", error = %e, "job sweep failed");
-        }
-        match ledger.store.job_get(n).await {
-            Ok(row) => row.map(|r| snapshot_of_row(&r)),
+        match self.try_lookup(id).await {
+            Ok(snap) => snap,
             Err(e) => {
                 tracing::warn!(target: "kaibo::jobs", error = %e, "job ledger read failed");
                 None
@@ -481,65 +478,101 @@ impl JobStore {
         }
     }
 
-    /// Every job: this process's, then ledger rows it does not hold, newest first.
+    /// [`lookup`](Self::lookup) that reports a ledger it cannot read instead of answering
+    /// "no such job".
+    pub async fn try_lookup(
+        &self,
+        id: &str,
+    ) -> Result<Option<JobSnapshot>, crate::store::StoreError> {
+        if let Some(snap) = self.get(id) {
+            return Ok(Some(snap));
+        }
+        let (Some(ledger), Some(n)) = (self.ledger.as_ref(), job_number(id)) else {
+            return Ok(None);
+        };
+        ledger.store.job_sweep_stale().await?;
+        Ok(ledger.store.job_get(n).await?.map(|r| snapshot_of_row(&r)))
+    }
+
+    /// Every job: this process's, then ledger rows it does not hold, newest first. A
+    /// ledger it cannot read is logged and its rows are left out;
+    /// [`try_list_all`](Self::try_list_all) reports it.
     pub async fn list_all(&self) -> Vec<(String, JobSnapshot)> {
+        match self.try_list_all().await {
+            Ok(all) => all,
+            Err(e) => {
+                tracing::warn!(target: "kaibo::jobs", error = %e, "job ledger read failed");
+                self.list()
+            }
+        }
+    }
+
+    /// [`list_all`](Self::list_all) that reports a ledger it cannot read.
+    pub async fn try_list_all(
+        &self,
+    ) -> Result<Vec<(String, JobSnapshot)>, crate::store::StoreError> {
         let mut out = self.list();
         let Some(ledger) = &self.ledger else {
-            return out;
+            return Ok(out);
         };
-        if let Err(e) = ledger.store.job_sweep_stale().await {
-            tracing::warn!(target: "kaibo::jobs", error = %e, "job sweep failed");
-        }
-        match ledger.store.job_list().await {
-            Ok(rows) => {
-                for row in rows {
-                    let id = format!("job-{}", row.id);
-                    if !out.iter().any(|(held, _)| *held == id) {
-                        out.push((id, snapshot_of_row(&row)));
-                    }
-                }
+        ledger.store.job_sweep_stale().await?;
+        for row in ledger.store.job_list().await? {
+            let id = format!("job-{}", row.id);
+            if !out.iter().any(|(held, _)| *held == id) {
+                out.push((id, snapshot_of_row(&row)));
             }
-            Err(e) => tracing::warn!(target: "kaibo::jobs", error = %e, "job ledger read failed"),
         }
         // Newest first by number; ids without one (`job-local-N`) keep their place after.
         out.sort_by_key(|(id, _)| std::cmp::Reverse(job_number(id).unwrap_or(-1)));
-        out
+        Ok(out)
     }
 
     /// Cancel a job by id: stop it here when this process runs it, record a request when
-    /// another process does.
+    /// another process does. A ledger that cannot be read or written reads as `Unknown`
+    /// (logged); [`try_cancel_any`](Self::try_cancel_any) reports it.
     pub async fn cancel_any(&self, id: &str) -> CancelOutcome {
+        match self.try_cancel_any(id).await {
+            Ok(outcome) => outcome,
+            Err(e) => {
+                tracing::warn!(target: "kaibo::jobs", error = %e, "job ledger failed during cancel");
+                CancelOutcome::Unknown
+            }
+        }
+    }
+
+    /// [`cancel_any`](Self::cancel_any) that reports a ledger failure.
+    pub async fn try_cancel_any(
+        &self,
+        id: &str,
+    ) -> Result<CancelOutcome, crate::store::StoreError> {
         let local = self.cancel(id);
         if local != CancelOutcome::Unknown {
             if local == CancelOutcome::Canceled {
                 self.record_canceled(id).await;
             }
-            return local;
+            return Ok(local);
         }
         let (Some(ledger), Some(n)) = (&self.ledger, job_number(id)) else {
-            return CancelOutcome::Unknown;
+            return Ok(CancelOutcome::Unknown);
         };
-        match ledger.store.job_get(n).await {
+        Ok(match ledger.store.job_get(n).await? {
             // This process's own row with no task behind it: the task was evicted and
             // aborted, so nothing will ever read a cancel request. Settle the row here.
-            Ok(Some(row)) if row.status == JobStatus::Running && *row.owner == *ledger.owner => {
+            Some(row) if row.status == JobStatus::Running && *row.owner == *ledger.owner => {
                 self.record_canceled(id).await;
                 CancelOutcome::Canceled
             }
-            Ok(Some(row)) if row.status == JobStatus::Running => {
-                match ledger.store.job_request_cancel(n).await {
-                    Ok(true) => CancelOutcome::Requested,
-                    Ok(false) => CancelOutcome::AlreadyFinished,
-                    Err(e) => {
-                        tracing::warn!(target: "kaibo::jobs", error = %e, "job ledger write failed");
-                        CancelOutcome::Unknown
-                    }
+            Some(row) if row.status == JobStatus::Running => {
+                if ledger.store.job_request_cancel(n).await? {
+                    CancelOutcome::Requested
+                } else {
+                    CancelOutcome::AlreadyFinished
                 }
             }
-            Ok(Some(row)) if row.status == JobStatus::Canceled => CancelOutcome::Canceled,
-            Ok(Some(_)) => CancelOutcome::AlreadyFinished,
-            _ => CancelOutcome::Unknown,
-        }
+            Some(row) if row.status == JobStatus::Canceled => CancelOutcome::Canceled,
+            Some(_) => CancelOutcome::AlreadyFinished,
+            None => CancelOutcome::Unknown,
+        })
     }
 
     async fn record_canceled(&self, id: &str) {
@@ -549,7 +582,8 @@ impl JobStore {
         if let Err(e) = ledger
             .store
             .job_finish(n, &ledger.owner, JobStatus::Canceled, None)
-            .await {
+            .await
+        {
             tracing::warn!(target: "kaibo::jobs", error = %e, "job ledger write failed");
         }
     }

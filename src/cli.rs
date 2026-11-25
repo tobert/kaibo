@@ -29,6 +29,8 @@
 //! tool description, so the top-level `about` front-loads what kaibo is and every
 //! flag doc earns its line (the "Writing for models" discipline).
 
+pub mod jobs;
+
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -82,6 +84,10 @@ EXIT CODES
        set, a missing or unbuildable provider key
     4  the work ran and failed — a provider/model-loop failure, or a kaish
        worker infra crash
+
+`kaibo jobs get` exits 0 for a job still running, 4 for one that failed, was canceled,
+or was interrupted. `kaibo jobs wait` exits 4 when `--timeout` passes first, and 2 for a
+handle that is not `job-N` or names no job.
 
 `kaibo kaish` is the one exception: it exits with kaish's own code instead of
 this table (0 ok, 1 the command failed, 124 timed out, 127 command not found,
@@ -141,6 +147,9 @@ pub enum Command {
     Kaish(KaishArgs),
     /// Provider batch lanes — submit many prompts at once, collect results, list handles.
     Batch(BatchArgs),
+    /// Background jobs (`job-N`) — list, read, wait for, or stop work started by
+    /// `consult_submit` and the other async tools, from any kaibo process.
+    Jobs(jobs::JobsArgs),
     /// Generate an image or audio into kaibo's artifact store and print the digest that
     /// reads it back.
     Generate(GenerateCliArgs),

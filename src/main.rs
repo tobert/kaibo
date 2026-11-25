@@ -83,6 +83,7 @@ async fn run_command(common: CommonArgs, command: Command) -> i32 {
         Command::Deliberate(args) => kaibo::cli::run_deliberate(common, args).await,
         Command::Kaish(args) => kaibo::cli::run_kaish(common, args).await,
         Command::Batch(args) => kaibo::cli::run_batch(common, args).await,
+        Command::Jobs(args) => kaibo::cli::jobs::run_jobs(common, args).await,
         Command::Generate(args) => kaibo::cli::run_generate(common, args).await,
         Command::Cas(args) => kaibo::cli::run_cas(common, args).await,
         Command::Models(args) => kaibo::cli::run_models(common, args).await,
