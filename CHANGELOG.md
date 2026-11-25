@@ -25,6 +25,8 @@ record. Each later release appends a new section at the top.
 - `url` 2.5.9 fixes RUSTSEC-2026-0592, a stack overflow in `Url::origin()` on deeply nested `blob:` URLs.
 
 ### Changed
+- Background jobs (`job-N`) are recorded in the state db: a finished answer stays readable for 7 days across restarts and from other kaibo processes, and a job whose process ended reads as interrupted.
+- `job_cancel` on a job another kaibo process runs takes effect within about ten seconds.
 - The `configure` prompt points the agent at its own host's guide and at the socket guide.
 
 ## [0.7.0] — 2026-11-18

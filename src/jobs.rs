@@ -6,8 +6,11 @@
 //! answer when it lands. This is the *same* diskless, persistence-shaped state as
 //! [`crate::session::SessionStore`] — an `Arc<Mutex<LruCache>>`, capacity-LRU, no TTL,
 //! the mutex never held across an `.await` — only the value is a job's live status
-//! instead of a conversation thread. kaibo writes nothing to disk: a job lives for the
-//! session and dies with the process, exactly as the spawned sub-agent it replaces did.
+//! instead of a conversation thread. The tasks live in this process. With persistence on,
+//! a [`Ledger`] also records each job in the state db (`store/jobs.rs`): the answer
+//! survives a restart, another kaibo process can read it, and a job whose owner died reads
+//! as interrupted. Memory answers first; the ledger answers for a job this process does
+//! not hold.
 //!
 //! The store is deliberately ignorant of *what* a job is. It spawns any
 //! `Future<Output = Result<JobResult, String>>` and tracks its terminal state, so the
@@ -33,6 +36,8 @@ use lru::LruCache;
 use tokio::task::AbortHandle;
 
 use crate::progress::ProgressLog;
+use crate::store::jobs::{JobRow, JobStatus, HEARTBEAT_EVERY_SECS};
+use crate::store::SessionStore;
 
 /// A completed job, ready to render back to the calling agent. `answer` already
 /// carries its provenance footer.
@@ -81,6 +86,9 @@ pub enum CancelOutcome {
     Canceled,
     /// The job had already reached a terminal state — nothing to abort.
     AlreadyFinished,
+    /// Another process runs the job. The cancel is recorded, and that process stops the
+    /// job at its next heartbeat (within about ten seconds).
+    Requested,
     /// No such job id (never existed, or evicted).
     Unknown,
 }
@@ -151,6 +159,32 @@ impl Drop for FinishGuard {
 pub struct JobStore {
     inner: Arc<Mutex<LruCache<String, Arc<Job>>>>,
     next_id: Arc<AtomicU64>,
+    ledger: Option<Ledger>,
+    heartbeat_started: Arc<std::sync::atomic::AtomicBool>,
+}
+
+/// The state-db side of a [`JobStore`]: the store handle and this process's owner token,
+/// which stamps every row this process creates and heartbeats.
+#[derive(Clone)]
+struct Ledger {
+    store: SessionStore,
+    owner: Arc<str>,
+}
+
+/// A token no other process shares: its pid plus the start time in nanoseconds.
+fn owner_token() -> String {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!("{}-{nanos:x}-{n}", std::process::id())
+}
+
+/// `job-12` to `12`; `None` for anything else.
+fn job_number(id: &str) -> Option<i64> {
+    id.strip_prefix("job-")?.parse().ok()
 }
 
 impl JobStore {
@@ -159,6 +193,50 @@ impl JobStore {
         Self {
             inner: Arc::new(Mutex::new(LruCache::new(capacity))),
             next_id: Arc::new(AtomicU64::new(1)),
+            ledger: None,
+            heartbeat_started: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        }
+    }
+
+    /// Record jobs in `store` as well as in memory. Call once, before the first submit.
+    pub fn with_ledger(mut self, store: SessionStore) -> Self {
+        self.ledger = Some(Ledger {
+            store,
+            owner: owner_token().into(),
+        });
+        self
+    }
+
+    /// Whether finished jobs outlive this process.
+    pub fn is_durable(&self) -> bool {
+        self.ledger.is_some()
+    }
+
+    /// Mint the id for a new job and, with a ledger, record it as running. A ledger that
+    /// cannot be written is logged and the job gets a process-local id: the consultation
+    /// still runs, it just will not be visible to other processes.
+    pub async fn mint(&self, kind: &str, label: &str) -> String {
+        if let Some(ledger) = &self.ledger {
+            match ledger.store.job_create(kind, label, &ledger.owner).await {
+                Ok(n) => return format!("job-{n}"),
+                Err(e) => tracing::warn!(
+                    target: "kaibo::jobs",
+                    error = %e,
+                    "job ledger write failed; this job is visible to this process only"
+                ),
+            }
+        }
+        self.local_id()
+    }
+
+    /// An id only this process knows. With a ledger it lives in its own namespace
+    /// (`job-local-N`), so it can never address another process's row.
+    fn local_id(&self) -> String {
+        let n = self.next_id.fetch_add(1, Ordering::Relaxed);
+        if self.ledger.is_some() {
+            format!("job-local-{n}")
+        } else {
+            format!("job-{n}")
         }
     }
 
@@ -172,8 +250,25 @@ impl JobStore {
     where
         F: Future<Output = Result<JobResult, String>> + Send + 'static,
     {
-        let n = self.next_id.fetch_add(1, Ordering::Relaxed);
-        let id = format!("job-{n}");
+        self.submit_as(self.local_id(), label, progress, fut)
+    }
+
+    /// [`submit`](Self::submit) under an id from [`mint`](Self::mint).
+    pub fn submit_as<F>(
+        &self,
+        id: String,
+        label: impl Into<String>,
+        progress: Arc<ProgressLog>,
+        fut: F,
+    ) -> String
+    where
+        F: Future<Output = Result<JobResult, String>> + Send + 'static,
+    {
+        let ledger = self.ledger.clone();
+        let ledger_id = job_number(&id);
+        if ledger.is_some() {
+            self.ensure_heartbeat();
+        }
 
         let state = Arc::new(Mutex::new(JobState::Running));
         let task_state = state.clone();
@@ -187,30 +282,50 @@ impl JobStore {
                 armed: true,
             };
             let outcome = fut.await;
-            {
+            // Land the result in memory under the state lock, which is released before any
+            // await. Only land it if a `job_cancel` didn't race in while we were finishing:
+            // a caller who asked to cancel gets `Canceled`, not a surprise late answer.
+            let landed = {
                 let mut s = task_state.lock().expect("job state mutex poisoned");
-                // Only land the result if a `job_cancel` didn't race in while we were
-                // finishing — a caller who asked to cancel gets `Canceled`, not a
-                // surprise late answer.
                 if matches!(*s, JobState::Running) {
                     let succeeded = outcome.is_ok();
+                    let record = match &outcome {
+                        Ok(result) => (JobStatus::Done, result.answer.clone()),
+                        Err(text) => (JobStatus::Failed, text.clone()),
+                    };
                     *s = match outcome {
                         Ok(result) => JobState::Done(result),
                         Err(text) => JobState::Failed(text),
                     };
-                    drop(s); // release the state lock before the log emit
-
-                    // Completion signal at **Warn** — kaibo's "the calling model should
-                    // see this" level (not severity): a finished/failed job is exactly
-                    // what a `job_wait` drains by default, and the `mcp_log` bridge also
-                    // mirrors it to a watching client. Still advisory — no MCP primitive
-                    // wakes the agent, so polling/`job_wait` stays the contract. (A canceled
-                    // job never reaches here — its task is aborted — no ping for it.)
-                    if succeeded {
-                        tracing::warn!(target: "kaibo::jobs", job = %task_id, "async job finished — collect it with `job_get`");
-                    } else {
-                        tracing::warn!(target: "kaibo::jobs", job = %task_id, "async job failed — `job_get` it for the reason");
+                    Some((succeeded, record))
+                } else {
+                    None
+                }
+            };
+            if let Some((succeeded, (status, text))) = landed {
+                // The ledger write comes before the completion ping, so a collector the
+                // ping wakes can already read the answer from the state db.
+                if let (Some(ledger), Some(n)) = (&ledger, ledger_id) {
+                    match ledger
+                        .store
+                        .job_finish(n, &ledger.owner, status, Some(&text))
+                        .await
+                    {
+                        Ok(true) => {}
+                        Ok(false) => tracing::warn!(target: "kaibo::jobs", job = %task_id, "job ledger row was already finished or canceled; the answer is in memory only"),
+                        Err(e) => tracing::warn!(target: "kaibo::jobs", job = %task_id, error = %e, "job ledger write failed; the answer is in memory only"),
                     }
+                }
+                // Completion signal at **Warn** — kaibo's "the calling model should
+                // see this" level (not severity): a finished/failed job is exactly
+                // what a `job_wait` drains by default, and the `mcp_log` bridge also
+                // mirrors it to a watching client. Still advisory — no MCP primitive
+                // wakes the agent, so polling/`job_wait` stays the contract. (A canceled
+                // job never reaches here — its task is aborted — no ping for it.)
+                if succeeded {
+                    tracing::warn!(target: "kaibo::jobs", job = %task_id, "async job finished — collect it with `job_get`");
+                } else {
+                    tracing::warn!(target: "kaibo::jobs", job = %task_id, "async job failed — `job_get` it for the reason");
                 }
             }
             // The future returned (no panic) — disarm so the guard's Drop is a no-op and
@@ -283,6 +398,162 @@ impl JobStore {
             .collect()
     }
 
+    /// Start the heartbeat task once: every [`HEARTBEAT_EVERY_SECS`] it refreshes the ledger
+    /// rows of the jobs this process still runs, stops any job another process asked to
+    /// cancel, and marks rows whose owner is gone as interrupted. It holds only a weak
+    /// reference, so it ends when the store is dropped.
+    fn ensure_heartbeat(&self) {
+        let Some(ledger) = self.ledger.clone() else {
+            return;
+        };
+        if self.heartbeat_started.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let weak = Arc::downgrade(&self.inner);
+        let next_id = self.next_id.clone();
+        let started = self.heartbeat_started.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(Duration::from_secs(HEARTBEAT_EVERY_SECS));
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                tick.tick().await;
+                let Some(inner) = weak.upgrade() else { return };
+                JobStore {
+                    inner,
+                    next_id: next_id.clone(),
+                    ledger: Some(ledger.clone()),
+                    heartbeat_started: started.clone(),
+                }
+                .heartbeat_once()
+                .await;
+            }
+        });
+    }
+
+    /// One heartbeat: refresh the rows of the jobs this process still runs, stop the ones
+    /// another process asked to cancel, and mark rows with no owner as interrupted.
+    pub async fn heartbeat_once(&self) {
+        let Some(ledger) = &self.ledger else { return };
+        let numbers: Vec<i64> = self
+            .lock()
+            .iter()
+            .filter(|(_, job)| {
+                matches!(
+                    *job.state.lock().expect("job state mutex poisoned"),
+                    JobState::Running
+                )
+            })
+            .filter_map(|(id, _)| job_number(id))
+            .collect();
+        match ledger.store.job_heartbeat(&ledger.owner, &numbers).await {
+            Ok(cancel) => {
+                for n in cancel {
+                    let id = format!("job-{n}");
+                    if self.cancel(&id) == CancelOutcome::Canceled {
+                        self.record_canceled(&id).await;
+                    }
+                }
+            }
+            Err(e) => tracing::warn!(target: "kaibo::jobs", error = %e, "job heartbeat failed"),
+        }
+        if let Err(e) = ledger.store.job_sweep_stale().await {
+            tracing::warn!(target: "kaibo::jobs", error = %e, "job sweep failed");
+        }
+    }
+
+    /// A job by id: this process first, then the ledger (a job from before a restart, or
+    /// one another process runs). `None` when neither knows it.
+    pub async fn lookup(&self, id: &str) -> Option<JobSnapshot> {
+        if let Some(snap) = self.get(id) {
+            return Some(snap);
+        }
+        let ledger = self.ledger.as_ref()?;
+        let n = job_number(id)?;
+        if let Err(e) = ledger.store.job_sweep_stale().await {
+            tracing::warn!(target: "kaibo::jobs", error = %e, "job sweep failed");
+        }
+        match ledger.store.job_get(n).await {
+            Ok(row) => row.map(|r| snapshot_of_row(&r)),
+            Err(e) => {
+                tracing::warn!(target: "kaibo::jobs", error = %e, "job ledger read failed");
+                None
+            }
+        }
+    }
+
+    /// Every job: this process's, then ledger rows it does not hold, newest first.
+    pub async fn list_all(&self) -> Vec<(String, JobSnapshot)> {
+        let mut out = self.list();
+        let Some(ledger) = &self.ledger else {
+            return out;
+        };
+        if let Err(e) = ledger.store.job_sweep_stale().await {
+            tracing::warn!(target: "kaibo::jobs", error = %e, "job sweep failed");
+        }
+        match ledger.store.job_list().await {
+            Ok(rows) => {
+                for row in rows {
+                    let id = format!("job-{}", row.id);
+                    if !out.iter().any(|(held, _)| *held == id) {
+                        out.push((id, snapshot_of_row(&row)));
+                    }
+                }
+            }
+            Err(e) => tracing::warn!(target: "kaibo::jobs", error = %e, "job ledger read failed"),
+        }
+        // Newest first by number; ids without one (`job-local-N`) keep their place after.
+        out.sort_by_key(|(id, _)| std::cmp::Reverse(job_number(id).unwrap_or(-1)));
+        out
+    }
+
+    /// Cancel a job by id: stop it here when this process runs it, record a request when
+    /// another process does.
+    pub async fn cancel_any(&self, id: &str) -> CancelOutcome {
+        let local = self.cancel(id);
+        if local != CancelOutcome::Unknown {
+            if local == CancelOutcome::Canceled {
+                self.record_canceled(id).await;
+            }
+            return local;
+        }
+        let (Some(ledger), Some(n)) = (&self.ledger, job_number(id)) else {
+            return CancelOutcome::Unknown;
+        };
+        match ledger.store.job_get(n).await {
+            // This process's own row with no task behind it: the task was evicted and
+            // aborted, so nothing will ever read a cancel request. Settle the row here.
+            Ok(Some(row)) if row.status == JobStatus::Running && *row.owner == *ledger.owner => {
+                self.record_canceled(id).await;
+                CancelOutcome::Canceled
+            }
+            Ok(Some(row)) if row.status == JobStatus::Running => {
+                match ledger.store.job_request_cancel(n).await {
+                    Ok(true) => CancelOutcome::Requested,
+                    Ok(false) => CancelOutcome::AlreadyFinished,
+                    Err(e) => {
+                        tracing::warn!(target: "kaibo::jobs", error = %e, "job ledger write failed");
+                        CancelOutcome::Unknown
+                    }
+                }
+            }
+            Ok(Some(row)) if row.status == JobStatus::Canceled => CancelOutcome::Canceled,
+            Ok(Some(_)) => CancelOutcome::AlreadyFinished,
+            _ => CancelOutcome::Unknown,
+        }
+    }
+
+    async fn record_canceled(&self, id: &str) {
+        let (Some(ledger), Some(n)) = (&self.ledger, job_number(id)) else {
+            return;
+        };
+        if let Err(e) = ledger
+            .store
+            .job_finish(n, &ledger.owner, JobStatus::Canceled, None)
+            .await {
+            tracing::warn!(target: "kaibo::jobs", error = %e, "job ledger write failed");
+        }
+    }
+
     /// Number of live jobs in the registry. For tests and diagnostics.
     pub fn len(&self) -> usize {
         self.lock().len()
@@ -298,6 +569,37 @@ impl JobStore {
     /// build-time bug it would be rather than masking it. Mirrors [`SessionStore`].
     fn lock(&self) -> std::sync::MutexGuard<'_, LruCache<String, Arc<Job>>> {
         self.inner.lock().expect("job store mutex poisoned")
+    }
+}
+
+/// A ledger row as a snapshot. A running row has no progress log here: the task is in
+/// another process, or in none.
+fn snapshot_of_row(row: &JobRow) -> JobSnapshot {
+    let state = match (row.status, &row.result) {
+        (JobStatus::Running, _) => JobState::Running,
+        (JobStatus::Done, answer) => JobState::Done(JobResult {
+            answer: answer.clone().unwrap_or_default(),
+        }),
+        (JobStatus::Failed, text) => JobState::Failed(text.clone().unwrap_or_default()),
+        (JobStatus::Canceled, _) => JobState::Canceled,
+        (JobStatus::Interrupted, _) => JobState::Failed(
+            "the kaibo process that ran this job ended before it finished, so there is no \
+             answer. Submit the question again."
+                .to_string(),
+        ),
+    };
+    let end = row.finished_at.unwrap_or_else(|| {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0)
+    });
+    JobSnapshot {
+        state,
+        label: row.label.clone(),
+        age: Duration::from_secs((end - row.created_at).max(0) as u64),
+        last_progress: None,
+        chat: None,
     }
 }
 
