@@ -3623,3 +3623,64 @@ fn the_tcp_listen_key_is_gone() {
     let err = Config::from_toml_str("[server.http]\nlisten = \"127.0.0.1:52426\"\n").unwrap_err();
     assert!(format!("{err:#}").contains("listen"), "{err:#}");
 }
+
+/// A stdio server forwards to a daemon only when asked: `connect` is off by default.
+#[test]
+fn connect_is_off_by_default_and_each_layer_can_set_it() {
+    use kaibo::config::ConnectMode;
+    assert_eq!(Config::builtin().http.connect, ConnectMode::Off);
+
+    let from_file = Config::from_toml_str("[server.http]\nconnect = \"auto\"\n").unwrap();
+    assert_eq!(from_file.http.connect, ConnectMode::Auto);
+
+    assert_eq!(
+        load_env(&[("KAIBO_CONNECT", "required")]).http.connect,
+        ConnectMode::Required
+    );
+    assert_eq!(
+        load_env(&[("KAIBO_CONNECT", "1")]).http.connect,
+        ConnectMode::Auto
+    );
+    assert_eq!(
+        load_env(&[("KAIBO_CONNECT", "0")]).http.connect,
+        ConnectMode::Off
+    );
+}
+
+/// `--connect` alone means `auto`, `--no-connect` closes what a lower layer opened, and
+/// both beat the file and the environment.
+#[test]
+fn connect_cli_flags_win_over_file_and_env() {
+    use kaibo::config::ConnectMode;
+    let mut c = Config::from_toml_str("[server.http]\nconnect = \"required\"\n").unwrap();
+    c.apply_connect_cli(None, true).unwrap();
+    assert_eq!(c.http.connect, ConnectMode::Off, "--no-connect wins");
+
+    let mut c = load_env(&[("KAIBO_CONNECT", "required")]);
+    assert_eq!(c.http.connect, ConnectMode::Required);
+    c.apply_connect_cli(Some("auto"), false).unwrap();
+    assert_eq!(c.http.connect, ConnectMode::Auto, "--connect beats the environment");
+
+    let mut c = Config::builtin();
+    c.apply_connect_cli(Some("auto"), false).unwrap();
+    assert_eq!(c.http.connect, ConnectMode::Auto);
+    c.apply_connect_cli(Some("required"), false).unwrap();
+    assert_eq!(c.http.connect, ConnectMode::Required);
+}
+
+/// A mode kaibo does not know is refused, naming the key and the three spellings.
+#[test]
+fn an_unknown_connect_mode_is_refused_with_the_choices() {
+    let err = Config::from_toml_str("[server.http]\nconnect = \"always\"\n")
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("[server.http] connect"), "{err}");
+    for choice in ["off", "auto", "required"] {
+        assert!(err.contains(choice), "{err}");
+    }
+    let err = Config::builtin()
+        .apply_connect_cli(Some("sometimes"), false)
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("--connect"), "{err}");
+}

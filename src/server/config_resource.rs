@@ -293,6 +293,8 @@ pub(crate) fn render_config_resource(
         enabled: bool,
         #[serde(skip_serializing_if = "Option::is_none")]
         socket: Option<String>,
+        /// `off`, `auto`, or `required`: whether a stdio server forwards to a daemon.
+        connect: &'static str,
     }
 
     /// The media CAS as resolved. `mode` is runtime truth (`"disk"` / `"memory"` /
@@ -838,6 +840,11 @@ pub(crate) fn render_config_resource(
         http: HttpDoc {
             enabled: config.http.enabled,
             socket: http_socket_path(config),
+            connect: match config.http.connect {
+                crate::config::ConnectMode::Off => "off",
+                crate::config::ConnectMode::Auto => "auto",
+                crate::config::ConnectMode::Required => "required",
+            },
         },
         cas: CasDoc {
             enabled: config.cas.enabled,

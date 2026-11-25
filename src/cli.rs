@@ -85,6 +85,9 @@ EXIT CODES
     4  the work ran and failed — a provider/model-loop failure, or a kaish
        worker infra crash
 
+`kaibo serve --connect=required` also exits 3 when no daemon answers on the socket,
+and 1 when the daemon ends a session it was forwarding.
+
 `kaibo jobs get` exits 0 for a job still running, 4 for one that failed, was canceled,
 or was interrupted. `kaibo jobs wait` exits 4 when `--timeout` passes first, and 2 for a
 handle that is not `job-N` or names no job.
@@ -386,10 +389,31 @@ pub struct ServeGates {
     #[arg(long)]
     pub no_http: bool,
 
-    /// The absolute path of the Unix socket `--http` binds (default
+    /// The absolute path of the Unix socket `--http` binds, or `--connect` dials (default
     /// `$XDG_RUNTIME_DIR/kaibo/mcp.sock`). Also KAIBO_HTTP_SOCKET / [server.http] socket.
     #[arg(long, value_name = "PATH")]
     pub socket: Option<String>,
+
+    /// Forward this stdio server to a daemon on the Unix socket instead of running one:
+    /// `--connect` (same as `--connect=auto`) forwards when a daemon answers and serves
+    /// in-process when none does; `--connect=required` refuses to start without one. The
+    /// daemon's own `--root`, allowed trees, and `--no-<tool>` gates apply, and this process's are
+    /// ignored; the in-process fallback of `auto` uses this process's own. A server that serves
+    /// the socket (`--http`, KAIBO_HTTP, or `[server.http] enabled`) ignores it. Also
+    /// KAIBO_CONNECT / [server.http] connect.
+    #[arg(
+        long,
+        value_name = "MODE",
+        num_args = 0..=1,
+        default_missing_value = "auto",
+        require_equals = true,
+        conflicts_with = "no_connect"
+    )]
+    pub connect: Option<String>,
+
+    /// Serve in-process even when KAIBO_CONNECT or [server.http] connect asks to forward.
+    #[arg(long)]
+    pub no_connect: bool,
 }
 
 impl ServeGates {

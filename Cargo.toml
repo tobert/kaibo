@@ -138,7 +138,9 @@ regex = "1"
 
 # MCP server: stdio by default. The opt-in streamable-HTTP transport is served on a Unix
 # socket only, never a network socket (AGENTS.md, "stdio by default; two bound sockets, neither on a network address").
-rmcp = { version = "3.11.0", features = ["server", "transport-io", "macros", "transport-streamable-http-server"] }
+# `client` + `transport-streamable-http-client-unix-socket` are the stdio bridge's half
+# (`src/bridge.rs`): hyper over a Unix socket, no reqwest and no TLS provider.
+rmcp = { version = "3.11.0", features = ["server", "client", "transport-io", "macros", "transport-streamable-http-server", "transport-streamable-http-client-unix-socket"] }
 # The socket transport (`src/server/http.rs`): hyper serves rmcp's streamable-HTTP service
 # over accepted Unix streams. hyper, hyper-util, and http-body-util are already in the tree
 # through reqwest; these add only their server halves (pure Rust, no TLS).
@@ -282,9 +284,10 @@ tokio = { version = "1", features = ["test-util"] }
 # as the server dependency above — one rmcp in the tree, features unified.
 # `client` adds the client service loop; `transport-child-process` spawns the server
 # and wires its stdio (it pulls `tokio/process` + `process-wrap`, both pure Rust).
-# Dev-only under resolver v2, so the shipped binary's dependency graph is unchanged;
-# `cargo tree -i aws-lc-rs` and `-i mimalloc` stay empty either way (all three features are
-# crypto-free — no reqwest, no TLS).
+# The `client` and unix-socket features are also normal dependencies now (the stdio
+# bridge, `src/bridge.rs`), so only `transport-child-process` is dev-only here. All of
+# them are crypto-free — no reqwest, no TLS: `cargo tree -i aws-lc-rs`, `-i mimalloc`,
+# and `-i webpki-root-certs` stay empty.
 rmcp = { version = "3.11.0", default-features = false, features = [
     "client",
     "transport-child-process",

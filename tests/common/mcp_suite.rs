@@ -1,5 +1,5 @@
-//! The transport-agnostic MCP suite, shared by `tests/mcp_stdio.rs` and
-//! `tests/mcp_socket.rs`. Each includes this file as a module and supplies
+//! The transport-agnostic MCP suite, shared by `tests/mcp_stdio.rs`,
+//! `tests/mcp_socket.rs`, and `tests/mcp_bridge.rs`. Each includes this file as a module and supplies
 //! `connect(&ChildEnv, args) -> Connected`, the one step that differs: how the binary
 //! is started and how the client reaches it. Every test below then runs, unchanged,
 //! over each transport, so the socket carries the same contract stdio does.

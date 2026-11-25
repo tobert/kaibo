@@ -146,6 +146,10 @@ surface rule in the invariants).
   allowed tree, and each accepted connection's peer uid must be kaibo's own; the door is the
   file mode, so there is no token. Never bind a network address for MCP, and change these
   rules only with a failing-first test in `tests/http_transport.rs` and `tests/no_bind.rs`.
+  `kaibo serve --connect` (`src/bridge.rs`) *dials* that socket and binds nothing: a stdio
+  process that copies MCP messages to the daemon. It checks that the socket's server runs
+  as the same user before it forwards, holds no handler or keys, and writes nothing. The
+  **daemon** is the long-lived `kaibo serve --http` process; "daemon" means only that.
 - **kaish is `!Send`.** The kernel runs on a dedicated thread behind `KaishWorker`;
   rig tools require `Send` futures. Don't hold the kernel across an `.await`.
 - **TLS is rustls + ring, no aws-lc / no OpenSSL.** The whole tree must stay free of
