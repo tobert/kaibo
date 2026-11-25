@@ -1083,8 +1083,8 @@ pub enum CastUsability {
 /// Resolved OpenTelemetry export config. **Off by default**: kaibo reads private
 /// source, and rig's GenAI spans carry prompts, completions, and source snippets,
 /// so a default run must ship nothing off-box. Enabling opens an *outbound* OTLP/
-/// HTTP connection to `endpoint` — allowed under the stdio-only invariant (kaibo
-/// never *binds*), but a real boundary, hence opt-in. See `src/telemetry.rs`.
+/// HTTP connection to `endpoint` — allowed under the no-network-bind invariant (kaibo
+/// binds no network address for MCP), but a real boundary, hence opt-in. See `src/telemetry.rs`.
 #[derive(Debug, Clone)]
 pub struct TelemetryConfig {
     /// Whether to stand up the OTLP exporter at all. `false` → zero overhead.
@@ -1417,6 +1417,8 @@ pub struct Config {
     /// `KAIBO_NO_CWD`, or `[server] infer_cwd = false`) when the allowed set should be
     /// exactly what you named; every call must then pass `path` explicitly.
     pub infer_cwd: bool,
+    /// `[server.http]`: the Unix-socket HTTP transport preview. Off by default.
+    pub http: HttpConfig,
     /// Default cast name when a call omits `cast`.
     pub default_cast: String,
     /// `EnvFilter` directive used when `RUST_LOG` is unset.
@@ -2467,6 +2469,7 @@ impl Config {
             .collect::<anyhow::Result<Vec<_>>>()?;
         let follow_worktrees = server.follow_worktrees.unwrap_or(true);
         let infer_cwd = server.infer_cwd.unwrap_or(true);
+        let http = merge_http(server.http.unwrap_or_default())?;
         let telemetry = merge_telemetry(raw.telemetry.unwrap_or_default())?;
         let persistence = merge_persistence(raw.persistence.unwrap_or_default())?;
         let cas = merge_cas(raw.cas.unwrap_or_default())?;
@@ -2501,6 +2504,7 @@ impl Config {
             allow_paths,
             follow_worktrees,
             infer_cwd,
+            http,
             default_cast,
             log,
             tools,
@@ -2531,6 +2535,27 @@ impl Config {
             )
         })?;
         Ok(cfg)
+    }
+
+    /// Apply `kaibo serve --http` / `--no-http` / `--socket` (highest precedence). clap
+    /// keeps the first two exclusive. `--socket` alone does not turn HTTP on; it sets the
+    /// path an enabled server binds.
+    pub fn apply_http_cli(
+        &mut self,
+        enable: bool,
+        disable: bool,
+        socket: Option<&str>,
+    ) -> Result<()> {
+        if enable {
+            self.http.enabled = true;
+        }
+        if disable {
+            self.http.enabled = false;
+        }
+        if let Some(socket) = socket {
+            self.http.socket = Some(parse_http_socket(socket, "--socket")?);
+        }
+        Ok(())
     }
 
     /// Apply CLI overrides (highest precedence). Called from `main` after load.
@@ -3121,6 +3146,19 @@ struct RawServer {
     cast: Option<String>,
     log: Option<String>,
     tools: Option<RawTools>,
+    /// `[server.http]`, the Unix-socket HTTP transport preview.
+    http: Option<RawHttp>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawHttp {
+    /// Serve MCP over HTTP instead of stdio. Default `false`. Env: `KAIBO_HTTP`. CLI:
+    /// `kaibo serve --http`.
+    enabled: Option<bool>,
+    /// Absolute path of the Unix socket. Default `$XDG_RUNTIME_DIR/kaibo/mcp.sock`.
+    /// Env: `KAIBO_HTTP_SOCKET`. CLI: `--socket`.
+    socket: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -3780,6 +3818,14 @@ fn apply_raw_env(raw: &mut RawConfig, get: &impl Fn(&str) -> Option<String>) -> 
     if let Some(v) = get("KAIBO_CAST") {
         server.cast = Some(v);
     }
+    // Both directions: `KAIBO_HTTP=0` must be able to close a socket the file opened.
+    if get("KAIBO_HTTP").is_some() {
+        server.http.get_or_insert_with(Default::default).enabled =
+            Some(env_flag(get, "KAIBO_HTTP"));
+    }
+    if let Some(v) = get("KAIBO_HTTP_SOCKET") {
+        server.http.get_or_insert_with(Default::default).socket = Some(v);
+    }
     if let Some(v) = get("KAIBO_LOG") {
         server.log = Some(v);
     }
@@ -4117,6 +4163,39 @@ fn parse_env_int<T: TryFrom<u64>>(name: &str, v: &str) -> Result<T> {
         bail!("{name}={v:?} is too large (max {})", i64::MAX);
     }
     T::try_from(n).map_err(|_| anyhow!("{name}={v:?} is out of range"))
+}
+
+/// `[server.http]`: serve MCP over streamable HTTP on a Unix socket (`src/http_socket.rs`).
+/// A preview: off by default, and there is no TCP listener.
+#[derive(Debug, Clone, Default)]
+pub struct HttpConfig {
+    /// Serve on the socket instead of stdio.
+    pub enabled: bool,
+    /// The socket path. `None` means the default, resolved when the server starts.
+    pub socket: Option<PathBuf>,
+}
+
+/// Parse a socket path: absolute, so a service manager's working directory cannot move it.
+pub fn parse_http_socket(raw: &str, source: &str) -> Result<PathBuf> {
+    let path = PathBuf::from(raw.trim());
+    if !path.is_absolute() {
+        bail!(
+            "{source} = {raw:?} is not an absolute path. Give the full path of the Unix \
+             socket, such as \"/run/user/1000/kaibo/mcp.sock\", or leave it unset for \
+             $XDG_RUNTIME_DIR/kaibo/mcp.sock."
+        );
+    }
+    Ok(path)
+}
+
+fn merge_http(raw: RawHttp) -> Result<HttpConfig> {
+    Ok(HttpConfig {
+        enabled: raw.enabled.unwrap_or(false),
+        socket: raw
+            .socket
+            .map(|s| parse_http_socket(&s, "[server.http] socket"))
+            .transpose()?,
+    })
 }
 
 /// A `KAIBO_NO_*` flag is on for any non-empty, non-"0"/"false" value.

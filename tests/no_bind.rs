@@ -1,9 +1,10 @@
-//! kaibo binds one socket, and only on loopback: the `kaibo login` callback.
+//! kaibo binds two sockets, never on a network address: the `kaibo login` loopback
+//! callback, and the opt-in MCP Unix socket (`src/http_socket.rs`).
 //!
 //! The invariant was "stdio only — kaibo can read a filesystem, so it never binds a
 //! socket". Signing in to a provider through the browser needs a redirect target, and
 //! for a local tool that can only be a listener on this machine. So the invariant now
-//! reads "kaibo binds only loopback, only at blessed sites", and this guard is what
+//! reads "kaibo binds no network address for MCP, and only at blessed sites", and this guard is what
 //! makes "only" true: every bind call in `src/` production code must be a marked line
 //! in a blessed file, and the count of marked lines is pinned. The MCP server binds
 //! nothing; the callback lives in `src/oauth/callback.rs`, is reachable only from
@@ -26,13 +27,22 @@ const FORBIDDEN: &[&str] = &[
     ".listen(",
 ];
 
-/// The one blessed bind site.
-const BLESSED_FILE: &str = "callback.rs";
-const BLESSED_MARKER: &str = "loopback-bind: the one-shot sign-in callback";
-const BLESSED_NEEDLE: &str = "TcpListener::bind(";
+/// The blessed bind sites: (file, marker, the one needle the marker excuses).
+const BLESSED: &[(&str, &str, &str)] = &[
+    (
+        "callback.rs",
+        "loopback-bind: the one-shot sign-in callback",
+        "TcpListener::bind(",
+    ),
+    (
+        "http_socket.rs",
+        "loopback-bind: the opt-in MCP Unix socket",
+        "UnixListener::bind(",
+    ),
+];
 
-/// Exactly one marked bind line tree-wide.
-const EXPECTED_BLESSED_LINES: usize = 1;
+/// Exactly one marked bind line per blessed site, tree-wide.
+const EXPECTED_BLESSED_LINES: usize = 2;
 
 fn rs_files(dir: &Path, out: &mut Vec<PathBuf>) {
     for entry in std::fs::read_dir(dir).expect("read src dir") {
@@ -60,7 +70,9 @@ fn strip_line_comment(line: &str) -> &str {
 }
 
 fn blessed(basename: &str, raw: &str, needle: &str) -> bool {
-    basename == BLESSED_FILE && raw.contains(BLESSED_MARKER) && needle == BLESSED_NEEDLE
+    BLESSED
+        .iter()
+        .any(|(file, marker, n)| basename == *file && raw.contains(marker) && needle == *n)
 }
 
 fn scan_source(basename: &str, source: &str) -> Vec<String> {
@@ -79,7 +91,11 @@ fn scan_source(basename: &str, source: &str) -> Vec<String> {
 fn marked_lines(basename: &str, source: &str) -> usize {
     production_code(source)
         .lines()
-        .filter(|raw| basename == BLESSED_FILE && raw.contains(BLESSED_MARKER))
+        .filter(|raw| {
+            BLESSED
+                .iter()
+                .any(|(file, marker, _)| basename == *file && raw.contains(marker))
+        })
         .count()
 }
 
@@ -98,7 +114,7 @@ fn sources() -> Vec<(String, String)> {
 }
 
 #[test]
-fn no_socket_is_bound_outside_the_sign_in_callback() {
+fn no_socket_is_bound_outside_the_blessed_sites() {
     let violations: Vec<String> = sources()
         .iter()
         .flat_map(|(name, text)| {
@@ -109,25 +125,28 @@ fn no_socket_is_bound_outside_the_sign_in_callback() {
         .collect();
     assert!(
         violations.is_empty(),
-        "kaibo binds no socket but the `kaibo login` callback (src/oauth/callback.rs). Found:\n  \
-         {}\nA new listener is a change to the stdio/loopback invariant: update AGENTS.md and \
+        "kaibo binds no socket but the `kaibo login` callback (src/oauth/callback.rs) and the \
+         MCP Unix socket (src/http_socket.rs). Found:\n  \
+         {}\nA new listener is a change to the stdio/socket invariant: update AGENTS.md and \
          this guard in the same change, with its review.",
         violations.join("\n  ")
     );
 }
 
 #[test]
-fn exactly_one_blessed_bind_line() {
+fn exactly_the_blessed_bind_lines() {
     let total: usize = sources().iter().map(|(n, t)| marked_lines(n, t)).sum();
     assert_eq!(
         total, EXPECTED_BLESSED_LINES,
-        "expected exactly one marked bind site"
+        "expected exactly one marked bind line per blessed site"
     );
 }
 
 #[test]
 fn teeth_the_guard_bites() {
-    let marked = format!("    TcpListener::bind(addr).await // {BLESSED_MARKER}\n");
+    let cb = "loopback-bind: the one-shot sign-in callback";
+    let uds = "loopback-bind: the opt-in MCP Unix socket";
+    let marked = format!("    TcpListener::bind(addr).await // {cb}\n");
     assert!(
         scan_source("callback.rs", &marked).is_empty(),
         "the marked callback bind passes"
@@ -140,10 +159,24 @@ fn teeth_the_guard_bites() {
         !scan_source("callback.rs", "    TcpListener::bind(addr).await?;\n").is_empty(),
         "an unmarked bind fails even in the callback file"
     );
-    let udp = format!("    UdpSocket::bind(addr) // {BLESSED_MARKER}\n");
+    let udp = format!("    UdpSocket::bind(addr) // {cb}\n");
     assert!(
         !scan_source("callback.rs", &udp).is_empty(),
         "the marker excuses only the TCP bind"
+    );
+    let unix = format!("    UnixListener::bind(path) // {uds}\n");
+    assert!(
+        scan_source("http_socket.rs", &unix).is_empty(),
+        "the marked socket bind passes"
+    );
+    assert!(
+        !scan_source("callback.rs", &unix).is_empty(),
+        "the socket marker is pinned to http_socket.rs"
+    );
+    let tcp_in_socket_file = format!("    TcpListener::bind(addr) // {uds}\n");
+    assert!(
+        !scan_source("http_socket.rs", &tcp_in_socket_file).is_empty(),
+        "the socket marker never excuses a TCP bind: no network address, ever"
     );
     assert!(
         scan_source(

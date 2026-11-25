@@ -12,6 +12,24 @@ use crate::credentials::WireKind;
 
 use super::ToolGating;
 
+/// The socket path `[http]` reports: the configured one, else the default this
+/// environment would bind. `None` where there is no Unix socket or no default.
+fn http_socket_path(config: &Config) -> Option<String> {
+    if let Some(p) = &config.http.socket {
+        return Some(p.display().to_string());
+    }
+    #[cfg(unix)]
+    {
+        crate::http_socket::default_socket_path()
+            .ok()
+            .map(|p| p.display().to_string())
+    }
+    #[cfg(not(unix))]
+    {
+        None
+    }
+}
+
 /// Render the `kaibo://config` TOML document. Shows the resolved runtime state —
 /// allowed trees, default cast, gated tools, sandbox limits, tunable defaults,
 /// each backend's kind/endpoint/key sources, and each cast's slots as
@@ -100,6 +118,9 @@ pub(crate) fn render_config_resource(
         /// Durable-store state (on by default): whether persistence is enabled, the
         /// resolved state-db path, and whether the store is actually open right now.
         persistence: PersistenceDoc,
+        /// `[server.http]`, the Unix-socket transport preview: on or off, and the socket
+        /// path the server binds or would bind.
+        http: HttpDoc,
         /// The media CAS: the on/off knob, the runtime mode (disk / memory / off),
         /// and where disk mode writes.
         cas: CasDoc,
@@ -265,6 +286,13 @@ pub(crate) fn render_config_resource(
         #[serde(skip_serializing_if = "Option::is_none")]
         path: Option<String>,
         active: bool,
+    }
+
+    #[derive(Serialize)]
+    struct HttpDoc {
+        enabled: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        socket: Option<String>,
     }
 
     /// The media CAS as resolved. `mode` is runtime truth (`"disk"` / `"memory"` /
@@ -806,6 +834,10 @@ pub(crate) fn render_config_resource(
                 .as_ref()
                 .map(|p| p.display().to_string()),
             active: persistence_active,
+        },
+        http: HttpDoc {
+            enabled: config.http.enabled,
+            socket: http_socket_path(config),
         },
         cas: CasDoc {
             enabled: config.cas.enabled,
@@ -1686,6 +1718,33 @@ mod tests {
         assert!(
             !body.contains("super-secret-token") && !body.contains("Bearer"),
             "a header value must never render — it can be a bearer token:\n{body}"
+        );
+    }
+
+    #[test]
+    fn config_resource_shows_the_socket_path() {
+        let config = Config::from_toml_str(
+            "[server.http]\nenabled = true\nsocket = \"/run/user/9/kaibo/x.sock\"\n",
+        )
+        .unwrap();
+        let body = render_config_resource(
+            &config,
+            &[],
+            None,
+            false,
+            vec![],
+            true,
+            crate::config::CasMode::Disk,
+            None,
+        );
+        let section = body
+            .split_once("[http]")
+            .expect("an [http] table renders")
+            .1;
+        assert!(section.contains("enabled = true"), "{section}");
+        assert!(
+            section.contains("socket = \"/run/user/9/kaibo/x.sock\""),
+            "{section}"
         );
     }
 

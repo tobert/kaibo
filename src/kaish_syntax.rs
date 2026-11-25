@@ -579,7 +579,7 @@ pub fn kaibo_instructions_with_scope(
          - **Allowed trees:**\n\
          {allowed_lines}\n\n\
          More without spending a turn: `kaibo://config`, `kaibo://tools`, \
-         `kaibo://kaish/*`.{casts}"
+         `kaibo://kaish/*`, setup: `kaibo://configure`, `kaibo://hosts`.{casts}"
     )
 }
 

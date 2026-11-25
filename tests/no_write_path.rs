@@ -1,11 +1,11 @@
-//! The read-only invariant, guarded at the source — now with four blessed exceptions.
+//! The read-only invariant, guarded at the source — now with five blessed sites.
 //!
 //! kaibo writes essentially nothing: no write path through kaish (enforced structurally —
 //! see `tests/sandbox.rs`/`tests/worker.rs`, where a kaish write is refused), and no
 //! handler-side `std::fs` write either. That has no runtime surface to probe — a handler
 //! that called `std::fs::write` would just succeed — so we guard it at the source:
-//! production code in `src/` must contain no filesystem-mutating call, save the **three
-//! blessed sites** below.
+//! production code in `src/` must contain no filesystem-mutating call, save the blessed
+//! sites below.
 //!
 //! **Blessed site 1** (the sanctioned first half of the read-only invariant amendment; see
 //! `docs/kaibo-persistence-and-cli.md`): a single `create_dir_all` in `src/store.rs`, in
@@ -47,6 +47,13 @@
 //! for the same reason, that `.write_all(` cannot tell a socket from a file. The socket
 //! itself is guarded separately (`tests/no_bind.rs`).
 //!
+//! **Blessed site 5** (2026-11-22): the Unix socket of the HTTP transport
+//! (`src/http_socket.rs`), one file at a path no model can aim, refused if it resolves into
+//! an allowed tree. Two lines: `set_permissions` narrowing the bound socket to `0600`, and
+//! the one `remove_file` behind `remove_own_socket`, which deletes only a socket this uid
+//! owns (a stale one before bind, our own at shutdown). The directory comes from the
+//! existing `create_state_dir` site, and the bind itself is guarded by `tests/no_bind.rs`.
+//!
 //! The carve-out is deliberately narrow, and this test keeps its teeth:
 //! - a blessed line is exempted **only** when its file is one of the blessed files
 //!   *and* the line's own raw text carries that file's marker *and* the call is one that
@@ -57,7 +64,7 @@
 //!   fails everywhere, including inside the blessed files, on any line lacking that
 //!   file's own marker;
 //! - the total number of blessed marker lines tree-wide is pinned to an **exact count**
-//!   (`EXPECTED_BLESSED_LINES`, currently 8), so a new write site — in an existing blessed
+//!   (`EXPECTED_BLESSED_LINES`, currently 10), so a new write site — in an existing blessed
 //!   file or a new one — can't quietly ride in behind an existing marker without this test
 //!   failing (`blessed_marker_count_matches_exactly`).
 //!
@@ -139,6 +146,19 @@ const BLESSED: &[Blessed] = &[
         // only toward private: see `secure_credentials_dir`.
         needles: &["set_permissions("],
     },
+    Blessed {
+        file: "http_socket.rs",
+        marker: "http-socket-remove: blessed by the HTTP socket invariant amendment (AGENTS.md)",
+        // Deleting a socket this uid owns: a stale one before bind, and our own at
+        // shutdown. `remove_own_socket` checks the type and the owner first.
+        needles: &["remove_file("],
+    },
+    Blessed {
+        file: "http_socket.rs",
+        marker: "http-socket-mode: blessed by the HTTP socket invariant amendment (AGENTS.md)",
+        // Narrowing the socket just bound to owner-only (0600).
+        needles: &["set_permissions("],
+    },
 ];
 
 /// One blessed write site: which file may carry it, the marker its line must show, and
@@ -162,9 +182,10 @@ struct Blessed {
 /// doc and the count breakdown in this file's module doc) + 1 in `cli.rs` (`kaibo cas
 /// read` handing an artifact's bytes to stdout) + 1 in `callback.rs` (the sign-in
 /// callback's reply to the browser) + 2 more in `store.rs` (creating the credentials
-/// directory at mode 700, and tightening an existing one to 700). Pinned so a new write
+/// directory at mode 700, and tightening an existing one to 700) + 2 in `http_socket.rs`
+/// (narrowing the MCP socket to 0600, and removing a socket this uid owns). Pinned so a new write
 /// site can't silently ride in behind an existing marker.
-const EXPECTED_BLESSED_LINES: usize = 8;
+const EXPECTED_BLESSED_LINES: usize = 10;
 
 fn rs_files(dir: &Path, out: &mut Vec<PathBuf>) {
     for entry in std::fs::read_dir(dir).expect("read src dir") {
@@ -291,8 +312,8 @@ fn blessed_marker_count_matches_exactly() {
     assert_eq!(
         total, EXPECTED_BLESSED_LINES,
         "expected exactly {EXPECTED_BLESSED_LINES} blessed write sites tree-wide (1 in \
-         src/store.rs + 3 in src/cas.rs + 1 in src/cli.rs + 1 in src/oauth/callback.rs), \
-         found {total}"
+         src/store.rs + 3 in src/cas.rs + 1 in src/cli.rs + 1 in src/oauth/callback.rs + 2 in \
+         src/store.rs for the credentials directory + 2 in src/http_socket.rs), found {total}"
     );
 }
 
@@ -501,5 +522,27 @@ fn teeth_wrong_marker_for_file_fails() {
     assert!(
         !scan_source("store.rs", &src_store).is_empty(),
         "cas.rs's marker must not exempt a write in store.rs"
+    );
+}
+
+#[test]
+fn teeth_socket_removal_is_pinned_to_its_file_and_call() {
+    let marked = "    std::fs::remove_file(path) // http-socket-remove: blessed by the HTTP socket invariant amendment (AGENTS.md)\n";
+    assert!(
+        scan_source("http_socket.rs", marked).is_empty(),
+        "the marked removal passes"
+    );
+    assert!(
+        !scan_source("store.rs", marked).is_empty(),
+        "the marker is pinned to http_socket.rs"
+    );
+    assert!(
+        !scan_source("http_socket.rs", "    std::fs::remove_file(path)?;\n").is_empty(),
+        "an unmarked removal fails even in the socket file"
+    );
+    let write = "    std::fs::write(path, b\"x\") // http-socket-remove: blessed by the HTTP socket invariant amendment (AGENTS.md)\n";
+    assert!(
+        !scan_source("http_socket.rs", write).is_empty(),
+        "the removal marker excuses remove_file only"
     );
 }

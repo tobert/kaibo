@@ -82,8 +82,11 @@ surface rule in the invariants).
   refused if it resolves into any allowed tree (`tests/store.rs`), and written via turso
   plus a **blessed `create_dir_all`** that `tests/no_write_path.rs` carves out. That store
   was the one deliberate write surface; the **media CAS** (`src/cas.rs` — generated
-  artifacts) is the second, under the same discipline: fixed XDG path, refused if
-  it resolves into an allowed tree, its own blessed marker. The CAS is safe by *shape*, not
+  artifacts) is the second, and the MCP socket file (`src/http_socket.rs`) the
+  third, under the same discipline: a path no model controls (the XDG runtime dir by
+  default, `[server.http] socket` to move it), refused if it resolves into an allowed tree
+  or sits in a directory another user could replace, and written only through its own
+  blessed markers. The CAS is safe by *shape*, not
   policy — **the address is the content hash**, so its API has no destination-path
   parameter for a model to aim; it is write-only (`create_new`; no unlink/truncate/rename,
   so an edit is copy-on-write) and never mounted into kaish, whose read side would
@@ -134,11 +137,15 @@ surface rule in the invariants).
   surfaced in the log and as `persistence.active = false` in `kaibo://config`; every other
   open error stays fatal. Connect-per-operation, never a shared `Connection`. See
   `src/store.rs`, `main.rs`.
-- **stdio only, with one loopback exception.** kaibo can read a filesystem, so the MCP
-  server never binds a socket. The one listener is `kaibo login`'s sign-in callback
-  (`src/oauth/callback.rs`): loopback only, started only by that CLI command, closed after
-  one sign-in or 5 minutes. `tests/no_bind.rs` pins it as the only bind site in `src/`; a
-  second listener is a change to this invariant, made here with its own review.
+- **stdio by default; two bound sockets, neither on a network address.** kaibo can read a
+  filesystem, so a socket is a door to it. `tests/no_bind.rs` pins both bind sites in
+  `src/`: `kaibo login`'s sign-in callback (`src/oauth/callback.rs`), loopback only, started
+  only by that CLI command, closed after one sign-in or 5 minutes; and the opt-in MCP
+  transport (`src/server/http.rs`, a preview), a **Unix socket** (`src/http_socket.rs`) and
+  never a TCP listener. That socket is off by default, mode `0600`, at a path outside every
+  allowed tree, and each accepted connection's peer uid must be kaibo's own; the door is the
+  file mode, so there is no token. Never bind a network address for MCP, and change these
+  rules only with a failing-first test in `tests/http_transport.rs` and `tests/no_bind.rs`.
 - **kaish is `!Send`.** The kernel runs on a dedicated thread behind `KaishWorker`;
   rig tools require `Send` futures. Don't hold the kernel across an `.await`.
 - **TLS is rustls + ring, no aws-lc / no OpenSSL.** The whole tree must stay free of
